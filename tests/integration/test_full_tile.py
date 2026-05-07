@@ -181,16 +181,42 @@ class TestFullTileIntegration:
         pytest.composite = composite
 
     def test_05_write_cog(self, tmp_path):
-        """Write composite to Cloud-Optimized GeoTIFF."""
-        print(f"\n--- Step 5: Write COG ---")
+        """Write composite to Cloud-Optimized GeoTIFF.
+
+        Uses uint16 encoding with scale/offset following standard practice:
+        - Landsat C2 L2 ST: uint16, scale=0.00341802, offset=149.0 (Kelvin)
+        - MODIS MOD11: uint16, scale=0.02, offset=0 (Kelvin)
+
+        Our encoding: scale=0.01, offset=-50.0 (Celsius)
+        Range: -50°C to +105.535°C with 0.01°C precision
+
+        References:
+        - https://www.usgs.gov/faqs/how-do-i-use-a-scale-factor-landsat-level-2-science-products
+        - https://lpdaac.usgs.gov/documents/118/MOD11_User_Guide_V6.pdf
+        """
+        print(f"\n--- Step 5: Write COG (uint16) ---")
         composite = pytest.composite
 
         start = time.perf_counter()
 
-        # Prepare data
-        lst_p50 = composite["lst_p50"].values
-        lst_p95 = composite["lst_p95"].values
-        qa_count = composite["qa_count"].values.astype(np.float32)
+        # Encoding constants
+        LST_SCALE = 0.01
+        LST_OFFSET = -50.0
+        LST_NODATA_CELSIUS = -9999.0
+
+        def encode_celsius_to_uint16(celsius):
+            """Encode Celsius to uint16. DN=0 is nodata."""
+            valid = celsius != LST_NODATA_CELSIUS
+            dn = np.zeros_like(celsius, dtype=np.uint16)
+            dn[valid] = np.round(
+                (celsius[valid] - LST_OFFSET) / LST_SCALE
+            ).clip(1, 65535).astype(np.uint16)
+            return dn
+
+        # Encode temperature bands to uint16
+        lst_p50 = encode_celsius_to_uint16(composite["lst_p50"].values)
+        lst_p95 = encode_celsius_to_uint16(composite["lst_p95"].values)
+        qa_count = composite["qa_count"].values.astype(np.uint16)
 
         # Stack bands
         data = np.stack([lst_p50, lst_p95, qa_count], axis=0)
@@ -203,17 +229,17 @@ class TestFullTileIntegration:
             data.shape[2], data.shape[1]
         )
 
-        # Write temp GeoTIFF
+        # Write temp GeoTIFF with uint16
         tmp_tif = tmp_path / "temp.tif"
         profile = {
             "driver": "GTiff",
-            "dtype": "float32",
+            "dtype": "uint16",
             "width": data.shape[2],
             "height": data.shape[1],
             "count": 3,
             "crs": "EPSG:4326",
             "transform": transform,
-            "nodata": -9999,
+            "nodata": 0,  # DN=0 is nodata
         }
 
         with rasterio.open(tmp_tif, "w", **profile) as dst:
@@ -241,11 +267,14 @@ class TestFullTileIntegration:
         print(f"COG written in {elapsed:.1f}s")
         print(f"File: {cog_path.name} ({file_size_mb:.1f} MB)")
 
-        # Validate
+        # Validate COG structure
         with rasterio.open(cog_path) as src:
             assert src.count == 3
             assert src.is_tiled
             assert src.crs.to_epsg() == 4326
+            assert src.dtypes[0] == "uint16", f"Expected uint16, got {src.dtypes[0]}"
+            print(f"Data type: {src.dtypes[0]}")
+            print(f"Encoding: scale=0.01, offset=-50.0 (Celsius)")
 
         pytest.cog_path = cog_path
         pytest.tmp_path = tmp_path

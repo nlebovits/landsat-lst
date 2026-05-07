@@ -277,12 +277,68 @@ End-to-end pipeline validated on 0.25° tile near Pergamino, Argentina.
 | QA mask | <0.1s | Cloud/shadow/snow filtering |
 | Temperature | <0.1s | Kelvin → Celsius conversion |
 | Composite | 23.4s | p50: 16.6–32.4°C (mean 26.3°C) |
-| COG write | 0.2s | 4.7 MB zstd-compressed |
+| COG write | 0.1s | 2.7 MB DEFLATE (uint16) |
 | VirtualZarr | 0.009s | Reference from COG |
 | Icechunk | 0.006s | Committed to store |
 | Roundtrip | <0.1s | Structure validated |
 
-**Known Issue:** zstd codec segfaults on Python 3.14 during Icechunk read-back compute. Workaround: validate structure only, skip compute. Works fine on Python 3.11/3.12.
+---
+
+## Data Type: uint16 with Scale/Offset
+
+**Decision:** Store LST composites as uint16 instead of float32.
+
+**Rationale:** This follows standard practice for analysis-ready LST products. Both the source data and major derived products use scaled integers:
+
+| Product | Data Type | Scale | Offset | Units | Reference |
+|---------|-----------|-------|--------|-------|-----------|
+| Landsat C2 L2 ST | uint16 | 0.00341802 | 149.0 | Kelvin | [USGS](https://www.usgs.gov/faqs/how-do-i-use-a-scale-factor-landsat-level-2-science-products) |
+| MODIS MOD11 LST | uint16 | 0.02 | 0 | Kelvin | [USGS LPDAAC](https://lpdaac.usgs.gov/documents/118/MOD11_User_Guide_V6.pdf) |
+
+From USGS: *"Level-2 products are written as scaled integers to allow conversion from floating point to integer for delivery... saves disk space and provides faster download times."*
+
+**Our encoding (Celsius output):**
+
+```python
+# Encoding: Celsius → uint16
+# Range: -50°C to +105.535°C (covers all terrestrial LST)
+# Precision: 0.01°C (exceeds source precision)
+SCALE = 0.01
+OFFSET = -50.0
+NODATA_UINT16 = 0  # -50°C is outside valid LST range
+
+def encode_celsius_to_uint16(celsius: np.ndarray, nodata: float = -9999.0) -> np.ndarray:
+    """Encode Celsius temperatures to uint16 with scale/offset."""
+    valid = celsius != nodata
+    dn = np.zeros_like(celsius, dtype=np.uint16)
+    dn[valid] = np.round((celsius[valid] - OFFSET) / SCALE).clip(1, 65535).astype(np.uint16)
+    return dn
+
+def decode_uint16_to_celsius(dn: np.ndarray) -> np.ndarray:
+    """Decode uint16 to Celsius temperatures."""
+    celsius = np.where(dn == 0, np.nan, dn * SCALE + OFFSET)
+    return celsius.astype(np.float32)
+```
+
+| Celsius | uint16 DN | Notes |
+|---------|-----------|-------|
+| -50.0°C | 1 | Minimum valid (DN=0 is nodata) |
+| 0.0°C | 5000 | |
+| 25.0°C | 7500 | Typical urban |
+| 50.0°C | 10000 | Hot desert |
+| 70.0°C | 12000 | Extreme surface |
+
+**Storage impact:**
+
+| Metric | float32 | uint16 | Savings |
+|--------|---------|--------|---------|
+| Bytes/pixel (3 bands) | 12 | 6 | 50% |
+| 0.25° test tile | ~4.8 MB | ~2.4 MB | 50% |
+| 5° production tile | ~1.9 GB | ~950 MB | 50% |
+| Per year (global) | ~1.1 TB | ~550 GB | 50% |
+| Full archive (2013-2025) | ~14 TB | ~7 TB | 50% |
+
+**Precision analysis:** The source Landsat ST band has ~0.1K precision (scale factor 0.00341802). Our 0.01°C encoding provides 10× finer precision than the source data — no information is lost.
 
 ---
 

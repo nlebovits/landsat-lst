@@ -21,12 +21,14 @@ ds = xr.open_zarr("icechunk://source.coop/radiant-earth/landsat-lst")
 
 ## Scaling Estimates
 
-| Scope | Size | Notes |
-|-------|------|-------|
-| 0.25° test tile | 4.8 MB | 901×901 px, 3 bands float32, DEFLATE |
-| 5° production tile | ~1.9 GB | 18,000×18,000 px |
-| Global land (1 year) | ~1.1 TB | ~560 land tiles × 1.9 GB |
-| Full archive (2013-2025) | ~14 TB | 13 years × 1.1 TB |
+| Scope | Size (uint16) | Notes |
+|-------|---------------|-------|
+| 0.25° test tile | ~2.4 MB | 901×901 px, 3 bands uint16, DEFLATE |
+| 5° production tile | ~950 MB | 18,000×18,000 px |
+| Global land (1 year) | ~550 GB | ~560 land tiles × 950 MB |
+| Full archive (2013-2025) | ~7 TB | 13 years × 550 GB |
+
+**50% storage savings** from using uint16 instead of float32 (see [Data Type decision](findings-phase0.md#data-type-uint16-with-scaleoffset)).
 
 COGs stored on Source Coop; Icechunk stores lightweight references (~MBs).
 
@@ -352,7 +354,17 @@ def generate_jobs(
 ### 1.3 COG Writer: `src/landsat_lst/cog.py`
 
 ```python
-"""COG writing utilities with Source Coop-compatible settings."""
+"""COG writing utilities with Source Coop-compatible settings.
+
+Data type: uint16 with scale/offset encoding for 50% storage reduction.
+This follows standard practice for analysis-ready LST products:
+- Landsat C2 L2 ST: uint16, scale=0.00341802, offset=149.0 (Kelvin)
+- MODIS MOD11: uint16, scale=0.02, offset=0 (Kelvin)
+
+References:
+- USGS: https://www.usgs.gov/faqs/how-do-i-use-a-scale-factor-landsat-level-2-science-products
+- MODIS: https://lpdaac.usgs.gov/documents/118/MOD11_User_Guide_V6.pdf
+"""
 
 from pathlib import Path
 import tempfile
@@ -365,6 +377,31 @@ import xarray as xr
 
 from landsat_lst.models import TileId
 
+# Encoding constants for Celsius → uint16
+# Range: -50°C to +105.535°C with 0.01°C precision
+# This exceeds source precision (~0.1K) so no information is lost
+LST_SCALE = 0.01
+LST_OFFSET = -50.0
+LST_NODATA_UINT16 = 0  # DN=0 reserved for nodata
+LST_NODATA_CELSIUS = -9999.0
+
+
+def encode_celsius_to_uint16(celsius: np.ndarray) -> np.ndarray:
+    """Encode Celsius temperatures to uint16 with scale/offset.
+    
+    Formula: DN = (celsius - offset) / scale
+    Decode:  celsius = DN * scale + offset
+    
+    DN=0 is reserved for nodata. Valid range is DN=1 to DN=65535,
+    representing -49.99°C to +105.535°C.
+    """
+    valid = celsius != LST_NODATA_CELSIUS
+    dn = np.zeros_like(celsius, dtype=np.uint16)
+    dn[valid] = np.round(
+        (celsius[valid] - LST_OFFSET) / LST_SCALE
+    ).clip(1, 65535).astype(np.uint16)
+    return dn
+
 
 def write_cog(
     ds: xr.Dataset,
@@ -375,18 +412,22 @@ def write_cog(
     """
     Write xarray Dataset to Cloud-Optimized GeoTIFF.
     
+    Data encoding:
+    - lst_p50, lst_p95: uint16, scale=0.01, offset=-50.0 (Celsius)
+    - qa_count: uint16 (raw count, no scaling)
+    
     Uses DEFLATE compression for universal compatibility (per portolan ADR-0019).
     Disables overviews for VirtualZarr compatibility.
     
     Returns the path to the written COG.
     """
-    # Prepare data arrays
-    lst_p50 = ds["lst_p50"].values
-    lst_p95 = ds["lst_p95"].values  
-    qa_count = ds["qa_count"].values.astype(np.float32)
+    # Encode temperature bands to uint16
+    lst_p50_uint16 = encode_celsius_to_uint16(ds["lst_p50"].values)
+    lst_p95_uint16 = encode_celsius_to_uint16(ds["lst_p95"].values)
+    qa_count_uint16 = ds["qa_count"].values.astype(np.uint16)
     
     # Stack into multiband array
-    data = np.stack([lst_p50, lst_p95, qa_count], axis=0)
+    data = np.stack([lst_p50_uint16, lst_p95_uint16, qa_count_uint16], axis=0)
     
     # Get spatial info
     lat = ds["latitude"].values
@@ -402,18 +443,21 @@ def write_cog(
     
     profile = {
         "driver": "GTiff",
-        "dtype": "float32",
+        "dtype": "uint16",
         "width": data.shape[2],
         "height": data.shape[1],
         "count": 3,
         "crs": "EPSG:4326",
         "transform": transform,
-        "nodata": -9999,
+        "nodata": 0,  # DN=0 is nodata for all bands
     }
     
     with rasterio.open(tmp_path, "w", **profile) as dst:
         dst.write(data)
         dst.descriptions = ("lst_p50", "lst_p95", "qa_count")
+    
+    # Note: Scale/offset stored in STAC metadata and Icechunk attrs,
+    # not in COG (cog_translate doesn't preserve per-band tags)
     
     # Translate to COG with Source Coop-compatible settings
     # DEFLATE for universal compatibility (not zstd)
@@ -773,3 +817,4 @@ See [findings-phase0.md](findings-phase0.md) for full details.
 5. **DEFLATE over ZSTD** for Source Coop compatibility (~same size, universal support)
 6. **Use `.median()` not `.quantile(0.5)`** — 200× faster for same result
 7. **Use `bilinear` resampling** for thermal data — 8× faster than nearest
+8. **Use uint16 with scale/offset** — 50% storage reduction, standard practice for LST products
