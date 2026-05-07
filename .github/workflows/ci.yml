@@ -1,0 +1,201 @@
+# Tier 2 CI - Runs on every PR and push to main
+# Philosophy: Starting from zero, all quality gates are STRICT.
+# Nothing passes with warnings - fix issues or they block the PR.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Check code formatting
+        run: uv run ruff format --check .
+
+      - name: Run linter
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run ty check src/
+
+      - name: Spell check
+        run: uv run codespell --skip "*.parquet,*.tif,.git,*.lock,.venv" src/ tests/ docs/
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run bandit security scan
+        run: uv run bandit -r src/landsat_lst -c pyproject.toml
+
+      - name: Audit dependencies
+        run: uv run pip-audit
+
+  dead-code:
+    name: Dead Code, Complexity & Duplication
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Check for dead code
+        run: uv run vulture src/landsat_lst tests --min-confidence 80
+
+      - name: Check code complexity
+        run: uv run xenon --max-absolute=C --max-modules=B --max-average=A src/landsat_lst
+
+      - name: Check for duplicate code
+        run: uv run pylint --disable=all --enable=duplicate-code --fail-under=9.5 src/landsat_lst/
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run unit tests
+        run: uv run pytest tests/unit -v --cov=src/landsat_lst --cov-report=xml -n auto
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.11'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+  test-smoke:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Cache test data
+        uses: actions/cache@v4
+        with:
+          path: tests/fixtures/data
+          key: test-data-v1-${{ hashFiles('tests/fixtures/*.py') }}
+
+      - name: Run smoke tests
+        run: uv run pytest tests/smoke -v -m smoke
+        timeout-minutes: 10
+
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Cache test data
+        uses: actions/cache@v4
+        with:
+          path: tests/fixtures/data
+          key: test-data-v1-${{ hashFiles('tests/fixtures/*.py') }}
+
+      - name: Run integration tests
+        run: uv run pytest tests/integration -v -m integration
+        timeout-minutes: 30
+
+  build:
+    name: Build Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Build package
+        run: uv build
+
+      - name: Check package contents
+        run: |
+          uv run python -c "import tarfile; t = tarfile.open(list(__import__('pathlib').Path('dist').glob('*.tar.gz'))[0]); print('\n'.join(t.getnames()))"

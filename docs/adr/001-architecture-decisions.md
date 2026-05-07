@@ -1,0 +1,264 @@
+# ADR-001: Landsat LST Pipeline Architecture Decisions
+
+**Status:** Accepted  
+**Date:** 2025-05-07  
+**Authors:** @nlebovits
+
+## Context
+
+This pipeline produces global annual Land Surface Temperature (LST) composites from Landsat Collection 2 Level-2 data. The output is intended for municipal decision-makers analyzing urban heat, not for research scientists who would composite raw data themselves.
+
+Output will be hosted on Source Cooperative as STAC-compliant COGs, with a virtual Zarr layer via IceChunk.
+
+---
+
+## Decisions
+
+### 1. Data Source
+
+**Decision:** Element 84 Earth Search STAC API
+
+- **Endpoint:** `https://earth-search.aws.element84.com/v1`
+- **Collection:** `landsat-c2-l2`
+
+**Rationale:** Data is stored in S3 (us-west-2). Since we run on AWS via Coiled, this eliminates cross-cloud egress costs and reduces latency compared to Planetary Computer (Azure).
+
+**Alternatives considered:**
+- Planetary Computer — requires Azure→AWS transfer, token auth
+- USGS direct — less cloud-optimized
+
+---
+
+### 2. Landsat Missions
+
+**Decision:** Landsat 8 and Landsat 9 only
+
+**Rationale:** Consistent sensor characteristics (TIRS). Landsat 7 has scan line corrector failure artifacts. Historical backfill (L5/L7) is on the roadmap but not in initial scope.
+
+---
+
+### 3. Temporal Scope
+
+**Decision:** Calendar year composites (January 1 – December 31)
+
+- **Initial years:** 2021, 2022, 2023, 2024, 2025
+- **Backfill:** Pre-2021 is on roadmap
+
+**Rationale:** Calendar years align with administrative reporting cycles for municipal users.
+
+---
+
+### 4. Coordinate Reference System
+
+**Decision:** EPSG:4326 (WGS84 geographic)
+
+**Rationale:**
+- STAC ecosystem expects 4326 for spatial queries
+- Web map display (3857) handled by tile servers (TiTiler) on-the-fly
+- Municipal users downloading COGs expect 4326
+- Area-aware analysis is out of scope for target users; researchers can reproject
+
+**Alternatives considered:**
+- EPSG:6933 (equal-area) — better for area calculations but unfamiliar to users, adds complexity
+- Native UTM — preserves resolution but creates ~120 zones globally
+
+---
+
+### 5. Tiling Scheme
+
+**Decision:** 5° × 5° fixed grid
+
+| Property | Value |
+|----------|-------|
+| Tile size | 5° latitude × 5° longitude |
+| Naming | Northwest corner, e.g., `N40W075` |
+| Pixels at 30m | ~18,500 × 18,500 (varies with latitude) |
+| Estimated tiles | ~800 after land/latitude mask |
+
+**Rationale:**
+- Simple, predictable grid
+- Good parallelism for Coiled (~800 independent tasks)
+- Manageable file sizes (~500-800MB compressed per tile)
+- Easy to skip ocean tiles
+
+**Alternatives considered:**
+- 10° tiles — too large (5GB+), fewer parallelism opportunities
+- 1° tiles — too many (~20,000), overhead dominates
+- WRS-2 path/row — complex overlaps, ~57,000 combinations
+
+---
+
+### 6. Spatial Filtering
+
+**Decision:** Land surface only, ±60° latitude
+
+| Filter | Implementation |
+|--------|----------------|
+| Land mask | Natural Earth 10m land polygons |
+| Latitude bounds | Clip to 60°N – 60°S |
+| Water bodies | Exclude via land mask (oceans, major lakes) |
+
+**Rationale:**
+- Focus is urban/populated areas
+- ±60° covers all significant population centers
+- Reduces data volume and processing time significantly
+- Natural Earth is simple, well-maintained, sufficient resolution
+
+**Alternatives considered:**
+- GHS-POP population threshold — adds complexity, marginal benefit
+- OSM land polygons — too detailed/large for this use case
+
+---
+
+### 7. QA Filtering
+
+**Decision:** Bitwise pixel-level masking from `qa_pixel` band
+
+```python
+def qa_mask(qa: xr.DataArray) -> xr.DataArray:
+    """Returns True for GOOD (usable) pixels."""
+    cloud = (qa >> 3) & 1        # bit 3: cloud
+    shadow = (qa >> 4) & 1       # bit 4: cloud shadow
+    snow = (qa >> 5) & 1         # bit 5: snow/ice
+    return (cloud == 0) & (shadow == 0) & (snow == 0)
+```
+
+**Rationale:**
+- Standard approach for Landsat science products
+- Pixel-level masking preserves maximum data
+- Simple binary flags (present/absent) rather than confidence levels
+
+**Note:** Scene-level cloud cover filter (`eo:cloud_cover < 20`) applied at STAC query time to reduce data volume before pixel-level masking.
+
+---
+
+### 8. Day/Night Passes
+
+**Decision:** Daytime passes only
+
+**Rationale:**
+- Urban heat island analysis focuses on daytime heating
+- Consistent solar illumination conditions
+- Simpler interpretation for municipal users
+
+---
+
+### 9. Temperature Units
+
+**Decision:** Celsius
+
+**Conversion:**
+```python
+# Landsat C2 L2 ST band scaling
+lst_kelvin = lwir11 * 0.00341802 + 149.0
+lst_celsius = lst_kelvin - 273.15
+```
+
+**Rationale:** Intuitive for municipal decision-makers worldwide (except US, but they'll manage).
+
+---
+
+### 10. Output Bands
+
+**Decision:** Three bands per tile COG
+
+| Band | Name | Description |
+|------|------|-------------|
+| 1 | `lst_p50` | Median (50th percentile) LST in °C |
+| 2 | `lst_p95` | 95th percentile LST in °C |
+| 3 | `qa_count` | Count of valid observations |
+
+**Rationale:**
+- p50 (median) — robust central tendency, less affected by outliers than mean
+- p95 — captures extreme heat events without being max (which catches errors)
+- qa_count — data quality indicator, shows observation density
+
+---
+
+### 11. Output Format
+
+**Decision:** Cloud-Optimized GeoTIFF (COG)
+
+| Property | Value |
+|----------|-------|
+| Format | COG |
+| Compression | DEFLATE |
+| Tiling | 512×512 internal tiles |
+| Overviews | Yes (nearest neighbor for qa_count, average for LST) |
+| Nodata | -9999 |
+
+**Rationale:** COG is the standard for cloud-native geospatial. DEFLATE balances compression ratio and read speed.
+
+---
+
+### 12. STAC Structure
+
+**Decision:** One collection per year, tiles as items
+
+```
+landsat-lst-annual/
+├── 2021/           # Collection: landsat-lst-2021
+│   ├── N40W075/    # Item
+│   ├── N40W070/    # Item
+│   └── ...
+├── 2022/           # Collection: landsat-lst-2022
+└── ...
+```
+
+**Rationale:**
+- Aligns with temporal query patterns (users query by year)
+- Items are individual tiles (spatial units)
+- Clean separation for incremental updates
+
+---
+
+### 13. Processing Infrastructure
+
+**Decision:** Coiled on AWS
+
+- **Cluster:** Dask distributed via Coiled
+- **Region:** us-west-2 (co-located with Earth Search data)
+- **Worker spec:** TBD based on profiling
+
+**Rationale:** Coiled handles cluster provisioning, scales to global processing, data locality with S3.
+
+---
+
+### 14. Final Destination
+
+**Decision:** Source Cooperative
+
+- COGs stored on Source Cooperative
+- STAC catalog published
+- Virtual Zarr via IceChunk for analysis-ready access
+
+**Rationale:** Source Cooperative is the appropriate home for open geospatial data products.
+
+---
+
+## Consequences
+
+### Positive
+- Simple, well-understood architecture
+- Good parallelism for global processing
+- Output format familiar to municipal GIS users
+- Cloud-native from source to destination
+
+### Negative
+- 4326 has area distortion (acceptable for target users)
+- 5° tiles may be suboptimal for some regions (acceptable tradeoff)
+- Calendar year composites may miss seasonal patterns (out of scope)
+
+### Risks
+- Earth Search availability/pricing changes
+- Coiled cost scaling for global processing
+- Source Cooperative storage limits
+
+---
+
+## References
+
+- [Landsat Collection 2 Level-2 Science Products](https://www.usgs.gov/landsat-missions/landsat-collection-2-level-2-science-products)
+- [Element 84 Earth Search](https://earth-search.aws.element84.com/v1)
+- [COG Specification](https://www.cogeo.org/)
+- [STAC Specification](https://stacspec.org/)

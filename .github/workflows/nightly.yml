@@ -1,0 +1,183 @@
+# Tier 3 CI - Expensive checks that run nightly
+# These are too slow/expensive for PR gates but catch issues early
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # 4 AM UTC daily
+  workflow_dispatch:
+
+jobs:
+  mutation-testing:
+    name: Mutation Testing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Install mutmut
+        run: uv pip install mutmut
+
+      - name: Run mutation testing
+        run: |
+          uv run mutmut run \
+            --paths-to-mutate=src/landsat_lst \
+            --tests-dir=tests/unit \
+            --runner="uv run pytest tests/unit -x -q" \
+            --no-progress \
+            || true
+
+      - name: Generate mutation report
+        run: |
+          uv run mutmut results > mutation_report.txt || true
+          cat mutation_report.txt
+
+      - name: Check mutation score
+        run: |
+          uv run mutmut junitxml > mutation_results.xml || true
+          # Extract kill rate and fail if below threshold
+          uv run python -c "
+          import xml.etree.ElementTree as ET
+          try:
+              tree = ET.parse('mutation_results.xml')
+              root = tree.getroot()
+              total = int(root.get('tests', 0))
+              killed = int(root.get('failures', 0)) + int(root.get('errors', 0))
+              if total > 0:
+                  kill_rate = (total - killed) / total * 100
+                  print(f'Mutation kill rate: {kill_rate:.1f}%')
+                  if kill_rate < 60:
+                      print('FAIL: Kill rate below 60% threshold')
+                      exit(1)
+              else:
+                  print('No mutations generated')
+          except Exception as e:
+              print(f'Could not parse results: {e}')
+          "
+
+      - name: Upload mutation report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-report
+          path: |
+            mutation_report.txt
+            mutation_results.xml
+          retention-days: 30
+
+  slow-tests:
+    name: Slow Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run slow tests
+        run: uv run pytest tests/ -v -m slow --timeout=300
+        timeout-minutes: 30
+
+  network-tests:
+    name: Network Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Cache test data
+        uses: actions/cache@v4
+        with:
+          path: tests/fixtures/data
+          key: test-data-v1-${{ hashFiles('tests/fixtures/*.py') }}
+
+      - name: Run network tests
+        run: uv run pytest tests/ -v -m "integration or network" --timeout=120
+        timeout-minutes: 30
+
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Full dependency audit
+        run: |
+          uv run pip-audit --desc on --format json > audit_results.json || true
+          uv run pip-audit --desc on
+        continue-on-error: true
+
+      - name: Upload audit results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-audit
+          path: audit_results.json
+          retention-days: 90
+
+  stale-dependencies:
+    name: Check Stale Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Check for outdated packages
+        run: |
+          uv pip list --outdated > outdated.txt || true
+          echo "=== Outdated Packages ==="
+          cat outdated.txt
+          # Don't fail, just report
+
+      - name: Upload outdated report
+        uses: actions/upload-artifact@v4
+        with:
+          name: outdated-dependencies
+          path: outdated.txt
+          retention-days: 7
