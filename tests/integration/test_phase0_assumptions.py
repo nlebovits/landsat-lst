@@ -16,8 +16,8 @@ Note: Uses Microsoft Planetary Computer (free, no requester-pays).
 
 import numpy as np
 import planetary_computer
-import pytest
 import pystac_client
+import pytest
 import xarray as xr
 from odc.stac import configure_rio, stac_load
 
@@ -348,9 +348,7 @@ class TestCOGStructureAssumptions:
             "height": data.shape[0],
             "count": 1,
             "crs": "EPSG:4326",
-            "transform": rasterio.transform.from_bounds(
-                *TEST_BBOX, data.shape[1], data.shape[0]
-            ),
+            "transform": rasterio.transform.from_bounds(*TEST_BBOX, data.shape[1], data.shape[0]),
         }
         with rasterio.open(tmp_tif, "w", **profile) as dst:
             dst.write(data.astype("float32"), 1)
@@ -442,9 +440,7 @@ class TestVirtualZarrAssumptions:
             "height": data.shape[0],
             "count": 1,
             "crs": "EPSG:4326",
-            "transform": rasterio.transform.from_bounds(
-                *TEST_BBOX, data.shape[1], data.shape[0]
-            ),
+            "transform": rasterio.transform.from_bounds(*TEST_BBOX, data.shape[1], data.shape[0]),
         }
         with rasterio.open(tmp_tif, "w", **profile) as dst:
             dst.write(data.astype("float32"), 1)
@@ -476,7 +472,7 @@ class TestVirtualZarrAssumptions:
         """Virtual dataset has chunk structure from COG tiles."""
         vds = _open_virtual_tiff(str(test_cog_path))
         # Get first data variable
-        var_name = list(vds.data_vars)[0]
+        var_name = next(iter(vds.data_vars))
         var = vds[var_name]
         # Should have encoding with chunks or chunksizes
         assert var.encoding or hasattr(var, "chunks")
@@ -571,9 +567,7 @@ class TestIcechunkAssumptions:
             "height": data.shape[0],
             "count": 1,
             "crs": "EPSG:4326",
-            "transform": rasterio.transform.from_bounds(
-                *TEST_BBOX, data.shape[1], data.shape[0]
-            ),
+            "transform": rasterio.transform.from_bounds(*TEST_BBOX, data.shape[1], data.shape[0]),
         }
         with rasterio.open(tmp_tif, "w", **profile) as dst:
             dst.write(data.astype("float32"), 1)
@@ -654,7 +648,7 @@ class TestIcechunkAssumptions:
         ds_read = xr.open_zarr(read_repo.readonly_session("main").store, consolidated=False)
 
         # Get first variable
-        var_name = list(ds_read.data_vars)[0]
+        var_name = next(iter(ds_read.data_vars))
         icechunk_data = ds_read[var_name].compute().values
 
         # Compare shapes at minimum

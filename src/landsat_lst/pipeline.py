@@ -49,7 +49,7 @@ def load_scenes(items: list, bbox: tuple[float, float, float, float]) -> xr.Data
         bands=["lwir11", "qa_pixel"],
         crs=settings.crs,
         resolution=settings.resolution,
-        chunks={"time": 10, "x": 2048, "y": 2048},
+        chunks={"time": 10, "latitude": 512, "longitude": 512},
         groupby="solar_day",
         bbox=bbox,
     )
@@ -71,7 +71,7 @@ def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
     valid_mask = ~np.isnan(lst)
     qa_count = valid_mask.sum(dim="time").astype(np.int16)  # ty: ignore[no-matching-overload]
 
-    lst_p50 = lst.quantile(0.5, dim="time", skipna=True).drop_vars("quantile")
+    lst_p50 = lst.median(dim="time", skipna=True)
     lst_p95 = lst.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
 
     lst_p50 = lst_p50.where(qa_count > 0, settings.nodata)

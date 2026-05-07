@@ -8,8 +8,8 @@ from landsat_lst.pipeline import query_stac
 
 @pytest.mark.integration
 class TestStacQuery:
-    def test_query_returns_items(self, pergamino_bbox: tuple[float, float, float, float]):
-        """Test that we can query Earth Search and get results."""
+    def test_query_returns_items(self):
+        """Test that we can query STAC and get results."""
         tile = TileId(lat=-30, lon=-65)
         job = ProcessingJob(tile=tile, year=2023)
 
@@ -17,7 +17,7 @@ class TestStacQuery:
 
         assert len(items) > 0
 
-    def test_items_have_required_assets(self, pergamino_bbox: tuple[float, float, float, float]):
+    def test_items_have_required_assets(self):
         """Test that returned items have the bands we need."""
         tile = TileId(lat=-30, lon=-65)
         job = ProcessingJob(tile=tile, year=2023)
@@ -29,7 +29,7 @@ class TestStacQuery:
             assert "lwir11" in item.assets or "ST_B10" in item.assets
             assert "qa_pixel" in item.assets
 
-    def test_items_are_landsat_8_or_9(self, pergamino_bbox: tuple[float, float, float, float]):
+    def test_items_are_landsat_8_or_9(self):
         """Test that we only get Landsat 8 and 9 scenes."""
         tile = TileId(lat=-30, lon=-65)
         job = ProcessingJob(tile=tile, year=2023)

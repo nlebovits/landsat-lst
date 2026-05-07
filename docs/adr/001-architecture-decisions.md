@@ -16,16 +16,18 @@ Output will be hosted on Source Cooperative as STAC-compliant COGs, with a virtu
 
 ### 1. Data Source
 
-**Decision:** Element 84 Earth Search STAC API
+**Decision:** Microsoft Planetary Computer STAC API
 
-- **Endpoint:** `https://earth-search.aws.element84.com/v1`
+- **Endpoint:** `https://planetarycomputer.microsoft.com/api/stac/v1`
 - **Collection:** `landsat-c2-l2`
 
-**Rationale:** Data is stored in S3 (us-west-2). Since we run on AWS via Coiled, this eliminates cross-cloud egress costs and reduces latency compared to Planetary Computer (Azure).
+**Rationale:** Planetary Computer provides **free egress** for Landsat data, eliminating data transfer costs entirely. Earth Search uses USGS requester-pays S3 buckets (~$0.09/GB egress), which would cost ~$630 for the full 7TB archive.
 
 **Alternatives considered:**
-- Planetary Computer — requires Azure→AWS transfer, token auth
+- Earth Search — requester-pays S3, significant egress costs
 - USGS direct — less cloud-optimized
+
+**Note:** Phase 0 testing (2026-05) validated this decision. Token signing is handled via `planetary_computer.sign_inplace()`.
 
 ---
 

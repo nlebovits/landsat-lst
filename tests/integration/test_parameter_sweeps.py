@@ -7,13 +7,11 @@ Run with: pytest -m sweep -v
 """
 
 import time
-from pathlib import Path
 
 import numpy as np
 import planetary_computer
-import pytest
 import pystac_client
-import xarray as xr
+import pytest
 from odc.stac import configure_rio, stac_load
 
 # Small bbox for fast sweeps (~0.1° near Pergamino)
@@ -89,7 +87,7 @@ class TestCloudCoverSweep:
             buckets = [0, 10, 20, 30, 40, 50, 100]
             for i in range(len(buckets) - 1):
                 count = sum(1 for cc in cloud_covers if buckets[i] <= cc < buckets[i + 1])
-                print(f"  {buckets[i]}-{buckets[i+1]}%: {count} scenes")
+                print(f"  {buckets[i]}-{buckets[i + 1]}%: {count} scenes")
 
 
 # =============================================================================

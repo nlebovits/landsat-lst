@@ -16,8 +16,8 @@ class Settings(BaseSettings):
     )
 
     stac_url: str = Field(
-        default="https://earth-search.aws.element84.com/v1",
-        description="STAC API endpoint URL",
+        default="https://planetarycomputer.microsoft.com/api/stac/v1",
+        description="STAC API endpoint URL (Planetary Computer has free egress)",
     )
     collection: str = Field(
         default="landsat-c2-l2",
@@ -47,9 +47,9 @@ class Settings(BaseSettings):
         description="Maximum cloud cover percentage for scene filtering",
     )
 
-    resolution: int = Field(
-        default=30,
-        description="Output resolution in meters",
+    resolution: float = Field(
+        default=0.00027778,
+        description="Output resolution in degrees (~30m at equator)",
     )
     crs: str = Field(
         default="EPSG:4326",

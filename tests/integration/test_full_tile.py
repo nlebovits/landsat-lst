@@ -4,24 +4,23 @@ End-to-end test: STAC query → composite → COG → VirtualZarr → Icechunk
 
 Uses optimized settings from parameter sweeps:
 - Cloud cover: ≤20%
-- Chunk size: 512×512
+- Chunk size: 512x512
 - Resampling: bilinear (thermal), nearest (QA)
-- Compression: zstd
+- Compression: DEFLATE (Source Coop compatible)
 - Statistics: median (not quantile)
 
 Run with: pytest -m tile -v -s
 """
 
 import time
-from pathlib import Path
 
+import icechunk
 import numpy as np
 import planetary_computer
-import pytest
 import pystac_client
+import pytest
 import rasterio
 import xarray as xr
-import icechunk
 from icechunk import ObjectStoreConfig, Repository, RepositoryConfig, VirtualChunkContainer
 from obspec_utils.registry import ObjectStoreRegistry
 from obstore.store import LocalStore
@@ -51,9 +50,9 @@ def stac_client():
 @pytest.fixture(scope="module")
 def stac_items(stac_client):
     """Query STAC for all valid scenes in the tile."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"FULL TILE INTEGRATION TEST: {TILE_NAME} ({TILE_YEAR})")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Bbox: {TILE_BBOX}")
 
     start = time.perf_counter()
@@ -76,7 +75,9 @@ def stac_items(stac_client):
 
     # Show scene distribution
     cloud_covers = [i.properties["eo:cloud_cover"] for i in items]
-    print(f"Cloud cover: {np.mean(cloud_covers):.1f}% avg, {np.min(cloud_covers):.1f}-{np.max(cloud_covers):.1f}% range")
+    print(
+        f"Cloud cover: {np.mean(cloud_covers):.1f}% avg, {np.min(cloud_covers):.1f}-{np.max(cloud_covers):.1f}% range"
+    )
 
     return items
 
@@ -87,7 +88,7 @@ class TestFullTileIntegration:
 
     def test_01_load_all_scenes(self, stac_items):
         """Load all scenes for the tile."""
-        print(f"\n--- Step 1: Load scenes ---")
+        print("\n--- Step 1: Load scenes ---")
         start = time.perf_counter()
 
         ds = stac_load(
@@ -111,7 +112,7 @@ class TestFullTileIntegration:
 
     def test_02_apply_qa_mask(self):
         """Apply QA mask to remove clouds/shadows/snow."""
-        print(f"\n--- Step 2: Apply QA mask ---")
+        print("\n--- Step 2: Apply QA mask ---")
         ds = pytest.ds
 
         qa = ds["qa_pixel"]
@@ -128,7 +129,7 @@ class TestFullTileIntegration:
 
     def test_03_convert_to_celsius(self):
         """Convert to Celsius using Landsat C2 L2 scaling."""
-        print(f"\n--- Step 3: Convert to Celsius ---")
+        print("\n--- Step 3: Convert to Celsius ---")
         lst_masked = pytest.lst_masked
 
         # Scale/offset from USGS
@@ -140,7 +141,7 @@ class TestFullTileIntegration:
 
     def test_04_compute_composite(self):
         """Compute annual composite: p50, p95, count."""
-        print(f"\n--- Step 4: Compute composite ---")
+        print("\n--- Step 4: Compute composite ---")
         lst_celsius = pytest.lst_celsius
 
         start = time.perf_counter()
@@ -159,11 +160,13 @@ class TestFullTileIntegration:
         lst_p95 = lst_p95.where(qa_count > 0, nodata)
 
         # Create composite dataset
-        composite = xr.Dataset({
-            "lst_p50": lst_p50.astype(np.float32),
-            "lst_p95": lst_p95.astype(np.float32),
-            "qa_count": qa_count,
-        })
+        composite = xr.Dataset(
+            {
+                "lst_p50": lst_p50.astype(np.float32),
+                "lst_p95": lst_p95.astype(np.float32),
+                "qa_count": qa_count,
+            }
+        )
 
         # Compute!
         print("Computing composite (this takes a while)...")
@@ -176,7 +179,9 @@ class TestFullTileIntegration:
         # Stats
         p50_valid = composite["lst_p50"].values[composite["lst_p50"].values != nodata]
         if len(p50_valid) > 0:
-            print(f"LST p50: {p50_valid.min():.1f}°C to {p50_valid.max():.1f}°C (mean {p50_valid.mean():.1f}°C)")
+            print(
+                f"LST p50: {p50_valid.min():.1f}°C to {p50_valid.max():.1f}°C (mean {p50_valid.mean():.1f}°C)"
+            )
 
         pytest.composite = composite
 
@@ -194,7 +199,7 @@ class TestFullTileIntegration:
         - https://www.usgs.gov/faqs/how-do-i-use-a-scale-factor-landsat-level-2-science-products
         - https://lpdaac.usgs.gov/documents/118/MOD11_User_Guide_V6.pdf
         """
-        print(f"\n--- Step 5: Write COG (uint16) ---")
+        print("\n--- Step 5: Write COG (uint16) ---")
         composite = pytest.composite
 
         start = time.perf_counter()
@@ -208,9 +213,9 @@ class TestFullTileIntegration:
             """Encode Celsius to uint16. DN=0 is nodata."""
             valid = celsius != LST_NODATA_CELSIUS
             dn = np.zeros_like(celsius, dtype=np.uint16)
-            dn[valid] = np.round(
-                (celsius[valid] - LST_OFFSET) / LST_SCALE
-            ).clip(1, 65535).astype(np.uint16)
+            dn[valid] = (
+                np.round((celsius[valid] - LST_OFFSET) / LST_SCALE).clip(1, 65535).astype(np.uint16)
+            )
             return dn
 
         # Encode temperature bands to uint16
@@ -225,8 +230,7 @@ class TestFullTileIntegration:
         lat = composite["latitude"].values
         lon = composite["longitude"].values
         transform = rasterio.transform.from_bounds(
-            lon.min(), lat.min(), lon.max(), lat.max(),
-            data.shape[2], data.shape[1]
+            lon.min(), lat.min(), lon.max(), lat.max(), data.shape[2], data.shape[1]
         )
 
         # Write temp GeoTIFF with uint16
@@ -274,14 +278,14 @@ class TestFullTileIntegration:
             assert src.crs.to_epsg() == 4326
             assert src.dtypes[0] == "uint16", f"Expected uint16, got {src.dtypes[0]}"
             print(f"Data type: {src.dtypes[0]}")
-            print(f"Encoding: scale=0.01, offset=-50.0 (Celsius)")
+            print("Encoding: scale=0.01, offset=-50.0 (Celsius)")
 
         pytest.cog_path = cog_path
         pytest.tmp_path = tmp_path
 
     def test_06_create_virtual_reference(self):
         """Create VirtualZarr reference from COG."""
-        print(f"\n--- Step 6: Create VirtualZarr reference ---")
+        print("\n--- Step 6: Create VirtualZarr reference ---")
         cog_path = pytest.cog_path
 
         start = time.perf_counter()
@@ -304,10 +308,9 @@ class TestFullTileIntegration:
 
     def test_07_write_to_icechunk(self):
         """Write virtual references to Icechunk store."""
-        print(f"\n--- Step 7: Write to Icechunk ---")
+        print("\n--- Step 7: Write to Icechunk ---")
         vds = pytest.vds
         tmp_path = pytest.tmp_path
-        cog_path = pytest.cog_path
 
         start = time.perf_counter()
 
@@ -340,7 +343,7 @@ class TestFullTileIntegration:
 
     def test_08_read_back_from_icechunk(self):
         """Read data back from Icechunk via xr.open_zarr."""
-        print(f"\n--- Step 8: Read back from Icechunk ---")
+        print("\n--- Step 8: Read back from Icechunk ---")
         icechunk_path = pytest.icechunk_path
         cog_parent_dir = pytest.cog_parent_dir
 
@@ -374,7 +377,7 @@ class TestFullTileIntegration:
 
     def test_09_validate_roundtrip(self):
         """Validate data integrity through the full pipeline."""
-        print(f"\n--- Step 9: Validate roundtrip ---")
+        print("\n--- Step 9: Validate roundtrip ---")
         cog_path = pytest.cog_path
         ds_read = pytest.ds_read
 
@@ -384,7 +387,7 @@ class TestFullTileIntegration:
             print(f"Original COG shape: {original_data.shape}")
 
         # Validate Icechunk dataset structure
-        var_name = list(ds_read.data_vars)[0]
+        var_name = next(iter(ds_read.data_vars))
         print(f"Icechunk variable: {var_name}")
         print(f"Icechunk dims: {ds_read[var_name].dims}")
         print(f"Icechunk shape: {ds_read[var_name].shape}")
@@ -398,11 +401,11 @@ class TestFullTileIntegration:
 
     def test_10_summary(self):
         """Print summary of full tile test."""
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("FULL TILE TEST COMPLETE")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Tile: {TILE_NAME}")
         print(f"Year: {TILE_YEAR}")
         print(f"Bbox: {TILE_BBOX}")
-        print(f"Pipeline: STAC → Load → QA → Composite → COG → VirtualZarr → Icechunk")
+        print("Pipeline: STAC → Load → QA → Composite → COG → VirtualZarr → Icechunk")
         print("All steps passed!")
