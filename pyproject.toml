@@ -40,6 +40,12 @@ dependencies = [
     "click>=8.1.0",
     "rich>=13.0.0",
     "structlog>=24.1.0",
+    "icechunk>=1.1.21",
+    "virtualizarr>=2.5.1",
+    "rio-cogeo>=7.0.2",
+    "odc-geo>=0.5.1",
+    "planetary-computer>=1.0.0",
+    "virtual-tiff>=0.5.0",
 ]
 
 [project.optional-dependencies]
@@ -148,6 +154,9 @@ markers = [
     "slow: Slow tests (skip with -m 'not slow')",
     "network: Tests requiring network access (nightly only)",
     "benchmark: Performance benchmarks (nightly only)",
+    "assumption: Phase 0 assumption validation (hits external APIs)",
+    "sweep: Parameter sweep tests for optimization",
+    "tile: Full tile integration tests (slow, ~5 min)",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

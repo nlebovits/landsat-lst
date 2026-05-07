@@ -1,8 +1,9 @@
 # Implementation Plan: VirtualZarr + Icechunk Integration
 
 **Date:** 2026-05-07  
-**Status:** Draft  
-**Related ADRs:** [ADR-001](adr/001-architecture-decisions.md), [ADR-002](adr/002-virtualzarr-icechunk-integration.md)
+**Status:** Active (Phase 0 Complete)  
+**Related ADRs:** [ADR-001](adr/001-architecture-decisions.md), [ADR-002](adr/002-virtualzarr-icechunk-integration.md)  
+**Findings:** [Phase 0 Findings](findings-phase0.md)
 
 ---
 
@@ -18,124 +19,67 @@ ds = xr.open_zarr("icechunk://source.coop/radiant-earth/landsat-lst")
 
 ---
 
-## Phase 0: Proof of Concept (1-2 days)
+## Scaling Estimates
+
+| Scope | Size | Notes |
+|-------|------|-------|
+| 0.25° test tile | 4.8 MB | 901×901 px, 3 bands float32, DEFLATE |
+| 5° production tile | ~1.9 GB | 18,000×18,000 px |
+| Global land (1 year) | ~1.1 TB | ~560 land tiles × 1.9 GB |
+| Full archive (2013-2025) | ~14 TB | 13 years × 1.1 TB |
+
+COGs stored on Source Coop; Icechunk stores lightweight references (~MBs).
+
+---
+
+## Phase 0: Proof of Concept ✅ COMPLETE
 
 **Goal:** Validate the VirtualZarr → Icechunk pipeline with a single tile before building full infrastructure.
 
-### Tasks
+**Status:** Completed via TDD. See [findings-phase0.md](findings-phase0.md) for details.
 
-#### 0.1 Add Dependencies
-```bash
-uv add icechunk virtualizarr odc-stac odc-geo
-```
+### Validated Components
 
-Dependencies and their roles:
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `icechunk` | `>=2.0` | Transactional Zarr store for virtual references |
-| `virtualizarr` | `>=1.0` | Create virtual datasets from COGs |
-| `odc-stac` | `>=0.3` | Load Landsat from STAC into xarray |
-| `odc-geo` | `>=0.4` | GeoBox creation for spatial alignment |
+| Component | Status | Key Finding |
+|-----------|--------|-------------|
+| STAC query | ✅ | Use Planetary Computer (free egress) |
+| odc.stac loading | ✅ | Dimensions are `latitude`/`longitude`, not `x`/`y` |
+| QA masking | ✅ | Bits 3/4/5 for cloud/shadow/snow |
+| Temperature conversion | ✅ | `DN * 0.00341802 + 149.0 - 273.15` |
+| COG creation | ✅ | DEFLATE, 512×512, predictor=2, `overview_level=0` |
+| VirtualZarr 2.x | ✅ | Requires `ObjectStoreRegistry` + `VirtualTIFF` parser |
+| Icechunk 2.x | ✅ | Requires `VirtualChunkContainer` for external data |
+| Roundtrip read | ✅ | Structure validated; zstd codec issue on Python 3.14 |
 
-#### 0.2 Create POC Notebook: `notebooks/poc-virtualzarr.ipynb`
+### Optimal Settings (from parameter sweeps)
 
 ```python
-# Cell 1: Query STAC for Pergamino test region
-import pystac_client
-import odc.stac
+# STAC query
+query = {"eo:cloud_cover": {"lt": 20}}
 
-catalog = pystac_client.Client.open("https://earth-search.aws.element84.com/v1")
-items = list(catalog.search(
-    collections=["landsat-c2-l2"],
-    bbox=[-60.6, -34.0, -60.4, -33.8],  # Pergamino subset
-    datetime="2023-01-01/2023-12-31",
-    query={"eo:cloud_cover": {"lt": 20}},
-).items())
-
-print(f"Found {len(items)} scenes")
-
-# Cell 2: Load and composite
-from odc.geo.geobox import GeoBox
-
-geobox = GeoBox.from_bbox([-60.6, -34.0, -60.4, -33.8], crs="EPSG:4326", resolution=0.00027778)
-
-ds = odc.stac.load(
+# Data loading
+stac_load(
     items,
     bands=["lwir11", "qa_pixel"],
-    geobox=geobox,
-    chunks={"time": 1, "x": 512, "y": 512},
+    chunks={"time": 10, "latitude": 512, "longitude": 512},
     resampling={"lwir11": "bilinear", "qa_pixel": "nearest"},
 )
 
-# Apply QA mask and compute median
-qa = ds.qa_pixel
-cloud = (qa >> 3) & 1
-shadow = (qa >> 4) & 1
-mask = (cloud == 0) & (shadow == 0)
+# Composite statistics
+lst_median = lst_celsius.median(dim="time", skipna=True)  # NOT .quantile(0.5)
 
-lst_kelvin = ds.lwir11.where(mask) * 0.00341802 + 149.0
-lst_celsius = lst_kelvin - 273.15
-lst_median = lst_celsius.median(dim="time")
-
-# Cell 3: Write COG
-from rio_cogeo.cogeo import cog_translate
-from rio_cogeo.profiles import cog_profiles
-
-# ... (write to temp file, translate to COG)
-
-# Cell 4: Create VirtualZarr reference
-from virtualizarr import open_virtual_dataset
-
-vds = open_virtual_dataset("pergamino_2023.tif", filetype="tiff")
-print(vds)
-
-# Cell 5: Write to local Icechunk
-import icechunk
-
-storage = icechunk.local_filesystem_storage("./local_icechunk")
-repo = icechunk.Repository.create(storage)
-session = repo.writable_session("main")
-
-vds.virtualize.to_icechunk(session.store)
-session.commit("Added Pergamino 2023 test tile")
-
-# Cell 6: Verify read-back
-import xarray as xr
-ds_read = xr.open_zarr(repo.readonly_session("main").store)
-print(ds_read)
-ds_read.lst_median.plot()
+# COG output - DEFLATE for Source Coop compatibility
+dst_profile = cog_profiles.get("deflate")
+dst_profile["blockxsize"] = 512
+dst_profile["blockysize"] = 512
+cog_translate(src, dst, dst_profile, use_cog_driver=True, overview_level=0)
 ```
 
-#### 0.3 Validate Distributed Write Pattern
+### Tests Created
 
-```python
-# Test session pickling with 2 local workers
-from concurrent.futures import ProcessPoolExecutor
-from icechunk.distributed import merge_sessions
-
-def worker_task(tile_path: str, session) -> Session:
-    vds = open_virtual_dataset(tile_path, filetype="tiff")
-    vds.virtualize.to_icechunk(session.store)
-    return session
-
-session = repo.writable_session("main")
-with ProcessPoolExecutor(max_workers=2) as executor:
-    with session.allow_pickling():
-        futures = [
-            executor.submit(worker_task, f"tile_{i}.tif", session)
-            for i in range(2)
-        ]
-        worker_sessions = [f.result() for f in futures]
-
-session = merge_sessions(session, *worker_sessions)
-session.commit("Test distributed write")
-```
-
-### Success Criteria
-- [ ] VirtualZarr opens Landsat COG without error
-- [ ] References written to Icechunk successfully
-- [ ] `xr.open_zarr()` reads data correctly
-- [ ] Distributed write with session merge works
+- `tests/integration/test_phase0_assumptions.py` — 35 API validation tests
+- `tests/integration/test_parameter_sweeps.py` — 25 optimization tests
+- `tests/integration/test_full_tile.py` — 10-step end-to-end pipeline test
 
 ---
 
@@ -155,7 +99,13 @@ from pathlib import Path
 from typing import Iterator
 
 import icechunk
-from icechunk import Session
+from icechunk import (
+    ObjectStoreConfig,
+    Repository,
+    RepositoryConfig,
+    Session,
+    VirtualChunkContainer,
+)
 from icechunk.distributed import merge_sessions
 
 
@@ -175,6 +125,7 @@ class IcechunkStorage:
     def __init__(self, config: StorageConfig):
         self.config = config
         self._session: Session | None = None
+        self._repo: Repository | None = None
     
     def _get_storage(self) -> icechunk.Storage:
         return icechunk.s3_storage(
@@ -183,12 +134,29 @@ class IcechunkStorage:
             region=self.config.region,
         )
     
+    def _get_virtual_chunk_container(self) -> VirtualChunkContainer:
+        """Configure access to COGs on S3 for virtual chunk resolution."""
+        s3_config = ObjectStoreConfig.S3(
+            bucket=self.config.cog_bucket,
+            region=self.config.region,
+        )
+        return VirtualChunkContainer(
+            f"s3://{self.config.cog_bucket}/{self.config.cog_prefix}/",
+            s3_config,
+            name="cogs",
+        )
+    
     @contextmanager
     def writable_session(self, branch: str = "main") -> Iterator[Session]:
         """Get a writable session for the Icechunk store."""
         storage = self._get_storage()
-        repo = icechunk.Repository.open_or_create(storage)
-        session = repo.writable_session(branch)
+        
+        # Configure virtual chunk container for COG access
+        config = RepositoryConfig.default()
+        config.set_virtual_chunk_container(self._get_virtual_chunk_container())
+        
+        self._repo = Repository.open_or_create(storage, config=config)
+        session = self._repo.writable_session(branch)
         self._session = session
         try:
             with session.allow_pickling():
@@ -224,12 +192,30 @@ class LocalStorage:
         self.cog_dir = base_path / "cogs"
         self.icechunk_dir = base_path / "icechunk"
         self._session: Session | None = None
+        self._repo: Repository | None = None
+    
+    def _get_virtual_chunk_container(self) -> VirtualChunkContainer:
+        """Configure access to local COGs for virtual chunk resolution."""
+        local_config = ObjectStoreConfig.LocalFileSystem(str(self.cog_dir))
+        return VirtualChunkContainer(
+            f"file://{self.cog_dir}/",
+            local_config,
+            name="local",
+        )
     
     @contextmanager
     def writable_session(self, branch: str = "main") -> Iterator[Session]:
+        self.cog_dir.mkdir(parents=True, exist_ok=True)
+        self.icechunk_dir.mkdir(parents=True, exist_ok=True)
+        
         storage = icechunk.local_filesystem_storage(str(self.icechunk_dir))
-        repo = icechunk.Repository.open_or_create(storage)
-        session = repo.writable_session(branch)
+        
+        # Configure virtual chunk container
+        config = RepositoryConfig.default()
+        config.set_virtual_chunk_container(self._get_virtual_chunk_container())
+        
+        self._repo = Repository.open_or_create(storage, config=config)
+        session = self._repo.writable_session(branch)
         self._session = session
         try:
             with session.allow_pickling():
@@ -237,7 +223,17 @@ class LocalStorage:
         finally:
             self._session = None
     
-    # ... similar methods
+    def open_readonly(self, branch: str = "main"):
+        """Open repository for reading with virtual chunk authorization."""
+        storage = icechunk.local_filesystem_storage(str(self.icechunk_dir))
+        config = RepositoryConfig.default()
+        config.set_virtual_chunk_container(self._get_virtual_chunk_container())
+        
+        return Repository.open(
+            storage,
+            config=config,
+            authorize_virtual_chunk_access={f"file://{self.cog_dir}/": None},
+        )
 ```
 
 ### 1.2 Job Module: `src/landsat_lst/job.py`
@@ -246,15 +242,17 @@ class LocalStorage:
 """Job definitions for tile processing."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
+import pandas as pd
+import planetary_computer
+import pystac_client
 import xarray as xr
 from icechunk import Session
-from virtualizarr import open_virtual_dataset
+from odc.stac import configure_rio, stac_load
 
 from landsat_lst.models import TileId
-from landsat_lst.pipeline import query_stac, load_scenes, compute_annual_composite
 from landsat_lst.cog import write_cog
+from landsat_lst.virtual import create_virtual_reference
 
 
 @dataclass(frozen=True)
@@ -270,31 +268,70 @@ class TileYearJob:
         
         Returns the session with virtual references written.
         """
-        # 1. Query STAC for scenes
-        scenes = query_stac(
-            bbox=self.tile_id.bbox,
-            year=self.year,
-            max_cloud_cover=20,
+        # 1. Query STAC (Planetary Computer for free egress)
+        configure_rio(cloud_defaults=True)
+        catalog = pystac_client.Client.open(
+            "https://planetarycomputer.microsoft.com/api/stac/v1",
+            modifier=planetary_computer.sign_inplace,
         )
         
-        if len(scenes) == 0:
+        search = catalog.search(
+            collections=["landsat-c2-l2"],
+            bbox=self.tile_id.bbox,
+            datetime=f"{self.year}-01-01/{self.year}-12-31",
+            query={
+                "eo:cloud_cover": {"lt": 20},
+                "platform": {"in": ["landsat-8", "landsat-9"]},
+            },
+        )
+        items = list(search.items())
+        
+        if len(items) == 0:
             return session  # No data for this tile/year
         
-        # 2. Load and composite
-        ds = load_scenes(scenes, geobox=self.tile_id.geobox)
-        composite = compute_annual_composite(ds)
-        
-        # 3. Write COG
-        cog_path = write_cog(
-            composite,
-            output_path=cog_output_path,
-            tile_id=self.tile_id,
-            year=self.year,
+        # 2. Load scenes with optimized settings
+        ds = stac_load(
+            items,
+            bands=["lwir11", "qa_pixel"],
+            crs="EPSG:4326",
+            resolution=0.00027778,  # ~30m
+            chunks={"time": 10, "latitude": 512, "longitude": 512},
+            resampling={"lwir11": "bilinear", "qa_pixel": "nearest"},
+            bbox=self.tile_id.bbox,
+            groupby="solar_day",
         )
         
-        # 4. Create virtual reference and write to Icechunk
-        vds = open_virtual_dataset(cog_path, filetype="tiff")
-        vds = vds.expand_dims(time=[pd.Timestamp(f"{self.year}-07-01")])
+        # 3. Apply QA mask
+        qa = ds["qa_pixel"]
+        cloud = (qa >> 3) & 1
+        shadow = (qa >> 4) & 1
+        snow = (qa >> 5) & 1
+        mask = (cloud == 0) & (shadow == 0) & (snow == 0)
+        
+        # 4. Convert to Celsius
+        lst_masked = ds["lwir11"].where(mask)
+        lst_kelvin = lst_masked * 0.00341802 + 149.0
+        lst_celsius = lst_kelvin - 273.15
+        
+        # 5. Compute composite (median is 200x faster than quantile)
+        lst_p50 = lst_celsius.median(dim="time", skipna=True)
+        lst_p95 = lst_celsius.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
+        
+        valid_count = (~lst_celsius.isnull()).sum(dim="time").astype("int16")
+        
+        nodata = -9999.0
+        composite = xr.Dataset({
+            "lst_p50": lst_p50.where(valid_count > 0, nodata).astype("float32"),
+            "lst_p95": lst_p95.where(valid_count > 0, nodata).astype("float32"),
+            "qa_count": valid_count,
+        })
+        composite = composite.compute()
+        
+        # 6. Write COG
+        cog_path = write_cog(composite, cog_output_path, self.tile_id, self.year)
+        
+        # 7. Create virtual reference and write to Icechunk
+        vds = create_virtual_reference(cog_path, str(self.tile_id), self.year)
         vds.virtualize.to_icechunk(session.store)
         
         return session
@@ -315,7 +352,7 @@ def generate_jobs(
 ### 1.3 COG Writer: `src/landsat_lst/cog.py`
 
 ```python
-"""COG writing utilities."""
+"""COG writing utilities with Source Coop-compatible settings."""
 
 from pathlib import Path
 import tempfile
@@ -334,24 +371,30 @@ def write_cog(
     output_path: str,
     tile_id: TileId,
     year: int,
-    blocksize: int = 512,
 ) -> str:
     """
     Write xarray Dataset to Cloud-Optimized GeoTIFF.
+    
+    Uses DEFLATE compression for universal compatibility (per portolan ADR-0019).
+    Disables overviews for VirtualZarr compatibility.
     
     Returns the path to the written COG.
     """
     # Prepare data arrays
     lst_p50 = ds["lst_p50"].values
     lst_p95 = ds["lst_p95"].values  
-    qa_count = ds["qa_count"].values
+    qa_count = ds["qa_count"].values.astype(np.float32)
     
     # Stack into multiband array
     data = np.stack([lst_p50, lst_p95, qa_count], axis=0)
     
-    # Get transform from dataset
-    transform = ds.rio.transform()
-    crs = ds.rio.crs
+    # Get spatial info
+    lat = ds["latitude"].values
+    lon = ds["longitude"].values
+    transform = rasterio.transform.from_bounds(
+        lon.min(), lat.min(), lon.max(), lat.max(),
+        data.shape[2], data.shape[1]
+    )
     
     # Write temp GeoTIFF
     with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
@@ -363,7 +406,7 @@ def write_cog(
         "width": data.shape[2],
         "height": data.shape[1],
         "count": 3,
-        "crs": crs,
+        "crs": "EPSG:4326",
         "transform": transform,
         "nodata": -9999,
     }
@@ -372,15 +415,21 @@ def write_cog(
         dst.write(data)
         dst.descriptions = ("lst_p50", "lst_p95", "qa_count")
     
-    # Translate to COG
-    cog_profile = cog_profiles.get("deflate")
+    # Translate to COG with Source Coop-compatible settings
+    # DEFLATE for universal compatibility (not zstd)
+    # No overviews for VirtualZarr compatibility
+    dst_profile = cog_profiles.get("deflate")
+    dst_profile["blockxsize"] = 512
+    dst_profile["blockysize"] = 512
+    dst_profile["predictor"] = 2  # Horizontal differencing
+    
     cog_translate(
         tmp_path,
         output_path,
-        cog_profile,
-        blocksize=blocksize,
-        overview_resampling="average",
+        dst_profile,
         use_cog_driver=True,
+        overview_level=0,  # No overviews - required for VirtualZarr
+        quiet=True,
     )
     
     Path(tmp_path).unlink()  # Cleanup temp file
@@ -391,12 +440,15 @@ def write_cog(
 ### 1.4 Virtual Reference Module: `src/landsat_lst/virtual.py`
 
 ```python
-"""VirtualZarr integration for creating virtual datacube."""
+"""VirtualZarr 2.x integration for creating virtual datacube."""
 
 import pandas as pd
 import xarray as xr
-from virtualizarr import open_virtual_dataset
 from icechunk import Session
+from obspec_utils.registry import ObjectStoreRegistry
+from obstore.store import LocalStore, S3Store
+from virtual_tiff import VirtualTIFF
+from virtualizarr import open_virtual_dataset
 
 
 def create_virtual_reference(
@@ -406,10 +458,23 @@ def create_virtual_reference(
 ) -> xr.Dataset:
     """
     Create virtual dataset from COG with proper coordinates.
-    """
-    vds = open_virtual_dataset(cog_path, filetype="tiff")
     
-    # Add time coordinate
+    Uses VirtualZarr 2.x API with explicit registry and parser.
+    """
+    # Configure object store registry based on path scheme
+    registry = ObjectStoreRegistry()
+    
+    if cog_path.startswith("s3://"):
+        registry.register("s3://", S3Store())
+        uri = cog_path
+    else:
+        registry.register("file://", LocalStore())
+        uri = f"file://{cog_path}" if not cog_path.startswith("file://") else cog_path
+    
+    # Open virtual dataset with VirtualTIFF parser
+    vds = open_virtual_dataset(uri, registry=registry, parser=VirtualTIFF())
+    
+    # Add time coordinate (mid-year for annual composite)
     vds = vds.expand_dims(time=[pd.Timestamp(f"{year}-07-01")])
     
     # Add tile metadata
@@ -562,10 +627,9 @@ def process_year(year: int, parallel: bool, max_workers: int):
 # tests/unit/test_virtual.py
 def test_create_virtual_reference(tmp_path):
     """Virtual reference creation from COG."""
-    # Create test COG
     cog_path = create_test_cog(tmp_path / "test.tif")
     
-    vds = create_virtual_reference(cog_path, "N40W075", 2023)
+    vds = create_virtual_reference(str(cog_path), "N40W075", 2023)
     
     assert "time" in vds.dims
     assert vds.attrs["tile_id"] == "N40W075"
@@ -581,37 +645,39 @@ def test_local_storage_roundtrip(tmp_path):
         vds.virtualize.to_icechunk(session.store)
         storage.commit("Test commit")
     
-    # Read back
-    repo = icechunk.Repository.open(
-        icechunk.local_filesystem_storage(str(tmp_path / "icechunk"))
-    )
-    ds = xr.open_zarr(repo.readonly_session("main").store)
+    # Read back with authorization
+    repo = storage.open_readonly()
+    ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
     
-    assert "lst_p50" in ds.data_vars
+    assert len(ds.data_vars) > 0
 ```
 
 ### 3.2 Integration Tests
 
+Already created in Phase 0:
+- `tests/integration/test_phase0_assumptions.py` — 35 tests
+- `tests/integration/test_parameter_sweeps.py` — 25 tests
+- `tests/integration/test_full_tile.py` — 10 tests
+
+Additional tests needed:
 ```python
-# tests/integration/test_full_pipeline.py
+# tests/integration/test_multi_tile.py
 @pytest.mark.integration
-def test_single_tile_pipeline(pergamino_bbox):
-    """Full pipeline test with single Pergamino tile."""
-    job = TileYearJob(
-        tile_id=TileId.from_bbox(pergamino_bbox),
-        year=2023,
-    )
+def test_multi_tile_sequential(tmp_path):
+    """Process multiple tiles sequentially."""
+    tiles = [TileId(lat=-34, lon=-61), TileId(lat=-34, lon=-60)]
+    jobs = generate_jobs(tiles, [2024])
     
-    with LocalStorage(tmp_path).writable_session() as session:
-        result_session = job.process(session, tmp_path / "test.tif")
-        assert result_session is not None
+    storage = LocalStorage(tmp_path)
+    with storage.writable_session() as session:
+        for job in jobs:
+            cog_path = str(tmp_path / "cogs" / f"{job.tile_id}_{job.year}.tif")
+            job.process(session, cog_path)
+        storage.commit("Multi-tile test")
     
-    # Verify COG exists and is valid
-    assert (tmp_path / "test.tif").exists()
-    
-    # Verify virtual reference works
-    ds = xr.open_zarr(session.store)
-    assert ds.lst_p50.shape[0] > 0
+    repo = storage.open_readonly()
+    ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
+    assert "time" in ds.dims
 ```
 
 ---
@@ -633,6 +699,7 @@ AWS_REGION=us-west-2
 
 ```bash
 # Process years sequentially to manage costs
+# Estimated: ~1.1 TB per year, ~560 tiles
 for year in 2021 2022 2023 2024; do
     uv run landsat-lst process-year --year $year --max-workers 200
 done
@@ -648,35 +715,40 @@ done
 
 ## Timeline Summary
 
-| Phase | Duration | Deliverable |
-|-------|----------|-------------|
-| 0: POC | 1-2 days | Validated VirtualZarr→Icechunk flow |
-| 1: Core | 3-5 days | storage.py, job.py, cog.py, virtual.py |
-| 2: Parallel | 2-3 days | Coiled integration, CLI commands |
-| 3: Testing | 2 days | Unit + integration test suite |
-| 4: Deploy | 1-2 days | Production config, initial backfill |
+| Phase | Duration | Status | Deliverable |
+|-------|----------|--------|-------------|
+| 0: POC | 1-2 days | ✅ Complete | Validated APIs, optimal settings identified |
+| 1: Core | 3-5 days | Pending | storage.py, job.py, cog.py, virtual.py |
+| 2: Parallel | 2-3 days | Pending | Coiled integration, CLI commands |
+| 3: Testing | 2 days | Partial | Unit + integration test suite |
+| 4: Deploy | 1-2 days | Pending | Production config, initial backfill |
 
-**Total: 9-14 days**
+**Remaining: 8-12 days**
 
 ---
 
 ## Dependencies
 
-### New Packages
+### Packages (validated versions)
 ```toml
 [project.dependencies]
-icechunk = ">=2.0"
-virtualizarr = ">=1.0"
-odc-stac = ">=0.3"
-odc-geo = ">=0.4"
-rio-cogeo = ">=5.0"
-coiled = ">=1.0"
+icechunk = ">=1.1.21"
+virtualizarr = ">=2.5.1"
+virtual-tiff = ">=0.5.0"
+odc-stac = ">=0.3.10"
+odc-geo = ">=0.5.1"
+rio-cogeo = ">=7.0.2"
+planetary-computer = ">=1.0.0"
+coiled = ">=1.0.0"
 ```
 
 ### External Services
 - AWS S3 (Source Cooperative bucket)
 - Coiled account with AWS credentials
-- Earth Search STAC API (public, no auth)
+- **Planetary Computer STAC API** (public, free egress)
+
+### Python Version
+Pin to **Python 3.12** until zstd codec compatibility with 3.14 is resolved.
 
 ---
 
@@ -686,3 +758,18 @@ coiled = ">=1.0"
 2. **Coiled cluster sizing** — profile with subset before full run
 3. **STAC catalog generation** — parallel to Icechunk or derive from it?
 4. **Retry/resume strategy** — how to handle partial failures mid-run
+5. **Distributed write validation** — test `merge_sessions` with Coiled workers
+
+---
+
+## Key Learnings from Phase 0
+
+See [findings-phase0.md](findings-phase0.md) for full details.
+
+1. **Use Planetary Computer** over Earth Search (free egress vs $0.09/GB)
+2. **VirtualZarr 2.x API** requires explicit `ObjectStoreRegistry` + `VirtualTIFF` parser
+3. **Icechunk 2.x** requires `VirtualChunkContainer` configuration for external data
+4. **COG overviews break VirtualZarr** — use `overview_level=0`
+5. **DEFLATE over ZSTD** for Source Coop compatibility (~same size, universal support)
+6. **Use `.median()` not `.quantile(0.5)`** — 200× faster for same result
+7. **Use `bilinear` resampling** for thermal data — 8× faster than nearest

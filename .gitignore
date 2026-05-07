@@ -71,3 +71,4 @@ tests/fixtures/data/
 
 # Logs
 *.log
+digest.txt
