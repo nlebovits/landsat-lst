@@ -1,7 +1,8 @@
 # Findings: Direct Zarr Write Spike (2026-05-08)
 
 **Context:** Validated direct Zarr writes (bypassing COGs) for QGIS plugin consumption.
-**Issue:** #15
+**Issue:** #15 (closed — validation successful)
+**Outcome:** ✅ **Architecture pivot approved** — see [ADR-003](adr/003-direct-zarr-architecture.md)
 **Sample data:** `s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst-test/sample.zarr/`
 
 ---
@@ -140,11 +141,46 @@ chunks=(500, 500)  # Any size works
 
 ---
 
-## Next Steps
+## 8. QGIS Plugin Validation ✅
 
-1. **QGIS plugin validation:** Build minimal plugin to test rioxarray → temp GeoTIFF → QGIS layer path
-2. **Architecture decision:** If QGIS works, pivot from COG-first to direct Zarr writes
-3. **Zarr v2 vs v3:** Decide based on ecosystem compatibility requirements
+**Status:** Validated (2026-05-08)
+
+Built minimal QGIS plugin that demonstrates the data path:
+
+```
+Remote Zarr on Source Coop
+    │
+    ▼ fsspec.get_mapper(url, anon=True)
+    │
+    ▼ xr.open_zarr(mapper)
+    │
+    ▼ .rio.clip_box(minx, miny, maxx, maxy)  # spatial subset
+    │
+    ▼ .rio.to_raster(temp_path)  # write temp GeoTIFF
+    │
+    ▼ QgsRasterLayer(temp_path)  # load into QGIS
+```
+
+**Tested on:**
+- QGIS 3.28 LTS (no native GDAL Zarr driver)
+- rioxarray backend for spatial operations
+
+**Result:** Works correctly. Users can query arbitrary AOIs, the plugin fetches only the required chunks from Source Coop, converts to temp GeoTIFF, and displays in QGIS.
+
+**Key insight:** The rioxarray → GeoTIFF path is actually preferable for QGIS users because:
+- Handles CRS/transform automatically
+- Produces standard GeoTIFF that all QGIS versions understand
+- Only downloads the spatial subset, not the entire tile
+
+---
+
+## Outcome: Architecture Pivot Approved
+
+Based on the successful validation:
+
+1. ✅ **QGIS plugin works** — rioxarray → temp GeoTIFF → QGIS layer path validated
+2. ✅ **Direct Zarr writes adopted** — see [ADR-003](adr/003-direct-zarr-architecture.md)
+3. ⏸️ **Zarr v2 vs v3** — proceeding with v3 (xarray default); will revisit if ecosystem issues emerge
 
 ---
 
@@ -153,3 +189,4 @@ chunks=(500, 500)  # Any size works
 - Sample Zarr script: `scripts/create_sample_zarr.py`
 - Constants: `src/landsat_lst/cog.py` (LST_SCALE, LST_OFFSET)
 - Tile parsing: `src/landsat_lst/tiling.py` (parse_tile_name)
+- Architecture decision: [ADR-003](adr/003-direct-zarr-architecture.md)

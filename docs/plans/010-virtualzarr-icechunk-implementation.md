@@ -1,13 +1,21 @@
 # Implementation Plan: Issue #10 — VirtualZarr + Icechunk Integration
 
 **Issue:** https://github.com/nlebovits/landsat-lst/issues/10
-**Status:** Ready for implementation
+**Status:** ⚠️ **SUPERSEDED** (2026-05-08)
 **Date:** 2026-05-08
 **Prerequisites:** Issues #5 (uint16 encoding) and #6 (retry/resume) merged
 
+> ## ⚠️ This Plan is Superseded
+>
+> **This implementation approach was abandoned.** During implementation (PR #14), we discovered that GDAL's COG blocksize constraint conflicts with VirtualZarr's concatenation requirements.
+>
+> **See [ADR-003](../adr/003-direct-zarr-architecture.md)** for the replacement architecture: direct Zarr writes.
+>
+> The content below is preserved for historical reference.
+
 ---
 
-## Overview
+## Overview (Historical)
 
 Implement virtual Zarr datacube access over COGs using VirtualZarr and Icechunk, enabling:
 

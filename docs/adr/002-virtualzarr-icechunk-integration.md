@@ -1,11 +1,22 @@
 # ADR-002: VirtualZarr and Icechunk Integration for Virtual Datacube
 
-**Status:** Accepted
+**Status:** ⚠️ **SUPERSEDED** by [ADR-003](003-direct-zarr-architecture.md)
 **Date:** 2026-05-07
 **Updated:** 2026-05-08 (API corrections from spike testing)
+**Superseded:** 2026-05-08
 **Authors:** @nlebovits
 
-## Context
+> ## ⚠️ This ADR is Superseded
+>
+> **This architecture was not implemented.** During implementation (PR #14), we discovered that GDAL's COG blocksize constraint (multiples of 16) conflicts with VirtualZarr's concatenation requirement (dimensions divisible by chunk size). No chunk size satisfies both constraints for our ~18,500 pixel tiles.
+>
+> **See [ADR-003](003-direct-zarr-architecture.md)** for the replacement architecture: direct Zarr writes without COG intermediate.
+>
+> The content below is preserved for historical reference.
+
+---
+
+## Context (Historical)
 
 ADR-001 established that our pipeline produces COGs with STAC metadata for Source Cooperative. This ADR addresses the additional requirement: providing a **virtual Zarr datacube** that allows xarray/Zarr access across all tiles without duplicating data.
 

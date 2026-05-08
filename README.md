@@ -10,38 +10,41 @@ This pipeline produces annual LST composites for municipal decision-makers analy
 - **lst_p95**: 95th percentile LST (°C)
 - **qa_count**: Number of valid observations
 
-Data is tiled on a 5° global grid, stored as Cloud-Optimized GeoTIFFs (COGs), and published as a STAC catalog.
+Data is tiled on a 5° global grid, stored as Zarr v3 stores, and published with a STAC catalog.
 
 ## Data Encoding
 
 LST bands are stored as **uint16** to reduce file size by 50%. To convert back to Celsius:
 
 ```python
-import rasterio
+import xarray as xr
+import fsspec
 
-with rasterio.open("N40W075_2023.tif") as src:
-    # Read scale/offset from TIFF tags
-    tags = src.tags(1)  # Band 1 (lst_p50)
-    scale = float(tags["LST_SCALE"])    # 0.01
-    offset = float(tags["LST_OFFSET"])  # -50.0
+# Open a tile from Source Coop
+mapper = fsspec.get_mapper(
+    "s3://us-west-2.opendata.source.coop/radiant-earth/landsat-lst/2023/N40W075.zarr",
+    anon=True
+)
+ds = xr.open_zarr(mapper)
 
-    # Read data and decode
-    dn = src.read(1)
-    nodata_mask = dn == 0
-    celsius = dn * scale + offset
-    celsius[nodata_mask] = float("nan")
+# Read scale/offset from Zarr attributes
+scale = ds["lst_p50"].attrs["lst_scale_factor"]    # 0.01
+offset = ds["lst_p50"].attrs["lst_add_offset"]     # -50.0
+
+# Decode to Celsius
+celsius = ds["lst_p50"] * scale + offset
 ```
 
 **Quick decode (if you know the constants):**
 ```python
-celsius = dn * 0.01 + (-50.0)  # DN=0 is nodata
+celsius = ds["lst_p50"] * 0.01 + (-50.0)  # fill_value=0 is nodata
 ```
 
-| Band | Name | Scale | Offset | Units |
-|------|------|-------|--------|-------|
-| 1 | lst_p50 | 0.01 | -50.0 | celsius |
-| 2 | lst_p95 | 0.01 | -50.0 | celsius |
-| 3 | qa_count | — | — | count |
+| Variable | Name | Scale | Offset | Units |
+|----------|------|-------|--------|-------|
+| lst_p50 | Median LST | 0.01 | -50.0 | celsius |
+| lst_p95 | 95th percentile LST | 0.01 | -50.0 | celsius |
+| qa_count | Observation count | — | — | count |
 
 ## Installation
 
@@ -62,39 +65,52 @@ landsat-lst process --year 2023
 landsat-lst list-tiles
 ```
 
-## Virtual Datacube Access
+## Data Access
 
-After processing COGs, create the virtual datacube layer for efficient xarray access:
-
-```bash
-landsat-lst virtualize --year 2023
-```
-
-Access via xarray:
+Each tile is stored as an independent Zarr store on Source Cooperative:
 
 ```python
 import xarray as xr
+import fsspec
 
-ds = xr.open_zarr("icechunk://source.coop/radiant-earth/landsat-lst")
+# Access a specific tile
+url = "s3://us-west-2.opendata.source.coop/radiant-earth/landsat-lst/2023/N40W075.zarr"
+mapper = fsspec.get_mapper(url, anon=True)
+ds = xr.open_zarr(mapper)
 
-# Spatial query (only fetches required byte ranges)
+# Spatial subset (only fetches required chunks)
 subset = ds.lst_p50.sel(
-    latitude=slice(45, 40),
-    longitude=slice(-75, -70)
+    latitude=slice(42, 40),
+    longitude=slice(-74, -75)
 )
 
 # Decode uint16 to Celsius
 lst_celsius = subset * 0.01 + (-50.0)
 ```
 
-See [docs/adr/002-virtualzarr-icechunk-integration.md](docs/adr/002-virtualzarr-icechunk-integration.md) for architecture details.
+### QGIS Access
+
+For QGIS users without native Zarr support, use rioxarray to convert to GeoTIFF:
+
+```python
+import rioxarray
+import fsspec
+
+url = "s3://us-west-2.opendata.source.coop/radiant-earth/landsat-lst/2023/N40W075.zarr"
+ds = xr.open_zarr(fsspec.get_mapper(url, anon=True))
+ds["lst_p50"].rio.to_raster("lst_subset.tif")
+# Open lst_subset.tif in QGIS
+```
+
+See [docs/adr/003-direct-zarr-architecture.md](docs/adr/003-direct-zarr-architecture.md) for architecture details.
 
 ## Architecture
 
 See [docs/adr/001-architecture-decisions.md](docs/adr/001-architecture-decisions.md) for detailed design decisions.
 
 Key choices:
-- **Data source**: Element 84 Earth Search (Landsat C2 L2)
+- **Data source**: Microsoft Planetary Computer (Landsat C2 L2)
+- **Output format**: Zarr v3 with 500×500 chunks
 - **CRS**: EPSG:4326
 - **Tiling**: 5° × 5° grid
 - **Temporal**: Calendar year composites
