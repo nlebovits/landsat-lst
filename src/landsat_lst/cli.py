@@ -17,9 +17,9 @@ def main() -> None:
 @click.option("--year", "-y", type=int, required=True, help="Year to process")
 @click.option("--tile", "-t", type=str, help="Specific tile to process (e.g., N40W075)")
 @click.option("--dry-run", is_flag=True, help="Show what would be processed without running")
-@click.option("--force", "-f", is_flag=True, help="Reprocess even if COG exists")
+@click.option("--force", "-f", is_flag=True, help="Reprocess even if Zarr exists")
 def process(year: int, tile: str | None, dry_run: bool, force: bool) -> None:
-    """Process Landsat data to annual composites."""
+    """Process Landsat data to annual Zarr composites."""
     from landsat_lst.job import generate_jobs, process_tile_job
     from landsat_lst.models import ProcessingJob
     from landsat_lst.tiling import LAND_TILES, parse_tile_name
@@ -37,7 +37,7 @@ def process(year: int, tile: str | None, dry_run: bool, force: bool) -> None:
         console.print(f"  Tiles: {len(jobs)} land tiles")
 
     if force:
-        console.print("  [yellow]Force mode: reprocessing existing COGs[/yellow]")
+        console.print("  [yellow]Force mode: reprocessing existing Zarr stores[/yellow]")
 
     if dry_run:
         console.print("[yellow]Dry run - no processing performed[/yellow]")
@@ -101,44 +101,6 @@ def tile_info(tile_name: str) -> None:
     """Show information about a specific tile."""
     console.print(f"[bold]Tile: {tile_name}[/bold]")
     console.print("[red]Not yet implemented[/red]")
-
-
-@main.command()
-@click.option("--year", "-y", type=int, required=True, help="Year to virtualize")
-@click.option("--force", "-f", is_flag=True, help="Overwrite existing virtual datacube")
-def virtualize(year: int, force: bool) -> None:
-    """Create virtual datacube from existing COGs for a year."""
-    from landsat_lst.storage import get_storage
-    from landsat_lst.tiling import LAND_TILES
-    from landsat_lst.virtual import create_virtual_datacube
-
-    storage = get_storage()
-
-    tile_paths = []
-    tile_names = []
-    for tile_name in sorted(LAND_TILES):
-        if storage.cog_exists(year, tile_name):
-            tile_paths.append(storage.cog_path(year, tile_name))
-            tile_names.append(tile_name)
-
-    if not tile_paths:
-        console.print(f"[red]No COGs found for {year}[/red]")
-        raise SystemExit(1)
-
-    console.print(f"[bold]Virtualizing {len(tile_paths)} tiles for {year}[/bold]")
-
-    if force:
-        console.print("[yellow]Force mode: overwriting existing datacube[/yellow]")
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        progress.add_task("Creating virtual datacube...", total=None)
-        snapshot_id = create_virtual_datacube(tile_paths, tile_names, year, storage)
-
-    console.print(f"[green]✓ Created virtual datacube: {snapshot_id[:12]}...[/green]")
 
 
 if __name__ == "__main__":

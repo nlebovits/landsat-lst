@@ -1,9 +1,8 @@
-"""Job orchestration with per-tile commits and retry/resume support.
+"""Job orchestration with idempotent Zarr writes and retry support.
 
-This module implements the retry/resume strategy from ADR-001 Section 16:
-- Idempotent COG check: skip tiles where output already exists
-- Per-tile Icechunk commits: durable partial progress
-- ConflictError retry: handle concurrent write conflicts
+This module implements the retry/resume strategy from ADR-001 Section 16
+(updated per ADR-003 for direct Zarr writes):
+- Idempotent Zarr check: skip tiles where output already exists
 - Coiled worker retry: recover from transient failures
 
 Usage:
@@ -19,17 +18,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import icechunk
 import structlog
-from obspec_utils.registry import ObjectStoreRegistry
-from virtual_tiff import VirtualTIFF
-from virtualizarr import open_virtual_dataset
 
-from landsat_lst.cog import write_cog
 from landsat_lst.config import settings
 from landsat_lst.models import ProcessingJob
 from landsat_lst.pipeline import process_tile
 from landsat_lst.storage import StorageBackend, get_storage
+from landsat_lst.zarr_writer import write_zarr
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -43,69 +38,8 @@ class JobResult:
 
     job: ProcessingJob
     status: str  # "completed", "skipped", "failed"
-    commit_id: str | None = None
-    cog_path: str | None = None
+    zarr_path: str | None = None
     error: str | None = None
-
-
-def _commit_to_icechunk(
-    cog_path: str,
-    storage: StorageBackend,
-    job: ProcessingJob,
-    max_retries: int = 10,
-) -> str:
-    """Write COG virtual references to Icechunk with conflict retry.
-
-    Implements the "uncooperative distributed writes" pattern from
-    Icechunk docs: each worker opens own session, commits independently,
-    retries on ConflictError.
-
-    Args:
-        cog_path: Path to the COG file (local path or s3:// URL)
-        storage: Storage backend for Icechunk
-        job: Processing job for commit message
-        max_retries: Maximum conflict retries before giving up
-
-    Returns:
-        Icechunk commit ID
-
-    Raises:
-        icechunk.ConflictError: If max retries exceeded
-    """
-    for attempt in range(max_retries):
-        try:
-            repo = icechunk.Repository.open_or_create(storage.icechunk_storage())
-            session = repo.writable_session("main")
-
-            registry = ObjectStoreRegistry()
-            parser = VirtualTIFF(ifd=0)  # ifd=0 for COGs with overviews
-            vds = open_virtual_dataset(cog_path, registry=registry, parser=parser)
-            vds.virtualize.to_icechunk(session.store)
-
-            commit_id = session.commit(f"Add {job.tile.name} {job.year}")
-            log.info(
-                "icechunk_commit",
-                tile=job.tile.name,
-                year=job.year,
-                commit_id=commit_id,
-                attempt=attempt + 1,
-            )
-            return commit_id
-
-        except icechunk.ConflictError:
-            log.warning(
-                "icechunk_conflict",
-                tile=job.tile.name,
-                year=job.year,
-                attempt=attempt + 1,
-                max_retries=max_retries,
-            )
-            if attempt == max_retries - 1:
-                raise
-            continue
-
-    msg = f"Max retries ({max_retries}) exceeded for {job.tile.name} {job.year}"
-    raise icechunk.ConflictError(msg)
 
 
 def process_tile_job(
@@ -117,10 +51,9 @@ def process_tile_job(
     """Process a single tile-year job with retry/resume support.
 
     This is the main entry point for tile processing. It implements:
-    1. Idempotent check: skip if COG exists (unless force=True)
+    1. Idempotent check: skip if Zarr exists (unless force=True)
     2. Pipeline: query STAC, load scenes, compute composite
-    3. COG write: uint16 encoding, TIFF tags
-    4. Icechunk commit: virtual references with conflict retry
+    3. Zarr write: uint16 encoding, proper metadata
 
     The @coiled.function decorator enables distributed execution.
     Use with retries parameter for transient failure recovery:
@@ -128,18 +61,18 @@ def process_tile_job(
 
     Args:
         job: Processing job specification (tile + year)
-        force: If True, reprocess even if COG exists
+        force: If True, reprocess even if Zarr exists
         storage: Storage backend (defaults to configured backend)
 
     Returns:
-        JobResult with status and commit info
+        JobResult with status and path info
     """
     storage = storage or get_storage()
     logger = log.bind(tile=job.tile.name, year=job.year)
 
     # Layer 1: Idempotent check
-    if not force and storage.cog_exists(job.year, job.tile.name):
-        logger.info("tile_skipped", reason="cog_exists")
+    if not force and storage.zarr_exists(job.year, job.tile.name):
+        logger.info("tile_skipped", reason="zarr_exists")
         return JobResult(job=job, status="skipped")
 
     try:
@@ -147,20 +80,16 @@ def process_tile_job(
         logger.info("tile_processing_start")
         composite = process_tile(job)
 
-        # Write COG
-        cog_path = storage.cog_path(job.year, job.tile.name)
-        logger.info("cog_writing", path=cog_path)
-        write_cog(composite, cog_path)
+        # Write Zarr store
+        zarr_path = storage.zarr_path(job.year, job.tile.name)
+        logger.info("zarr_writing", path=zarr_path)
+        write_zarr(composite, zarr_path)
 
-        # Layer 3: Commit to Icechunk (with conflict retry)
-        commit_id = _commit_to_icechunk(cog_path, storage, job)
-
-        logger.info("tile_completed", commit_id=commit_id)
+        logger.info("tile_completed", zarr_path=zarr_path)
         return JobResult(
             job=job,
             status="completed",
-            commit_id=commit_id,
-            cog_path=cog_path,
+            zarr_path=zarr_path,
         )
 
     except Exception as e:
@@ -180,7 +109,7 @@ def run_batch(
 
     Args:
         jobs: Iterable of processing jobs
-        force: If True, reprocess even if COGs exist
+        force: If True, reprocess even if Zarr stores exist
         storage: Storage backend (defaults to configured backend)
 
     Returns:
@@ -212,7 +141,7 @@ def run_distributed(
 
     Args:
         jobs: List of processing jobs
-        force: If True, reprocess even if COGs exist
+        force: If True, reprocess even if Zarr stores exist
         retries: Number of retries per job (default from settings)
 
     Returns:
@@ -222,7 +151,7 @@ def run_distributed(
         ImportError: If Coiled is not configured
     """
     try:
-        import coiled  # noqa: PLC0415 - lazy import for optional dependency
+        import coiled  # noqa: PLC0415
     except ImportError as e:
         msg = "Coiled is required for distributed execution. Install with: pip install coiled"
         raise ImportError(msg) from e

@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Nissim Lebovits", email = "nlebovits@pm.me" }]
-keywords = ["landsat", "land-surface-temperature", "urban-heat", "stac", "cog"]
+keywords = ["landsat", "land-surface-temperature", "urban-heat", "stac", "zarr"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -40,13 +40,10 @@ dependencies = [
     "click>=8.1.0",
     "rich>=13.0.0",
     "structlog>=24.1.0",
-    "icechunk>=1.1.21",
-    "virtualizarr>=2.5.1",
-    "rio-cogeo>=7.0.2",
     "odc-geo>=0.5.1",
     "planetary-computer>=1.0.0",
-    "virtual-tiff>=0.5.0",
     "s3fs>=2026.4.0",
+    "zarr>=3.0.0",
 ]
 
 [project.optional-dependencies]
