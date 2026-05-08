@@ -1,6 +1,7 @@
 """Configuration and settings for the LST pipeline."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,9 +25,36 @@ class Settings(BaseSettings):
         description="STAC collection ID",
     )
 
+    # Storage backend selection
+    storage_backend: Literal["local", "s3"] = Field(
+        default="local",
+        description="Storage backend: 'local' for testing, 's3' for production",
+    )
+
+    # Local storage (testing)
     output_dir: Path = Field(
         default=Path("output"),
-        description="Output directory for COGs",
+        description="Local output directory for COGs (used when storage_backend='local')",
+    )
+
+    # S3 storage (production)
+    s3_bucket: str = Field(
+        default="source-coop-radiant-earth",
+        description="S3 bucket for COG storage",
+    )
+    s3_prefix: str = Field(
+        default="landsat-lst",
+        description="S3 key prefix for COGs",
+    )
+    s3_region: str = Field(
+        default="us-west-2",
+        description="AWS region for S3 bucket",
+    )
+
+    # Icechunk storage
+    icechunk_prefix: str = Field(
+        default="icechunk",
+        description="Subdirectory/prefix for Icechunk store (under output_dir or s3_prefix)",
     )
 
     tile_size_degrees: float = Field(
@@ -72,6 +100,12 @@ class Settings(BaseSettings):
     dask_memory_limit: str = Field(
         default="6GB",
         description="Memory limit per Dask worker",
+    )
+
+    # Coiled retry settings
+    coiled_retries: int = Field(
+        default=3,
+        description="Number of retries for Coiled worker failures",
     )
 
 

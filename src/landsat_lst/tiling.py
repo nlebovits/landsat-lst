@@ -813,6 +813,32 @@ def tile_from_point(lat: float, lon: float, tile_size: float = 5.0) -> TileId:
     return TileId(lat=tile_lat, lon=tile_lon)
 
 
+def parse_tile_name(name: str) -> TileId:
+    """Parse a tile name like 'N40W075' back to a TileId.
+
+    Args:
+        name: Tile name in format N40W075 or S10E030.
+
+    Returns:
+        TileId with lat/lon coordinates.
+
+    Raises:
+        ValueError: If name format is invalid.
+    """
+    import re  # noqa: PLC0415
+
+    match = re.match(r"^([NS])(\d{2})([EW])(\d{3})$", name)
+    if not match:
+        msg = f"Invalid tile name format: {name}"
+        raise ValueError(msg)
+
+    lat_dir, lat_val, lon_dir, lon_val = match.groups()
+    lat = int(lat_val) * (1 if lat_dir == "N" else -1)
+    lon = int(lon_val) * (1 if lon_dir == "E" else -1)
+
+    return TileId(lat=lat, lon=lon)
+
+
 def tiles_intersecting_bbox(
     bbox: tuple[float, float, float, float],
     tile_size: float = 5.0,

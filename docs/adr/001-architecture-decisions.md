@@ -1,7 +1,7 @@
 # ADR-001: Landsat LST Pipeline Architecture Decisions
 
-**Status:** Accepted  
-**Date:** 2025-05-07  
+**Status:** Accepted
+**Date:** 2025-05-07
 **Authors:** @nlebovits
 
 ## Context
@@ -305,6 +305,83 @@ landsat-lst-annual/
 - Virtual Zarr via IceChunk for analysis-ready access
 
 **Rationale:** Source Cooperative is the appropriate home for open geospatial data products.
+
+---
+
+### 16. Retry/Resume with Per-Tile Commits
+
+**Decision:** Per-tile Icechunk commits with idempotent COG checks and retry-on-conflict
+
+**Context:** Global processing = 10,000+ tile-year jobs. Failures are guaranteed (network errors, OOM, spot preemption). Without checkpointing, partial progress is lost and re-runs redo completed work.
+
+**Implementation (three layers):**
+
+| Layer | Purpose | Implementation |
+|-------|---------|----------------|
+| Idempotent COG check | Skip completed work | `s3.head_object()` before processing |
+| Per-tile commits | Durable partial progress | Icechunk commit after each tile |
+| Worker retry | Transient failure recovery | Coiled `@function(retries=3)` decorator |
+
+**Per-tile commit pattern:**
+```python
+def process_tile(job: TileYearJob, storage: IcechunkStorage) -> str | None:
+    # Layer 1: Idempotent check
+    if cog_exists(job):
+        return None  # Already done
+
+    # Process tile...
+
+    # Layer 2: Per-tile commit with conflict retry
+    while True:
+        try:
+            repo = Repository.open(storage)
+            session = repo.writable_session("main")
+            vds.virtualize.to_icechunk(session.store)
+            return session.commit(f"Add {job.tile_id} {job.year}")
+        except ConflictError:
+            continue  # Retry with fresh session
+```
+
+**Rationale for per-tile commits (vs ADR-002 session merge):**
+
+ADR-002 Section 4 describes session pickling + `merge_sessions()` for batch commits. We chose per-tile commits instead:
+
+| Factor | Per-tile commits | Session merge |
+|--------|-----------------|---------------|
+| Durability | High — survives worker death | Low — all-or-nothing |
+| Progress recovery | Resume from any point | Restart entire batch |
+| Overhead | ~1 commit per tile | 1 commit per batch |
+| Conflict handling | Simple retry loop | Complex merge resolution |
+| Failure cost | ~minutes | ~hours |
+
+For 10,000+ jobs with guaranteed failures, per-tile durability outweighs commit overhead. The ~1 second commit overhead is negligible vs ~5 minute tile processing time.
+
+**Icechunk conflict resolution:**
+
+When two workers commit concurrently, Icechunk raises `ConflictError`. Our strategy:
+- **Uncooperative distributed writes** — each worker opens own session, commits independently
+- **Retry on conflict** — catch `ConflictError`, reopen session, retry commit
+- **No rebase** — workers process different tiles, so conflicts resolve on retry
+
+This follows the [Icechunk parallel writes documentation](https://github.com/earth-mover/icechunk/blob/main/docs/docs/icechunk-python/parallel.md).
+
+**COG existence check location:**
+
+| Environment | Check method |
+|-------------|--------------|
+| Local (testing) | `Path(output_dir / filename).exists()` |
+| S3 (production) | `s3.head_object(Bucket=bucket, Key=key)` |
+
+Factory pattern in `storage.py` abstracts this.
+
+**CLI support:**
+- `--force` flag bypasses COG existence check for reprocessing
+- Progress logging via structlog with tile/year context
+
+**Alternatives considered:**
+- Session merge (ADR-002 pattern) — too fragile for 10k jobs, partial progress lost on any failure
+- External state tracking (SQLite/JSON) — unnecessary given COG existence is authoritative
+- Coiled checkpointing — doesn't integrate with Icechunk transactional model
 
 ---
 
