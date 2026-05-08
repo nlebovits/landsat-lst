@@ -46,6 +46,7 @@ dependencies = [
     "odc-geo>=0.5.1",
     "planetary-computer>=1.0.0",
     "virtual-tiff>=0.5.0",
+    "s3fs>=2026.4.0",
 ]
 
 [project.optional-dependencies]
