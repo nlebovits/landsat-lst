@@ -190,17 +190,18 @@ def write_zarr(
         )
         return str(output_path)
     else:
-        # Icechunk session - output has .store and .commit attributes
+        # Icechunk session - must use icechunk.xarray.to_icechunk for Dask arrays
+        # Regular to_zarr() fails because sessions can't be pickled to workers
         if group is None:
             msg = "group parameter required when writing to Icechunk session"
             raise ValueError(msg)
 
-        # Write to Icechunk session store
-        encoded.to_zarr(
-            output.store,  # type: ignore[union-attr]
+        from icechunk.xarray import to_icechunk  # noqa: PLC0415
+
+        to_icechunk(
+            encoded,
+            output,  # type: ignore[arg-type] - Session type
             group=group,
             mode="w",
-            consolidated=False,  # Icechunk handles consolidation
-            encoding=encoding,
         )
         return group

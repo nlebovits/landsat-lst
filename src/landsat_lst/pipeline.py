@@ -1,6 +1,7 @@
 """Main ETL pipeline for Landsat LST composites."""
 
 import numpy as np
+import planetary_computer as pc
 import pystac_client
 import xarray as xr
 from odc.stac import stac_load
@@ -13,13 +14,19 @@ from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 def query_stac(job: ProcessingJob) -> list:
     """Query STAC catalog for Landsat scenes.
 
+    Signs all items with Planetary Computer SAS tokens for higher rate limits
+    when accessing Azure Blob storage.
+
     Args:
         job: Processing job with tile and year info.
 
     Returns:
-        List of STAC items matching the query.
+        List of signed STAC items matching the query.
     """
-    catalog = pystac_client.Client.open(settings.stac_url)
+    catalog = pystac_client.Client.open(
+        settings.stac_url,
+        modifier=pc.sign_inplace,
+    )
 
     search = catalog.search(
         collections=[settings.collection],
@@ -71,7 +78,8 @@ def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
     valid_mask = ~np.isnan(lst)
     qa_count = valid_mask.sum(dim="time").astype(np.int16)  # ty: ignore[no-matching-overload]
 
-    lst_p50 = lst.median(dim="time", skipna=True)
+    # Use quantile(0.5) instead of median() - median has issues with Dask arrays
+    lst_p50 = lst.quantile(0.5, dim="time", skipna=True).drop_vars("quantile")
     lst_p95 = lst.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
 
     lst_p50 = lst_p50.where(qa_count > 0, settings.nodata)
