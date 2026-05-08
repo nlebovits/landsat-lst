@@ -66,9 +66,7 @@ def _write_tiff_tags(cog_path: Path) -> None:
     Note: We use IGNORE_COG_LAYOUT_BREAK because we're only updating
     metadata tags, not pixel data, which is safe for COG layout.
     """
-    with rasterio.open(
-        cog_path, "r+", IGNORE_COG_LAYOUT_BREAK="YES"
-    ) as dst:
+    with rasterio.open(cog_path, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as dst:
         # LST bands (1 and 2)
         for band in (1, 2):
             dst.update_tags(
