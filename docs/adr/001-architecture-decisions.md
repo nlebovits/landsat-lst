@@ -201,13 +201,69 @@ lst_celsius = lst_kelvin - 273.15
 | Compression | DEFLATE |
 | Tiling | 512×512 internal tiles |
 | Overviews | Yes (nearest neighbor for qa_count, average for LST) |
-| Nodata | -9999 |
+| Data type | uint16 (all bands) |
+| Nodata | 0 (packed output) |
 
 **Rationale:** COG is the standard for cloud-native geospatial. DEFLATE balances compression ratio and read speed.
 
 ---
 
-### 12. STAC Structure
+### 12. Data Encoding (uint16 Packing)
+
+**Decision:** Pack LST values as uint16 with linear scale/offset
+
+| Property | Value |
+|----------|-------|
+| Scale | 0.01 |
+| Offset | -50.0 |
+| Nodata (packed) | 0 |
+| Nodata (internal) | -9999.0 |
+| Valid DN range | 1–65535 |
+| Temperature range | -49.99°C to +605.35°C |
+
+**Decode formula:**
+```python
+celsius = dn * 0.01 + (-50.0)
+# or equivalently: celsius = (dn - 5000) * 0.01
+```
+
+**Rationale:**
+- **50% storage reduction** — uint16 (2 bytes) vs float32 (4 bytes)
+- **0.01°C precision** — exceeds measurement accuracy of Landsat TIRS (~0.5°C)
+- **-50°C floor** — covers coldest realistic urban temperatures (pipeline excludes polar regions via ±60° latitude filter)
+- **DN=0 as nodata** — follows CF Conventions `_FillValue` pattern for packed data
+
+**Nodata handling:**
+- Internal processing uses `-9999.0` (float, clearly invalid temperature)
+- Encoding step maps `-9999.0 → 0` (uint16 nodata)
+- This separation keeps config.py unchanged and isolates packing logic to `cog.py`
+
+**Metadata storage:**
+
+| Location | Purpose | Implementation |
+|----------|---------|----------------|
+| TIFF tags | Self-describing COG | `LST_SCALE`, `LST_OFFSET`, `LST_UNITS` per band |
+| STAC properties | Catalog-level discovery | `lst:scale`, `lst:offset`, `lst:units` (see #2) |
+| Icechunk attrs | Zarr/xarray access | `scale_factor`, `add_offset` per variable (see #10) |
+
+**Rationale for TIFF tags as primary:**
+- **Self-describing** — metadata travels with the file
+- **Universal access** — GDAL, rasterio, QGIS all read TIFF tags
+- **No external dependencies** — users don't need STAC catalog or Icechunk
+
+**Decode helper approach:**
+- **README snippet only** — users downloading COGs won't have `landsat_lst` installed
+- **No package function** — avoids forcing dependency installation for simple decode
+- **COG tags are primary** — snippet is backup documentation
+
+**Alternatives considered:**
+- float32 output — simpler but doubles storage cost
+- int16 with different offset — narrower range, no benefit
+- Package decode function — adds friction for GIS users who just want the formula
+
+---
+
+### 13. STAC Structure
 
 **Decision:** One collection per year, tiles as items
 
@@ -228,7 +284,7 @@ landsat-lst-annual/
 
 ---
 
-### 13. Processing Infrastructure
+### 14. Processing Infrastructure
 
 **Decision:** Coiled on AWS
 
@@ -240,7 +296,7 @@ landsat-lst-annual/
 
 ---
 
-### 14. Final Destination
+### 15. Final Destination
 
 **Decision:** Source Cooperative
 

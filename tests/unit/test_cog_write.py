@@ -13,7 +13,14 @@ import xarray as xr
 from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
 
-from landsat_lst.cog import write_cog
+from landsat_lst.cog import (
+    LST_NODATA_FLOAT,
+    LST_NODATA_UINT16,
+    LST_OFFSET,
+    LST_SCALE,
+    encode_lst_uint16,
+    write_cog,
+)
 
 
 class TestChunkedCOGWrite:
@@ -245,3 +252,142 @@ class TestWriteCogFunction:
 
         assert output_path.exists()
         assert not tmp_tif.exists(), "Temp file should be cleaned up"
+
+
+class TestEncodeLstUint16:
+    """Test uint16 encoding of LST values."""
+
+    def test_encode_basic_values(self):
+        """Test encoding of typical LST values."""
+        # 25°C should encode to: (25 - (-50)) / 0.01 = 7500
+        data = xr.DataArray([25.0, 30.0, 35.0], dims=["x"])
+        encoded = encode_lst_uint16(data)
+
+        assert encoded.dtype == np.uint16
+        assert int(encoded[0]) == 7500  # 25°C
+        assert int(encoded[1]) == 8000  # 30°C
+        assert int(encoded[2]) == 8500  # 35°C
+
+    def test_encode_nodata_float(self):
+        """Test that -9999.0 nodata maps to 0."""
+        data = xr.DataArray([25.0, LST_NODATA_FLOAT, 30.0], dims=["x"])
+        encoded = encode_lst_uint16(data)
+
+        assert int(encoded[0]) == 7500
+        assert int(encoded[1]) == LST_NODATA_UINT16  # nodata -> 0
+        assert int(encoded[2]) == 8000
+
+    def test_encode_nan(self):
+        """Test that NaN maps to nodata (0)."""
+        data = xr.DataArray([25.0, np.nan, 30.0], dims=["x"])
+        encoded = encode_lst_uint16(data)
+
+        assert int(encoded[0]) == 7500
+        assert int(encoded[1]) == LST_NODATA_UINT16  # nan -> 0
+        assert int(encoded[2]) == 8000
+
+    def test_encode_clamps_to_valid_range(self):
+        """Test that values are clamped to 1-65535."""
+        # -100°C would give negative DN, should clamp to 1
+        # 700°C would overflow, should clamp to 65535
+        data = xr.DataArray([-100.0, 700.0], dims=["x"])
+        encoded = encode_lst_uint16(data)
+
+        assert int(encoded[0]) == 1  # clamped low
+        assert int(encoded[1]) == 65535  # clamped high
+
+    def test_roundtrip_decode(self):
+        """Test that encode/decode roundtrip preserves values within precision."""
+        original = xr.DataArray([25.0, 30.5, 35.99], dims=["x"])
+        encoded = encode_lst_uint16(original)
+
+        # Apply inverse transform to decode
+        decoded = encoded.astype(np.float32) * LST_SCALE + LST_OFFSET
+
+        # Should be within 0.01°C precision
+        np.testing.assert_allclose(decoded.values, original.values, atol=0.01)
+
+
+class TestTiffTags:
+    """Test TIFF tag metadata writing."""
+
+    @pytest.fixture
+    def composite_dataset(self) -> xr.Dataset:
+        """Create test composite dataset."""
+        shape = (2048, 2048)
+        chunks = (512, 512)
+        rng = np.random.default_rng(42)
+
+        ds = xr.Dataset(
+            {
+                "lst_p50": (
+                    ["latitude", "longitude"],
+                    rng.uniform(20.0, 40.0, shape).astype(np.float32),
+                ),
+                "lst_p95": (
+                    ["latitude", "longitude"],
+                    rng.uniform(30.0, 50.0, shape).astype(np.float32),
+                ),
+                "qa_count": (
+                    ["latitude", "longitude"],
+                    rng.integers(1, 100, shape).astype(np.int16),
+                ),
+            },
+            coords={
+                "latitude": np.linspace(-34.0, -33.0, shape[0]),
+                "longitude": np.linspace(-61.0, -60.0, shape[1]),
+            },
+        )
+        return ds.chunk({"latitude": chunks[0], "longitude": chunks[1]})
+
+    def test_tiff_tags_present(self, composite_dataset, tmp_path):
+        """Test that TIFF tags are written to COG."""
+        output_path = tmp_path / "test_cog.tif"
+        write_cog(composite_dataset, output_path)
+
+        with rasterio.open(output_path) as src:
+            # Band 1 (lst_p50) should have LST tags
+            tags1 = src.tags(1)
+            assert tags1["LST_SCALE"] == str(LST_SCALE)
+            assert tags1["LST_OFFSET"] == str(LST_OFFSET)
+            assert tags1["LST_UNITS"] == "celsius"
+
+            # Band 2 (lst_p95) should have LST tags
+            tags2 = src.tags(2)
+            assert tags2["LST_SCALE"] == str(LST_SCALE)
+            assert tags2["LST_OFFSET"] == str(LST_OFFSET)
+            assert tags2["LST_UNITS"] == "celsius"
+
+            # Band 3 (qa_count) should only have units
+            tags3 = src.tags(3)
+            assert tags3["UNITS"] == "count"
+            assert "LST_SCALE" not in tags3
+
+    def test_output_dtype_is_uint16(self, composite_dataset, tmp_path):
+        """Test that all bands are encoded as uint16."""
+        output_path = tmp_path / "test_cog.tif"
+        write_cog(composite_dataset, output_path)
+
+        with rasterio.open(output_path) as src:
+            # All bands should be uint16 (avoids dtype promotion issues)
+            assert src.dtypes[0] == "uint16"
+            assert src.dtypes[1] == "uint16"
+            assert src.dtypes[2] == "uint16"
+
+    def test_decode_from_tiff_tags(self, composite_dataset, tmp_path):
+        """Test decoding COG data using embedded TIFF tags."""
+        output_path = tmp_path / "test_cog.tif"
+        write_cog(composite_dataset, output_path)
+
+        with rasterio.open(output_path) as src:
+            tags = src.tags(1)
+            scale = float(tags["LST_SCALE"])
+            offset = float(tags["LST_OFFSET"])
+
+            dn = src.read(1)
+            valid_mask = dn != 0
+            decoded = dn.astype(np.float32) * scale + offset
+
+            # Check decoded values are in reasonable LST range
+            assert decoded[valid_mask].min() > -50  # Above offset
+            assert decoded[valid_mask].max() < 100  # Reasonable max

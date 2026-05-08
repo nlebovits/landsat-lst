@@ -12,6 +12,37 @@ This pipeline produces annual LST composites for municipal decision-makers analy
 
 Data is tiled on a 5° global grid, stored as Cloud-Optimized GeoTIFFs (COGs), and published as a STAC catalog.
 
+## Data Encoding
+
+LST bands are stored as **uint16** to reduce file size by 50%. To convert back to Celsius:
+
+```python
+import rasterio
+
+with rasterio.open("N40W075_2023.tif") as src:
+    # Read scale/offset from TIFF tags
+    tags = src.tags(1)  # Band 1 (lst_p50)
+    scale = float(tags["LST_SCALE"])    # 0.01
+    offset = float(tags["LST_OFFSET"])  # -50.0
+
+    # Read data and decode
+    dn = src.read(1)
+    nodata_mask = dn == 0
+    celsius = dn * scale + offset
+    celsius[nodata_mask] = float("nan")
+```
+
+**Quick decode (if you know the constants):**
+```python
+celsius = dn * 0.01 + (-50.0)  # DN=0 is nodata
+```
+
+| Band | Name | Scale | Offset | Units |
+|------|------|-------|--------|-------|
+| 1 | lst_p50 | 0.01 | -50.0 | celsius |
+| 2 | lst_p95 | 0.01 | -50.0 | celsius |
+| 3 | qa_count | — | — | count |
+
 ## Installation
 
 ```bash
