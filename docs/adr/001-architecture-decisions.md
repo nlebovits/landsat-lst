@@ -8,7 +8,7 @@
 
 This pipeline produces global annual Land Surface Temperature (LST) composites from Landsat Collection 2 Level-2 data. The output is intended for municipal decision-makers analyzing urban heat, not for research scientists who would composite raw data themselves.
 
-Output will be hosted on Source Cooperative as STAC-compliant COGs, with a virtual Zarr layer via IceChunk.
+Output will be hosted on Source Cooperative as Zarr stores with STAC catalog. See [ADR-003](adr/003-direct-zarr-architecture.md) for the architecture pivot from COG+Icechunk to direct Zarr.
 
 ---
 
@@ -193,18 +193,44 @@ lst_celsius = lst_kelvin - 273.15
 
 ### 11. Output Format
 
-**Decision:** Cloud-Optimized GeoTIFF (COG)
+> **⚠️ SUPERSEDED (2026-05-08):** This section's COG decision has been superseded by [ADR-003](003-direct-zarr-architecture.md), which pivots to direct Zarr writes. The historical context below is preserved for reference.
 
-| Property | Value |
-|----------|-------|
-| Format | COG |
-| Compression | DEFLATE |
-| Tiling | 512×512 internal tiles |
-| Overviews | Yes (nearest neighbor for qa_count, average for LST) |
-| Data type | uint16 (all bands) |
-| Nodata | 0 (packed output) |
+**Decision:** ~~Cloud-Optimized GeoTIFF (COG)~~ → **Zarr v3** (see ADR-003)
 
-**Rationale:** COG is the standard for cloud-native geospatial. DEFLATE balances compression ratio and read speed.
+| Property | Original (COG) | Current (Zarr) |
+|----------|----------------|----------------|
+| Format | COG | Zarr v3 |
+| Compression | DEFLATE | Blosc (zstd) |
+| Chunk size | 512×512 | 500×500 |
+| Data type | uint16 | uint16 |
+| Nodata/Fill | 0 | 0 |
+
+**Why the pivot:** GDAL requires COG block sizes to be multiples of 16, but VirtualZarr concatenation requires array dimensions evenly divisible by chunk size. Our ~18,500 pixel tiles have no chunk size satisfying both constraints. Direct Zarr writes avoid this conflict entirely.
+
+**Chunk size rationale (500×500):**
+- 18,500 ÷ 500 = 37 exactly (no partial edge chunks)
+- No GDAL multiple-of-16 constraint for Zarr
+- Aligns with industry practice (Earthmover, Dynamical.org use non-power-of-2 chunks)
+
+<details>
+<summary>Historical COG rationale (superseded)</summary>
+
+GDAL/rasterio requires COG block sizes to be **multiples of 16**. Our 5° tiles at ~30m resolution produce ~18,500 pixels per side. No multiple of 16 divides 18,500 evenly (18,500 = 2² × 5³ × 37):
+- 512 ÷ 16 = 32 ✓ (GDAL-compatible)
+- 500 ÷ 16 = 31.25 ✗ (fails GDAL constraint)
+- 18,500 ÷ 512 = 36.13 (partial edge chunks)
+
+Non-power-of-2 chunk sizes are standard in geospatial (when GDAL constraint is met):
+- Earthmover serverless-datacube: 1200×1200 default
+- Dynamical.org reformatters: 50×50, 121×121, varies by dataset
+- USGS Landsat COGs: 256×256
+- Microsoft Planetary Computer ERA5: 150×150
+
+</details>
+
+**References:**
+- [ADR-003: Direct Zarr Architecture](003-direct-zarr-architecture.md) — current architecture
+- [findings-direct-zarr-spike.md](../findings-direct-zarr-spike.md) — validation findings
 
 ---
 
@@ -300,87 +326,74 @@ landsat-lst-annual/
 
 **Decision:** Source Cooperative
 
-- COGs stored on Source Cooperative
-- STAC catalog published
-- Virtual Zarr via IceChunk for analysis-ready access
+> **Updated (2026-05-08):** Per [ADR-003](003-direct-zarr-architecture.md), output format changed from COG to Zarr.
+
+- **Zarr stores** on Source Cooperative (one per tile)
+- STAC catalog published (pointing to Zarr stores)
+- Direct xarray access via `xr.open_zarr()`
 
 **Rationale:** Source Cooperative is the appropriate home for open geospatial data products.
 
 ---
 
-### 16. Retry/Resume with Per-Tile Commits
+### 16. Retry/Resume with Idempotent Writes
 
-**Decision:** Per-tile Icechunk commits with idempotent COG checks and retry-on-conflict
+> **Updated (2026-05-08):** Per [ADR-003](003-direct-zarr-architecture.md), Icechunk commits replaced with direct Zarr writes. The core retry/resume pattern remains.
+
+**Decision:** Idempotent per-tile Zarr writes with existence checks
 
 **Context:** Global processing = 10,000+ tile-year jobs. Failures are guaranteed (network errors, OOM, spot preemption). Without checkpointing, partial progress is lost and re-runs redo completed work.
 
-**Implementation (three layers):**
+**Implementation (two layers):**
 
 | Layer | Purpose | Implementation |
 |-------|---------|----------------|
-| Idempotent COG check | Skip completed work | `s3.head_object()` before processing |
-| Per-tile commits | Durable partial progress | Icechunk commit after each tile |
+| Idempotent check | Skip completed work | Check if `.zarr/` exists on S3 |
 | Worker retry | Transient failure recovery | Coiled `@function(retries=3)` decorator |
 
-**Per-tile commit pattern:**
+**Per-tile write pattern:**
 ```python
-def process_tile(job: TileYearJob, storage: IcechunkStorage) -> str | None:
+def process_tile(job: TileYearJob, storage: ZarrStorage) -> str | None:
     # Layer 1: Idempotent check
-    if cog_exists(job):
+    if zarr_exists(job):
         return None  # Already done
 
     # Process tile...
+    composite = create_composite(job)
 
-    # Layer 2: Per-tile commit with conflict retry
-    while True:
-        try:
-            repo = Repository.open(storage)
-            session = repo.writable_session("main")
-            vds.virtualize.to_icechunk(session.store)
-            return session.commit(f"Add {job.tile_id} {job.year}")
-        except ConflictError:
-            continue  # Retry with fresh session
+    # Layer 2: Write Zarr store
+    output_path = storage.get_zarr_path(job)
+    composite.to_zarr(output_path, mode="w")
+    return output_path
 ```
 
-**Rationale for per-tile commits (vs ADR-002 session merge):**
-
-ADR-002 Section 4 describes session pickling + `merge_sessions()` for batch commits. We chose per-tile commits instead:
-
-| Factor | Per-tile commits | Session merge |
-|--------|-----------------|---------------|
-| Durability | High — survives worker death | Low — all-or-nothing |
-| Progress recovery | Resume from any point | Restart entire batch |
-| Overhead | ~1 commit per tile | 1 commit per batch |
-| Conflict handling | Simple retry loop | Complex merge resolution |
-| Failure cost | ~minutes | ~hours |
-
-For 10,000+ jobs with guaranteed failures, per-tile durability outweighs commit overhead. The ~1 second commit overhead is negligible vs ~5 minute tile processing time.
-
-**Icechunk conflict resolution:**
-
-When two workers commit concurrently, Icechunk raises `ConflictError`. Our strategy:
-- **Uncooperative distributed writes** — each worker opens own session, commits independently
-- **Retry on conflict** — catch `ConflictError`, reopen session, retry commit
-- **No rebase** — workers process different tiles, so conflicts resolve on retry
-
-This follows the [Icechunk parallel writes documentation](https://github.com/earth-mover/icechunk/blob/main/docs/docs/icechunk-python/parallel.md).
-
-**COG existence check location:**
+**Zarr existence check:**
 
 | Environment | Check method |
 |-------------|--------------|
-| Local (testing) | `Path(output_dir / filename).exists()` |
-| S3 (production) | `s3.head_object(Bucket=bucket, Key=key)` |
+| Local (testing) | `Path(output_dir / "tile.zarr").exists()` |
+| S3 (production) | `s3.head_object(Bucket=bucket, Key="tile.zarr/.zmetadata")` |
 
 Factory pattern in `storage.py` abstracts this.
 
 **CLI support:**
-- `--force` flag bypasses COG existence check for reprocessing
+- `--force` flag bypasses existence check for reprocessing
 - Progress logging via structlog with tile/year context
 
-**Alternatives considered:**
-- Session merge (ADR-002 pattern) — too fragile for 10k jobs, partial progress lost on any failure
-- External state tracking (SQLite/JSON) — unnecessary given COG existence is authoritative
+**Parallel write safety:**
+- Each tile writes to its own independent Zarr store
+- No conflicts possible (unlike Icechunk shared repository)
+- Simpler than previous Icechunk conflict/retry pattern
+
+<details>
+<summary>Historical Icechunk pattern (superseded)</summary>
+
+The original design used Icechunk per-tile commits with conflict retry:
+- Workers opened Icechunk sessions, committed independently
+- `ConflictError` caught and retried with fresh session
+- This complexity is eliminated with direct Zarr writes
+
+</details>
 - Coiled checkpointing — doesn't integrate with Icechunk transactional model
 
 ---

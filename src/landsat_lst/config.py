@@ -34,17 +34,17 @@ class Settings(BaseSettings):
     # Local storage (testing)
     output_dir: Path = Field(
         default=Path("output"),
-        description="Local output directory for COGs (used when storage_backend='local')",
+        description="Local output directory for Zarr stores (used when storage_backend='local')",
     )
 
     # S3 storage (production)
     s3_bucket: str = Field(
         default="source-coop-radiant-earth",
-        description="S3 bucket for COG storage",
+        description="S3 bucket for Zarr/Icechunk storage",
     )
     s3_prefix: str = Field(
         default="landsat-lst",
-        description="S3 key prefix for COGs",
+        description="S3 key prefix for Zarr stores",
     )
     s3_region: str = Field(
         default="us-west-2",
@@ -52,9 +52,17 @@ class Settings(BaseSettings):
     )
 
     # Icechunk storage
+    use_icechunk: bool = Field(
+        default=False,
+        description="Use Icechunk for versioned Zarr storage (enables time-travel)",
+    )
     icechunk_prefix: str = Field(
         default="icechunk",
         description="Subdirectory/prefix for Icechunk store (under output_dir or s3_prefix)",
+    )
+    icechunk_max_retries: int = Field(
+        default=5,
+        description="Maximum retry attempts for Icechunk ConflictError",
     )
 
     tile_size_degrees: float = Field(

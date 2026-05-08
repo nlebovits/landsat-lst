@@ -1,13 +1,23 @@
 # Implementation Plan: VirtualZarr + Icechunk Integration
 
-**Date:** 2026-05-07  
-**Status:** Active (Phase 0 Complete)  
-**Related ADRs:** [ADR-001](adr/001-architecture-decisions.md), [ADR-002](adr/002-virtualzarr-icechunk-integration.md)  
+**Date:** 2026-05-07
+**Status:** ⚠️ **SUPERSEDED** (2026-05-08)
+**Related ADRs:** [ADR-001](adr/001-architecture-decisions.md), [ADR-002](adr/002-virtualzarr-icechunk-integration.md)
 **Findings:** [Phase 0 Findings](findings-phase0.md)
+
+> ## ⚠️ This Plan is Superseded
+>
+> **This implementation approach was abandoned** after discovering that GDAL's COG blocksize constraint (multiples of 16) conflicts with VirtualZarr's concatenation requirement. The architecture has pivoted to direct Zarr writes.
+>
+> **See:**
+> - [ADR-003: Direct Zarr Architecture](adr/003-direct-zarr-architecture.md) — replacement architecture
+> - [findings-direct-zarr-spike.md](findings-direct-zarr-spike.md) — validation findings
+>
+> The content below is preserved for historical reference only.
 
 ---
 
-## Overview
+## Overview (Historical)
 
 This plan describes the implementation of the VirtualZarr + Icechunk virtual datacube layer on top of the COG + STAC output defined in ADR-001.
 
@@ -123,19 +133,19 @@ class StorageConfig:
 
 class IcechunkStorage:
     """Manages Icechunk repository for virtual references."""
-    
+
     def __init__(self, config: StorageConfig):
         self.config = config
         self._session: Session | None = None
         self._repo: Repository | None = None
-    
+
     def _get_storage(self) -> icechunk.Storage:
         return icechunk.s3_storage(
             bucket=self.config.icechunk_bucket,
             prefix=self.config.icechunk_prefix,
             region=self.config.region,
         )
-    
+
     def _get_virtual_chunk_container(self) -> VirtualChunkContainer:
         """Configure access to COGs on S3 for virtual chunk resolution."""
         s3_config = ObjectStoreConfig.S3(
@@ -147,16 +157,16 @@ class IcechunkStorage:
             s3_config,
             name="cogs",
         )
-    
+
     @contextmanager
     def writable_session(self, branch: str = "main") -> Iterator[Session]:
         """Get a writable session for the Icechunk store."""
         storage = self._get_storage()
-        
+
         # Configure virtual chunk container for COG access
         config = RepositoryConfig.default()
         config.set_virtual_chunk_container(self._get_virtual_chunk_container())
-        
+
         self._repo = Repository.open_or_create(storage, config=config)
         session = self._repo.writable_session(branch)
         self._session = session
@@ -165,22 +175,22 @@ class IcechunkStorage:
                 yield session
         finally:
             self._session = None
-    
+
     def commit(
-        self, 
-        message: str, 
+        self,
+        message: str,
         worker_sessions: list[Session] | None = None
     ) -> str:
         """Commit changes, merging worker sessions if provided."""
         if self._session is None:
             raise RuntimeError("No active session")
-        
+
         if worker_sessions:
             valid_sessions = [s for s in worker_sessions if s is not None]
             self._session = merge_sessions(self._session, *valid_sessions)
-        
+
         return self._session.commit(message)
-    
+
     def cog_path(self, tile_id: str, year: int) -> str:
         """Generate S3 path for a COG."""
         return f"s3://{self.config.cog_bucket}/{self.config.cog_prefix}/{year}/{tile_id}.tif"
@@ -188,14 +198,14 @@ class IcechunkStorage:
 
 class LocalStorage:
     """Local filesystem storage for development."""
-    
+
     def __init__(self, base_path: Path):
         self.base_path = base_path
         self.cog_dir = base_path / "cogs"
         self.icechunk_dir = base_path / "icechunk"
         self._session: Session | None = None
         self._repo: Repository | None = None
-    
+
     def _get_virtual_chunk_container(self) -> VirtualChunkContainer:
         """Configure access to local COGs for virtual chunk resolution."""
         local_config = ObjectStoreConfig.LocalFileSystem(str(self.cog_dir))
@@ -204,18 +214,18 @@ class LocalStorage:
             local_config,
             name="local",
         )
-    
+
     @contextmanager
     def writable_session(self, branch: str = "main") -> Iterator[Session]:
         self.cog_dir.mkdir(parents=True, exist_ok=True)
         self.icechunk_dir.mkdir(parents=True, exist_ok=True)
-        
+
         storage = icechunk.local_filesystem_storage(str(self.icechunk_dir))
-        
+
         # Configure virtual chunk container
         config = RepositoryConfig.default()
         config.set_virtual_chunk_container(self._get_virtual_chunk_container())
-        
+
         self._repo = Repository.open_or_create(storage, config=config)
         session = self._repo.writable_session(branch)
         self._session = session
@@ -224,13 +234,13 @@ class LocalStorage:
                 yield session
         finally:
             self._session = None
-    
+
     def open_readonly(self, branch: str = "main"):
         """Open repository for reading with virtual chunk authorization."""
         storage = icechunk.local_filesystem_storage(str(self.icechunk_dir))
         config = RepositoryConfig.default()
         config.set_virtual_chunk_container(self._get_virtual_chunk_container())
-        
+
         return Repository.open(
             storage,
             config=config,
@@ -260,14 +270,14 @@ from landsat_lst.virtual import create_virtual_reference
 @dataclass(frozen=True)
 class TileYearJob:
     """Processing job for a single tile and year."""
-    
+
     tile_id: TileId
     year: int
-    
+
     def process(self, session: Session, cog_output_path: str) -> Session:
         """
         Process tile: STAC query → composite → COG → virtual reference.
-        
+
         Returns the session with virtual references written.
         """
         # 1. Query STAC (Planetary Computer for free egress)
@@ -276,7 +286,7 @@ class TileYearJob:
             "https://planetarycomputer.microsoft.com/api/stac/v1",
             modifier=planetary_computer.sign_inplace,
         )
-        
+
         search = catalog.search(
             collections=["landsat-c2-l2"],
             bbox=self.tile_id.bbox,
@@ -287,10 +297,10 @@ class TileYearJob:
             },
         )
         items = list(search.items())
-        
+
         if len(items) == 0:
             return session  # No data for this tile/year
-        
+
         # 2. Load scenes with optimized settings
         ds = stac_load(
             items,
@@ -302,25 +312,25 @@ class TileYearJob:
             bbox=self.tile_id.bbox,
             groupby="solar_day",
         )
-        
+
         # 3. Apply QA mask
         qa = ds["qa_pixel"]
         cloud = (qa >> 3) & 1
         shadow = (qa >> 4) & 1
         snow = (qa >> 5) & 1
         mask = (cloud == 0) & (shadow == 0) & (snow == 0)
-        
+
         # 4. Convert to Celsius
         lst_masked = ds["lwir11"].where(mask)
         lst_kelvin = lst_masked * 0.00341802 + 149.0
         lst_celsius = lst_kelvin - 273.15
-        
+
         # 5. Compute composite (median is 200x faster than quantile)
         lst_p50 = lst_celsius.median(dim="time", skipna=True)
         lst_p95 = lst_celsius.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
-        
+
         valid_count = (~lst_celsius.isnull()).sum(dim="time").astype("int16")
-        
+
         nodata = -9999.0
         composite = xr.Dataset({
             "lst_p50": lst_p50.where(valid_count > 0, nodata).astype("float32"),
@@ -328,14 +338,14 @@ class TileYearJob:
             "qa_count": valid_count,
         })
         composite = composite.compute()
-        
+
         # 6. Write COG
         cog_path = write_cog(composite, cog_output_path, self.tile_id, self.year)
-        
+
         # 7. Create virtual reference and write to Icechunk
         vds = create_virtual_reference(cog_path, str(self.tile_id), self.year)
         vds.virtualize.to_icechunk(session.store)
-        
+
         return session
 
 
@@ -388,10 +398,10 @@ LST_NODATA_CELSIUS = -9999.0
 
 def encode_celsius_to_uint16(celsius: np.ndarray) -> np.ndarray:
     """Encode Celsius temperatures to uint16 with scale/offset.
-    
+
     Formula: DN = (celsius - offset) / scale
     Decode:  celsius = DN * scale + offset
-    
+
     DN=0 is reserved for nodata. Valid range is DN=1 to DN=65535,
     representing -49.99°C to +105.535°C.
     """
@@ -411,24 +421,24 @@ def write_cog(
 ) -> str:
     """
     Write xarray Dataset to Cloud-Optimized GeoTIFF.
-    
+
     Data encoding:
     - lst_p50, lst_p95: uint16, scale=0.01, offset=-50.0 (Celsius)
     - qa_count: uint16 (raw count, no scaling)
-    
+
     Uses DEFLATE compression for universal compatibility (per portolan ADR-0019).
     Disables overviews for VirtualZarr compatibility.
-    
+
     Returns the path to the written COG.
     """
     # Encode temperature bands to uint16
     lst_p50_uint16 = encode_celsius_to_uint16(ds["lst_p50"].values)
     lst_p95_uint16 = encode_celsius_to_uint16(ds["lst_p95"].values)
     qa_count_uint16 = ds["qa_count"].values.astype(np.uint16)
-    
+
     # Stack into multiband array
     data = np.stack([lst_p50_uint16, lst_p95_uint16, qa_count_uint16], axis=0)
-    
+
     # Get spatial info
     lat = ds["latitude"].values
     lon = ds["longitude"].values
@@ -436,11 +446,11 @@ def write_cog(
         lon.min(), lat.min(), lon.max(), lat.max(),
         data.shape[2], data.shape[1]
     )
-    
+
     # Write temp GeoTIFF
     with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
         tmp_path = tmp.name
-    
+
     profile = {
         "driver": "GTiff",
         "dtype": "uint16",
@@ -451,14 +461,14 @@ def write_cog(
         "transform": transform,
         "nodata": 0,  # DN=0 is nodata for all bands
     }
-    
+
     with rasterio.open(tmp_path, "w", **profile) as dst:
         dst.write(data)
         dst.descriptions = ("lst_p50", "lst_p95", "qa_count")
-    
+
     # Note: Scale/offset stored in STAC metadata and Icechunk attrs,
     # not in COG (cog_translate doesn't preserve per-band tags)
-    
+
     # Translate to COG with Source Coop-compatible settings
     # DEFLATE for universal compatibility (not zstd)
     # No overviews for VirtualZarr compatibility
@@ -466,7 +476,7 @@ def write_cog(
     dst_profile["blockxsize"] = 512
     dst_profile["blockysize"] = 512
     dst_profile["predictor"] = 2  # Horizontal differencing
-    
+
     cog_translate(
         tmp_path,
         output_path,
@@ -475,9 +485,9 @@ def write_cog(
         overview_level=0,  # No overviews - required for VirtualZarr
         quiet=True,
     )
-    
+
     Path(tmp_path).unlink()  # Cleanup temp file
-    
+
     return output_path
 ```
 
@@ -502,29 +512,29 @@ def create_virtual_reference(
 ) -> xr.Dataset:
     """
     Create virtual dataset from COG with proper coordinates.
-    
+
     Uses VirtualZarr 2.x API with explicit registry and parser.
     """
     # Configure object store registry based on path scheme
     registry = ObjectStoreRegistry()
-    
+
     if cog_path.startswith("s3://"):
         registry.register("s3://", S3Store())
         uri = cog_path
     else:
         registry.register("file://", LocalStore())
         uri = f"file://{cog_path}" if not cog_path.startswith("file://") else cog_path
-    
+
     # Open virtual dataset with VirtualTIFF parser
     vds = open_virtual_dataset(uri, registry=registry, parser=VirtualTIFF())
-    
+
     # Add time coordinate (mid-year for annual composite)
     vds = vds.expand_dims(time=[pd.Timestamp(f"{year}-07-01")])
-    
+
     # Add tile metadata
     vds.attrs["tile_id"] = tile_id
     vds.attrs["year"] = year
-    
+
     return vds
 
 
@@ -597,7 +607,7 @@ def run_parallel(
     max_workers: int = 100,
 ) -> None:
     """Run all jobs in parallel on Coiled."""
-    
+
     with storage.writable_session() as session:
         # Map jobs to workers
         results = list(tqdm(
@@ -610,10 +620,10 @@ def run_parallel(
             total=len(jobs),
             desc="Processing tiles",
         ))
-        
+
         # Filter successful results
         worker_sessions = [r for r in results if r is not None]
-        
+
         # Commit all changes
         storage.commit(
             f"Processed {len(worker_sessions)} tiles",
@@ -634,22 +644,22 @@ def process_year(year: int, parallel: bool, max_workers: int):
     from landsat_lst.job import generate_jobs
     from landsat_lst.runner import run_parallel
     from landsat_lst.storage import IcechunkStorage, StorageConfig
-    
+
     # Generate tile list
     tiles = generate_land_tiles()
     jobs = generate_jobs(tiles, [year])
-    
+
     click.echo(f"Processing {len(jobs)} tiles for {year}")
-    
+
     # Configure storage
     config = StorageConfig(
         cog_bucket="source-coop-radiant-earth",
         cog_prefix="landsat-lst",
-        icechunk_bucket="source-coop-radiant-earth", 
+        icechunk_bucket="source-coop-radiant-earth",
         icechunk_prefix="landsat-lst/icechunk",
     )
     storage = IcechunkStorage(config)
-    
+
     if parallel:
         run_parallel(jobs, storage, max_workers=max_workers)
     else:
@@ -672,27 +682,27 @@ def process_year(year: int, parallel: bool, max_workers: int):
 def test_create_virtual_reference(tmp_path):
     """Virtual reference creation from COG."""
     cog_path = create_test_cog(tmp_path / "test.tif")
-    
+
     vds = create_virtual_reference(str(cog_path), "N40W075", 2023)
-    
+
     assert "time" in vds.dims
     assert vds.attrs["tile_id"] == "N40W075"
 
 
-# tests/unit/test_storage.py  
+# tests/unit/test_storage.py
 def test_local_storage_roundtrip(tmp_path):
     """Write and read back from local Icechunk."""
     storage = LocalStorage(tmp_path)
-    
+
     with storage.writable_session() as session:
         vds = create_test_virtual_dataset()
         vds.virtualize.to_icechunk(session.store)
         storage.commit("Test commit")
-    
+
     # Read back with authorization
     repo = storage.open_readonly()
     ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
-    
+
     assert len(ds.data_vars) > 0
 ```
 
@@ -711,14 +721,14 @@ def test_multi_tile_sequential(tmp_path):
     """Process multiple tiles sequentially."""
     tiles = [TileId(lat=-34, lon=-61), TileId(lat=-34, lon=-60)]
     jobs = generate_jobs(tiles, [2024])
-    
+
     storage = LocalStorage(tmp_path)
     with storage.writable_session() as session:
         for job in jobs:
             cog_path = str(tmp_path / "cogs" / f"{job.tile_id}_{job.year}.tif")
             job.process(session, cog_path)
         storage.commit("Multi-tile test")
-    
+
     repo = storage.open_readonly()
     ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
     assert "time" in ds.dims

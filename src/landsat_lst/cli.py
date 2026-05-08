@@ -17,9 +17,9 @@ def main() -> None:
 @click.option("--year", "-y", type=int, required=True, help="Year to process")
 @click.option("--tile", "-t", type=str, help="Specific tile to process (e.g., N40W075)")
 @click.option("--dry-run", is_flag=True, help="Show what would be processed without running")
-@click.option("--force", "-f", is_flag=True, help="Reprocess even if COG exists")
+@click.option("--force", "-f", is_flag=True, help="Reprocess even if Zarr exists")
 def process(year: int, tile: str | None, dry_run: bool, force: bool) -> None:
-    """Process Landsat data to annual composites."""
+    """Process Landsat data to annual Zarr composites."""
     from landsat_lst.job import generate_jobs, process_tile_job
     from landsat_lst.models import ProcessingJob
     from landsat_lst.tiling import LAND_TILES, parse_tile_name
@@ -37,7 +37,7 @@ def process(year: int, tile: str | None, dry_run: bool, force: bool) -> None:
         console.print(f"  Tiles: {len(jobs)} land tiles")
 
     if force:
-        console.print("  [yellow]Force mode: reprocessing existing COGs[/yellow]")
+        console.print("  [yellow]Force mode: reprocessing existing Zarr stores[/yellow]")
 
     if dry_run:
         console.print("[yellow]Dry run - no processing performed[/yellow]")

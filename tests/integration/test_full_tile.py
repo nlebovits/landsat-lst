@@ -1,36 +1,29 @@
-"""Full 5° tile integration test.
+"""Full tile integration test with direct Zarr + Icechunk.
 
-End-to-end test: STAC query → composite → COG → VirtualZarr → Icechunk
+End-to-end test: STAC query → composite → Zarr → Icechunk
 
 Uses optimized settings from parameter sweeps:
 - Cloud cover: ≤20%
-- Chunk size: 512x512
+- Chunk size: 500x500
 - Resampling: bilinear (thermal), nearest (QA)
-- Compression: DEFLATE (Source Coop compatible)
-- Statistics: median (not quantile)
+- Storage: Icechunk for versioned writes
 
 Run with: pytest -m tile -v -s
 """
 
 import time
 
-import icechunk
 import numpy as np
 import planetary_computer
 import pystac_client
 import pytest
-import rasterio
 import xarray as xr
-from icechunk import ObjectStoreConfig, Repository, RepositoryConfig, VirtualChunkContainer
-from obspec_utils.registry import ObjectStoreRegistry
-from obstore.store import LocalStore
 from odc.stac import configure_rio, stac_load
-from rio_cogeo.cogeo import cog_translate
-from rio_cogeo.profiles import cog_profiles
-from virtual_tiff import VirtualTIFF
-from virtualizarr import open_virtual_dataset
 
-# 0.25° tile for integration test (~900x900px, ~500MB)
+from landsat_lst.storage import IcechunkStorage
+from landsat_lst.zarr_writer import write_zarr
+
+# 0.25° tile for integration test (~900x900px)
 # Located within Pergamino region for good data availability
 TILE_BBOX = (-60.5, -34.0, -60.25, -33.75)
 TILE_NAME = "test_tile"
@@ -76,7 +69,8 @@ def stac_items(stac_client):
     # Show scene distribution
     cloud_covers = [i.properties["eo:cloud_cover"] for i in items]
     print(
-        f"Cloud cover: {np.mean(cloud_covers):.1f}% avg, {np.min(cloud_covers):.1f}-{np.max(cloud_covers):.1f}% range"
+        f"Cloud cover: {np.mean(cloud_covers):.1f}% avg, "
+        f"{np.min(cloud_covers):.1f}-{np.max(cloud_covers):.1f}% range"
     )
 
     return items
@@ -84,7 +78,7 @@ def stac_items(stac_client):
 
 @pytest.mark.tile
 class TestFullTileIntegration:
-    """End-to-end test for a complete 5° tile."""
+    """End-to-end test for direct Zarr + Icechunk pipeline."""
 
     def test_01_load_all_scenes(self, stac_items):
         """Load all scenes for the tile."""
@@ -96,7 +90,7 @@ class TestFullTileIntegration:
             bands=["lwir11", "qa_pixel"],
             crs="EPSG:4326",
             resolution=0.00027778,  # ~30m
-            chunks={"time": 10, "latitude": 512, "longitude": 512},
+            chunks={"time": 10, "latitude": 500, "longitude": 500},
             resampling={"lwir11": "bilinear", "qa_pixel": "nearest"},
             bbox=TILE_BBOX,
             groupby="solar_day",
@@ -140,22 +134,13 @@ class TestFullTileIntegration:
         print("Temperature conversion applied (lazy)")
 
     def test_04_compute_composite(self):
-        """Build annual composite: p50, p95, count (LAZY - no .compute()).
-
-        CRITICAL: This step keeps the composite lazy (chunked). The actual
-        computation happens during COG write, streaming one chunk at a time.
-        This enables processing tiles that would otherwise OOM.
-
-        Memory model:
-        - Without chunked write: 5° tile = 18000x18000 x 150 times x 4 bytes = ~388 GB
-        - With chunked write: 512x512 chunk x 150 times x 4 bytes = ~157 MB peak
-        """
+        """Build annual composite: p50, p95, count (LAZY - no .compute())."""
         print("\n--- Step 4: Build composite (lazy) ---")
         lst_celsius = pytest.lst_celsius
 
         start = time.perf_counter()
 
-        # Use .median() instead of .quantile(0.5) - 200x faster
+        # Use .median() instead of .quantile(0.5) - much faster
         lst_p50 = lst_celsius.median(dim="time", skipna=True)
         lst_p95 = lst_celsius.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
 
@@ -173,12 +158,12 @@ class TestFullTileIntegration:
             {
                 "lst_p50": lst_p50.astype(np.float32),
                 "lst_p95": lst_p95.astype(np.float32),
-                "qa_count": qa_count,
+                "qa_count": qa_count.astype(np.uint16),
             }
         )
 
-        # Rechunk to optimal size for COG write
-        composite = composite.chunk({"latitude": 512, "longitude": 512})
+        # Rechunk to optimal size for Zarr write
+        composite = composite.chunk({"latitude": 500, "longitude": 500})
 
         elapsed = time.perf_counter() - start
         print(f"Composite graph built in {elapsed:.1f}s (lazy)")
@@ -190,174 +175,45 @@ class TestFullTileIntegration:
 
         pytest.composite = composite
 
-    def test_05_write_cog(self, tmp_path):
-        """Write composite to Cloud-Optimized GeoTIFF using chunked streaming.
-
-        CRITICAL: Uses rioxarray chunked write pattern to avoid OOM.
-        The composite is LAZY (not computed) - rioxarray streams chunks
-        to disk one at a time, bounded by chunk size (~157 MB per chunk).
-
-        Two-stage approach:
-        1. Stream chunks to tiled GeoTIFF via rioxarray (memory-bounded)
-        2. Translate to COG with compression and overviews (disk-bound)
-
-        Note: This test uses float32 for simplicity. Production code should
-        use uint16 encoding for 43% storage reduction (see d87f18e).
-        """
-        import threading
-
-        import rioxarray  # noqa: F401 - needed for .rio accessor
-
-        print("\n--- Step 5: Write COG (chunked streaming) ---")
+    def test_05_write_to_icechunk(self, tmp_path):
+        """Write composite to Icechunk repository."""
+        print("\n--- Step 5: Write to Icechunk ---")
         composite = pytest.composite
 
-        # Verify composite is still lazy
-        assert composite.chunks is not None, "Composite should be chunked for memory-bounded write"
-
         start = time.perf_counter()
 
-        # Set CRS and spatial dims for rioxarray
-        composite = composite.rio.write_crs("EPSG:4326")
-        composite = composite.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude")
+        # Create Icechunk storage
+        icechunk_path = tmp_path / "icechunk"
+        storage = IcechunkStorage.from_local(icechunk_path)
 
-        # Stage 1: Chunked write to temp GeoTIFF (memory-bounded)
-        tmp_tif = tmp_path / "temp.tif"
-        stacked = composite.to_array(dim="band")
+        # Write to Icechunk
+        session = storage.writable_session()
+        group_path = f"{TILE_YEAR}/{TILE_NAME}"
 
-        print("Streaming chunks to disk...")
-        stacked.rio.to_raster(
-            str(tmp_tif),
-            tiled=True,
-            lock=threading.Lock(),
-        )
+        print(f"Writing to Icechunk group: {group_path}")
+        write_zarr(composite, session, group=group_path, chunks=(500, 500))
 
-        stage1_elapsed = time.perf_counter() - start
-        print(f"Stage 1 (chunked write): {stage1_elapsed:.1f}s")
-
-        # Stage 2: COG translation with compression and overviews
-        cog_path = tmp_path / f"{TILE_NAME}_{TILE_YEAR}.tif"
-        dst_profile = cog_profiles.get("deflate")
-        dst_profile["blockxsize"] = 512
-        dst_profile["blockysize"] = 512
-
-        cog_translate(
-            str(tmp_tif),
-            str(cog_path),
-            dst_profile,
-            use_cog_driver=True,
-            overview_level=None,  # Auto-generate overviews; VirtualTIFF(ifd=0) handles them
-            quiet=True,
-        )
-
-        # Clean up temp file
-        tmp_tif.unlink()
+        # Commit
+        commit_id = session.commit(f"Add {TILE_NAME} for {TILE_YEAR}")
 
         elapsed = time.perf_counter() - start
-        file_size_mb = cog_path.stat().st_size / (1024 * 1024)
-
-        print(f"Total COG write: {elapsed:.1f}s")
-        print(f"File: {cog_path.name} ({file_size_mb:.1f} MB)")
-
-        # Validate COG structure
-        with rasterio.open(cog_path) as src:
-            assert src.count == 3
-            assert src.crs.to_epsg() == 4326
-            # Note: small tiles may not be tiled (optimization by rio-cogeo)
-            if src.width > 512 or src.height > 512:
-                assert src.is_tiled, "Large COGs should be tiled"
-            print(f"Data type: {src.dtypes[0]}")
-            print(f"Overviews: {src.overviews(1)}")
-
-        pytest.cog_path = cog_path
-        pytest.tmp_path = tmp_path
-
-    def test_06_create_virtual_reference(self):
-        """Create VirtualZarr reference from COG."""
-        print("\n--- Step 6: Create VirtualZarr reference ---")
-        cog_path = pytest.cog_path
-
-        start = time.perf_counter()
-
-        # VirtualZarr 2.x API
-        registry = ObjectStoreRegistry()
-        registry.register("file://", LocalStore())
-
-        # VirtualTIFF(ifd=0) selects full-res IFD, allowing COGs with overviews
-        # Without ifd=0, COGs with overviews cause "conflicting sizes for dimension y"
-        vds = open_virtual_dataset(
-            f"file://{cog_path}",
-            registry=registry,
-            parser=VirtualTIFF(ifd=0),
-        )
-
-        elapsed = time.perf_counter() - start
-        print(f"Virtual dataset created in {elapsed:.3f}s")
-        print(f"Variables: {list(vds.data_vars)}")
-
-        pytest.vds = vds
-
-    def test_07_write_to_icechunk(self):
-        """Write virtual references to Icechunk store."""
-        print("\n--- Step 7: Write to Icechunk ---")
-        vds = pytest.vds
-        tmp_path = pytest.tmp_path
-
-        start = time.perf_counter()
-
-        # Configure Icechunk with local file access
-        cog_parent_dir = str(tmp_path)
-        local_config = ObjectStoreConfig.LocalFileSystem(cog_parent_dir)
-        container = VirtualChunkContainer(
-            f"file://{cog_parent_dir}/",
-            local_config,
-            name="local",
-        )
-
-        icechunk_path = str(tmp_path / "icechunk")
-        storage = icechunk.local_filesystem_storage(icechunk_path)
-        config = RepositoryConfig.default()
-        config.set_virtual_chunk_container(container)
-
-        repo = Repository.create(storage, config=config)
-        session = repo.writable_session("main")
-
-        vds.virtualize.to_icechunk(session.store)
-        commit_id = session.commit(f"Added {TILE_NAME} {TILE_YEAR}")
-
-        elapsed = time.perf_counter() - start
-        print(f"Icechunk commit in {elapsed:.3f}s")
+        print(f"Icechunk write + commit in {elapsed:.1f}s")
         print(f"Commit ID: {commit_id[:16]}...")
 
-        pytest.icechunk_path = icechunk_path
-        pytest.cog_parent_dir = cog_parent_dir
+        pytest.icechunk_storage = storage
+        pytest.group_path = group_path
 
-    def test_08_read_back_from_icechunk(self):
-        """Read data back from Icechunk via xr.open_zarr."""
-        print("\n--- Step 8: Read back from Icechunk ---")
-        icechunk_path = pytest.icechunk_path
-        cog_parent_dir = pytest.cog_parent_dir
+    def test_06_read_back_from_icechunk(self):
+        """Read data back from Icechunk."""
+        print("\n--- Step 6: Read back from Icechunk ---")
+        storage = pytest.icechunk_storage
+        group_path = pytest.group_path
 
         start = time.perf_counter()
 
-        # Open with virtual chunk authorization
-        local_config = ObjectStoreConfig.LocalFileSystem(cog_parent_dir)
-        container = VirtualChunkContainer(
-            f"file://{cog_parent_dir}/",
-            local_config,
-            name="local",
-        )
-
-        storage = icechunk.local_filesystem_storage(icechunk_path)
-        config = RepositoryConfig.default()
-        config.set_virtual_chunk_container(container)
-
-        repo = Repository.open(
-            storage,
-            config=config,
-            authorize_virtual_chunk_access={f"file://{cog_parent_dir}/": None},
-        )
-
-        ds_read = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
+        # Read from Icechunk
+        session = storage.readonly_session()
+        ds_read = xr.open_zarr(session.store, group=group_path, consolidated=False)
 
         elapsed = time.perf_counter() - start
         print(f"Opened from Icechunk in {elapsed:.3f}s")
@@ -365,31 +221,54 @@ class TestFullTileIntegration:
 
         pytest.ds_read = ds_read
 
-    def test_09_validate_roundtrip(self):
-        """Validate data integrity through the full pipeline."""
-        print("\n--- Step 9: Validate roundtrip ---")
-        cog_path = pytest.cog_path
+    def test_07_validate_structure(self):
+        """Validate dataset structure."""
+        print("\n--- Step 7: Validate structure ---")
         ds_read = pytest.ds_read
 
-        # Read original COG directly
-        with rasterio.open(cog_path) as src:
-            original_data = src.read()
-            print(f"Original COG shape: {original_data.shape}")
+        # Check variables exist
+        assert "lst_p50" in ds_read.data_vars
+        assert "lst_p95" in ds_read.data_vars
+        assert "qa_count" in ds_read.data_vars
 
-        # Validate Icechunk dataset structure
-        var_name = next(iter(ds_read.data_vars))
-        print(f"Icechunk variable: {var_name}")
-        print(f"Icechunk dims: {ds_read[var_name].dims}")
-        print(f"Icechunk shape: {ds_read[var_name].shape}")
+        # Check dtype (should be uint16 after encoding)
+        assert ds_read["lst_p50"].dtype == np.uint16
+        assert ds_read["lst_p95"].dtype == np.uint16
+        assert ds_read["qa_count"].dtype == np.uint16
 
-        # Shape validation
-        assert ds_read[var_name].shape[-2:] == original_data.shape[-2:], (
-            f"Shape mismatch: {ds_read[var_name].shape} vs {original_data.shape}"
-        )
+        # Check encoding attributes preserved
+        assert ds_read["lst_p50"].attrs["lst_scale_factor"] == 0.01
+        assert ds_read["lst_p50"].attrs["lst_add_offset"] == -50.0
 
-        print("✓ Roundtrip structure validated")
+        print("✓ Structure validated")
 
-    def test_10_summary(self):
+    def test_08_validate_values(self):
+        """Validate data values are reasonable."""
+        print("\n--- Step 8: Validate values ---")
+        ds_read = pytest.ds_read
+
+        # Decode values
+        scale = ds_read["lst_p50"].attrs["lst_scale_factor"]
+        offset = ds_read["lst_p50"].attrs["lst_add_offset"]
+
+        p50_celsius = ds_read["lst_p50"].values * scale + offset
+        p95_celsius = ds_read["lst_p95"].values * scale + offset
+
+        # Check reasonable temperature range (Argentina in winter/summer)
+        # Allow wide range for different seasons and nodata handling
+        valid_p50 = p50_celsius[(p50_celsius > -50) & (p50_celsius < 60)]
+        valid_p95 = p95_celsius[(p95_celsius > -50) & (p95_celsius < 60)]
+
+        if len(valid_p50) > 0:
+            print(f"P50 range: {valid_p50.min():.1f}°C to {valid_p50.max():.1f}°C")
+            print(f"P95 range: {valid_p95.min():.1f}°C to {valid_p95.max():.1f}°C")
+
+            # Sanity check: P95 should be >= P50
+            assert valid_p95.mean() >= valid_p50.mean(), "P95 should be >= P50"
+
+        print("✓ Values validated")
+
+    def test_09_summary(self):
         """Print summary of full tile test."""
         print(f"\n{'=' * 60}")
         print("FULL TILE TEST COMPLETE")
@@ -397,5 +276,5 @@ class TestFullTileIntegration:
         print(f"Tile: {TILE_NAME}")
         print(f"Year: {TILE_YEAR}")
         print(f"Bbox: {TILE_BBOX}")
-        print("Pipeline: STAC → Load → QA → Composite → COG → VirtualZarr → Icechunk")
+        print("Pipeline: STAC → Load → QA → Composite → Zarr → Icechunk")
         print("All steps passed!")

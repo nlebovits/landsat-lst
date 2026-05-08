@@ -6,11 +6,12 @@ import pytest
 
 from landsat_lst.job import (
     JobResult,
-    _commit_to_icechunk,
+    _write_to_icechunk_with_retry,
     generate_jobs,
     process_tile_job,
 )
 from landsat_lst.models import ProcessingJob, TileId
+from landsat_lst.storage import IcechunkStorage
 
 
 @pytest.fixture
@@ -23,9 +24,20 @@ def sample_job():
 def mock_storage():
     """Create a mock storage backend."""
     storage = MagicMock()
-    storage.cog_exists.return_value = False
-    storage.cog_path.return_value = "/tmp/test/2023/N40W075.tif"
-    storage.icechunk_storage.return_value = MagicMock()
+    storage.zarr_exists.return_value = False
+    storage.zarr_path.return_value = "/tmp/test/2023/N40W075.zarr"
+    return storage
+
+
+@pytest.fixture
+def mock_icechunk_storage():
+    """Create a mock IcechunkStorage backend."""
+    storage = MagicMock(spec=IcechunkStorage)
+    storage.zarr_exists.return_value = False
+    storage.zarr_path.return_value = "2023/N40W075"
+    session = MagicMock()
+    session.commit.return_value = "snapshot_abc123"
+    storage.writable_session.return_value = session
     return storage
 
 
@@ -36,17 +48,26 @@ class TestJobResult:
         result = JobResult(
             job=sample_job,
             status="completed",
-            commit_id="abc123",
-            cog_path="/tmp/test.tif",
+            zarr_path="/tmp/test.zarr",
         )
         assert result.status == "completed"
-        assert result.commit_id == "abc123"
+        assert result.zarr_path == "/tmp/test.zarr"
         assert result.error is None
+
+    def test_completed_with_commit_id(self, sample_job):
+        result = JobResult(
+            job=sample_job,
+            status="completed",
+            zarr_path="2023/N40W075",
+            commit_id="abc123def456",
+        )
+        assert result.status == "completed"
+        assert result.commit_id == "abc123def456"
 
     def test_skipped_result(self, sample_job):
         result = JobResult(job=sample_job, status="skipped")
         assert result.status == "skipped"
-        assert result.commit_id is None
+        assert result.zarr_path is None
 
     def test_failed_result(self, sample_job):
         result = JobResult(job=sample_job, status="failed", error="Test error")
@@ -55,45 +76,43 @@ class TestJobResult:
 
 
 class TestIdempotentCheck:
-    """Tests for idempotent COG existence check."""
+    """Tests for idempotent Zarr existence check."""
 
-    def test_skips_existing_cog(self, sample_job, mock_storage):
-        """Should skip processing when COG already exists."""
-        mock_storage.cog_exists.return_value = True
+    def test_skips_existing_zarr(self, sample_job, mock_storage):
+        """Should skip processing when Zarr already exists."""
+        mock_storage.zarr_exists.return_value = True
 
         result = process_tile_job(sample_job, force=False, storage=mock_storage)
 
         assert result.status == "skipped"
-        mock_storage.cog_exists.assert_called_once_with(2023, "N40W075")
+        mock_storage.zarr_exists.assert_called_once_with(2023, "N40W075")
 
-    def test_force_reprocesses_existing_cog(self, sample_job, mock_storage):
-        """Should reprocess when force=True even if COG exists."""
-        mock_storage.cog_exists.return_value = True
+    def test_force_reprocesses_existing_zarr(self, sample_job, mock_storage):
+        """Should reprocess when force=True even if Zarr exists."""
+        mock_storage.zarr_exists.return_value = True
 
         with (
             patch("landsat_lst.job.process_tile") as mock_process,
-            patch("landsat_lst.job.write_cog"),
-            patch("landsat_lst.job._commit_to_icechunk") as mock_commit,
+            patch("landsat_lst.job.write_zarr") as mock_write,
         ):
             mock_process.return_value = MagicMock()
-            mock_commit.return_value = "commit123"
+            mock_write.return_value = "/tmp/test.zarr"
 
             result = process_tile_job(sample_job, force=True, storage=mock_storage)
 
         assert result.status == "completed"
-        mock_storage.cog_exists.assert_not_called()
+        mock_storage.zarr_exists.assert_not_called()
 
     def test_processes_new_tile(self, sample_job, mock_storage):
-        """Should process tile when COG doesn't exist."""
-        mock_storage.cog_exists.return_value = False
+        """Should process tile when Zarr doesn't exist."""
+        mock_storage.zarr_exists.return_value = False
 
         with (
             patch("landsat_lst.job.process_tile") as mock_process,
-            patch("landsat_lst.job.write_cog"),
-            patch("landsat_lst.job._commit_to_icechunk") as mock_commit,
+            patch("landsat_lst.job.write_zarr") as mock_write,
         ):
             mock_process.return_value = MagicMock()
-            mock_commit.return_value = "commit123"
+            mock_write.return_value = "/tmp/test.zarr"
 
             result = process_tile_job(sample_job, force=False, storage=mock_storage)
 
@@ -101,73 +120,97 @@ class TestIdempotentCheck:
         mock_process.assert_called_once()
 
 
-class TestIcechunkCommit:
-    """Tests for Icechunk commit with conflict retry."""
+class TestIcechunkConflictRetry:
+    """Tests for Icechunk conflict retry logic."""
 
-    def test_successful_commit(self, sample_job, mock_storage):
+    def test_successful_commit_first_try(self, sample_job, mock_icechunk_storage):
         """Should commit successfully on first try."""
-        mock_repo = MagicMock()
-        mock_session = MagicMock()
-        mock_session.commit.return_value = "commit_id_123"
-        mock_repo.writable_session.return_value = mock_session
+        composite = MagicMock()
+        logger = MagicMock()
 
-        with patch("landsat_lst.job.icechunk") as mock_ic:
-            mock_ic.Repository.open_or_create.return_value = mock_repo
-            with patch("landsat_lst.job.open_virtual_dataset") as mock_vds:
-                mock_vds.return_value = MagicMock()
+        with patch("landsat_lst.job.write_zarr"):
+            group_path, commit_id = _write_to_icechunk_with_retry(
+                composite, mock_icechunk_storage, sample_job, logger
+            )
 
-                commit_id = _commit_to_icechunk("/tmp/test.tif", mock_storage, sample_job)
+        assert group_path == "2023/N40W075"
+        assert commit_id == "snapshot_abc123"
+        mock_icechunk_storage.writable_session.assert_called_once()
 
-        assert commit_id == "commit_id_123"
-
-    def test_retry_on_conflict(self, sample_job, mock_storage):
+    def test_retries_on_conflict(self, sample_job, tmp_path):
         """Should retry on ConflictError."""
-        mock_repo = MagicMock()
-        mock_session = MagicMock()
+        import icechunk as ic
 
-        # Create a custom exception class for testing
-        class MockConflictError(Exception):
-            pass
+        storage = IcechunkStorage.from_local(tmp_path / "icechunk")
+        composite = MagicMock()
+        logger = MagicMock()
 
-        # Fail first two times, succeed third
-        mock_session.commit.side_effect = [
-            MockConflictError("conflict"),
-            MockConflictError("conflict"),
-            "commit_id_123",
-        ]
-        mock_repo.writable_session.return_value = mock_session
+        # ConflictError requires (expected_parent, actual_parent)
+        conflict_error = ic.ConflictError("expected_snap", "actual_snap")
 
-        with patch("landsat_lst.job.icechunk") as mock_ic:
-            mock_ic.Repository.open_or_create.return_value = mock_repo
-            mock_ic.ConflictError = MockConflictError
-            with patch("landsat_lst.job.open_virtual_dataset") as mock_vds:
-                mock_vds.return_value = MagicMock()
+        # Mock writable_session to return sessions that fail then succeed
+        session1 = MagicMock()
+        session1.commit.side_effect = conflict_error
+        session2 = MagicMock()
+        session2.commit.return_value = "snapshot_success"
 
-                commit_id = _commit_to_icechunk("/tmp/test.tif", mock_storage, sample_job)
+        with (
+            patch.object(storage, "writable_session", side_effect=[session1, session2]),
+            patch("landsat_lst.job.write_zarr"),
+        ):
+            _group_path, commit_id = _write_to_icechunk_with_retry(
+                composite, storage, sample_job, logger
+            )
 
-        assert commit_id == "commit_id_123"
-        assert mock_session.commit.call_count == 3
+        assert commit_id == "snapshot_success"
+        assert logger.warning.call_count == 1  # One conflict warning
 
-    def test_max_retries_exceeded(self, sample_job, mock_storage):
+    def test_max_retries_exceeded(self, sample_job, tmp_path):
         """Should raise after max retries."""
-        mock_repo = MagicMock()
-        mock_session = MagicMock()
+        import icechunk as ic
 
-        # Create a custom exception class for testing
-        class MockConflictError(Exception):
-            pass
+        storage = IcechunkStorage.from_local(tmp_path / "icechunk")
+        composite = MagicMock()
+        logger = MagicMock()
 
-        mock_session.commit.side_effect = MockConflictError("conflict")
-        mock_repo.writable_session.return_value = mock_session
+        # ConflictError requires (expected_parent, actual_parent)
+        conflict_error = ic.ConflictError("expected_snap", "actual_snap")
 
-        with patch("landsat_lst.job.icechunk") as mock_ic:
-            mock_ic.Repository.open_or_create.return_value = mock_repo
-            mock_ic.ConflictError = MockConflictError
-            with patch("landsat_lst.job.open_virtual_dataset") as mock_vds:
-                mock_vds.return_value = MagicMock()
+        # Mock to always conflict
+        session = MagicMock()
+        session.commit.side_effect = conflict_error
 
-                with pytest.raises(MockConflictError):
-                    _commit_to_icechunk("/tmp/test.tif", mock_storage, sample_job, max_retries=3)
+        with (
+            patch.object(storage, "writable_session", return_value=session),
+            patch("landsat_lst.job.write_zarr"),
+            patch("landsat_lst.job.settings") as mock_settings,
+        ):
+            mock_settings.icechunk_max_retries = 3
+
+            with pytest.raises(ic.ConflictError):
+                _write_to_icechunk_with_retry(composite, storage, sample_job, logger)
+
+        assert session.commit.call_count == 3
+
+
+class TestIcechunkIntegration:
+    """Tests for IcechunkStorage in process_tile_job."""
+
+    def test_uses_icechunk_path(self, sample_job, mock_icechunk_storage):
+        """Should use Icechunk write path when storage is IcechunkStorage."""
+        with (
+            patch("landsat_lst.job.process_tile") as mock_process,
+            patch("landsat_lst.job._write_to_icechunk_with_retry") as mock_write,
+            patch("landsat_lst.job.isinstance", return_value=True),
+        ):
+            mock_process.return_value = MagicMock()
+            mock_write.return_value = ("2023/N40W075", "snapshot123")
+
+            # Use real isinstance check by actually using IcechunkStorage mock
+            result = process_tile_job(sample_job, storage=mock_icechunk_storage)
+
+        assert result.status == "completed"
+        assert result.commit_id == "snapshot123"
 
 
 class TestGenerateJobs:
@@ -201,7 +244,7 @@ class TestProcessTileJobFailure:
 
     def test_returns_failed_on_exception(self, sample_job, mock_storage):
         """Should return failed status when pipeline raises."""
-        mock_storage.cog_exists.return_value = False
+        mock_storage.zarr_exists.return_value = False
 
         with patch("landsat_lst.job.process_tile") as mock_process:
             mock_process.side_effect = ValueError("No scenes found")
