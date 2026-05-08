@@ -1,9 +1,12 @@
 """Unit tests for tiling utilities."""
 
+import pytest
+
 from landsat_lst.tiling import (
     LAND_TILES,
     generate_global_tiles,
     generate_land_tiles,
+    parse_tile_name,
     tile_from_point,
     tiles_intersecting_bbox,
 )
@@ -129,3 +132,48 @@ class TestTilesIntersectingBbox:
         tiles = list(tiles_intersecting_bbox(bbox))
         names = [t.name for t in tiles]
         assert len(names) == len(set(names))
+
+
+class TestParseTileName:
+    """Tests for tile name parsing."""
+
+    def test_parse_northern_western(self):
+        """Should parse N40W075 correctly."""
+        tile = parse_tile_name("N40W075")
+        assert tile.lat == 40
+        assert tile.lon == -75
+        assert tile.name == "N40W075"
+
+    def test_parse_northern_eastern(self):
+        """Should parse N50E000 correctly."""
+        tile = parse_tile_name("N50E000")
+        assert tile.lat == 50
+        assert tile.lon == 0
+
+    def test_parse_southern_western(self):
+        """Should parse S35W060 correctly."""
+        tile = parse_tile_name("S35W060")
+        assert tile.lat == -35
+        assert tile.lon == -60
+
+    def test_parse_southern_eastern(self):
+        """Should parse S35E145 correctly."""
+        tile = parse_tile_name("S35E145")
+        assert tile.lat == -35
+        assert tile.lon == 145
+
+    def test_roundtrip_all_land_tiles(self):
+        """Should roundtrip all land tiles through parse/name."""
+        for name in LAND_TILES:
+            tile = parse_tile_name(name)
+            assert tile.name == name
+
+    def test_invalid_format_raises(self):
+        """Should raise ValueError for invalid format."""
+        with pytest.raises(ValueError, match="Invalid tile name"):
+            parse_tile_name("invalid")
+
+    def test_wrong_length_raises(self):
+        """Should raise ValueError for wrong length."""
+        with pytest.raises(ValueError, match="Invalid tile name"):
+            parse_tile_name("N40W75")  # Missing leading zero
