@@ -55,6 +55,7 @@ dev = [
     "pytest-cov>=5.0.0",
     "pytest-xdist>=3.5.0",
     "pytest-mock>=3.14.0",
+    "pytest-timeout>=2.3.0",
     # Type checking
     "ty>=0.0.1a0",
     # Linting and formatting
