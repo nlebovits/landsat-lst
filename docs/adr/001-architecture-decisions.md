@@ -206,6 +206,27 @@ lst_celsius = lst_kelvin - 273.15
 
 **Rationale:** COG is the standard for cloud-native geospatial. DEFLATE balances compression ratio and read speed.
 
+**Chunk size rationale (512×512):**
+
+GDAL/rasterio requires COG block sizes to be **multiples of 16**. Our 5° tiles at ~30m resolution produce ~18,500 pixels per side. No multiple of 16 divides 18,500 evenly (18,500 = 2² × 5³ × 37):
+- 512 ÷ 16 = 32 ✓ (GDAL-compatible)
+- 500 ÷ 16 = 31.25 ✗ (fails GDAL constraint)
+- 18,500 ÷ 512 = 36.13 (partial edge chunks)
+
+VirtualZarr handles partial edge chunks correctly. The alternative would be changing tile dimensions to 18,432 × 18,432 (= 36 × 512), but that would complicate the 5° grid alignment.
+
+Non-power-of-2 chunk sizes are standard in geospatial (when GDAL constraint is met):
+- Earthmover serverless-datacube: 1200×1200 default
+- Dynamical.org reformatters: 50×50, 121×121, varies by dataset
+- USGS Landsat COGs: 256×256
+- Microsoft Planetary Computer ERA5: 150×150
+
+**References:**
+- Spike validation: `scripts/spike_virtualzarr_icechunk.py` (2026-05-08)
+- Earthmover: https://github.com/earth-mover/serverless-datacube-demo
+- Dynamical.org: https://github.com/dynamical-org/reformatters
+- USGS COG spec: LSDS-1388 Landsat Cloud Optimized GeoTIFF Data Format Control Book
+
 ---
 
 ### 12. Data Encoding (uint16 Packing)

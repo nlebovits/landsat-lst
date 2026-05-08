@@ -62,6 +62,33 @@ landsat-lst process --year 2023
 landsat-lst list-tiles
 ```
 
+## Virtual Datacube Access
+
+After processing COGs, create the virtual datacube layer for efficient xarray access:
+
+```bash
+landsat-lst virtualize --year 2023
+```
+
+Access via xarray:
+
+```python
+import xarray as xr
+
+ds = xr.open_zarr("icechunk://source.coop/radiant-earth/landsat-lst")
+
+# Spatial query (only fetches required byte ranges)
+subset = ds.lst_p50.sel(
+    latitude=slice(45, 40),
+    longitude=slice(-75, -70)
+)
+
+# Decode uint16 to Celsius
+lst_celsius = subset * 0.01 + (-50.0)
+```
+
+See [docs/adr/002-virtualzarr-icechunk-integration.md](docs/adr/002-virtualzarr-icechunk-integration.md) for architecture details.
+
 ## Architecture
 
 See [docs/adr/001-architecture-decisions.md](docs/adr/001-architecture-decisions.md) for detailed design decisions.

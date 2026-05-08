@@ -100,7 +100,7 @@ def write_cog(
             Must be chunked (lazy) for memory efficiency.
             Must have CRS and spatial dims set.
         output_path: Output COG file path.
-        blocksize: COG tile size (default 512x512).
+        blocksize: COG tile size (default 512x512, must be multiple of 16).
         compression: Compression algorithm (deflate, lzw, zstd).
         add_overviews: Whether to add overviews (default True).
             VirtualTIFF(ifd=0) handles COGs with overviews.
