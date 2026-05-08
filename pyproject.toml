@@ -44,6 +44,7 @@ dependencies = [
     "planetary-computer>=1.0.0",
     "s3fs>=2026.4.0",
     "zarr>=3.0.0",
+    "icechunk>=1.1.21",
 ]
 
 [project.optional-dependencies]

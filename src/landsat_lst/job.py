@@ -1,9 +1,9 @@
 """Job orchestration with idempotent Zarr writes and retry support.
 
-This module implements the retry/resume strategy from ADR-001 Section 16
-(updated per ADR-003 for direct Zarr writes):
+This module implements the retry/resume strategy from ADR-001 Section 16:
 - Idempotent Zarr check: skip tiles where output already exists
 - Coiled worker retry: recover from transient failures
+- Icechunk conflict retry: handle concurrent distributed writes
 
 Usage:
     from landsat_lst.job import process_tile_job, run_batch
@@ -23,7 +23,7 @@ import structlog
 from landsat_lst.config import settings
 from landsat_lst.models import ProcessingJob
 from landsat_lst.pipeline import process_tile
-from landsat_lst.storage import StorageBackend, get_storage
+from landsat_lst.storage import IcechunkStorage, StorageBackend, get_storage
 from landsat_lst.zarr_writer import write_zarr
 
 if TYPE_CHECKING:
@@ -39,7 +39,59 @@ class JobResult:
     job: ProcessingJob
     status: str  # "completed", "skipped", "failed"
     zarr_path: str | None = None
+    commit_id: str | None = None
     error: str | None = None
+
+
+def _write_to_icechunk_with_retry(
+    composite,
+    storage: IcechunkStorage,
+    job: ProcessingJob,
+    logger,
+) -> tuple[str, str]:
+    """Write to Icechunk with conflict retry for concurrent workers.
+
+    When multiple Coiled workers write tiles simultaneously, each opens
+    its own writable session. On commit, if another worker committed first,
+    Icechunk raises ConflictError. We retry with a fresh session.
+
+    Args:
+        composite: Dataset to write
+        storage: IcechunkStorage instance
+        job: Processing job for logging
+        logger: Structured logger
+
+    Returns:
+        Tuple of (group_path, commit_id)
+
+    Raises:
+        icechunk.ConflictError: After max retries exceeded
+    """
+    import icechunk as ic  # noqa: PLC0415
+
+    group_path = storage.zarr_path(job.year, job.tile.name)
+    max_retries = settings.icechunk_max_retries
+
+    for attempt in range(max_retries):
+        try:
+            session = storage.writable_session()
+            logger.info("icechunk_writing", group=group_path, attempt=attempt + 1)
+
+            write_zarr(composite, session, group=group_path)
+
+            commit_msg = f"Add {job.tile.name} for {job.year}"
+            commit_id = session.commit(commit_msg)
+            logger.info("icechunk_committed", commit_id=commit_id[:12])
+            return group_path, commit_id
+
+        except ic.ConflictError:
+            logger.warning("icechunk_conflict", attempt=attempt + 1)
+            if attempt == max_retries - 1:
+                raise
+            continue
+
+    msg = f"Failed to commit after {max_retries} retries"
+    raise RuntimeError(msg)
 
 
 def process_tile_job(
@@ -54,6 +106,7 @@ def process_tile_job(
     1. Idempotent check: skip if Zarr exists (unless force=True)
     2. Pipeline: query STAC, load scenes, compute composite
     3. Zarr write: uint16 encoding, proper metadata
+    4. Icechunk commit: with conflict retry (if using IcechunkStorage)
 
     The @coiled.function decorator enables distributed execution.
     Use with retries parameter for transient failure recovery:
@@ -80,17 +133,29 @@ def process_tile_job(
         logger.info("tile_processing_start")
         composite = process_tile(job)
 
-        # Write Zarr store
-        zarr_path = storage.zarr_path(job.year, job.tile.name)
-        logger.info("zarr_writing", path=zarr_path)
-        write_zarr(composite, zarr_path)
+        # Layer 3: Write to storage
+        if isinstance(storage, IcechunkStorage):
+            # Icechunk path with conflict retry
+            zarr_path, commit_id = _write_to_icechunk_with_retry(composite, storage, job, logger)
+            logger.info("tile_completed", zarr_path=zarr_path, commit_id=commit_id[:12])
+            return JobResult(
+                job=job,
+                status="completed",
+                zarr_path=zarr_path,
+                commit_id=commit_id,
+            )
+        else:
+            # Plain Zarr path
+            zarr_path = storage.zarr_path(job.year, job.tile.name)
+            logger.info("zarr_writing", path=zarr_path)
+            write_zarr(composite, zarr_path)
 
-        logger.info("tile_completed", zarr_path=zarr_path)
-        return JobResult(
-            job=job,
-            status="completed",
-            zarr_path=zarr_path,
-        )
+            logger.info("tile_completed", zarr_path=zarr_path)
+            return JobResult(
+                job=job,
+                status="completed",
+                zarr_path=zarr_path,
+            )
 
     except Exception as e:
         logger.exception("tile_failed", error=str(e))

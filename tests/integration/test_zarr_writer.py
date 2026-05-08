@@ -93,12 +93,15 @@ def test_encode_lst_uint16_nodata():
 @pytest.mark.integration
 def test_write_zarr_creates_store(tmp_path):
     """Test that write_zarr creates a valid Zarr store."""
+    from pathlib import Path
+
     storage = LocalStorage(tmp_path)
     composite = _create_test_composite("N40W075")
 
     zarr_path = storage.zarr_path(2023, "N40W075")
     result_path = write_zarr(composite, zarr_path, chunks=(50, 50))
 
+    result_path = Path(result_path)
     assert result_path.exists()
     assert (result_path / ".zmetadata").exists() or (result_path / "zarr.json").exists()
 
@@ -200,3 +203,79 @@ def test_storage_zarr_exists(tmp_path):
 def test_write_zarr_default_chunks():
     """Test that DEFAULT_CHUNKS is set correctly."""
     assert DEFAULT_CHUNKS == (500, 500)
+
+
+@pytest.mark.integration
+def test_write_zarr_to_icechunk_session(tmp_path):
+    """Test writing to Icechunk session."""
+    from landsat_lst.storage import IcechunkStorage
+
+    # Create Icechunk storage
+    storage = IcechunkStorage.from_local(tmp_path / "icechunk")
+    composite = _create_test_composite("N40W075")
+
+    # Get writable session and write
+    session = storage.writable_session()
+    group_path = write_zarr(composite, session, group="2023/N40W075", chunks=(50, 50))
+
+    # Commit
+    commit_id = session.commit("test commit")
+
+    assert group_path == "2023/N40W075"
+    assert commit_id is not None
+
+    # Read back and verify
+    read_session = storage.readonly_session()
+    ds = xr.open_zarr(read_session.store, group="2023/N40W075", consolidated=False)
+
+    assert "lst_p50" in ds.data_vars
+    assert ds["lst_p50"].dtype == np.uint16
+
+
+@pytest.mark.integration
+def test_write_zarr_icechunk_roundtrip_values(tmp_path):
+    """Test that values survive Icechunk roundtrip."""
+    from landsat_lst.storage import IcechunkStorage
+
+    storage = IcechunkStorage.from_local(tmp_path / "icechunk")
+    composite = _create_test_composite("N40W075")
+
+    session = storage.writable_session()
+    write_zarr(composite, session, group="2023/N40W075", chunks=(50, 50))
+    session.commit("test")
+
+    # Read back
+    ds = xr.open_zarr(storage.readonly_session().store, group="2023/N40W075", consolidated=False)
+
+    # Decode and verify values (original: 25.0 and 35.0 Celsius)
+    scale = ds["lst_p50"].attrs["lst_scale_factor"]
+    offset = ds["lst_p50"].attrs["lst_add_offset"]
+
+    decoded_p50 = ds["lst_p50"].values * scale + offset
+    decoded_p95 = ds["lst_p95"].values * scale + offset
+
+    np.testing.assert_array_almost_equal(decoded_p50, 25.0, decimal=2)
+    np.testing.assert_array_almost_equal(decoded_p95, 35.0, decimal=2)
+
+
+@pytest.mark.integration
+def test_icechunk_storage_zarr_exists(tmp_path):
+    """Test IcechunkStorage.zarr_exists() works correctly."""
+    from landsat_lst.storage import IcechunkStorage
+
+    storage = IcechunkStorage.from_local(tmp_path / "icechunk")
+
+    # Initially doesn't exist
+    assert storage.zarr_exists(2023, "N40W075") is False
+
+    # Write data
+    composite = _create_test_composite("N40W075")
+    session = storage.writable_session()
+    write_zarr(composite, session, group="2023/N40W075", chunks=(50, 50))
+    session.commit("test")
+
+    # Now exists
+    assert storage.zarr_exists(2023, "N40W075") is True
+
+    # Other tile still doesn't exist
+    assert storage.zarr_exists(2023, "N40W070") is False

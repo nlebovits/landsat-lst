@@ -1,14 +1,23 @@
-"""Storage abstraction for local and S3 Zarr backends.
+"""Storage abstraction for local, S3, and Icechunk Zarr backends.
 
-Simplified from the original COG + Icechunk version per ADR-003.
-Now only handles Zarr store existence checks and path generation.
+Supports three storage modes:
+- LocalStorage: Plain Zarr stores on local filesystem (testing)
+- S3Storage: Plain Zarr stores on S3 (production without versioning)
+- IcechunkStorage: Versioned Zarr in Icechunk repository (production with versioning)
+
+See ADR-003 for architecture details.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Any
+from pathlib import Path  # noqa: TC003 - used at runtime in type hints
+from typing import TYPE_CHECKING, Any
 
 from landsat_lst.config import settings
+
+if TYPE_CHECKING:
+    import icechunk as ic
 
 
 class StorageBackend(ABC):
@@ -43,7 +52,7 @@ class LocalStorage(StorageBackend):
 
 
 class S3Storage(StorageBackend):
-    """S3 storage for production."""
+    """S3 storage for production (plain Zarr, no versioning)."""
 
     def __init__(
         self,
@@ -96,8 +105,92 @@ class S3Storage(StorageBackend):
         return f"{self.prefix}/{year}/{tile_name}.zarr"
 
 
+class IcechunkStorage(StorageBackend):
+    """Icechunk repository storage for versioned Zarr writes.
+
+    All tiles are stored in a single repository with group structure:
+    /{year}/{tile_name}/
+        lst_p50/
+        lst_p95/
+        qa_count/
+
+    Each tile write is a commit, enabling time-travel and audit trail.
+    """
+
+    def __init__(self, repo: ic.Repository):
+        self._repo = repo
+
+    @classmethod
+    def from_local(cls, path: Path) -> IcechunkStorage:
+        """Create IcechunkStorage with local filesystem backend."""
+        import icechunk as ic  # noqa: PLC0415
+
+        path.mkdir(parents=True, exist_ok=True)
+        storage = ic.local_filesystem_storage(str(path))
+        repo = ic.Repository.open_or_create(storage)
+        return cls(repo)
+
+    @classmethod
+    def from_s3(
+        cls,
+        bucket: str,
+        prefix: str,
+        region: str,
+    ) -> IcechunkStorage:
+        """Create IcechunkStorage with S3 backend."""
+        import icechunk as ic  # noqa: PLC0415
+
+        storage = ic.s3_storage(
+            bucket=bucket,
+            prefix=prefix,
+            region=region,
+            from_env=True,
+        )
+        repo = ic.Repository.open_or_create(storage)
+        return cls(repo)
+
+    def zarr_exists(self, year: int, tile_name: str) -> bool:
+        """Check if tile-year group exists in repository."""
+        import zarr  # noqa: PLC0415
+
+        try:
+            session = self._repo.readonly_session("main")
+            group_path = f"{year}/{tile_name}"
+            zarr.open_group(session.store, path=group_path, mode="r")
+            return True
+        except (KeyError, FileNotFoundError):
+            return False
+
+    def zarr_path(self, year: int, tile_name: str) -> str:
+        """Return the group path within Icechunk (not a file path)."""
+        return f"{year}/{tile_name}"
+
+    def writable_session(self) -> ic.Session:
+        """Get a writable session for the main branch."""
+        return self._repo.writable_session("main")
+
+    def readonly_session(self) -> ic.Session:
+        """Get a readonly session for reading."""
+        return self._repo.readonly_session("main")
+
+    @property
+    def repo(self) -> ic.Repository:
+        """Access the underlying repository."""
+        return self._repo
+
+
 def get_storage() -> StorageBackend:
     """Factory function to get the configured storage backend."""
+    if settings.use_icechunk:
+        if settings.storage_backend == "s3":
+            return IcechunkStorage.from_s3(
+                bucket=settings.s3_bucket,
+                prefix=f"{settings.s3_prefix}/{settings.icechunk_prefix}",
+                region=settings.s3_region,
+            )
+        icechunk_path = settings.output_dir / settings.icechunk_prefix
+        return IcechunkStorage.from_local(icechunk_path)
+
     if settings.storage_backend == "s3":
         return S3Storage()
     return LocalStorage()

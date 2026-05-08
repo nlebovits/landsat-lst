@@ -79,16 +79,20 @@ See [findings-direct-zarr-spike.md](../findings-direct-zarr-spike.md) for detail
 
 ## Decision
 
-**Pivot to direct Zarr writes, abandoning COG + VirtualZarr architecture.**
+**Pivot to direct Zarr writes with Icechunk versioning, abandoning COG + VirtualZarr virtual references.**
+
+Key distinction:
+- **Removed:** COGs, VirtualZarr virtual byte-range references
+- **Kept:** Icechunk for versioned storage (Git-like commits, time-travel)
 
 ### New Architecture
 
 ```
-Landsat STAC → Process → Zarr on Source Coop
-                           │
-                           ├── Python: xr.open_zarr(url)
-                           ├── QGIS: rioxarray → temp GeoTIFF → layer
-                           └── Browser: deck-gl-raster (Zarr native)
+Landsat STAC → Process → Zarr writes → Icechunk Repository
+                                              │
+                                              ├── Python: xr.open_zarr(session.store)
+                                              ├── QGIS: rioxarray → temp GeoTIFF → layer
+                                              └── Versioning: time-travel, audit trail
 ```
 
 ### Storage Format
@@ -103,23 +107,28 @@ Landsat STAC → Process → Zarr on Source Coop
 
 ### Data Organization
 
+Data is stored in a single Icechunk repository with groups per tile-year:
+
 ```
-s3://source-coop-radiant-earth/landsat-lst/
+icechunk://source-coop-radiant-earth/landsat-lst/
+├── (Icechunk metadata: branches, commits, snapshots)
 ├── 2023/
-│   ├── N40W075.zarr/       # One Zarr store per tile
+│   ├── N40W075/           # Group per tile-year
 │   │   ├── lst_p50/
 │   │   ├── lst_p95/
 │   │   └── qa_count/
-│   ├── N40W070.zarr/
+│   ├── N40W070/
 │   └── ...
 └── 2024/
     └── ...
 ```
 
-**Rationale for tile-as-store (vs single concatenated store):**
-- Heterogeneous tile dimensions (latitude-dependent pixel counts) prevent clean concatenation
-- Per-tile stores enable independent processing and updates
-- QGIS plugin reads individual tiles anyway
+Each tile write creates a commit: `"Add N40W075 for 2023"`
+
+**Rationale for single repository with tile groups:**
+- Git-like versioning across entire dataset (time-travel, audit trail)
+- Per-tile groups enable independent processing
+- Conflict retry handles concurrent distributed writes
 - Avoids VirtualZarr concatenation constraints entirely
 
 ---
@@ -127,7 +136,8 @@ s3://source-coop-radiant-earth/landsat-lst/
 ## Consequences
 
 ### Positive
-- **Simpler architecture** — no VirtualZarr, Icechunk, or virtual references
+- **Simpler architecture** — no COGs, no VirtualZarr virtual references
+- **Versioned storage** — Icechunk provides Git-like commits and time-travel
 - **Flexible chunk size** — 500×500 aligns perfectly with tile dimensions (18,500 ÷ 500 = 37)
 - **Direct writes** — no COG intermediate step
 - **Lower storage** — single format instead of COG + virtual refs
@@ -155,19 +165,21 @@ s3://source-coop-radiant-earth/landsat-lst/
 
 ### Phase 1: Documentation (this PR)
 - Create ADR-003 (this document)
-- Mark ADR-002 as superseded
+- Mark ADR-002 as superseded (VirtualZarr virtual references only)
 - Update ADR-001 §11 with supersession notice
 - Update README with new architecture
 
-### Phase 2: Implementation (future PR)
-- Replace `cog.py` with `zarr_writer.py`
-- Update CLI commands
-- Remove VirtualZarr/Icechunk dependencies
+### Phase 2: Implementation (this PR)
+- Create `zarr_writer.py` for direct Zarr writes
+- Add `IcechunkStorage` class to `storage.py`
+- Update `job.py` with Icechunk commit and conflict retry
+- Remove COG dependencies (`rio-cogeo`, `virtualizarr`, `virtual-tiff`)
+- Keep `icechunk` dependency for versioned storage
 - Update integration tests
 
-### Phase 3: Cleanup
-- Remove `virtual.py` module
-- Remove spike scripts
+### Phase 3: Cleanup (this PR)
+- Remove `cog.py` and `virtual.py` modules
+- Remove spike scripts (keep for reference)
 - Archive old implementation plans
 
 ---

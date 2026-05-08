@@ -1,7 +1,8 @@
 """Zarr writing with uint16 encoding for LST composites.
 
-This module provides direct Zarr writes for LST composite data,
-replacing the previous COG + VirtualZarr architecture.
+This module provides Zarr writes for LST composite data, supporting both:
+- Plain Zarr stores (local filesystem or S3)
+- Icechunk sessions (versioned storage with commits)
 
 Memory model:
 - Chunked writes via xarray/zarr (memory-bounded)
@@ -18,11 +19,15 @@ See ADR-003 for architecture rationale.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING, Union
 
 import numpy as np
 import rioxarray  # noqa: F401 - needed for .rio accessor
 import xarray as xr
 from pyproj import CRS
+
+if TYPE_CHECKING:
+    import icechunk as ic
 
 # Encoding constants for LST bands (lst_p50, lst_p95)
 LST_SCALE: float = 0.01
@@ -32,6 +37,9 @@ LST_FILL_VALUE: int = 0
 
 # Zarr chunking (500x500 divides 18,500 evenly = 37 chunks)
 DEFAULT_CHUNKS: tuple[int, int] = (500, 500)
+
+# Type alias for output target
+OutputTarget = Union[Path, str, "ic.Session"]
 
 
 def encode_lst_uint16(data: xr.DataArray) -> xr.DataArray:
@@ -104,27 +112,32 @@ def _add_zarr_metadata(ds: xr.Dataset) -> xr.Dataset:
 
 def write_zarr(
     composite: xr.Dataset,
-    output_path: Path | str,
+    output: OutputTarget,
     *,
     chunks: tuple[int, int] = DEFAULT_CHUNKS,
-) -> Path:
+    group: str | None = None,
+) -> str:
     """Write composite Dataset to Zarr store with uint16 encoding.
+
+    Supports two output modes:
+    1. Path/str: Write to plain Zarr store (local or S3)
+    2. Icechunk Session: Write to session.store with group path
 
     Args:
         composite: Dataset with lst_p50, lst_p95, qa_count variables.
             LST variables should be float32 in Celsius, nodata=-9999.0.
             Must have CRS and spatial dims set.
-        output_path: Output Zarr store path (local or s3://).
+        output: Output path (Path/str) OR Icechunk Session.
         chunks: Chunk size for spatial dimensions (default 500x500).
+        group: Zarr group path (required when output is Icechunk Session).
 
     Returns:
-        Path to the written Zarr store.
+        Path/URL to written Zarr store, or group path for Icechunk.
 
     Raises:
         ValueError: If composite is missing required variables.
+        ValueError: If group is not provided for Icechunk session.
     """
-    output_path = Path(output_path) if isinstance(output_path, str) else output_path
-
     # Validate required variables
     required = {"lst_p50", "lst_p95", "qa_count"}
     missing = required - set(composite.data_vars)
@@ -158,19 +171,36 @@ def write_zarr(
     chunk_dict = {"latitude": chunks[0], "longitude": chunks[1]}
     encoded = encoded.chunk(chunk_dict)
 
-    # Set up encoding (let Zarr v3 use default compression)
+    # Set up encoding
     encoding = {}
     for var in encoded.data_vars:
         encoding[var] = {
             "chunks": chunks,
         }
 
-    # Write to Zarr
-    encoded.to_zarr(
-        output_path,
-        mode="w",
-        consolidated=True,
-        encoding=encoding,
-    )
+    # Write to appropriate target
+    if isinstance(output, (Path, str)):
+        # Write to plain Zarr path
+        output_path = Path(output) if isinstance(output, str) else output
+        encoded.to_zarr(
+            str(output_path),
+            mode="w",
+            consolidated=True,
+            encoding=encoding,
+        )
+        return str(output_path)
+    else:
+        # Icechunk session - output has .store and .commit attributes
+        if group is None:
+            msg = "group parameter required when writing to Icechunk session"
+            raise ValueError(msg)
 
-    return output_path
+        # Write to Icechunk session store
+        encoded.to_zarr(
+            output.store,  # type: ignore[union-attr]
+            group=group,
+            mode="w",
+            consolidated=False,  # Icechunk handles consolidation
+            encoding=encoding,
+        )
+        return group
