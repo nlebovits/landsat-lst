@@ -75,7 +75,8 @@ Output will be hosted on Source Cooperative as STAC-compliant COGs, with a virtu
 | Tile size | 5° latitude × 5° longitude |
 | Naming | Northwest corner, e.g., `N40W075` |
 | Pixels at 30m | ~18,500 × 18,500 (varies with latitude) |
-| Estimated tiles | ~800 after land/latitude mask |
+| Total tiles | 1,728 (24 lat bands × 72 lon columns) |
+| Land tiles | 700 (59.5% reduction from land mask) |
 
 **Rationale:**
 - Simple, predictable grid
@@ -96,19 +97,32 @@ Output will be hosted on Source Cooperative as STAC-compliant COGs, with a virtu
 
 | Filter | Implementation |
 |--------|----------------|
-| Land mask | Natural Earth 10m land polygons |
-| Latitude bounds | Clip to 60°N – 60°S |
-| Water bodies | Exclude via land mask (oceans, major lakes) |
+| Land mask | Natural Earth 110m land polygons (hardcoded tile list) |
+| Latitude bounds | 60°N – 60°S (tile NW corners from N60 to S55) |
+| Water bodies | Excluded via land mask (oceans, major lakes) |
 
-**Rationale:**
-- Focus is urban/populated areas
-- ±60° covers all significant population centers
-- Reduces data volume and processing time significantly
-- Natural Earth is simple, well-maintained, sufficient resolution
+**Implementation (2026-05-08):**
+
+The land mask is implemented as a hardcoded `frozenset` of 700 tile names in `tiling.py`, generated from Natural Earth 110m land polygons. This approach was chosen for:
+
+1. **Zero dependencies** — no geodatasets package or runtime downloads
+2. **Zero I/O** — instant frozenset lookup vs shapefile parsing
+3. **Reproducibility** — deterministic tile list every run
+4. **Sufficient precision** — 110m resolution is adequate for 5° (~550km) tiles
+
+**Rationale for ±60° bounds:**
+- 60°N includes all populated northern areas (Russia, Canada, Scandinavia)
+- 55°S includes Tierra del Fuego (southernmost populated land)
+- Excludes Antarctica (34+ tiles below -65°S with no inhabitants)
+- Arctic cities (65-70°N) excluded as edge cases for urban heat analysis
+
+**Result:** 700 land tiles vs 1,728 total = 59.5% reduction in processing.
 
 **Alternatives considered:**
+- Runtime Natural Earth lookup — adds I/O and potential network dependency
 - GHS-POP population threshold — adds complexity, marginal benefit
-- OSM land polygons — too detailed/large for this use case
+- geodatasets package — adds dependency for one-time data generation
+- 10m Natural Earth — overkill for 5° tile filtering
 
 ---
 

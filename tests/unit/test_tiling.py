@@ -1,7 +1,9 @@
 """Unit tests for tiling utilities."""
 
 from landsat_lst.tiling import (
+    LAND_TILES,
     generate_global_tiles,
+    generate_land_tiles,
     tile_from_point,
     tiles_intersecting_bbox,
 )
@@ -25,6 +27,73 @@ class TestGenerateGlobalTiles:
         lon_count = 360 // 5
         expected = lat_count * lon_count
         assert len(tiles) == expected
+
+
+class TestGenerateLandTiles:
+    """Tests for land-filtered tile generation."""
+
+    def test_returns_fewer_tiles_than_global(self):
+        """Land filtering should significantly reduce tile count."""
+        global_tiles = list(generate_global_tiles())
+        land_tiles = list(generate_land_tiles())
+
+        assert len(land_tiles) < len(global_tiles)
+        assert len(land_tiles) == 700  # Known count from Natural Earth 110m
+
+    def test_all_returned_tiles_are_in_land_set(self):
+        """Every returned tile should be in the LAND_TILES set."""
+        for tile in generate_land_tiles():
+            assert tile.name in LAND_TILES
+
+    def test_known_land_tiles_included(self):
+        """Spot check: tiles over known land masses should be included."""
+        land_tiles = {t.name for t in generate_land_tiles()}
+
+        # Continental tiles that must be present
+        assert "N40W075" in land_tiles  # New York area
+        assert "N50E000" in land_tiles  # Western Europe
+        assert "S35W060" in land_tiles  # Buenos Aires area
+        assert "N35E135" in land_tiles  # Japan
+        assert "S35E145" in land_tiles  # Melbourne area
+
+    def test_ocean_tiles_excluded(self):
+        """Spot check: tiles over open ocean should be excluded."""
+        land_tiles = {t.name for t in generate_land_tiles()}
+
+        # Mid-ocean tiles that must NOT be present
+        assert "N30W030" not in land_tiles  # Mid-Atlantic
+        assert "S30W090" not in land_tiles  # South Pacific
+        assert "N00E160" not in land_tiles  # Central Pacific
+
+    def test_respects_latitude_bounds(self):
+        """Land tiles should respect the ±60° latitude bounds."""
+        for tile in generate_land_tiles():
+            assert tile.lat <= 60
+            assert tile.lat - 5 >= -60
+
+
+class TestLandTilesConstant:
+    """Tests for the LAND_TILES constant itself."""
+
+    def test_count_matches_expected(self):
+        """Verify the hardcoded count is correct."""
+        assert len(LAND_TILES) == 700
+
+    def test_all_entries_are_valid_tile_names(self):
+        """Every entry should match the tile naming convention."""
+        import re
+
+        pattern = re.compile(r"^[NS]\d{2}[EW]\d{3}$")
+        for name in LAND_TILES:
+            assert pattern.match(name), f"Invalid tile name: {name}"
+
+    def test_no_tiles_outside_latitude_bounds(self):
+        """No tiles should have NW corner outside ±60°."""
+        for name in LAND_TILES:
+            lat = int(name[1:3])
+            if name[0] == "S":
+                lat = -lat
+            assert -55 <= lat <= 60, f"Tile {name} outside latitude bounds"
 
 
 class TestTileFromPoint:
