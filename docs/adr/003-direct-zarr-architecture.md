@@ -60,13 +60,16 @@ ds = xr.open_zarr(mapper)
 # Works correctly
 ```
 
-### Test 3: QGIS Plugin Validation
+### Test 3: QGIS Plugin Validation ✅ COMPLETE
+
 Built minimal QGIS plugin that:
 1. Reads spatial subset from remote Zarr via rioxarray
 2. Converts to temporary GeoTIFF
 3. Loads as QGIS raster layer
 
 **Result:** Works on QGIS 3.28 LTS (older version without native GDAL Zarr driver).
+
+**Production validated (2026-05-08):** The rioxarray → temp GeoTIFF → QGIS layer path is confirmed working for end users.
 
 ### Findings Documented
 See [findings-direct-zarr-spike.md](../findings-direct-zarr-spike.md) for detailed learnings:
