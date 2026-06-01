@@ -6,6 +6,10 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# STAC endpoint presets
+STAC_PLANETARY_COMPUTER = "https://planetarycomputer.microsoft.com/api/stac/v1"
+STAC_EARTH_SEARCH = "https://earth-search.aws.element84.com/v1"
+
 
 class Settings(BaseSettings):
     """Pipeline configuration settings."""
@@ -17,8 +21,8 @@ class Settings(BaseSettings):
     )
 
     stac_url: str = Field(
-        default="https://planetarycomputer.microsoft.com/api/stac/v1",
-        description="STAC API endpoint URL (Planetary Computer has free egress)",
+        default=STAC_EARTH_SEARCH,
+        description="STAC API endpoint. Earth Search is 4.6x faster on Coiled (same-region S3).",
     )
     collection: str = Field(
         default="landsat-c2-l2",

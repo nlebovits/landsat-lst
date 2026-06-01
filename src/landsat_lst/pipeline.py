@@ -1,7 +1,8 @@
 """Main ETL pipeline for Landsat LST composites."""
 
+import os
+
 import numpy as np
-import planetary_computer as pc
 import pystac_client
 import xarray as xr
 from odc.stac import stac_load
@@ -10,22 +11,50 @@ from landsat_lst.config import settings
 from landsat_lst.models import ProcessingJob
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 
+# Planetary Computer URL prefix for conditional signing
+_PC_URL_PREFIX = "https://planetarycomputer.microsoft.com"
+
+
+def _is_planetary_computer() -> bool:
+    """Check if using Planetary Computer endpoint."""
+    return settings.stac_url.startswith(_PC_URL_PREFIX)
+
+
+def _configure_requester_pays() -> None:
+    """Configure GDAL/rasterio for AWS requester-pays buckets.
+
+    Earth Search serves Landsat data from the usgs-landsat bucket which
+    requires requester-pays. These env vars must be set before rasterio
+    opens any files.
+    """
+    os.environ.setdefault("AWS_REQUEST_PAYER", "requester")
+    os.environ.setdefault("GDAL_HTTP_UNSAFESSL", "NO")
+
 
 def query_stac(job: ProcessingJob) -> list:
     """Query STAC catalog for Landsat scenes.
 
-    Signs all items with Planetary Computer SAS tokens for higher rate limits
-    when accessing Azure Blob storage.
+    For Planetary Computer: signs items with SAS tokens for Azure access.
+    For Earth Search: configures requester-pays for S3 access.
 
     Args:
         job: Processing job with tile and year info.
 
     Returns:
-        List of signed STAC items matching the query.
+        List of STAC items matching the query.
     """
+    modifier = None
+
+    if _is_planetary_computer():
+        import planetary_computer as pc  # noqa: PLC0415
+
+        modifier = pc.sign_inplace
+    else:
+        _configure_requester_pays()
+
     catalog = pystac_client.Client.open(
         settings.stac_url,
-        modifier=pc.sign_inplace,
+        modifier=modifier,
     )
 
     search = catalog.search(
