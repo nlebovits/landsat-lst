@@ -76,6 +76,7 @@ def stac_items(stac_client):
     return items
 
 
+@pytest.mark.slow
 @pytest.mark.tile
 class TestFullTileIntegration:
     """End-to-end test for direct Zarr + Icechunk pipeline."""
