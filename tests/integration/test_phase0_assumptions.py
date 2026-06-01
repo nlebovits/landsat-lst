@@ -65,6 +65,7 @@ def stac_items(stac_client):
 # =============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.assumption
 class TestSTACAssumptions:
     """Validate Earth Search STAC API contract."""
@@ -122,6 +123,7 @@ class TestSTACAssumptions:
 # =============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.assumption
 class TestODCLoadingAssumptions:
     """Validate odc.stac loading behavior."""
@@ -185,6 +187,7 @@ class TestODCLoadingAssumptions:
 # =============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.assumption
 class TestQAMaskingAssumptions:
     """Validate QA pixel bit structure assumptions."""
@@ -246,6 +249,7 @@ class TestQAMaskingAssumptions:
 # =============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.assumption
 class TestTemperatureConversionAssumptions:
     """Validate thermal band scale/offset assumptions."""
@@ -317,6 +321,7 @@ class TestTemperatureConversionAssumptions:
 # =============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.assumption
 class TestIcechunkAssumptions:
     """Validate Icechunk storage basics."""

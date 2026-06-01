@@ -35,6 +35,7 @@ def stac_client():
 # =============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.sweep
 class TestCloudCoverSweep:
     """Find optimal cloud cover threshold for scene availability vs quality."""
@@ -95,6 +96,7 @@ class TestCloudCoverSweep:
 # =============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.sweep
 class TestChunkSizeSweep:
     """Find optimal chunk size for memory efficiency and read performance."""
@@ -156,6 +158,7 @@ class TestChunkSizeSweep:
 # =============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.sweep
 class TestResamplingSweep:
     """Compare resampling methods for quality and speed."""
@@ -217,6 +220,7 @@ class TestResamplingSweep:
 # =============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.sweep
 class TestCompositeStatsSweep:
     """Compare different composite statistics (median, mean, percentiles)."""
