@@ -277,13 +277,13 @@ def verify_output(result: ProfileResult, output_dir: Path) -> None:
         "verification_complete",
         variables=list(ds.data_vars),
         shape=dict(ds.sizes),
-        lst_p50_dtype=str(ds["lst_p50"].dtype),
-        lst_p50_range=f"[{int(ds['lst_p50'].min().values)}, {int(ds['lst_p50'].max().values)}]",
+        lst_p95_dtype=str(ds["lst_p95"].dtype),
+        lst_p95_range=f"[{int(ds['lst_p95'].min().values)}, {int(ds['lst_p95'].max().values)}]",
         qa_count_max=int(ds["qa_count"].max().values),
     )
 
     # Check attributes
-    assert "lst_scale_factor" in ds["lst_p50"].attrs, "Missing scale_factor attribute"
+    assert "lst_scale_factor" in ds["lst_p95"].attrs, "Missing scale_factor attribute"
     assert "_CRS" in ds.attrs, "Missing _CRS attribute"
 
     log.info("verification_passed", commit_id=result.commit_id[:12] if result.commit_id else None)

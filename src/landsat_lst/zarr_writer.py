@@ -29,7 +29,7 @@ from pyproj import CRS
 if TYPE_CHECKING:
     import icechunk as ic
 
-# Encoding constants for LST bands (lst_p50, lst_p95)
+# Encoding constants for LST bands (lst_p95)
 LST_SCALE: float = 0.01
 LST_OFFSET: float = -50.0
 LST_NODATA_FLOAT: float = -9999.0
@@ -83,20 +83,17 @@ def _add_zarr_metadata(ds: xr.Dataset) -> xr.Dataset:
     ds.attrs["institution"] = "Radiant Earth"
 
     # LST band attributes (non-CF names to preserve on read)
-    for var in ["lst_p50", "lst_p95"]:
-        if var in ds:
-            ds[var].attrs.update(
-                {
-                    "lst_scale_factor": LST_SCALE,
-                    "lst_add_offset": LST_OFFSET,
-                    "units": "DN (decode: celsius = dn * 0.01 + (-50.0))",
-                    "long_name": "Land Surface Temperature"
-                    if var == "lst_p50"
-                    else "Land Surface Temperature 95th Percentile",
-                    "valid_min": 1,
-                    "valid_max": 65535,
-                }
-            )
+    if "lst_p95" in ds:
+        ds["lst_p95"].attrs.update(
+            {
+                "lst_scale_factor": LST_SCALE,
+                "lst_add_offset": LST_OFFSET,
+                "units": "DN (decode: celsius = dn * 0.01 + (-50.0))",
+                "long_name": "Land Surface Temperature 95th Percentile",
+                "valid_min": 1,
+                "valid_max": 65535,
+            }
+        )
 
     # QA count attributes
     if "qa_count" in ds:
@@ -125,7 +122,7 @@ def write_zarr(
     2. Icechunk Session: Write to session.store with group path
 
     Args:
-        composite: Dataset with lst_p50, lst_p95, qa_count variables.
+        composite: Dataset with lst_p95, qa_count variables.
             LST variables should be float32 in Celsius, nodata=-9999.0.
             Must have CRS and spatial dims set.
         output: Output path (Path/str) OR Icechunk Session.
@@ -141,7 +138,7 @@ def write_zarr(
         ValueError: If group is not provided for Icechunk session.
     """
     # Validate required variables
-    required = {"lst_p50", "lst_p95", "qa_count"}
+    required = {"lst_p95", "qa_count"}
     missing = required - set(composite.data_vars)
     if missing:
         msg = f"Composite missing required variables: {missing}"
@@ -154,7 +151,6 @@ def write_zarr(
     # Encode LST bands to uint16, qa_count stays uint16
     encoded = xr.Dataset(
         {
-            "lst_p50": encode_lst_uint16(composite["lst_p50"]),
             "lst_p95": encode_lst_uint16(composite["lst_p95"]),
             "qa_count": composite["qa_count"].astype(np.uint16),
         },
