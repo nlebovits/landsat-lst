@@ -30,15 +30,9 @@ def _create_test_composite(tile_name: str, n_pixels: int = 100) -> xr.Dataset:
     lon = np.linspace(tile_id.lon, tile_id.lon + 5, n_pixels, endpoint=False)
 
     # Known values for verification
-    lst_p50_celsius = 25.0
     lst_p95_celsius = 35.0
     qa_count_value = 50
 
-    lst_p50 = xr.DataArray(
-        np.full((n_pixels, n_pixels), lst_p50_celsius, dtype=np.float32),
-        dims=["latitude", "longitude"],
-        coords={"latitude": lat, "longitude": lon},
-    )
     lst_p95 = xr.DataArray(
         np.full((n_pixels, n_pixels), lst_p95_celsius, dtype=np.float32),
         dims=["latitude", "longitude"],
@@ -52,7 +46,6 @@ def _create_test_composite(tile_name: str, n_pixels: int = 100) -> xr.Dataset:
 
     return xr.Dataset(
         {
-            "lst_p50": lst_p50.chunk({"latitude": 50, "longitude": 50}),
             "lst_p95": lst_p95.chunk({"latitude": 50, "longitude": 50}),
             "qa_count": qa_count.chunk({"latitude": 50, "longitude": 50}),
         }
@@ -118,12 +111,10 @@ def test_write_zarr_roundtrip(tmp_path):
     # Read back
     ds = xr.open_zarr(zarr_path)
 
-    assert "lst_p50" in ds.data_vars
     assert "lst_p95" in ds.data_vars
     assert "qa_count" in ds.data_vars
 
     # Verify uint16 encoding
-    assert ds["lst_p50"].dtype == np.uint16
     assert ds["lst_p95"].dtype == np.uint16
     assert ds["qa_count"].dtype == np.uint16
 
@@ -140,14 +131,12 @@ def test_write_zarr_value_roundtrip(tmp_path):
     ds = xr.open_zarr(zarr_path)
 
     # Decode and check values
-    scale = ds["lst_p50"].attrs["lst_scale_factor"]
-    offset = ds["lst_p50"].attrs["lst_add_offset"]
+    scale = ds["lst_p95"].attrs["lst_scale_factor"]
+    offset = ds["lst_p95"].attrs["lst_add_offset"]
 
-    decoded_p50 = ds["lst_p50"].values * scale + offset
     decoded_p95 = ds["lst_p95"].values * scale + offset
 
-    # Original values were 25.0 and 35.0
-    np.testing.assert_array_almost_equal(decoded_p50, 25.0, decimal=2)
+    # Original value was 35.0
     np.testing.assert_array_almost_equal(decoded_p95, 35.0, decimal=2)
 
 
@@ -178,8 +167,8 @@ def test_write_zarr_variable_attrs(tmp_path):
     ds = xr.open_zarr(zarr_path)
 
     # LST bands have non-CF encoding attrs
-    assert ds["lst_p50"].attrs["lst_scale_factor"] == LST_SCALE
-    assert ds["lst_p50"].attrs["lst_add_offset"] == LST_OFFSET
+    assert ds["lst_p95"].attrs["lst_scale_factor"] == LST_SCALE
+    assert ds["lst_p95"].attrs["lst_add_offset"] == LST_OFFSET
 
     # QA count has units
     assert ds["qa_count"].attrs["units"] == "count"
@@ -228,8 +217,8 @@ def test_write_zarr_to_icechunk_session(tmp_path):
     read_session = storage.readonly_session()
     ds = xr.open_zarr(read_session.store, group="2023/N40W075", consolidated=False)
 
-    assert "lst_p50" in ds.data_vars
-    assert ds["lst_p50"].dtype == np.uint16
+    assert "lst_p95" in ds.data_vars
+    assert ds["lst_p95"].dtype == np.uint16
 
 
 @pytest.mark.integration
@@ -247,14 +236,12 @@ def test_write_zarr_icechunk_roundtrip_values(tmp_path):
     # Read back
     ds = xr.open_zarr(storage.readonly_session().store, group="2023/N40W075", consolidated=False)
 
-    # Decode and verify values (original: 25.0 and 35.0 Celsius)
-    scale = ds["lst_p50"].attrs["lst_scale_factor"]
-    offset = ds["lst_p50"].attrs["lst_add_offset"]
+    # Decode and verify values (original: 35.0 Celsius)
+    scale = ds["lst_p95"].attrs["lst_scale_factor"]
+    offset = ds["lst_p95"].attrs["lst_add_offset"]
 
-    decoded_p50 = ds["lst_p50"].values * scale + offset
     decoded_p95 = ds["lst_p95"].values * scale + offset
 
-    np.testing.assert_array_almost_equal(decoded_p50, 25.0, decimal=2)
     np.testing.assert_array_almost_equal(decoded_p95, 35.0, decimal=2)
 
 

@@ -171,15 +171,15 @@ def verify_s3_output(zarr_path: str) -> dict:
             "success": True,
             "variables": list(ds.data_vars),
             "shape": dict(ds.sizes),
-            "lst_p50_dtype": str(ds["lst_p50"].dtype),
-            "has_scale_factor": "lst_scale_factor" in ds["lst_p50"].attrs,
+            "lst_p95_dtype": str(ds["lst_p95"].dtype),
+            "has_scale_factor": "lst_scale_factor" in ds["lst_p95"].attrs,
             "has_crs": "_CRS" in ds.attrs,
         }
 
         # Check data ranges
-        lst_p50 = ds["lst_p50"].values
-        verification["lst_p50_min"] = int(lst_p50[~(lst_p50 == -9999)].min())
-        verification["lst_p50_max"] = int(lst_p50[~(lst_p50 == -9999)].max())
+        lst_p95 = ds["lst_p95"].values
+        verification["lst_p95_min"] = int(lst_p95[~(lst_p95 == -9999)].min())
+        verification["lst_p95_max"] = int(lst_p95[~(lst_p95 == -9999)].max())
         verification["qa_count_max"] = int(ds["qa_count"].max().values)
 
         log.info("verification_passed", **verification)
@@ -214,13 +214,13 @@ def print_access_urls(zarr_path: str, tile_name: str, year: int) -> None:
     print("  1. Install 'qgis-stac-plugin' if not installed")
     print("  2. Add Source Cooperative STAC catalog or use direct S3 path")
     print(f"  3. Navigate to: {year}/{tile_name}.zarr")
-    print("  4. Load lst_p50 layer")
+    print("  4. Load lst_p95 layer")
 
     # Python access
     print("\nPython Access:")
     print("  import xarray as xr")
     print(f'  ds = xr.open_zarr("{zarr_path}")')
-    print('  ds["lst_p50"].plot()')
+    print('  ds["lst_p95"].plot()')
 
     print("=" * 70)
 
@@ -319,8 +319,8 @@ def print_results(result: dict, wall_time: float, skip_verify: bool) -> None:
             if verification["success"]:
                 print(f"Variables: {verification['variables']}")
                 print(f"Shape: {verification['shape']}")
-                lo, hi = verification["lst_p50_min"], verification["lst_p50_max"]
-                print(f"LST P50 range: [{lo}, {hi}] (raw uint16)")
+                lo, hi = verification["lst_p95_min"], verification["lst_p95_max"]
+                print(f"LST P95 range: [{lo}, {hi}] (raw uint16)")
                 print(f"QA count max: {verification['qa_count_max']}")
 
         print_access_urls(result["zarr_path"], result["tile"], result["year"])

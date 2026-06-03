@@ -74,8 +74,6 @@ class CompositeStats(BaseModel):
     min_observations: int
     max_observations: int
     mean_observations: float
-    lst_p50_min: float | None = None
-    lst_p50_max: float | None = None
     lst_p95_min: float | None = None
     lst_p95_max: float | None = None
 

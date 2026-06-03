@@ -92,13 +92,17 @@ def load_scenes(items: list, bbox: tuple[float, float, float, float]) -> xr.Data
 
 
 def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
-    """Compute annual LST composite with p50, p95, and observation count.
+    """Compute annual LST composite with p95 and observation count.
 
     Args:
         data: Dataset with thermal and QA bands across time.
 
     Returns:
-        Dataset with lst_p50, lst_p95, and qa_count bands.
+        Dataset with lst_p95 and qa_count bands.
+
+    Note:
+        P50 (median) was removed per stakeholder feedback - hot season temps
+        (P95) are what matter for urban heat applications. See issue #22.
     """
     masked = apply_qa_mask(data)
 
@@ -107,16 +111,11 @@ def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
     valid_mask = ~np.isnan(lst)
     qa_count = valid_mask.sum(dim="time").astype(np.int16)  # ty: ignore[no-matching-overload]
 
-    # Use quantile(0.5) instead of median() - median has issues with Dask arrays
-    lst_p50 = lst.quantile(0.5, dim="time", skipna=True).drop_vars("quantile")
     lst_p95 = lst.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
-
-    lst_p50 = lst_p50.where(qa_count > 0, settings.nodata)
     lst_p95 = lst_p95.where(qa_count > 0, settings.nodata)
 
     return xr.Dataset(
         {
-            "lst_p50": lst_p50.astype(np.float32),
             "lst_p95": lst_p95.astype(np.float32),
             "qa_count": qa_count,
         }

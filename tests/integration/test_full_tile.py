@@ -135,14 +135,12 @@ class TestFullTileIntegration:
         print("Temperature conversion applied (lazy)")
 
     def test_04_compute_composite(self):
-        """Build annual composite: p50, p95, count (LAZY - no .compute())."""
+        """Build annual composite: p95 and count (LAZY - no .compute())."""
         print("\n--- Step 4: Build composite (lazy) ---")
         lst_celsius = pytest.lst_celsius
 
         start = time.perf_counter()
 
-        # Use .median() instead of .quantile(0.5) - much faster
-        lst_p50 = lst_celsius.median(dim="time", skipna=True)
         lst_p95 = lst_celsius.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
 
         # Count valid observations
@@ -151,13 +149,11 @@ class TestFullTileIntegration:
 
         # Set nodata where no valid observations
         nodata = -9999.0
-        lst_p50 = lst_p50.where(qa_count > 0, nodata)
         lst_p95 = lst_p95.where(qa_count > 0, nodata)
 
         # Create composite dataset - STAYS LAZY (chunked)
         composite = xr.Dataset(
             {
-                "lst_p50": lst_p50.astype(np.float32),
                 "lst_p95": lst_p95.astype(np.float32),
                 "qa_count": qa_count.astype(np.uint16),
             }
@@ -228,18 +224,16 @@ class TestFullTileIntegration:
         ds_read = pytest.ds_read
 
         # Check variables exist
-        assert "lst_p50" in ds_read.data_vars
         assert "lst_p95" in ds_read.data_vars
         assert "qa_count" in ds_read.data_vars
 
         # Check dtype (should be uint16 after encoding)
-        assert ds_read["lst_p50"].dtype == np.uint16
         assert ds_read["lst_p95"].dtype == np.uint16
         assert ds_read["qa_count"].dtype == np.uint16
 
         # Check encoding attributes preserved
-        assert ds_read["lst_p50"].attrs["lst_scale_factor"] == 0.01
-        assert ds_read["lst_p50"].attrs["lst_add_offset"] == -50.0
+        assert ds_read["lst_p95"].attrs["lst_scale_factor"] == 0.01
+        assert ds_read["lst_p95"].attrs["lst_add_offset"] == -50.0
 
         print("✓ Structure validated")
 
@@ -249,23 +243,17 @@ class TestFullTileIntegration:
         ds_read = pytest.ds_read
 
         # Decode values
-        scale = ds_read["lst_p50"].attrs["lst_scale_factor"]
-        offset = ds_read["lst_p50"].attrs["lst_add_offset"]
+        scale = ds_read["lst_p95"].attrs["lst_scale_factor"]
+        offset = ds_read["lst_p95"].attrs["lst_add_offset"]
 
-        p50_celsius = ds_read["lst_p50"].values * scale + offset
         p95_celsius = ds_read["lst_p95"].values * scale + offset
 
         # Check reasonable temperature range (Argentina in winter/summer)
         # Allow wide range for different seasons and nodata handling
-        valid_p50 = p50_celsius[(p50_celsius > -50) & (p50_celsius < 60)]
         valid_p95 = p95_celsius[(p95_celsius > -50) & (p95_celsius < 60)]
 
-        if len(valid_p50) > 0:
-            print(f"P50 range: {valid_p50.min():.1f}°C to {valid_p50.max():.1f}°C")
+        if len(valid_p95) > 0:
             print(f"P95 range: {valid_p95.min():.1f}°C to {valid_p95.max():.1f}°C")
-
-            # Sanity check: P95 should be >= P50
-            assert valid_p95.mean() >= valid_p50.mean(), "P95 should be >= P50"
 
         print("✓ Values validated")
 
