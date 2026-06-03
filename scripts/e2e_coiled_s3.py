@@ -281,13 +281,13 @@ def print_dry_run(tile: str, year: int, zarr_path: str, aws_env: dict) -> None:
     creds = "with session token" if "AWS_SESSION_TOKEN" in aws_env else "long-term"
     print(f"AWS credentials: {creds}")
     print("\nThis will:")
-    print("  1. Spin up a Coiled worker in us-west-2")
+    print("  1. Spin up 2 Coiled workers in us-west-2")
     print("  2. Query Earth Search STAC for Landsat scenes")
     print("  3. Load and compute annual LST composite")
     print("  4. Write Zarr store to Source Cooperative S3")
     print("  5. Verify the output is readable")
-    print("\nEstimated time: 2-5 minutes")
-    print("Estimated cost: ~$0.05-0.10 (Coiled compute)")
+    print("\nEstimated time: 10-15 minutes")
+    print("Estimated cost: ~$0.40-0.60 (Coiled compute, 2 workers)")
     print("=" * 70)
 
 
@@ -361,7 +361,8 @@ def main():
     @coiled.function(
         region="us-west-2",
         environ=aws_env,
-        keepalive="5 minutes",
+        n_workers=2,  # Fixed 2 workers: I/O bound, more workers don't help
+        keepalive="30 minutes",  # Longer keepalive for batch processing
         name=cluster_name,
     )
     def run_on_coiled(tile_name: str, year: int) -> dict:
