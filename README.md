@@ -22,7 +22,7 @@ import fsspec
 
 # Open a tile from Source Coop
 mapper = fsspec.get_mapper(
-    "s3://us-west-2.opendata.source.coop/radiant-earth/landsat-lst/2023/N40W075.zarr",
+    "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr",
     anon=True
 )
 ds = xr.open_zarr(mapper)
@@ -65,6 +65,23 @@ landsat-lst process --year 2023
 landsat-lst list-tiles
 ```
 
+### Distributed Processing (Coiled)
+
+For production-scale processing, the pipeline runs on [Coiled](https://coiled.io) with AWS:
+
+```bash
+# Ensure AWS SSO session is active
+aws sso login --profile radiant-earth
+
+# Run E2E test for a single tile
+uv run python scripts/e2e_coiled_s3.py --tile N40W075 --year 2024
+
+# Dry run (show config without processing)
+uv run python scripts/e2e_coiled_s3.py --dry-run
+```
+
+Output is written to Source Cooperative S3.
+
 ## Data Access
 
 Each tile is stored as an independent Zarr store on Source Cooperative:
@@ -74,7 +91,7 @@ import xarray as xr
 import fsspec
 
 # Access a specific tile
-url = "s3://us-west-2.opendata.source.coop/radiant-earth/landsat-lst/2023/N40W075.zarr"
+url = "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr"
 mapper = fsspec.get_mapper(url, anon=True)
 ds = xr.open_zarr(mapper)
 
@@ -96,7 +113,7 @@ For QGIS users without native Zarr support, use rioxarray to convert to GeoTIFF:
 import rioxarray
 import fsspec
 
-url = "s3://us-west-2.opendata.source.coop/radiant-earth/landsat-lst/2023/N40W075.zarr"
+url = "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr"
 ds = xr.open_zarr(fsspec.get_mapper(url, anon=True))
 ds["lst_p50"].rio.to_raster("lst_subset.tif")
 # Open lst_subset.tif in QGIS
@@ -109,7 +126,7 @@ See [docs/adr/003-direct-zarr-architecture.md](docs/adr/003-direct-zarr-architec
 See [docs/adr/001-architecture-decisions.md](docs/adr/001-architecture-decisions.md) for detailed design decisions.
 
 Key choices:
-- **Data source**: Microsoft Planetary Computer (Landsat C2 L2)
+- **Data source**: Earth Search (Landsat C2 L2)
 - **Output format**: Zarr v3 with 500×500 chunks
 - **CRS**: EPSG:4326
 - **Tiling**: 5° × 5° grid

@@ -116,6 +116,7 @@ def write_zarr(
     *,
     chunks: tuple[int, int] = DEFAULT_CHUNKS,
     group: str | None = None,
+    storage_options: dict | None = None,
 ) -> str:
     """Write composite Dataset to Zarr store with uint16 encoding.
 
@@ -130,6 +131,7 @@ def write_zarr(
         output: Output path (Path/str) OR Icechunk Session.
         chunks: Chunk size for spatial dimensions (default 500x500).
         group: Zarr group path (required when output is Icechunk Session).
+        storage_options: Optional dict of fsspec options for S3 (e.g. credentials).
 
     Returns:
         Path/URL to written Zarr store, or group path for Icechunk.
@@ -180,15 +182,16 @@ def write_zarr(
 
     # Write to appropriate target
     if isinstance(output, (Path, str)):
-        # Write to plain Zarr path
-        output_path = Path(output) if isinstance(output, str) else output
+        # Write to plain Zarr path (keep strings as-is for S3 URLs)
+        output_str = str(output)
         encoded.to_zarr(
-            str(output_path),
+            output_str,
             mode="w",
             consolidated=True,
             encoding=encoding,
+            storage_options=storage_options,
         )
-        return str(output_path)
+        return output_str
     else:
         # Icechunk session - must use icechunk.xarray.to_icechunk for Dask arrays
         # Regular to_zarr() fails because sessions can't be pickled to workers
