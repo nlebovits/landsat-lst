@@ -149,8 +149,7 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
         settings.resolution,
         land_polygons,
     )
-    # Flip mask vertically: rasterio uses north-down, xarray uses south-up
-    land_mask = land_mask[::-1, :]
+    # Both rasterio and odc-stac use north-down (descending latitude), no flip needed
     land_mask_da = xr.DataArray(
         land_mask,
         dims=["latitude", "longitude"],
