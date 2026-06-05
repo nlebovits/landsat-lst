@@ -45,6 +45,7 @@ def convert_to_celsius(lwir_band: xr.DataArray) -> xr.DataArray:
     """Convert Landsat thermal band to Celsius.
 
     Applies Landsat Collection 2 Level-2 scaling factors.
+    Masks fill value (0) which indicates nodata (scene edges, SLC-off gaps).
 
     Args:
         lwir_band: LWIR11 band (ST_B10) from Landsat C2 L2.
@@ -56,7 +57,10 @@ def convert_to_celsius(lwir_band: xr.DataArray) -> xr.DataArray:
         Scale factor: 0.00341802
         Offset: 149.0
         Result is in Kelvin, then converted to Celsius.
+        Fill value: 0 (converts to -124°C if not masked)
     """
-    lst_kelvin = lwir_band * 0.00341802 + 149.0
+    # Mask fill value (0) before conversion - these are nodata pixels
+    lwir_valid = lwir_band.where(lwir_band != 0)
+    lst_kelvin = lwir_valid * 0.00341802 + 149.0
     lst_celsius = lst_kelvin - 273.15
     return lst_celsius
