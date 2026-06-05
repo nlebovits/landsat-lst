@@ -8,6 +8,7 @@ import xarray as xr
 from odc.stac import stac_load
 
 from landsat_lst.config import settings
+from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
 from landsat_lst.models import ProcessingJob
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 
@@ -140,6 +141,25 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
     data = load_scenes(items, job.tile.bbox)
 
     composite = compute_annual_composite(data)
+
+    # Apply land mask to exclude ocean/water pixels (Natural Earth 10m)
+    land_polygons = load_land_polygons()
+    land_mask = get_land_mask_for_bbox(
+        job.tile.bbox,
+        settings.resolution,
+        land_polygons,
+    )
+    # Flip mask vertically: rasterio uses north-down, xarray uses south-up
+    land_mask = land_mask[::-1, :]
+    land_mask_da = xr.DataArray(
+        land_mask,
+        dims=["latitude", "longitude"],
+        coords={
+            "latitude": composite.latitude,
+            "longitude": composite.longitude,
+        },
+    )
+    composite["lst_p95"] = composite["lst_p95"].where(land_mask_da)
 
     composite.attrs["tile"] = job.tile.name
     composite.attrs["year"] = job.year
