@@ -1,7 +1,8 @@
-"""Integration tests for land mask functionality.
+"""Integration tests for land mask and data quality.
 
 Verifies that ocean pixels are correctly masked to NaN using Natural Earth
-10m land polygons. See issue #26.
+10m land polygons, and that LST output values are in valid ranges.
+See issues #26, #30.
 """
 
 import numpy as np
@@ -9,6 +10,7 @@ import pytest
 
 from landsat_lst.config import settings
 from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
+from landsat_lst.qa import convert_to_celsius
 
 
 class TestLandMask:
@@ -75,3 +77,42 @@ class TestLandMask:
 
         assert land_pixels > 0, "Coastal tile should have land pixels"
         assert water_pixels > 0, "Coastal tile should have water pixels"
+
+
+class TestLSTValueRange:
+    """Tests for LST output value validation. See issue #30."""
+
+    def test_zero_fill_not_converted_to_temperature(self):
+        """LWIR fill value (0) should become NaN, not -124°C.
+
+        This catches the bug where unmasked fill values converted to
+        unrealistic temperatures via the scale/offset formula.
+        """
+        import xarray as xr
+
+        # Simulate raw LWIR data with fill values
+        data = np.array([[0, 0, 45000], [45000, 0, 45000]], dtype=np.float32)
+        lwir = xr.DataArray(data, dims=["y", "x"])
+
+        celsius = convert_to_celsius(lwir)
+
+        # No values should be below -50°C (physical impossibility for LST)
+        valid = celsius.values[~np.isnan(celsius.values)]
+        assert len(valid) > 0, "Should have some valid values"
+        assert valid.min() > -50, (
+            f"Min temp {valid.min():.1f}°C is unrealistic - likely unmasked fill value"
+        )
+
+    def test_valid_dn_produces_reasonable_temperature(self):
+        """Valid Landsat DN values should produce Earth-like temperatures."""
+        import xarray as xr
+
+        # DN range for typical LST: ~30000-55000
+        # 45000 DN → ~20°C (reasonable surface temp)
+        data = np.array([[45000]], dtype=np.float32)
+        lwir = xr.DataArray(data, dims=["y", "x"])
+
+        celsius = convert_to_celsius(lwir)
+
+        temp = float(celsius.values[0, 0])
+        assert -30 < temp < 70, f"Temperature {temp}°C outside valid range"
