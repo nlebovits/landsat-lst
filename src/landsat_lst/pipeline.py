@@ -95,6 +95,9 @@ def load_scenes(items: list, bbox: tuple[float, float, float, float]) -> xr.Data
 def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
     """Compute annual LST composite with p95 and observation count.
 
+    WARNING: This function does NOT apply land masking. For production output
+    that excludes ocean pixels, use process_tile() instead. See issue #26.
+
     Args:
         data: Dataset with thermal and QA bands across time.
 

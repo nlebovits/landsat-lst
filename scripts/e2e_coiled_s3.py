@@ -52,7 +52,7 @@ S3_PREFIX = "nlebovits/landsat-lst"
 S3_REGION = "us-west-2"
 
 
-def process_tile_on_worker(tile_name: str, year: int) -> dict:  # noqa: PLR0915
+def process_tile_on_worker(tile_name: str, year: int) -> dict:
     """Process a single tile on a Coiled worker. Returns result dict."""
     import os as worker_os  # noqa: PLC0415
     import time as worker_time  # noqa: PLC0415
@@ -90,11 +90,7 @@ def process_tile_on_worker(tile_name: str, year: int) -> dict:  # noqa: PLR0915
         worker_os.environ.setdefault("AWS_REQUEST_PAYER", "requester")
 
         from landsat_lst.models import ProcessingJob  # noqa: PLC0415
-        from landsat_lst.pipeline import (  # noqa: PLC0415
-            compute_annual_composite,
-            load_scenes,
-            query_stac,
-        )
+        from landsat_lst.pipeline import process_tile  # noqa: PLC0415
         from landsat_lst.storage import S3Storage  # noqa: PLC0415
         from landsat_lst.tiling import parse_tile_name  # noqa: PLC0415
         from landsat_lst.zarr_writer import write_zarr  # noqa: PLC0415
@@ -103,32 +99,15 @@ def process_tile_on_worker(tile_name: str, year: int) -> dict:  # noqa: PLR0915
         job = ProcessingJob(tile=tile, year=year)
         worker_log.info("job_created", tile=tile_name, year=year, bbox=tile.bbox)
 
-        # Stage 1: STAC Query
+        # Run full pipeline (includes STAC query, load, composite, AND land mask)
         t0 = worker_time.time()
-        items = query_stac(job)
-        result["stages"]["stac_query"] = round(worker_time.time() - t0, 2)
-        result["scene_count"] = len(items)
-        worker_log.info("stac_query_complete", scenes=len(items))
-
-        if not items:
-            result["error"] = "No scenes found"
-            return result
-
-        # Stage 2: Load Scenes
-        t0 = worker_time.time()
-        data = load_scenes(items, job.tile.bbox)
-        result["stages"]["load_scenes"] = round(worker_time.time() - t0, 2)
-        result["data_shape"] = dict(data.sizes)
-        worker_log.info("load_scenes_complete", shape=dict(data.sizes))
-
-        # Stage 3: Build Composite (lazy)
-        t0 = worker_time.time()
-        composite = compute_annual_composite(data)
-        result["stages"]["build_composite"] = round(worker_time.time() - t0, 2)
+        composite = process_tile(job)
+        result["stages"]["process_tile"] = round(worker_time.time() - t0, 2)
+        result["scene_count"] = composite.attrs.get("scene_count", 0)
         result["output_shape"] = dict(composite.sizes)
-        worker_log.info("composite_built", shape=dict(composite.sizes))
+        worker_log.info("process_tile_complete", shape=dict(composite.sizes))
 
-        # Stage 4: Compute + Write to S3 (lazy compute streams to Zarr)
+        # Write to S3
         t0 = worker_time.time()
         storage = S3Storage()
         zarr_path = storage.zarr_path(year, tile_name)

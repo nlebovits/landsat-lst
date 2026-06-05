@@ -4,6 +4,10 @@
 Runs the same tile/year through both endpoints and compares performance.
 Use this locally first, then on Coiled for production-representative results.
 
+NOTE: This script measures raw STAC/compute performance and does NOT apply
+land masking. Output is not production-quality. For production data, use
+the CLI (landsat-lst process) or process_tile() which includes land masking.
+
 Usage:
     # Local benchmark (quick validation)
     uv run python scripts/benchmark_endpoints.py
