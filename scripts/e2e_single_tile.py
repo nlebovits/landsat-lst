@@ -187,11 +187,7 @@ def setup_dask_cluster(workers: int, threads: int, memory: str):
 def run_pipeline(tile_name: str, year: int, output_dir: Path) -> ProfileResult:
     """Run the full pipeline with profiling instrumentation."""
     from landsat_lst.models import ProcessingJob  # noqa: PLC0415
-    from landsat_lst.pipeline import (  # noqa: PLC0415
-        compute_annual_composite,
-        load_scenes,
-        query_stac,
-    )
+    from landsat_lst.pipeline import process_tile  # noqa: PLC0415
     from landsat_lst.storage import IcechunkStorage  # noqa: PLC0415
     from landsat_lst.tiling import parse_tile_name  # noqa: PLC0415
     from landsat_lst.zarr_writer import write_zarr  # noqa: PLC0415
@@ -204,33 +200,20 @@ def run_pipeline(tile_name: str, year: int, output_dir: Path) -> ProfileResult:
         job = ProcessingJob(tile=tile, year=year)
         log.info("job_created", tile=tile_name, year=year, bbox=tile.bbox)
 
-        # Stage 1: STAC Query
-        with timed_stage("stac_query", result) as stage:
-            items = query_stac(job)
-            result.scene_count = len(items)
-            stage.extra["scene_count"] = len(items)
-            if not items:
-                raise ValueError(f"No scenes found for {tile_name} in {year}")
-
-        # Stage 2: Load Scenes (this triggers Dask task graph construction)
-        with timed_stage("load_scenes", result) as stage:
-            data = load_scenes(items, job.tile.bbox)
-            stage.extra["shape"] = str(dict(data.sizes))
-            stage.extra["chunks"] = str(data.chunks)
-            stage.extra["nbytes_lazy"] = f"{data.nbytes / 1e9:.2f} GB"
-
-        # Stage 3: Compute Annual Composite (this triggers Dask compute)
-        with timed_stage("compute_composite", result) as stage:
+        # Run full pipeline (STAC query, load, composite, land mask)
+        with timed_stage("process_tile", result) as stage:
             from dask.diagnostics import ProgressBar  # noqa: PLC0415
 
-            composite = compute_annual_composite(data)
+            composite = process_tile(job)
+            result.scene_count = composite.attrs.get("scene_count", 0)
             # Force compute with progress bar
             with ProgressBar(dt=10):  # Update every 10 seconds
                 composite = composite.compute()
             stage.extra["output_shape"] = str(dict(composite.sizes))
             stage.extra["nbytes"] = f"{composite.nbytes / 1e6:.2f} MB"
+            stage.extra["scene_count"] = result.scene_count
 
-        # Stage 4: Write to Icechunk
+        # Write to Icechunk
         with timed_stage("icechunk_write", result) as stage:
             icechunk_path = output_dir / "icechunk"
             storage = IcechunkStorage.from_local(icechunk_path)

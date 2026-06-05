@@ -53,3 +53,13 @@ class TestConvertToCelsius:
 
         assert np.isnan(celsius.values[0, 0])
         assert not np.isnan(celsius.values[0, 1])
+
+    def test_zero_fill_value_becomes_nan(self):
+        """Zero is Landsat fill/nodata value - should become NaN, not -124°C."""
+        data = np.array([[0, 40000.0]], dtype=np.float32)
+        lwir = xr.DataArray(data, dims=["y", "x"])
+
+        celsius = convert_to_celsius(lwir)
+
+        assert np.isnan(celsius.values[0, 0]), "Fill value 0 should become NaN"
+        assert not np.isnan(celsius.values[0, 1]), "Valid DN should convert normally"
