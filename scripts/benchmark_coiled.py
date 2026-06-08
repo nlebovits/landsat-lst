@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING
 
 import coiled
 
+from landsat_lst.config import settings
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -88,7 +90,7 @@ def benchmark_on_worker(
             collections=["landsat-c2-l2"],
             bbox=BBOX,
             datetime=DATETIME,
-            query={"eo:cloud_cover": {"lt": 50}},
+            query={"eo:cloud_cover": {"lt": settings.max_cloud_cover}},
         )
         items = list(search.items())
         query_time = time_mod.time() - t0

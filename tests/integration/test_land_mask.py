@@ -107,7 +107,7 @@ class TestMaskOrientation:
             collections=["landsat-c2-l2"],
             bbox=bbox,
             datetime="2024-06-01/2024-06-30",
-            query={"eo:cloud_cover": {"lt": 20}},
+            query={"eo:cloud_cover": {"lt": settings.max_cloud_cover}},
         )
         items = list(search.items())[:1]
 
@@ -225,7 +225,7 @@ class TestDataQualityEndToEnd:
             bbox=bbox,
             datetime="2024-06-01/2024-08-31",  # Summer
             query={
-                "eo:cloud_cover": {"lt": 20},
+                "eo:cloud_cover": {"lt": settings.max_cloud_cover},
                 "platform": {"in": ["landsat-8", "landsat-9"]},
             },
         )

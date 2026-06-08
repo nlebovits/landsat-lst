@@ -14,6 +14,8 @@ import pystac_client
 import pytest
 from odc.stac import configure_rio, stac_load
 
+from landsat_lst.config import settings
+
 # Small bbox for fast sweeps (~0.1° near Pergamino)
 SWEEP_BBOX = (-60.45, -33.95, -60.35, -33.85)
 SWEEP_YEAR = 2024
@@ -109,7 +111,7 @@ class TestChunkSizeSweep:
             bbox=SWEEP_BBOX,
             datetime=SWEEP_DATETIME,
             query={
-                "eo:cloud_cover": {"lt": 20},
+                "eo:cloud_cover": {"lt": settings.max_cloud_cover},
                 "platform": {"in": ["landsat-8", "landsat-9"]},
             },
         )
@@ -171,7 +173,7 @@ class TestResamplingSweep:
             bbox=SWEEP_BBOX,
             datetime=SWEEP_DATETIME,
             query={
-                "eo:cloud_cover": {"lt": 20},
+                "eo:cloud_cover": {"lt": settings.max_cloud_cover},
                 "platform": {"in": ["landsat-8", "landsat-9"]},
             },
         )
@@ -233,7 +235,7 @@ class TestCompositeStatsSweep:
             bbox=SWEEP_BBOX,
             datetime=SWEEP_DATETIME,
             query={
-                "eo:cloud_cover": {"lt": 20},
+                "eo:cloud_cover": {"lt": settings.max_cloud_cover},
                 "platform": {"in": ["landsat-8", "landsat-9"]},
             },
         )
