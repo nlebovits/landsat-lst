@@ -59,7 +59,7 @@ log = structlog.get_logger()
 SWEEP_BBOX = (-75.25, 39.75, -74.75, 40.25)  # 0.5 x 0.5 degree Philadelphia sub-tile
 SWEEP_DATE_START = "2024-06-01"
 SWEEP_DATE_END = "2024-06-30"
-SWEEP_MAX_CLOUD = 30  # Relaxed from 20% to get more scenes
+# Scene-level cloud cover threshold uses settings.max_cloud_cover (default 100)
 
 CHUNK_SIZES = [256, 512, 1024]
 WORKER_COUNTS = [4, 8]
@@ -99,7 +99,7 @@ def query_sweep_scenes() -> list:
         bbox=SWEEP_BBOX,
         datetime=f"{SWEEP_DATE_START}/{SWEEP_DATE_END}",
         query={
-            "eo:cloud_cover": {"lt": SWEEP_MAX_CLOUD},
+            "eo:cloud_cover": {"lt": settings.max_cloud_cover},
             "platform": {"in": ["landsat-8", "landsat-9"]},
         },
     )
@@ -375,7 +375,7 @@ def main():
     print(f"{'=' * 60}")
     print(f"Bbox: {SWEEP_BBOX} (0.5 x 0.5 degree Philadelphia)")
     print(f"Date range: {SWEEP_DATE_START} to {SWEEP_DATE_END}")
-    print(f"Max cloud cover: {SWEEP_MAX_CLOUD}%")
+    print(f"Max cloud cover: {settings.max_cloud_cover}%")
     print(f"Chunk sizes: {CHUNK_SIZES}")
     print(f"Worker counts: {WORKER_COUNTS}")
     print(f"Configurations: {len(CHUNK_SIZES) * len(WORKER_COUNTS)}")
