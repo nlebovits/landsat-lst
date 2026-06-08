@@ -83,8 +83,9 @@ class Settings(BaseSettings):
     )
 
     max_cloud_cover: int = Field(
-        default=20,
-        description="Maximum cloud cover percentage for scene filtering",
+        default=100,
+        description="Maximum cloud cover percentage for scene filtering. "
+        "Set to 100 to disable scene-level filtering and rely on pixel-level QA.",
     )
 
     resolution: float = Field(

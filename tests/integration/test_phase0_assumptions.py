@@ -20,6 +20,8 @@ import pytest
 import xarray as xr
 from odc.stac import configure_rio, stac_load
 
+from landsat_lst.config import settings
+
 # Small bbox for fast tests (~0.2° near Pergamino, Argentina)
 TEST_BBOX = (-60.5, -34.0, -60.3, -33.8)
 TEST_YEAR = 2024  # Use 2024 for better data availability
@@ -50,7 +52,7 @@ def stac_items(stac_client):
         bbox=TEST_BBOX,
         datetime=TEST_DATETIME,
         query={
-            "eo:cloud_cover": {"lt": 20},
+            "eo:cloud_cover": {"lt": settings.max_cloud_cover},
             "platform": {"in": ["landsat-8", "landsat-9"]},
         },
     )

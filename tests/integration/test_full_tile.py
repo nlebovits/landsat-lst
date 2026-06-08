@@ -20,6 +20,7 @@ import pytest
 import xarray as xr
 from odc.stac import configure_rio, stac_load
 
+from landsat_lst.config import settings
 from landsat_lst.storage import IcechunkStorage
 from landsat_lst.zarr_writer import write_zarr
 
@@ -54,7 +55,7 @@ def stac_items(stac_client):
         bbox=TILE_BBOX,
         datetime=f"{TILE_YEAR}-01-01/{TILE_YEAR}-12-31",
         query={
-            "eo:cloud_cover": {"lt": 20},
+            "eo:cloud_cover": {"lt": settings.max_cloud_cover},
             "platform": {"in": ["landsat-8", "landsat-9"]},
         },
     )
