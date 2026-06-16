@@ -48,6 +48,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+analysis = [
+    # Figure generation for analysis writeups (e.g. findings docs).
+    # geopandas/rasterio/pandas/dask are already core deps.
+    "matplotlib>=3.8.0",
+]
 dev = [
     # Testing
     "pytest>=8.0.0",
@@ -201,7 +206,7 @@ skips = [
 
 [tool.codespell]
 skip = "*.parquet,*.tif,*.tiff,.git,*.lock,.venv,uv.lock"
-ignore-words-list = "crs,nd"
+ignore-words-list = "crs,nd,nam"
 
 # ============================================================================
 # Vulture Configuration (dead code detection)

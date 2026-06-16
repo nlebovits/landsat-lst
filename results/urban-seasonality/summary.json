@@ -1,0 +1,190 @@
+{
+  "timestamp": "2026-06-16T08:08:56.629321+00:00",
+  "stac_endpoint": "https://planetarycomputer.microsoft.com/api/stac/v1",
+  "start_year": 2020,
+  "end_year": 2024,
+  "bbox": [
+    -60.942796,
+    -34.17645991,
+    -60.138771,
+    -33.54020044
+  ],
+  "n_scenes": 346,
+  "scene_days": {
+    "total": 346,
+    "per_month": {
+      "1": 30,
+      "2": 28,
+      "3": 25,
+      "4": 29,
+      "5": 30,
+      "6": 30,
+      "7": 29,
+      "8": 30,
+      "9": 26,
+      "10": 29,
+      "11": 29,
+      "12": 31
+    },
+    "per_season": {
+      "summer": 89,
+      "autumn": 84,
+      "winter": 89,
+      "spring": 84
+    }
+  },
+  "monthly_counts": [
+    {
+      "month": 1,
+      "counts": {
+        "urbana": 22053.3,
+        "periurbana": 9037.866666666667,
+        "urbano en ruralidad": 10416.733333333334,
+        "rural": 2768435.6
+      }
+    },
+    {
+      "month": 2,
+      "counts": {
+        "urbana": 22154.39285714286,
+        "periurbana": 8624.0,
+        "urbano en ruralidad": 10272.25,
+        "rural": 2709350.6071428573
+      }
+    },
+    {
+      "month": 3,
+      "counts": {
+        "urbana": 20842.88,
+        "periurbana": 8190.36,
+        "urbano en ruralidad": 9739.84,
+        "rural": 2561158.0
+      }
+    },
+    {
+      "month": 4,
+      "counts": {
+        "urbana": 20520.827586206895,
+        "periurbana": 8386.344827586207,
+        "urbano en ruralidad": 10068.344827586207,
+        "rural": 2653223.103448276
+      }
+    },
+    {
+      "month": 5,
+      "counts": {
+        "urbana": 19131.6,
+        "periurbana": 8211.8,
+        "urbano en ruralidad": 9945.9,
+        "rural": 2612142.2
+      }
+    },
+    {
+      "month": 6,
+      "counts": {
+        "urbana": 15549.733333333334,
+        "periurbana": 7019.6,
+        "urbano en ruralidad": 9745.266666666666,
+        "rural": 2522760.033333333
+      }
+    },
+    {
+      "month": 7,
+      "counts": {
+        "urbana": 18511.896551724138,
+        "periurbana": 7990.172413793103,
+        "urbano en ruralidad": 10272.551724137931,
+        "rural": 2690505.6896551726
+      }
+    },
+    {
+      "month": 8,
+      "counts": {
+        "urbana": 17095.066666666666,
+        "periurbana": 7460.5,
+        "urbano en ruralidad": 9917.9,
+        "rural": 2574196.6666666665
+      }
+    },
+    {
+      "month": 9,
+      "counts": {
+        "urbana": 18231.23076923077,
+        "periurbana": 8117.807692307692,
+        "urbano en ruralidad": 10272.076923076924,
+        "rural": 2697156.6923076925
+      }
+    },
+    {
+      "month": 10,
+      "counts": {
+        "urbana": 17472.689655172413,
+        "periurbana": 7776.413793103448,
+        "urbano en ruralidad": 10066.48275862069,
+        "rural": 2620631.6551724137
+      }
+    },
+    {
+      "month": 11,
+      "counts": {
+        "urbana": 17762.068965517243,
+        "periurbana": 7620.310344827586,
+        "urbano en ruralidad": 9508.551724137931,
+        "rural": 2493379.6896551726
+      }
+    },
+    {
+      "month": 12,
+      "counts": {
+        "urbana": 19117.387096774193,
+        "periurbana": 8423.90322580645,
+        "urbano en ruralidad": 10286.870967741936,
+        "rural": 2708120.0
+      }
+    }
+  ],
+  "summer_vs_nonsummer": {
+    "summer": {
+      "urbana": 21062.483146067414,
+      "periurbana": 8693.808988764045,
+      "urbano en ruralidad": 10326.044943820225,
+      "rural": 2728838.258426966
+    },
+    "non_summer": {
+      "urbana": 18296.237354085602,
+      "periurbana": 7852.151750972763,
+      "urbano en ruralidad": 9947.09727626459,
+      "rural": 2601955.0778210117
+    }
+  },
+  "p95_by_class": [
+    {
+      "clazz": "urbana",
+      "n_pixels": 33004,
+      "annual_p95": 39.68,
+      "summer_p95": 43.27,
+      "delta": 3.59
+    },
+    {
+      "clazz": "periurbana",
+      "n_pixels": 13292,
+      "annual_p95": 42.04,
+      "summer_p95": 46.6,
+      "delta": 4.56
+    },
+    {
+      "clazz": "urbano en ruralidad",
+      "n_pixels": 13576,
+      "annual_p95": 40.79,
+      "summer_p95": 45.06,
+      "delta": 4.27
+    },
+    {
+      "clazz": "rural",
+      "n_pixels": 3733417,
+      "annual_p95": 44.5,
+      "summer_p95": 48.89,
+      "delta": 4.39
+    }
+  ]
+}
