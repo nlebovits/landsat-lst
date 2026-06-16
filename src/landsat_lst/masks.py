@@ -39,6 +39,8 @@ def get_land_mask_for_bbox(
     bbox: tuple[float, float, float, float],
     resolution: float,
     land_polygons: gpd.GeoDataFrame,
+    *,
+    target_shape: tuple[int, int] | None = None,
 ) -> np.ndarray:
     """Create a land mask raster for a bounding box.
 
@@ -46,14 +48,21 @@ def get_land_mask_for_bbox(
         bbox: Bounding box as (west, south, east, north).
         resolution: Pixel resolution in degrees.
         land_polygons: GeoDataFrame of land polygons.
+        target_shape: Optional (height, width) to match exactly. If provided,
+            overrides resolution-based calculation to ensure alignment with
+            the target raster (e.g., odc-stac output which may use different
+            rounding).
 
     Returns:
         Boolean numpy array where True indicates land.
     """
     west, south, east, north = bbox
 
-    width = int((east - west) / resolution)
-    height = int((north - south) / resolution)
+    if target_shape is not None:
+        height, width = target_shape
+    else:
+        width = int((east - west) / resolution)
+        height = int((north - south) / resolution)
 
     transform = rasterio.transform.from_bounds(west, south, east, north, width, height)
 

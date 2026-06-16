@@ -64,6 +64,8 @@ output/
 *.tiff
 !tests/fixtures/**/*.tif
 tests/fixtures/data/
+data/*.gpkg
+.serena/
 
 # Environment
 .env
