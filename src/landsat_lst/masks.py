@@ -1,4 +1,11 @@
-"""Land and water masking utilities."""
+"""Land and water masking utilities.
+
+The land mask uses Natural Earth 10m land polygons with a 25km coastal buffer
+to ensure coverage of barrier islands, marshes, estuaries, and other coastal
+features that may be missing from the generalized NE polygons. The goal is to
+exclude open ocean while erring on the side of inclusion for any potentially
+inhabited or administered areas. See docs/findings-land-mask-buffer.md.
+"""
 
 from pathlib import Path
 
@@ -9,24 +16,44 @@ import xarray as xr
 from shapely.geometry import box
 
 NATURAL_EARTH_URL = "https://naciscdn.org/naturalearth/10m/physical/ne_10m_land.zip"
+COASTAL_BUFFER_METERS = 25_000  # 25km buffer for coastal features
 
 
-def load_land_polygons(cache_dir: Path | None = None) -> gpd.GeoDataFrame:
-    """Load Natural Earth 10m land polygons.
+def load_land_polygons(
+    cache_dir: Path | None = None,
+    *,
+    buffer_meters: int = COASTAL_BUFFER_METERS,
+) -> gpd.GeoDataFrame:
+    """Load Natural Earth 10m land polygons with coastal buffer.
+
+    The buffer ensures coverage of barrier islands, marshes, and coastal
+    features that may be missing from the generalized NE 10m polygons.
+    See docs/findings-land-mask-buffer.md for rationale.
 
     Args:
         cache_dir: Optional directory to cache downloaded data.
+        buffer_meters: Buffer distance in meters (default 25km). Set to 0
+            to disable buffering.
 
     Returns:
-        GeoDataFrame of land polygons in EPSG:4326.
+        GeoDataFrame of (buffered) land polygons in EPSG:4326.
     """
+    cache_suffix = f"_buf{buffer_meters // 1000}km" if buffer_meters else ""
+    cache_filename = f"ne_10m_land{cache_suffix}.gpkg"
+
     if cache_dir:
-        cache_path = cache_dir / "ne_10m_land.gpkg"
+        cache_path = cache_dir / cache_filename
         if cache_path.exists():
             return gpd.read_file(cache_path)
 
     land = gpd.read_file(NATURAL_EARTH_URL)
     land = land.to_crs("EPSG:4326")
+
+    if buffer_meters > 0:
+        # Buffer in a projected CRS for accurate distance, then reproject back
+        land_projected = land.to_crs("EPSG:3857")
+        land_projected["geometry"] = land_projected.geometry.buffer(buffer_meters)
+        land = land_projected.to_crs("EPSG:4326")
 
     if cache_dir:
         cache_dir.mkdir(parents=True, exist_ok=True)
