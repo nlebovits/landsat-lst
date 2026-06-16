@@ -146,11 +146,15 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
     composite = compute_annual_composite(data)
 
     # Apply land mask to exclude ocean/water pixels (Natural Earth 10m)
+    # Pass target_shape to ensure mask matches composite dimensions exactly
+    # (odc-stac may use different rounding than int() truncation)
     land_polygons = load_land_polygons()
+    target_shape = (len(composite.latitude), len(composite.longitude))
     land_mask = get_land_mask_for_bbox(
         job.tile.bbox,
         settings.resolution,
         land_polygons,
+        target_shape=target_shape,
     )
     # Both rasterio and odc-stac use north-down (descending latitude), no flip needed
     land_mask_da = xr.DataArray(

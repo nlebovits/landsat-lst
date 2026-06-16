@@ -45,6 +45,7 @@ dependencies = [
     "s3fs>=2026.4.0",
     "zarr>=3.0.0",
     "icechunk>=1.1.21",
+    "bokeh>=3.9.1",
 ]
 
 [project.optional-dependencies]
