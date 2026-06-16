@@ -46,8 +46,9 @@ class TestLandMask:
             return row, col
 
         # Test point in Atlantic Ocean (should be False/water)
-        # At 40.5°N, the NJ coast is ~-74°W, so -73.5°W is ocean
-        ocean_lat, ocean_lon = 40.5, -73.5
+        # With 25km coastal buffer, need to be >25km from shore
+        # At 40.5°N, the NJ coast is ~-74°W, so -72.5°W is ~150km offshore
+        ocean_lat, ocean_lon = 40.5, -72.5
         ocean_row, ocean_col = latlon_to_pixel(ocean_lat, ocean_lon)
         assert not mask[ocean_row, ocean_col], (
             f"Ocean point ({ocean_lat}, {ocean_lon}) should be masked (False)"
@@ -125,10 +126,12 @@ class TestMaskOrientation:
             f"If this changed, the land mask flip logic needs updating!"
         )
 
-    def test_manhattan_is_land_raritan_bay_is_water(self, land_polygons):
-        """Verify mask correctly identifies known land/water points.
+    def test_manhattan_is_land_mask_has_water(self, land_polygons):
+        """Verify mask correctly identifies land and contains both land/water.
 
-        This catches mask inversion bugs like the flip error.
+        With 25km coastal buffer, many near-shore areas are included as land.
+        This test verifies Manhattan is land and the mask has water pixels.
+        See docs/findings-land-mask-buffer.md for rationale.
         """
         import rasterio.transform
 
@@ -146,13 +149,10 @@ class TestMaskOrientation:
         row, col = rasterio.transform.rowcol(transform, -74.0, 40.75)
         assert mask[row, col], "Manhattan should be land (True)"
 
-        # Raritan Bay - definitely water
-        row, col = rasterio.transform.rowcol(transform, -74.2, 40.45)
-        assert not mask[row, col], "Raritan Bay should be water (False)"
-
-        # Atlantic Ocean - definitely water
-        row, col = rasterio.transform.rowcol(transform, -73.6, 40.5)
-        assert not mask[row, col], "Atlantic Ocean should be water (False)"
+        # Mask should have both land and water pixels
+        # Even with 25km buffer, bbox extends into open Atlantic
+        assert mask.sum() > 0, "Should have land pixels"
+        assert (~mask).sum() > 0, "Should have water pixels (open ocean)"
 
 
 class TestLSTValueRange:
@@ -308,21 +308,23 @@ class TestDataQualityEndToEnd:
         )
 
     def test_has_both_land_and_water_pixels(self, processed_coastal_tile):
-        """Coastal tile should have both valid (land) and NaN (water) pixels."""
+        """Coastal tile should have mostly valid (land) pixels.
+
+        Note: With the 25km coastal buffer, small coastal bboxes may have
+        near-100% land coverage. This is intentional to include barrier
+        islands, bays, and coastal features. See docs/findings-land-mask-buffer.md.
+        """
         result, _ = processed_coastal_tile
 
-        nan_count = np.isnan(result.values).sum()
         valid_count = (~np.isnan(result.values)).sum()
         total = result.values.size
 
         assert valid_count > 0, "Should have some valid land pixels"
-        assert nan_count > 0, "Coastal tile should have some water (NaN) pixels"
 
-        # Sanity check ratios
+        # Sanity check: should have substantial coverage
+        # NaN pixels may come from QA masking (clouds) rather than water mask
         land_pct = 100 * valid_count / total
-        assert 10 < land_pct < 95, (
-            f"Land coverage {land_pct:.1f}% is unusual for coastal tile (expected 10-95%)"
-        )
+        assert land_pct > 10, f"Land coverage {land_pct:.1f}% is too low - masking may be broken"
 
     def test_geographic_bounds_match_request(self, processed_coastal_tile):
         """Output coordinates should match requested bbox."""
