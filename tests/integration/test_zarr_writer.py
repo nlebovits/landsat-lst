@@ -108,8 +108,8 @@ def test_write_zarr_roundtrip(tmp_path):
     zarr_path = storage.zarr_path(2023, "N40W075")
     write_zarr(composite, zarr_path, chunks=(50, 50))
 
-    # Read back
-    ds = xr.open_zarr(zarr_path)
+    # Read back native resolution (multiscale level "0")
+    ds = xr.open_zarr(f"{zarr_path}/0")
 
     assert "lst_p95" in ds.data_vars
     assert "qa_count" in ds.data_vars
@@ -128,7 +128,7 @@ def test_write_zarr_value_roundtrip(tmp_path):
     zarr_path = storage.zarr_path(2023, "N40W075")
     write_zarr(composite, zarr_path, chunks=(50, 50))
 
-    ds = xr.open_zarr(zarr_path)
+    ds = xr.open_zarr(f"{zarr_path}/0")
 
     # Decode and check values
     scale = ds["lst_p95"].attrs["lst_scale_factor"]
@@ -149,7 +149,7 @@ def test_write_zarr_has_crs(tmp_path):
     zarr_path = storage.zarr_path(2023, "N40W075")
     write_zarr(composite, zarr_path, chunks=(50, 50))
 
-    ds = xr.open_zarr(zarr_path)
+    ds = xr.open_zarr(f"{zarr_path}/0")
 
     assert "_CRS" in ds.attrs
     assert "EPSG" in ds.attrs["crs"] or "4326" in ds.attrs["_CRS"]
@@ -164,7 +164,7 @@ def test_write_zarr_variable_attrs(tmp_path):
     zarr_path = storage.zarr_path(2023, "N40W075")
     write_zarr(composite, zarr_path, chunks=(50, 50))
 
-    ds = xr.open_zarr(zarr_path)
+    ds = xr.open_zarr(f"{zarr_path}/0")
 
     # LST bands have non-CF encoding attrs
     assert ds["lst_p95"].attrs["lst_scale_factor"] == LST_SCALE
@@ -213,9 +213,9 @@ def test_write_zarr_to_icechunk_session(tmp_path):
     assert group_path == "2023/N40W075"
     assert commit_id is not None
 
-    # Read back and verify
+    # Read back native level and verify
     read_session = storage.readonly_session()
-    ds = xr.open_zarr(read_session.store, group="2023/N40W075", consolidated=False)
+    ds = xr.open_zarr(read_session.store, group="2023/N40W075/0", consolidated=False)
 
     assert "lst_p95" in ds.data_vars
     assert ds["lst_p95"].dtype == np.uint16
@@ -233,8 +233,8 @@ def test_write_zarr_icechunk_roundtrip_values(tmp_path):
     write_zarr(composite, session, group="2023/N40W075", chunks=(50, 50))
     session.commit("test")
 
-    # Read back
-    ds = xr.open_zarr(storage.readonly_session().store, group="2023/N40W075", consolidated=False)
+    # Read back native level
+    ds = xr.open_zarr(storage.readonly_session().store, group="2023/N40W075/0", consolidated=False)
 
     # Decode and verify values (original: 35.0 Celsius)
     scale = ds["lst_p95"].attrs["lst_scale_factor"]

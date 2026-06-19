@@ -117,7 +117,6 @@ icechunk://source-coop-radiant-earth/landsat-lst/
 ├── (Icechunk metadata: branches, commits, snapshots)
 ├── 2023/
 │   ├── N40W075/           # Group per tile-year
-│   │   ├── lst_p50/
 │   │   ├── lst_p95/
 │   │   └── qa_count/
 │   ├── N40W070/
@@ -127,6 +126,11 @@ icechunk://source-coop-radiant-earth/landsat-lst/
 ```
 
 Each tile write creates a commit: `"Add N40W075 for 2023"`
+
+> **Updated by [ADR-004](004-geozarr-multiscale-overviews.md):** tiles are now written
+> as GeoZarr multiscale pyramids. Native data moved into a level subgroup `0/`, with
+> overviews in sibling groups `1/2/3/` and GeoZarr `proj`/`spatial`/`multiscales`
+> metadata on the tile group. Read native data from `{year}/{tile}/0`.
 
 **Rationale for single repository with tile groups:**
 - Git-like versioning across entire dataset (time-travel, audit trail)

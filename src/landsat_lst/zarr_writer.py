@@ -13,7 +13,9 @@ Encoding (LST bands only):
 - Decode: celsius = dn * 0.01 + (-50.0)
 - Fill value: 0 (uint16)
 
-See ADR-003 for architecture rationale.
+Output is a GeoZarr multiscale pyramid: native resolution in level group ``0`` plus
+coarsened overview groups, with GeoZarr proj/spatial/multiscales metadata on the parent.
+See ADR-003 (direct Zarr + Icechunk) and ADR-004 (GeoZarr multiscale overviews).
 """
 
 from __future__ import annotations
@@ -24,10 +26,19 @@ from typing import TYPE_CHECKING, Union
 import numpy as np
 import rioxarray  # noqa: F401 - needed for .rio accessor
 import xarray as xr
+import zarr
 from pyproj import CRS
+from zarr.codecs import BloscCname, BloscCodec
+
+from landsat_lst.config import settings
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import icechunk as ic
+
+# Permanent UUID of the GeoZarr multiscales convention (zarr-conventions/multiscales)
+MULTISCALES_UUID = "d35379db-88df-4056-af3a-620245f8e347"
 
 # Encoding constants for LST bands (lst_p95)
 LST_SCALE: float = 0.01
@@ -107,6 +118,133 @@ def _add_zarr_metadata(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+def _spatial_transform(ds: xr.Dataset) -> list[float]:
+    """Affine transform in GeoZarr/rasterio order ``[a, b, c, d, e, f]``.
+
+    Derived from the dataset's own latitude/longitude coordinates via rioxarray,
+    so it is correct for both native and coarsened (overview) levels. Requires
+    CRS and spatial dims to have been set on ``ds``.
+    """
+    affine = ds.rio.transform()
+    return [affine.a, affine.b, affine.c, affine.d, affine.e, affine.f]
+
+
+def _geozarr_spatial_attrs(ds: xr.Dataset) -> dict:
+    """GeoZarr ``proj`` + ``spatial`` convention attributes for a georeferenced group.
+
+    These are what web viewers (xpublish-tiles, icechunk-js, deck.gl-zarr) read to
+    interpret CRS and pixel geolocation. Written alongside the existing GDAL-style
+    ``_CRS``/GeoTransform attrs (which GDAL readers use) rather than replacing them.
+    """
+    return {
+        "proj:code": "EPSG:4326",
+        "spatial:dimensions": ["latitude", "longitude"],
+        "spatial:transform": _spatial_transform(ds),
+        "spatial:shape": [int(ds.sizes["latitude"]), int(ds.sizes["longitude"])],
+    }
+
+
+def build_overviews(
+    composite: xr.Dataset, factors: Sequence[int]
+) -> list[tuple[str, int, xr.Dataset]]:
+    """Build multiscale levels (native + coarsened overviews) from a float composite.
+
+    Each overview is derived from the **native** resolution (not the previous level)
+    so the block mean is exact rather than a weighted mean-of-means. ``lst_p95`` is
+    averaged with fill (``-9999``) and ocean (``NaN``) excluded -- critical, since
+    averaging fill DN=0 would otherwise drag overview temperatures toward -50 degC.
+    ``qa_count`` is averaged as a float observation count.
+
+    Args:
+        composite: Float dataset with ``lst_p95`` (Celsius, nodata=-9999/NaN) and
+            ``qa_count``. CRS/spatial dims need not be set yet.
+        factors: Downsample factors for overview levels (e.g. ``[4, 16, 64]``).
+
+    Returns:
+        Ordered ``[(level_name, scale_factor, level_dataset), ...]`` where level
+        ``"0"`` is native (factor 1). ``level_dataset`` keeps float ``lst_p95``
+        (NaN for missing) -- encoding to uint16 happens downstream, per level.
+    """
+    # Treat -9999 nodata as NaN so it is excluded from the block means.
+    lst = composite["lst_p95"].where(composite["lst_p95"] != LST_NODATA_FLOAT)
+    qa = composite["qa_count"].astype(np.float32)
+    src_attrs = dict(composite.attrs)
+    native = xr.Dataset({"lst_p95": lst, "qa_count": qa}, coords=composite.coords, attrs=src_attrs)
+
+    levels: list[tuple[str, int, xr.Dataset]] = [("0", 1, native)]
+    for i, factor in enumerate(factors, start=1):
+        coarsen = native.coarsen(latitude=factor, longitude=factor, boundary="trim")
+        coarsened = coarsen.mean(skipna=True)  # ty: ignore[unresolved-attribute]
+        coarsened.attrs = src_attrs
+        levels.append((str(i), factor, coarsened))
+    return levels
+
+
+def _multiscales_attr(levels: list[tuple[str, int, xr.Dataset]]) -> dict:
+    """GeoZarr ``multiscales`` convention layout for the pyramid (set on parent group).
+
+    ``transform.scale`` is the cumulative factor relative to native; every overview
+    is ``derived_from`` native (``"0"``), matching :func:`build_overviews`.
+    """
+    layout = []
+    for name, factor, _ds in levels:
+        entry: dict = {
+            "asset": name,
+            "transform": {
+                "scale": [float(factor), float(factor)],
+                "translation": [0.0, 0.0],
+            },
+        }
+        if factor != 1:
+            entry["derived_from"] = "0"
+        layout.append(entry)
+    return {
+        "zarr_conventions": [{"name": "multiscales", "uuid": MULTISCALES_UUID}],
+        "multiscales": {"layout": layout, "resampling_method": "average"},
+    }
+
+
+def _encode_level(level: xr.Dataset) -> xr.Dataset:
+    """Encode one float level to uint16 with CRS, GDAL, and GeoZarr metadata.
+
+    ``qa_count`` arrives as a float mean (from coarsening) and is rounded back to an
+    integer observation count.
+    """
+    encoded = xr.Dataset(
+        {
+            "lst_p95": encode_lst_uint16(level["lst_p95"]),
+            "qa_count": level["qa_count"].round().fillna(0).astype(np.uint16),
+        },
+        coords=level.coords,
+        attrs=dict(level.attrs),
+    )
+    encoded = encoded.rio.write_crs("EPSG:4326")
+    encoded = encoded.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude")
+    encoded = _add_zarr_metadata(encoded)
+    # GeoZarr proj/spatial on the level group (written as group attrs by the writer).
+    encoded.attrs.update(_geozarr_spatial_attrs(encoded))
+    return encoded
+
+
+def _level_chunks(level: xr.Dataset, chunks: tuple[int, int]) -> tuple[int, int]:
+    """Clamp the default chunk size to the level's shape (overviews are small)."""
+    ny = int(level.sizes["latitude"])
+    nx = int(level.sizes["longitude"])
+    return (min(chunks[0], ny), min(chunks[1], nx))
+
+
+def _compressors() -> tuple:
+    """Blosc compressor tuple from settings, or empty if compression is disabled."""
+    if settings.compression_level <= 0:
+        return ()
+    return (
+        BloscCodec(
+            cname=BloscCname(settings.compression_codec),
+            clevel=settings.compression_level,
+        ),
+    )
+
+
 def write_zarr(
     composite: xr.Dataset,
     output: OutputTarget,
@@ -114,28 +252,37 @@ def write_zarr(
     chunks: tuple[int, int] = DEFAULT_CHUNKS,
     group: str | None = None,
     storage_options: dict | None = None,
+    factors: Sequence[int] | None = None,
 ) -> str:
-    """Write composite Dataset to Zarr store with uint16 encoding.
+    """Write composite as a GeoZarr multiscale pyramid with uint16 encoding.
+
+    Writes native resolution as level group ``0`` plus one coarsened overview group
+    per entry in ``factors`` (e.g. ``1``=4x, ``2``=16x). The parent group carries the
+    GeoZarr ``multiscales`` layout and ``proj``/``spatial`` conventions; each level
+    group carries its own ``proj``/``spatial`` attrs and GDAL ``_CRS``. All arrays are
+    Blosc-compressed (see ``settings.compression_*``).
 
     Supports two output modes:
-    1. Path/str: Write to plain Zarr store (local or S3)
-    2. Icechunk Session: Write to session.store with group path
+    1. Path/str: Write to plain Zarr store (local or S3).
+    2. Icechunk Session: Write to ``session.store`` under ``group`` (caller commits).
+       For Icechunk, every level + the parent metadata land in the session uncommitted,
+       so the caller's single ``session.commit()`` makes the whole pyramid atomic.
 
     Args:
-        composite: Dataset with lst_p95, qa_count variables.
-            LST variables should be float32 in Celsius, nodata=-9999.0.
-            Must have CRS and spatial dims set.
+        composite: Dataset with ``lst_p95`` (float32 Celsius, nodata=-9999.0) and
+            ``qa_count`` variables.
         output: Output path (Path/str) OR Icechunk Session.
-        chunks: Chunk size for spatial dimensions (default 500x500).
-        group: Zarr group path (required when output is Icechunk Session).
-        storage_options: Optional dict of fsspec options for S3 (e.g. credentials).
+        chunks: Spatial chunk size, clamped per level (default 500x500).
+        group: Zarr group path (required when output is an Icechunk Session).
+        storage_options: Optional fsspec options for S3 (plain Zarr path only).
+        factors: Overview downsample factors. Defaults to ``settings.pyramid_factors``.
 
     Returns:
-        Path/URL to written Zarr store, or group path for Icechunk.
+        The store path/URL (plain Zarr) or the parent group path (Icechunk).
 
     Raises:
-        ValueError: If composite is missing required variables.
-        ValueError: If group is not provided for Icechunk session.
+        ValueError: If ``composite`` is missing required variables, or if ``group`` is
+            not provided for an Icechunk session.
     """
     # Validate required variables
     required = {"lst_p95", "qa_count"}
@@ -144,63 +291,72 @@ def write_zarr(
         msg = f"Composite missing required variables: {missing}"
         raise ValueError(msg)
 
-    # Ensure CRS and spatial dims are set
-    composite = composite.rio.write_crs("EPSG:4326")
-    composite = composite.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude")
+    if factors is None:
+        factors = settings.pyramid_factors
 
-    # Encode LST bands to uint16, qa_count stays uint16
-    encoded = xr.Dataset(
-        {
-            "lst_p95": encode_lst_uint16(composite["lst_p95"]),
-            "qa_count": composite["qa_count"].astype(np.uint16),
-        },
-        coords=composite.coords,
-        attrs=composite.attrs,
-    )
+    levels = build_overviews(composite, factors)
+    compressors = _compressors()
 
-    # Preserve CRS and spatial dims
-    encoded = encoded.rio.write_crs("EPSG:4326")
-    encoded = encoded.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude")
-
-    # Add metadata attributes
-    encoded = _add_zarr_metadata(encoded)
-
-    # Rechunk for optimal Zarr access
-    chunk_dict = {"latitude": chunks[0], "longitude": chunks[1]}
-    encoded = encoded.chunk(chunk_dict)
-
-    # Set up encoding
-    encoding = {}
-    for var in encoded.data_vars:
-        encoding[var] = {
-            "chunks": chunks,
-        }
-
-    # Write to appropriate target
+    # Branch on output type up front so the writer/store handles are well-typed.
     if isinstance(output, (Path, str)):
-        # Write to plain Zarr path (keep strings as-is for S3 URLs)
+        is_icechunk = False
         output_str = str(output)
-        encoded.to_zarr(
-            output_str,
-            mode="w",
-            consolidated=True,
-            encoding=encoding,
-            storage_options=storage_options,
-        )
-        return output_str
+        attr_store = output_str
+        parent_path = ""
     else:
-        # Icechunk session - must use icechunk.xarray.to_icechunk for Dask arrays
-        # Regular to_zarr() fails because sessions can't be pickled to workers
         if group is None:
             msg = "group parameter required when writing to Icechunk session"
             raise ValueError(msg)
-
+        # to_icechunk (not to_zarr) is required for Dask arrays: sessions can't be
+        # pickled to workers.
         from icechunk.xarray import to_icechunk  # noqa: PLC0415
 
-        to_icechunk(
-            encoded,
-            output,  # type: ignore[arg-type] - Session type
-            group=group,
-            mode="w",
+        is_icechunk = True
+        attr_store = output.store
+        parent_path = group
+        output_str = group  # parent group path is the return value for Icechunk
+
+    native_encoded: xr.Dataset | None = None
+    for name, _factor, level in levels:
+        encoded = _encode_level(level)
+        lch = _level_chunks(encoded, chunks)
+        encoded = encoded.chunk({"latitude": lch[0], "longitude": lch[1]})
+        encoding = {
+            var: {"chunks": lch, **({"compressors": compressors} if compressors else {})}
+            for var in encoded.data_vars
+        }
+        if name == "0":
+            native_encoded = encoded
+
+        if is_icechunk:
+            to_icechunk(
+                encoded,
+                output,  # ty: ignore[invalid-argument-type] - narrowed to Session above
+                group=f"{group}/{name}",
+                mode="w",
+                encoding=encoding,
+            )
+        else:
+            encoded.to_zarr(
+                f"{output_str}/{name}",
+                mode="w",
+                consolidated=True,
+                encoding=encoding,
+                storage_options=storage_options,
+            )
+
+    # Stamp the parent group with the GeoZarr multiscales layout + native proj/spatial.
+    # native_encoded is always set: level "0" is the first entry from build_overviews.
+    assert native_encoded is not None
+    if is_icechunk:
+        parent = zarr.open_group(attr_store, path=parent_path, mode="a")
+    else:
+        parent = zarr.open_group(
+            attr_store, path=parent_path, mode="a", storage_options=storage_options
         )
-        return group
+    parent.attrs.update(_multiscales_attr(levels))
+    parent.attrs.update(_geozarr_spatial_attrs(native_encoded))
+    parent.attrs["title"] = "Landsat LST Annual Composite"
+    parent.attrs["institution"] = "Radiant Earth"
+
+    return output_str

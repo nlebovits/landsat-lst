@@ -242,8 +242,9 @@ def run_pipeline(tile_name: str, year: int, output_dir: Path) -> ProfileResult:
 
 
 def verify_output(result: ProfileResult, output_dir: Path) -> None:
-    """Verify the written Zarr can be read back correctly."""
+    """Verify the written GeoZarr multiscale pyramid can be read back correctly."""
     import xarray as xr  # noqa: PLC0415
+    import zarr  # noqa: PLC0415
 
     from landsat_lst.storage import IcechunkStorage  # noqa: PLC0415
 
@@ -253,8 +254,18 @@ def verify_output(result: ProfileResult, output_dir: Path) -> None:
     storage = IcechunkStorage.from_local(icechunk_path)
     session = storage.readonly_session()
 
-    group_path = f"{result.year}/{result.tile}"
-    ds = xr.open_zarr(session.store, group=group_path)
+    # Parent group carries the GeoZarr multiscales + proj/spatial conventions.
+    parent_path = f"{result.year}/{result.tile}"
+    parent = zarr.open_group(session.store, path=parent_path, mode="r")
+    assert "multiscales" in parent.attrs, "Missing multiscales attribute on parent group"
+    assert "proj:code" in parent.attrs, "Missing proj:code (GeoZarr) attribute"
+    assert "spatial:transform" in parent.attrs, "Missing spatial:transform (GeoZarr) attribute"
+    layout = parent.attrs["multiscales"]["layout"]
+    level_names = [entry["asset"] for entry in layout]
+    log.info("multiscales_levels", levels=level_names)
+
+    # Native data lives in level group "0".
+    ds = xr.open_zarr(session.store, group=f"{parent_path}/0")
 
     log.info(
         "verification_complete",
@@ -268,6 +279,14 @@ def verify_output(result: ProfileResult, output_dir: Path) -> None:
     # Check attributes
     assert "lst_scale_factor" in ds["lst_p95"].attrs, "Missing scale_factor attribute"
     assert "_CRS" in ds.attrs, "Missing _CRS attribute"
+
+    # Each overview level should be readable and coarser than native.
+    native_h = ds.sizes["latitude"]
+    for name in level_names:
+        if name == "0":
+            continue
+        lvl = xr.open_zarr(session.store, group=f"{parent_path}/{name}")
+        assert lvl.sizes["latitude"] < native_h, f"Level {name} not coarser than native"
 
     log.info("verification_passed", commit_id=result.commit_id[:12] if result.commit_id else None)
 

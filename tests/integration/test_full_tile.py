@@ -209,9 +209,9 @@ class TestFullTileIntegration:
 
         start = time.perf_counter()
 
-        # Read from Icechunk
+        # Read from Icechunk (native data lives in multiscale level "0")
         session = storage.readonly_session()
-        ds_read = xr.open_zarr(session.store, group=group_path, consolidated=False)
+        ds_read = xr.open_zarr(session.store, group=f"{group_path}/0", consolidated=False)
 
         elapsed = time.perf_counter() - start
         print(f"Opened from Icechunk in {elapsed:.3f}s")
