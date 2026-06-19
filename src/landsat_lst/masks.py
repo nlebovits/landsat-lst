@@ -55,6 +55,12 @@ def load_land_polygons(
         land_projected["geometry"] = land_projected.geometry.buffer(buffer_meters)
         land = land_projected.to_crs("EPSG:4326")
 
+        # Buffering + reprojection to EPSG:4326 can produce self-intersecting
+        # geometries near the antimeridian, which raise GEOS TopologyException
+        # ("side location conflict") in downstream .clip(). Repair them so the
+        # land set is valid for any tile. See issue #31.
+        land["geometry"] = land.geometry.make_valid()
+
     if cache_dir:
         cache_dir.mkdir(parents=True, exist_ok=True)
         land.to_file(cache_path, driver="GPKG")

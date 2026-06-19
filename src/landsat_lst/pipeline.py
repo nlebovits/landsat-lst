@@ -1,6 +1,7 @@
 """Main ETL pipeline for Landsat LST composites."""
 
 import os
+from collections.abc import Callable
 
 import numpy as np
 import pystac_client
@@ -35,7 +36,12 @@ def _configure_requester_pays() -> None:
 def query_stac(job: ProcessingJob) -> list:
     """Query STAC catalog for Landsat scenes.
 
-    For Planetary Computer: signs items with SAS tokens for Azure access.
+    For Planetary Computer: items are returned UNSIGNED. Azure access is
+    handled at read time via refreshable GDAL config (``/vsiaz/`` paths plus a
+    timer-refreshed ``AZURE_STORAGE_SAS_TOKEN``); see
+    :func:`landsat_lst.azure_auth.enable_pc_azure_refresh`. Baking SAS tokens
+    into URLs (``pc.sign_inplace``) is avoided because those tokens expire
+    ~45min after the query and would fail mid-compute on long-running tiles.
     For Earth Search: configures requester-pays for S3 access.
 
     Args:
@@ -44,19 +50,10 @@ def query_stac(job: ProcessingJob) -> list:
     Returns:
         List of STAC items matching the query.
     """
-    modifier = None
-
-    if _is_planetary_computer():
-        import planetary_computer as pc  # noqa: PLC0415
-
-        modifier = pc.sign_inplace
-    else:
+    if not _is_planetary_computer():
         _configure_requester_pays()
 
-    catalog = pystac_client.Client.open(
-        settings.stac_url,
-        modifier=modifier,
-    )
+    catalog = pystac_client.Client.open(settings.stac_url)
 
     search = catalog.search(
         collections=[settings.collection],
@@ -71,12 +68,19 @@ def query_stac(job: ProcessingJob) -> list:
     return list(search.items())
 
 
-def load_scenes(items: list, bbox: tuple[float, float, float, float]) -> xr.Dataset:
+def load_scenes(
+    items: list,
+    bbox: tuple[float, float, float, float],
+    patch_url: Callable[[str], str] | None = None,
+) -> xr.Dataset:
     """Load Landsat scenes as an xarray Dataset.
 
     Args:
         items: List of STAC items to load.
         bbox: Bounding box for spatial subsetting.
+        patch_url: Optional per-asset URL transform applied by odc-stac before
+            building the load graph. Used for Planetary Computer to rewrite blob
+            hrefs to token-free ``/vsiaz/`` paths (auth via GDAL config).
 
     Returns:
         Dataset with thermal and QA bands.
@@ -89,6 +93,7 @@ def load_scenes(items: list, bbox: tuple[float, float, float, float]) -> xr.Data
         chunks={"time": 10, "latitude": 512, "longitude": 512},
         groupby="solar_day",
         bbox=bbox,
+        patch_url=patch_url,
     )
 
 
@@ -141,7 +146,16 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
         msg = f"No scenes found for {job.tile.name} in {job.year}"
         raise ValueError(msg)
 
-    data = load_scenes(items, job.tile.bbox)
+    # Planetary Computer: set up refreshable Azure SAS auth (local + Dask
+    # workers) and rewrite asset hrefs to token-free /vsiaz/ paths so a
+    # long-running compute never reads with an expired token. No-op for AWS.
+    patch_url = None
+    if _is_planetary_computer():
+        from landsat_lst.azure_auth import enable_pc_azure_refresh  # noqa: PLC0415
+
+        patch_url = enable_pc_azure_refresh(items)
+
+    data = load_scenes(items, job.tile.bbox, patch_url=patch_url)
 
     composite = compute_annual_composite(data)
 
