@@ -102,6 +102,25 @@ class Settings(BaseSettings):
         description="NoData value for output rasters",
     )
 
+    # Multiscale overviews (GeoZarr multiscales convention)
+    pyramid_factors: list[int] = Field(
+        default=[4, 16, 64],
+        description="Downsample factors (relative to native) for overview levels. "
+        "Default is a sparse 4x pyramid (4x/16x/64x): ~6.7% storage overhead, "
+        "tuned for mostly zoomed-out global viewing. Use [2, 4, 8, 16, 32, 64] for "
+        "a full 2x pyramid (~33% overhead, smoother near-native zoom).",
+    )
+
+    # Compression (Zarr v3 codec)
+    compression_codec: str = Field(
+        default="zstd",
+        description="Blosc compression codec name (e.g. 'zstd', 'lz4', 'blosclz').",
+    )
+    compression_level: int = Field(
+        default=5,
+        description="Blosc compression level (0-9). 0 disables compression.",
+    )
+
     dask_workers: int = Field(
         default=8,
         description="Number of Dask workers for local processing",
