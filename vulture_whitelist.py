@@ -16,6 +16,10 @@ _.process  # noqa: F821
 _.list_tiles  # noqa: F821
 _.tile_info  # noqa: F821
 
+# Dask WorkerPlugin API: setup/teardown receive `worker` (called as
+# plugin.setup(worker=...)), required by the interface even when unused.
+_.worker  # noqa: F821
+
 # pytest fixtures
 _.tiny_bbox  # noqa: F821
 _.pergamino_bbox  # noqa: F821
