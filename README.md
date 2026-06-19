@@ -6,11 +6,17 @@ Global annual Land Surface Temperature composites from Landsat Collection 2 Leve
 
 This pipeline produces annual LST composites for municipal decision-makers analyzing urban heat. Output includes:
 
-- **lst_p50**: Median LST (°C)
 - **lst_p95**: 95th percentile LST (°C)
 - **qa_count**: Number of valid observations
 
-Data is tiled on a 5° global grid, stored as Zarr v3 stores, and published with a STAC catalog.
+Data is tiled on a 5° global grid and stored as **GeoZarr multiscale pyramids**
+(versioned with Icechunk), published with a STAC catalog. Each tile is a pyramid:
+native resolution in level group `0` and coarsened overviews in `1`/`2`/`3` — see
+[Data Access](#data-access) and [ADR-004](docs/adr/004-geozarr-multiscale-overviews.md).
+
+## Architecture
+
+Design decisions are recorded as ADRs in [`docs/adr/`](docs/adr/README.md).
 
 ## Data Encoding
 
@@ -20,29 +26,28 @@ LST bands are stored as **uint16** to reduce file size by 50%. To convert back t
 import xarray as xr
 import fsspec
 
-# Open a tile from Source Coop
+# Open native resolution (multiscale level "0") from Source Coop
 mapper = fsspec.get_mapper(
     "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr",
     anon=True
 )
-ds = xr.open_zarr(mapper)
+ds = xr.open_zarr(mapper, group="0")
 
 # Read scale/offset from Zarr attributes
-scale = ds["lst_p50"].attrs["lst_scale_factor"]    # 0.01
-offset = ds["lst_p50"].attrs["lst_add_offset"]     # -50.0
+scale = ds["lst_p95"].attrs["lst_scale_factor"]    # 0.01
+offset = ds["lst_p95"].attrs["lst_add_offset"]     # -50.0
 
 # Decode to Celsius
-celsius = ds["lst_p50"] * scale + offset
+celsius = ds["lst_p95"] * scale + offset
 ```
 
 **Quick decode (if you know the constants):**
 ```python
-celsius = ds["lst_p50"] * 0.01 + (-50.0)  # fill_value=0 is nodata
+celsius = ds["lst_p95"] * 0.01 + (-50.0)  # fill_value=0 is nodata
 ```
 
 | Variable | Name | Scale | Offset | Units |
 |----------|------|-------|--------|-------|
-| lst_p50 | Median LST | 0.01 | -50.0 | celsius |
 | lst_p95 | 95th percentile LST | 0.01 | -50.0 | celsius |
 | qa_count | Observation count | — | — | count |
 
@@ -84,25 +89,43 @@ Output is written to Source Cooperative S3.
 
 ## Data Access
 
-Each tile is stored as an independent Zarr store on Source Cooperative:
+Each tile is stored as an independent GeoZarr multiscale pyramid on Source Cooperative.
+The tile store is a group of resolution levels — open level `0` for native resolution:
 
 ```python
 import xarray as xr
 import fsspec
 
-# Access a specific tile
+# Access a specific tile at native resolution (level "0")
 url = "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr"
 mapper = fsspec.get_mapper(url, anon=True)
-ds = xr.open_zarr(mapper)
+ds = xr.open_zarr(mapper, group="0")
 
 # Spatial subset (only fetches required chunks)
-subset = ds.lst_p50.sel(
+subset = ds.lst_p95.sel(
     latitude=slice(42, 40),
     longitude=slice(-74, -75)
 )
 
 # Decode uint16 to Celsius
 lst_celsius = subset * 0.01 + (-50.0)
+```
+
+#### Multiscale overviews (GeoZarr)
+
+Each tile group follows the GeoZarr `multiscales` convention: native resolution is
+level `0`, with coarsened overviews in `1` (4x), `2` (16x), `3` (64x) for fast
+zoomed-out / web rendering. The tile group's attributes describe the pyramid:
+
+```python
+import zarr
+
+root = zarr.open_group(mapper, mode="r")          # the tile group
+print(root.attrs["multiscales"]["layout"])         # level layout + scale factors
+print(root.attrs["proj:code"], root.attrs["spatial:transform"])  # GeoZarr proj/spatial
+
+# Open a coarse overview (16x) instead of full resolution
+overview = xr.open_zarr(mapper, group="2")
 ```
 
 ### QGIS Access
@@ -114,8 +137,8 @@ import rioxarray
 import fsspec
 
 url = "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr"
-ds = xr.open_zarr(fsspec.get_mapper(url, anon=True))
-ds["lst_p50"].rio.to_raster("lst_subset.tif")
+ds = xr.open_zarr(fsspec.get_mapper(url, anon=True), group="0")
+ds["lst_p95"].rio.to_raster("lst_subset.tif")
 # Open lst_subset.tif in QGIS
 ```
 

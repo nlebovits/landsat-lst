@@ -108,13 +108,18 @@ class S3Storage(StorageBackend):
 class IcechunkStorage(StorageBackend):
     """Icechunk repository storage for versioned Zarr writes.
 
-    All tiles are stored in a single repository with group structure:
-    /{year}/{tile_name}/
-        lst_p50/
-        lst_p95/
-        qa_count/
+    All tiles are stored in a single repository as GeoZarr multiscale pyramids
+    (see ADR-004). The tile group carries GeoZarr proj/spatial/multiscales metadata;
+    native data lives in level subgroup ``0`` and overviews in ``1``/``2``/``3``:
 
-    Each tile write is a commit, enabling time-travel and audit trail.
+        /{year}/{tile_name}/        # GeoZarr multiscales + proj/spatial attrs
+            0/                      # native resolution
+                lst_p95/
+                qa_count/
+            1/ 2/ 3/                # 4x / 16x / 64x overviews
+
+    Each tile write is a single commit (native + all overviews), enabling
+    time-travel and audit trail.
     """
 
     def __init__(self, repo: ic.Repository):

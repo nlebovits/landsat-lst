@@ -13,7 +13,9 @@ Encoding (LST bands only):
 - Decode: celsius = dn * 0.01 + (-50.0)
 - Fill value: 0 (uint16)
 
-See ADR-003 for architecture rationale.
+Output is a GeoZarr multiscale pyramid: native resolution in level group ``0`` plus
+coarsened overview groups, with GeoZarr proj/spatial/multiscales metadata on the parent.
+See ADR-003 (direct Zarr + Icechunk) and ADR-004 (GeoZarr multiscale overviews).
 """
 
 from __future__ import annotations
