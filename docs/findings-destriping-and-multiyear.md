@@ -230,8 +230,8 @@ season-aware per-scene normalization.
 
 ## Open questions / next steps
 
-1. **Productionize season-aware normalization.** Currently only `seasonal_debias`
-   in `scripts/season_aware_p95_test.py`. **Recommended next step:** wire it into
+1. **Productionize season-aware normalization** (tracked in #46). Currently only
+   `seasonal_debias` in `scripts/season_aware_p95_test.py`. **Recommended next step:** wire it into
    `pipeline.py` / `process_tile` so production composites are debiased.
 2. **Offset-outlier cap.** Add a magnitude cap on per-scene offsets to reject
    outlier scenes (e.g. the −66 °C scene) — a safeguard against the monthly

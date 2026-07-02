@@ -65,7 +65,7 @@ climatology** (not the annual mean), which preserves the seasonal / hot signal.
 Validated on the 3-year AOI: seams removed, no artifacts, mean **41.0 °C** preserved.
 
 **Status: prototype only** in `scripts/season_aware_p95_test.py`. Productionizing into
-`pipeline.py` / `process_tile` is **deferred** pending 5-year evaluation. This is a
+`pipeline.py` / `process_tile` is **deferred** and tracked in #46. This is a
 public "conversation-starter" product, not a peer-reviewed claim, so independent-reference
 validation (MODIS / ECOSTRESS) is **recommended for added confidence, not a prerequisite
 for shipping**.
