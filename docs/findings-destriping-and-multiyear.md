@@ -79,11 +79,14 @@ where the longer window earns its keep.
 
 ### Decision
 
-**3-year P95 is the production default** — the sweet spot. It removes the per-month
-coverage holes and triples the number of observations in the P95's hot tail (more
-robust extreme estimate) for 3× the compute. **5 years** roughly doubles the compute
-again for little additional coverage or robustness at this site, so it stays under
-final evaluation rather than being adopted outright.
+**5-year P95 is the production default**, chosen for consistency with established
+products (WRI uses a 5-year window) — that external precedent makes the methodology
+easy to defend. Both 3- and 5-year remove the per-month coverage holes and give a
+robust hot-tail P95; 5-year is marginally hotter (mean 42.0 vs 41.0 °C) but not
+measurably cleaner (offset std 12.9 vs 12.3). It costs ~1.4× the reads of 3-year, but
+a single 5-year composite is *cheaper* than five separate annual composites (one load
++ one P95 + one write). **3-year is a supported, lighter fallback** when compute is
+constrained.
 
 ---
 
@@ -214,7 +217,7 @@ removes only the deviation-from-expected.
 | Component | Decision | Status |
 |---|---|---|
 | P95 (vs lower percentile) | **Keep P95** — cleanest and most seam-robust | Locked |
-| Window length | **3-year** default; 5-year under final eval | Adopted (3yr) |
+| Window length | **5-year** default (WRI-aligned); 3-year lighter fallback | Adopted (5yr) |
 | Improved QA mask (dilated cloud + cirrus) | **In pipeline** | Shipped (`qa.py`) |
 | Physical-plausibility clamp (−50/80 °C) | **In pipeline** | Shipped (`config.py`, `convert_to_celsius`) |
 | Scene-level cloud filter | **Disabled** (redundant) | Confirmed (issue #34) |
@@ -240,10 +243,12 @@ season-aware per-scene normalization.
    claim — the method is a standard correction for a documented ~1–5 K per-scene error
    and is unlikely to be challenged for this use. So far we have self-consistency and
    visual checks, which are sufficient to ship a v1.
-4. **Global-scale compute.** The 3-year default triples the per-tile compute vs.
-   1 year; confirm the global run stays within budget, and re-decide 3yr vs 5yr on
-   the basis of real high-latitude / cloudy tiles where coverage — not this benign
-   AOI — drives the choice.
+4. **Global-scale compute.** The dominant cost is reading 5 years of Landsat per tile
+   across all land tiles — this belongs on **Coiled / Earth Search** (same-region S3, no
+   egress), not local PC (a single 1-year *full* 5° tile already ran 45–77 min here).
+   The 5-year window is ~1.4× the reads of 3-year, but a single 5-year composite is
+   cheaper than five annual composites. Confirm the global run stays within budget; drop
+   to the 3-year fallback if it doesn't.
 
 ---
 

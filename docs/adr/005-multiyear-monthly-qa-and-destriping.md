@@ -24,13 +24,18 @@ This ADR records only the decisions.
 
 ## Decision
 
-### 1. Multi-year composite windows — 3-year P95 is the production default
+### 1. Multi-year composite windows — 5-year P95 is the production default
 
 `ProcessingJob` gains a multi-year window (`end_year`, `window_label`); P95 is pooled
-across **all** scenes in the window. **3 years is the default.** It eliminates the
-per-month zero-coverage holes a single year has and ~triples P95 robustness, for 3×
-compute. 5 years adds negligible quality for 5× cost. Storage is ~identical across
-windows (see #2), so this is a compute-vs-quality choice, not a storage one.
+across **all** scenes in the window. **5 years is the default**, chosen for consistency
+with established products (WRI uses a 5-year window), which makes the methodology easy to
+defend. Both 3- and 5-year eliminate the per-month zero-coverage holes a single year has
+and give a robust P95; 5-year is marginally hotter (mean 42.0 vs 41.0 °C at the AOI) but
+not measurably cleaner. Storage is ~identical across windows (see #2), so the window is a
+**compute-vs-defensibility** choice, not a storage or quality one. Note a single 5-year
+composite is *cheaper* than five separate annual composites (one scene load + one P95 +
+one write, versus five), though ~1.4× the reads of 3-year. **3-year remains a supported,
+lighter alternative** when compute is constrained.
 
 ### 2. `qa_count` becomes a 12-month climatology, uint8
 
@@ -94,7 +99,8 @@ Recorded so they are not revisited:
   hygiene). Independent-reference validation (MODIS / ECOSTRESS) is a **recommended
   confidence check, not a blocker** — the method is a standard correction for a documented
   ~1–5 K per-scene error and is unlikely to be challenged for this product's use.
-- Deferred (not gating): **5-year window evaluation** to confirm the 3-year default.
+- 5-year is the default (WRI-aligned); 3-year is the lighter fallback. The main cost is
+  global-scale reads (5 years of Landsat per tile) — a Coiled / Earth Search job, not local.
 
 ## References
 - [`docs/findings-destriping-and-multiyear.md`](../findings-destriping-and-multiyear.md)
