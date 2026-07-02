@@ -228,9 +228,9 @@ class TestFullTileIntegration:
         assert "lst_p95" in ds_read.data_vars
         assert "qa_count" in ds_read.data_vars
 
-        # Check dtype (should be uint16 after encoding)
+        # Check dtype after encoding: LST uint16 DN, QA count uint8.
         assert ds_read["lst_p95"].dtype == np.uint16
-        assert ds_read["qa_count"].dtype == np.uint16
+        assert ds_read["qa_count"].dtype == np.uint8
 
         # Check encoding attributes preserved
         assert ds_read["lst_p95"].attrs["lst_scale_factor"] == 0.01

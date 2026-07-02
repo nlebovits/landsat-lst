@@ -3,7 +3,7 @@
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 
 class TileId(BaseModel):
@@ -46,22 +46,50 @@ class YearRange(BaseModel):
 
 
 class ProcessingJob(BaseModel):
-    """A single processing job for one tile and one year."""
+    """A single processing job for one tile and a one- or multi-year window.
+
+    ``year`` is the first (inclusive) year of the window. For a multi-year
+    composite, set ``end_year`` to the last (inclusive) year; the P95 is then
+    pooled across every scene in ``[year, end_year]``. When ``end_year`` is
+    ``None`` the job is a single-year composite (backward compatible).
+    """
 
     tile: TileId
     year: int = Field(ge=2013, le=2030)
+    end_year: int | None = Field(
+        default=None,
+        ge=2013,
+        le=2030,
+        description="Last inclusive year for a multi-year window; None = single year",
+    )
+
+    @model_validator(mode="after")
+    def _check_year_window(self) -> "ProcessingJob":
+        if self.end_year is not None and self.end_year < self.year:
+            msg = f"end_year ({self.end_year}) must be >= year ({self.year})"
+            raise ValueError(msg)
+        return self
 
     @computed_field
     @property
     def datetime_range(self) -> str:
-        """ISO datetime range for STAC query."""
-        return f"{self.year}-01-01/{self.year}-12-31"
+        """ISO datetime range for STAC query (spans the full window)."""
+        last = self.end_year or self.year
+        return f"{self.year}-01-01/{last}-12-31"
+
+    @computed_field
+    @property
+    def window_label(self) -> str:
+        """Storage/label token: ``2024`` for single year, ``2020-2024`` for a range."""
+        if self.end_year is None or self.end_year == self.year:
+            return str(self.year)
+        return f"{self.year}-{self.end_year}"
 
     @computed_field
     @property
     def output_filename(self) -> str:
         """Output COG filename."""
-        return f"lst_{self.year}_{self.tile.name}.tif"
+        return f"lst_{self.window_label}_{self.tile.name}.tif"
 
 
 class CompositeStats(BaseModel):

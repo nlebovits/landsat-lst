@@ -57,3 +57,22 @@ class TestProcessingJob:
     def test_output_filename(self):
         job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2023)
         assert job.output_filename == "lst_2023_N40W075.tif"
+
+    def test_single_year_window_label(self):
+        job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2024)
+        assert job.window_label == "2024"
+
+    def test_multi_year_datetime_range_and_label(self):
+        job = ProcessingJob(tile=TileId(lat=-30, lon=-65), year=2020, end_year=2024)
+        assert job.datetime_range == "2020-01-01/2024-12-31"
+        assert job.window_label == "2020-2024"
+        assert job.output_filename == "lst_2020-2024_S30W065.tif"
+
+    def test_end_year_equal_to_year_is_single(self):
+        job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2022, end_year=2022)
+        assert job.window_label == "2022"
+        assert job.datetime_range == "2022-01-01/2022-12-31"
+
+    def test_end_year_before_year_rejected(self):
+        with pytest.raises(ValueError, match="end_year"):
+            ProcessingJob(tile=TileId(lat=40, lon=-75), year=2024, end_year=2020)

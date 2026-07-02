@@ -55,6 +55,12 @@ analysis = [
     # geopandas/rasterio/pandas/dask are already core deps.
     "matplotlib>=3.8.0",
 ]
+frisky = [
+    # Experimental Rust reimplementation of the Dask scheduler. Optional: the
+    # decision-run driver hijacks the Dask client with it when installed, and
+    # falls back to plain Dask otherwise. See getfrisky.dev.
+    "frisky",
+]
 dev = [
     # Testing
     "pytest>=8.0.0",

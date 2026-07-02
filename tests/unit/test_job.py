@@ -85,7 +85,7 @@ class TestIdempotentCheck:
         result = process_tile_job(sample_job, force=False, storage=mock_storage)
 
         assert result.status == "skipped"
-        mock_storage.zarr_exists.assert_called_once_with(2023, "N40W075")
+        mock_storage.zarr_exists.assert_called_once_with("2023", "N40W075")
 
     def test_force_reprocesses_existing_zarr(self, sample_job, mock_storage):
         """Should reprocess when force=True even if Zarr exists."""

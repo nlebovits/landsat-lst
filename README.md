@@ -1,13 +1,13 @@
 # Landsat LST
 
-Global annual Land Surface Temperature composites from Landsat Collection 2 Level-2 data.
+Global Land Surface Temperature composites — annual or multi-year — from Landsat Collection 2 Level-2 data.
 
 ## Overview
 
-This pipeline produces annual LST composites for municipal decision-makers analyzing urban heat. Output includes:
+This pipeline produces annual or multi-year LST composites for municipal decision-makers analyzing urban heat. A composite pools *every* scene in its window (one year, e.g. `2024`, or a range, e.g. `2020-2024`) into a single percentile — multi-year windows fill cloud/orbit gaps and suppress scene-footprint striping. Output includes:
 
-- **lst_p95**: 95th percentile LST (°C)
-- **qa_count**: Number of valid observations
+- **lst_p95**: 95th percentile LST (°C), pooled across all scenes in the window
+- **qa_count**: 12-month climatology of valid-observation counts (`(month, latitude, longitude)`, one band per calendar month; month M = valid observations in calendar month M pooled across the window)
 
 Data is tiled on a 5° global grid and stored as **GeoZarr multiscale pyramids**
 (versioned with Icechunk), published with a STAC catalog. Each tile is a pyramid:
@@ -49,13 +49,26 @@ celsius = ds["lst_p95"] * 0.01 + (-50.0)  # fill_value=0 is nodata
 | Variable | Name | Scale | Offset | Units |
 |----------|------|-------|--------|-------|
 | lst_p95 | 95th percentile LST | 0.01 | -50.0 | celsius |
-| qa_count | Observation count | — | — | count |
+| qa_count | Valid observations per calendar month (uint8, 12 bands: `month` × lat × lon) | — | — | count |
 
 ## Installation
 
 ```bash
 uv sync
 ```
+
+## Configuration
+
+Settings live in [`landsat_lst.config`](src/landsat_lst/config.py) and can be
+overridden via environment variables (prefix `LST_`) or a `.env` file. Notable
+data-quality and performance settings:
+
+| Setting | Env var | Default | Purpose |
+|---------|---------|---------|---------|
+| `lst_valid_min` | `LST_LST_VALID_MIN` | `-50.0` | Drop physically implausible cold LST (e.g. ~-124 °C DN=0 / resampling artifacts) |
+| `lst_valid_max` | `LST_LST_VALID_MAX` | `80.0` | Drop high-DN saturation/fill artifacts without clipping real extreme heat |
+| `load_chunk_size` | `LST_LOAD_CHUNK_SIZE` | `512` | odc-stac spatial (lat/lon) chunk; smaller (e.g. 256) cuts peak memory for the P95 quantile on multi-year / large-tile runs |
+| `max_cloud_cover` | `LST_MAX_CLOUD_COVER` | `100` | Scene-level cloud filter; 100 disables it and relies on pixel-level QA |
 
 ## Usage
 
@@ -68,6 +81,26 @@ landsat-lst process --year 2023
 
 # List available tiles
 landsat-lst list-tiles
+```
+
+#### Multi-year composites
+
+A `ProcessingJob` accepts an optional `end_year` to pool every scene across a
+multi-year window into a single P95 (percentiles are computed on the pooled
+scenes, never averaged across per-year P95s). The window label
+(`2024` or `2020-2024`) keys the output storage group and COG filenames:
+
+```python
+from landsat_lst.models import ProcessingJob
+from landsat_lst.pipeline import process_tile
+from landsat_lst.tiling import parse_tile_name
+
+# Single year (backward compatible)
+job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2024)
+
+# Five-year window 2020-2024 -> group/COGs keyed "2020-2024"
+job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2020, end_year=2024)
+composite = process_tile(job)
 ```
 
 ### Distributed Processing (Coiled)
@@ -144,6 +177,25 @@ ds["lst_p95"].rio.to_raster("lst_subset.tif")
 
 See [docs/adr/003-direct-zarr-architecture.md](docs/adr/003-direct-zarr-architecture.md) for architecture details.
 
+### COG export
+
+QGIS-ready Cloud-Optimized GeoTIFFs are produced by the reusable
+[`landsat_lst.cog`](src/landsat_lst/cog.py) module (`cog_export`), which derives
+two COGs from a native-resolution composite level:
+
+- a **single-band LST COG** with GDAL scale/offset embedded, so viewers auto-decode
+  DN to Celsius (`degC = DN * 0.01 - 50`); and
+- a **12-band monthly QA COG** (one `qa_count` band per calendar month, no nodata so
+  a value of 0 = "no valid observations that month" stays visible for gap diagnosis).
+
+```python
+import xarray as xr
+from landsat_lst.cog import cog_export
+
+native = xr.open_zarr(store, group="2020-2024/0")  # decoded native level
+cog_export(native, "lst.tif", "qa_monthly.tif")
+```
+
 ## Architecture
 
 See [docs/adr/001-architecture-decisions.md](docs/adr/001-architecture-decisions.md) for detailed design decisions.
@@ -153,7 +205,7 @@ Key choices:
 - **Output format**: Zarr v3 with 500×500 chunks
 - **CRS**: EPSG:4326
 - **Tiling**: 5° × 5° grid
-- **Temporal**: Calendar year composites
+- **Temporal**: Calendar-year or multi-year window composites (pooled P95)
 - **Spatial**: Land only, ±60° latitude
 
 ## Development
@@ -175,6 +227,30 @@ uv run pytest
 # Install pre-commit hooks
 uv run prek install
 ```
+
+### Optional extras
+
+`uv sync --all-extras` installs everything; individual extras can be installed on
+their own:
+
+- `analysis` — `matplotlib` for figure generation in analysis/findings writeups.
+- `frisky` — experimental Rust reimplementation of the Dask scheduler
+  ([getfrisky.dev](https://getfrisky.dev)). Kept behind a fallback: the multi-year
+  decision driver uses it when installed but reverts to plain Dask otherwise
+  (it crashed gathering large results, so **production uses Dask**).
+
+### Scripts
+
+Notable scripts in [`scripts/`](scripts/):
+
+- `pergamino_multiyear_decision.py` — multi-window (1/3/5-year) decision driver that
+  writes GeoZarr pyramids + COGs and emits a `report.md` of gap/striping and measured
+  compression metrics. Runs locally against Planetary Computer; `--no-frisky` forces
+  plain Dask.
+- `season_aware_p95_test.py` — prototype of season-aware de-striping (per-scene bias
+  removal relative to a per-pixel monthly climatology). Not part of the production
+  pipeline — see [docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md)
+  and [docs/adr/005-multiyear-monthly-qa-and-destriping.md](docs/adr/005-multiyear-monthly-qa-and-destriping.md).
 
 ## License
 
