@@ -116,7 +116,7 @@ def test_write_geozarr_multiscale_icechunk(tmp_path, synthetic_composite) -> Non
         assert ds.sizes["latitude"] == exp
         assert ds.sizes["longitude"] == exp
         assert ds["lst_p95"].dtype == np.uint16
-        assert ds["qa_count"].dtype == np.uint16
+        assert ds["qa_count"].dtype == np.uint8
         assert "proj:code" in ds.attrs
         assert "_CRS" in ds.attrs  # GDAL metadata preserved alongside GeoZarr
 

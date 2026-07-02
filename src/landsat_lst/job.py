@@ -69,7 +69,7 @@ def _write_to_icechunk_with_retry(
     """
     import icechunk as ic  # noqa: PLC0415
 
-    group_path = storage.zarr_path(job.year, job.tile.name)
+    group_path = storage.zarr_path(job.window_label, job.tile.name)
     max_retries = settings.icechunk_max_retries
 
     for attempt in range(max_retries):
@@ -79,7 +79,7 @@ def _write_to_icechunk_with_retry(
 
             write_zarr(composite, session, group=group_path)
 
-            commit_msg = f"Add {job.tile.name} for {job.year}"
+            commit_msg = f"Add {job.tile.name} for {job.window_label}"
             commit_id = session.commit(commit_msg)
             logger.info("icechunk_committed", commit_id=commit_id[:12])
             return group_path, commit_id
@@ -121,10 +121,10 @@ def process_tile_job(
         JobResult with status and path info
     """
     storage = storage or get_storage()
-    logger = log.bind(tile=job.tile.name, year=job.year)
+    logger = log.bind(tile=job.tile.name, year=job.window_label)
 
     # Layer 1: Idempotent check
-    if not force and storage.zarr_exists(job.year, job.tile.name):
+    if not force and storage.zarr_exists(job.window_label, job.tile.name):
         logger.info("tile_skipped", reason="zarr_exists")
         return JobResult(job=job, status="skipped")
 
@@ -146,7 +146,7 @@ def process_tile_job(
             )
         else:
             # Plain Zarr path
-            zarr_path = storage.zarr_path(job.year, job.tile.name)
+            zarr_path = storage.zarr_path(job.window_label, job.tile.name)
             logger.info("zarr_writing", path=zarr_path)
             write_zarr(composite, zarr_path)
 

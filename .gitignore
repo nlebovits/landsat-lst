@@ -74,3 +74,6 @@ data/*.gpkg
 # Logs
 *.log
 digest.txt
+
+# Decision-run outputs (large COGs + icechunk repo)
+results/

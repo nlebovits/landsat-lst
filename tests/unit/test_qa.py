@@ -29,6 +29,21 @@ class TestCreateQaMask:
         mask = create_qa_mask(qa)
         assert not mask[0, 0]
 
+    def test_dilated_cloud_pixels_are_masked(self):
+        """Bit 1 (dilated cloud, near-cloud edge) must be masked."""
+        qa = xr.DataArray(np.array([[1 << 1]], dtype=np.uint16), dims=["y", "x"])
+        assert not create_qa_mask(qa)[0, 0]
+
+    def test_cirrus_pixels_are_masked(self):
+        """Bit 2 (cirrus / thin cloud) must be masked."""
+        qa = xr.DataArray(np.array([[1 << 2]], dtype=np.uint16), dims=["y", "x"])
+        assert not create_qa_mask(qa)[0, 0]
+
+    def test_clear_bit6_only_is_valid(self):
+        """A pixel with only the 'clear' bit (6) set stays usable."""
+        qa = xr.DataArray(np.array([[1 << 6]], dtype=np.uint16), dims=["y", "x"])
+        assert create_qa_mask(qa)[0, 0]
+
 
 class TestConvertToCelsius:
     def test_known_conversion(self):
@@ -63,3 +78,18 @@ class TestConvertToCelsius:
 
         assert np.isnan(celsius.values[0, 0]), "Fill value 0 should become NaN"
         assert not np.isnan(celsius.values[0, 1]), "Valid DN should convert normally"
+
+    def test_implausible_values_clamped_to_nan(self):
+        """Resampling/saturation junk outside the physical range becomes NaN.
+
+        DN=100 -> ~-123.8°C (below min); DN=65535 -> ~99.9°C (above max);
+        DN=40000 -> ~12.6°C stays valid.
+        """
+        data = np.array([[100.0, 65535.0, 40000.0]], dtype=np.float32)
+        lwir = xr.DataArray(data, dims=["y", "x"])
+
+        celsius = convert_to_celsius(lwir)
+
+        assert np.isnan(celsius.values[0, 0]), "~-124°C junk should be dropped"
+        assert np.isnan(celsius.values[0, 1]), "~100°C saturation junk should be dropped"
+        assert not np.isnan(celsius.values[0, 2]), "In-range value should survive"

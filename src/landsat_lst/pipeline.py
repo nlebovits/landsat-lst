@@ -85,12 +85,13 @@ def load_scenes(
     Returns:
         Dataset with thermal and QA bands.
     """
+    csize = settings.load_chunk_size
     return stac_load(
         items,
         bands=["lwir11", "qa_pixel"],
         crs=settings.crs,
         resolution=settings.resolution,
-        chunks={"time": 10, "latitude": 512, "longitude": 512},
+        chunks={"time": 10, "latitude": csize, "longitude": csize},
         groupby="solar_day",
         bbox=bbox,
         patch_url=patch_url,
@@ -98,7 +99,18 @@ def load_scenes(
 
 
 def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
-    """Compute annual LST composite with p95 and observation count.
+    """Compute an LST P95 composite with a per-month observation count.
+
+    The P95 is pooled across *every* time step in ``data``. For a multi-year
+    window (``ProcessingJob.end_year`` set) this pools all scenes across all
+    years -- the correct way to build a multi-year percentile (never average
+    per-year P95s: percentile-of-percentiles is wrong).
+
+    ``qa_count`` is a **12-month climatology**: for month M it is the number of
+    valid (cloud-free, QA-passing) observations in month M pooled across all
+    years in the window. Dims ``(month, latitude, longitude)``, always 12
+    months (missing months filled 0), dtype ``uint8`` (counts stay well under
+    255 even for a 5-year window).
 
     WARNING: This function does NOT apply land masking. For production output
     that excludes ocean pixels, use process_tile() instead. See issue #26.
@@ -107,7 +119,8 @@ def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
         data: Dataset with thermal and QA bands across time.
 
     Returns:
-        Dataset with lst_p95 and qa_count bands.
+        Dataset with ``lst_p95`` ``(latitude, longitude)`` and ``qa_count``
+        ``(month, latitude, longitude)`` bands.
 
     Note:
         P50 (median) was removed per stakeholder feedback - hot season temps
@@ -117,11 +130,23 @@ def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
 
     lst = convert_to_celsius(masked["lwir11"])
 
-    valid_mask = ~np.isnan(lst)
-    qa_count = valid_mask.sum(dim="time").astype(np.int16)  # ty: ignore[no-matching-overload]
+    # notnull() (not ~np.isnan) so the result stays a typed xarray DataArray.
+    valid_mask = lst.notnull()
+
+    # Per-calendar-month climatology of valid observations. groupby pools every
+    # year in the window into its month bucket; reindex guarantees all 12 months.
+    qa_count = (
+        valid_mask.groupby("time.month")
+        .sum()
+        .reindex(month=range(1, 13), fill_value=0)
+        .astype(np.uint8)
+    )
+
+    # Total valid obs per pixel (across the whole window) gates the P95 fill.
+    total_valid = valid_mask.sum(dim="time")
 
     lst_p95 = lst.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
-    lst_p95 = lst_p95.where(qa_count > 0, settings.nodata)
+    lst_p95 = lst_p95.where(total_valid > 0, settings.nodata)
 
     return xr.Dataset(
         {
@@ -132,13 +157,18 @@ def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
 
 
 def process_tile(job: ProcessingJob) -> xr.Dataset:
-    """Process a single tile for one year.
+    """Process a single tile for the job's window (single- or multi-year).
+
+    Runs the full production pipeline: STAC query over ``job.datetime_range``,
+    QA-masked scene load, pooled-P95 composite with a 12-month ``qa_count``
+    climatology, and Natural Earth land masking.
 
     Args:
-        job: Processing job specification.
+        job: Processing job specification (``year`` plus optional ``end_year``).
 
     Returns:
-        Dataset with annual composite.
+        Dataset with the LST P95 composite (``lst_p95``) and per-month
+        ``qa_count`` for the job's window.
     """
     items = query_stac(job)
 
@@ -180,9 +210,13 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
         },
     )
     composite["lst_p95"] = composite["lst_p95"].where(land_mask_da)
+    # Zero out ocean in the per-month counts too (broadcasts over the month dim);
+    # keeps qa_count uint8 and makes ocean compress away.
+    composite["qa_count"] = composite["qa_count"].where(land_mask_da, 0).astype(np.uint8)
 
     composite.attrs["tile"] = job.tile.name
     composite.attrs["year"] = job.year
+    composite.attrs["window"] = job.window_label
     composite.attrs["scene_count"] = len(items)
 
     return composite

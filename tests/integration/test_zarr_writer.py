@@ -31,17 +31,18 @@ def _create_test_composite(tile_name: str, n_pixels: int = 100) -> xr.Dataset:
 
     # Known values for verification
     lst_p95_celsius = 35.0
-    qa_count_value = 50
+    qa_count_value = 4  # per-month count (fits uint8)
 
     lst_p95 = xr.DataArray(
         np.full((n_pixels, n_pixels), lst_p95_celsius, dtype=np.float32),
         dims=["latitude", "longitude"],
         coords={"latitude": lat, "longitude": lon},
     )
+    # qa_count is a 12-month climatology: (month, latitude, longitude).
     qa_count = xr.DataArray(
-        np.full((n_pixels, n_pixels), qa_count_value, dtype=np.uint16),
-        dims=["latitude", "longitude"],
-        coords={"latitude": lat, "longitude": lon},
+        np.full((12, n_pixels, n_pixels), qa_count_value, dtype=np.uint8),
+        dims=["month", "latitude", "longitude"],
+        coords={"month": np.arange(1, 13), "latitude": lat, "longitude": lon},
     )
 
     return xr.Dataset(
@@ -114,9 +115,10 @@ def test_write_zarr_roundtrip(tmp_path):
     assert "lst_p95" in ds.data_vars
     assert "qa_count" in ds.data_vars
 
-    # Verify uint16 encoding
+    # Verify encoding: LST uint16 DN, per-month QA uint8 with 12 months.
     assert ds["lst_p95"].dtype == np.uint16
-    assert ds["qa_count"].dtype == np.uint16
+    assert ds["qa_count"].dtype == np.uint8
+    assert ds["qa_count"].sizes["month"] == 12
 
 
 @pytest.mark.integration

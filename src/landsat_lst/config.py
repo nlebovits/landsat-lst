@@ -102,6 +102,19 @@ class Settings(BaseSettings):
         description="NoData value for output rasters",
     )
 
+    lst_valid_min: float = Field(
+        default=-50.0,
+        description="Minimum physically-plausible land surface temperature (degC). "
+        "Values below are treated as artifacts (e.g. ~-124degC DN=0/resampling junk) "
+        "and dropped. Conservative: only removes clearly non-physical values.",
+    )
+    lst_valid_max: float = Field(
+        default=80.0,
+        description="Maximum physically-plausible land surface temperature (degC). "
+        "Above the hottest observed land skin temps (~70-80degC deserts); drops "
+        "high-DN saturation/fill artifacts without clipping real extreme heat.",
+    )
+
     # Multiscale overviews (GeoZarr multiscales convention)
     pyramid_factors: list[int] = Field(
         default=[4, 16, 64],
@@ -119,6 +132,13 @@ class Settings(BaseSettings):
     compression_level: int = Field(
         default=5,
         description="Blosc compression level (0-9). 0 disables compression.",
+    )
+
+    load_chunk_size: int = Field(
+        default=512,
+        description="Spatial (lat/lon) chunk size for odc-stac scene loading. "
+        "Smaller values shrink each per-block time stack, cutting peak memory for "
+        "the P95 quantile on multi-year/large-tile runs (e.g. 256 for a 4x drop).",
     )
 
     dask_workers: int = Field(

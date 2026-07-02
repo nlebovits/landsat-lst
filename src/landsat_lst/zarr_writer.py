@@ -90,7 +90,7 @@ def _add_zarr_metadata(ds: xr.Dataset) -> xr.Dataset:
     # Dataset-level attributes
     ds.attrs["_CRS"] = CRS.from_epsg(4326).to_wkt()
     ds.attrs["crs"] = "EPSG:4326"
-    ds.attrs["title"] = "Landsat LST Annual Composite"
+    ds.attrs["title"] = "Landsat LST P95 Composite"
     ds.attrs["institution"] = "Radiant Earth"
 
     # LST band attributes (non-CF names to preserve on read)
@@ -106,12 +106,22 @@ def _add_zarr_metadata(ds: xr.Dataset) -> xr.Dataset:
             }
         )
 
-    # QA count attributes
+    # QA count attributes. qa_count is a 12-month climatology: month M holds the
+    # valid-observation count for calendar month M pooled across the window.
     if "qa_count" in ds:
         ds["qa_count"].attrs.update(
             {
                 "units": "count",
-                "long_name": "Number of valid observations",
+                "long_name": "Number of valid observations per calendar month",
+            }
+        )
+
+    # Month coordinate (1..12) for the qa_count climatology.
+    if "month" in ds.coords:
+        ds["month"].attrs.update(
+            {
+                "long_name": "calendar month",
+                "units": "month_of_year",
             }
         )
 
@@ -207,13 +217,17 @@ def _multiscales_attr(levels: list[tuple[str, int, xr.Dataset]]) -> dict:
 def _encode_level(level: xr.Dataset) -> xr.Dataset:
     """Encode one float level to uint16 with CRS, GDAL, and GeoZarr metadata.
 
-    ``qa_count`` arrives as a float mean (from coarsening) and is rounded back to an
-    integer observation count.
+    ``qa_count`` is a per-month climatology ``(month, latitude, longitude)``; it
+    arrives as a float mean (from coarsening) and is rounded back to an integer
+    observation count stored as ``uint8`` (counts stay well under 255).
     """
+    qa = level["qa_count"].round().fillna(0).astype(np.uint8)
+    if "month" in qa.dims:
+        qa = qa.transpose("month", "latitude", "longitude")
     encoded = xr.Dataset(
         {
             "lst_p95": encode_lst_uint16(level["lst_p95"]),
-            "qa_count": level["qa_count"].round().fillna(0).astype(np.uint16),
+            "qa_count": qa,
         },
         coords=level.coords,
         attrs=dict(level.attrs),
@@ -231,6 +245,33 @@ def _level_chunks(level: xr.Dataset, chunks: tuple[int, int]) -> tuple[int, int]
     ny = int(level.sizes["latitude"])
     nx = int(level.sizes["longitude"])
     return (min(chunks[0], ny), min(chunks[1], nx))
+
+
+def _chunk_and_encoding(
+    encoded: xr.Dataset, lch: tuple[int, int], compressors: tuple
+) -> tuple[xr.Dataset, dict]:
+    """Chunk a level and build its per-variable Zarr encoding.
+
+    ``qa_count`` may carry a leading ``month`` dim (12-month climatology); it is
+    kept in a single chunk and gets a 3-tuple chunk spec, while 2D variables use
+    the ``(lat, lon)`` spatial chunk.
+    """
+    chunk_spec: dict[str, int] = {"latitude": lch[0], "longitude": lch[1]}
+    if "month" in encoded.dims:
+        chunk_spec["month"] = -1
+    encoded = encoded.chunk(chunk_spec)
+
+    encoding = {}
+    for var in encoded.data_vars:
+        da = encoded[var]
+        var_chunks: tuple[int, ...] = (
+            (int(da.sizes["month"]), lch[0], lch[1]) if "month" in da.dims else lch
+        )
+        encoding[var] = {
+            "chunks": var_chunks,
+            **({"compressors": compressors} if compressors else {}),
+        }
+    return encoded, encoding
 
 
 def _compressors() -> tuple:
@@ -320,11 +361,7 @@ def write_zarr(
     for name, _factor, level in levels:
         encoded = _encode_level(level)
         lch = _level_chunks(encoded, chunks)
-        encoded = encoded.chunk({"latitude": lch[0], "longitude": lch[1]})
-        encoding = {
-            var: {"chunks": lch, **({"compressors": compressors} if compressors else {})}
-            for var in encoded.data_vars
-        }
+        encoded, encoding = _chunk_and_encoding(encoded, lch, compressors)
         if name == "0":
             native_encoded = encoded
 
@@ -356,7 +393,7 @@ def write_zarr(
         )
     parent.attrs.update(_multiscales_attr(levels))
     parent.attrs.update(_geozarr_spatial_attrs(native_encoded))
-    parent.attrs["title"] = "Landsat LST Annual Composite"
+    parent.attrs["title"] = "Landsat LST P95 Composite"
     parent.attrs["institution"] = "Radiant Earth"
 
     return output_str

@@ -24,11 +24,15 @@ class StorageBackend(ABC):
     """Abstract base class for storage backends."""
 
     @abstractmethod
-    def zarr_exists(self, year: int, tile_name: str) -> bool:
-        """Check if a Zarr store already exists for this tile/year."""
+    def zarr_exists(self, year: int | str, tile_name: str) -> bool:
+        """Check if a Zarr store already exists for this tile/window.
+
+        ``year`` is a window label: an ``int`` year (``2024``) or a multi-year
+        range string (``"2020-2024"``); it is the top-level group/prefix.
+        """
 
     @abstractmethod
-    def zarr_path(self, year: int, tile_name: str) -> str:
+    def zarr_path(self, year: int | str, tile_name: str) -> str:
         """Return the path/URL where a Zarr store should be written."""
 
 
@@ -39,15 +43,15 @@ class LocalStorage(StorageBackend):
         self.output_dir = output_dir or settings.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def zarr_exists(self, year: int, tile_name: str) -> bool:
+    def zarr_exists(self, year: int | str, tile_name: str) -> bool:
         return self._zarr_dir(year, tile_name).exists()
 
-    def zarr_path(self, year: int, tile_name: str) -> str:
+    def zarr_path(self, year: int | str, tile_name: str) -> str:
         path = self._zarr_dir(year, tile_name)
         path.parent.mkdir(parents=True, exist_ok=True)
         return str(path)
 
-    def _zarr_dir(self, year: int, tile_name: str) -> Path:
+    def _zarr_dir(self, year: int | str, tile_name: str) -> Path:
         return self.output_dir / str(year) / f"{tile_name}.zarr"
 
 
@@ -73,7 +77,7 @@ class S3Storage(StorageBackend):
             self._client = boto3.client("s3", region_name=self.region)
         return self._client
 
-    def zarr_exists(self, year: int, tile_name: str) -> bool:
+    def zarr_exists(self, year: int | str, tile_name: str) -> bool:
         from botocore.exceptions import ClientError  # noqa: PLC0415
 
         try:
@@ -98,10 +102,10 @@ class S3Storage(StorageBackend):
                     raise
             raise
 
-    def zarr_path(self, year: int, tile_name: str) -> str:
+    def zarr_path(self, year: int | str, tile_name: str) -> str:
         return f"s3://{self.bucket}/{self._zarr_key(year, tile_name)}"
 
-    def _zarr_key(self, year: int, tile_name: str) -> str:
+    def _zarr_key(self, year: int | str, tile_name: str) -> str:
         return f"{self.prefix}/{year}/{tile_name}.zarr"
 
 
@@ -154,7 +158,7 @@ class IcechunkStorage(StorageBackend):
         repo = ic.Repository.open_or_create(storage)
         return cls(repo)
 
-    def zarr_exists(self, year: int, tile_name: str) -> bool:
+    def zarr_exists(self, year: int | str, tile_name: str) -> bool:
         """Check if tile-year group exists in repository."""
         import zarr  # noqa: PLC0415
 
@@ -166,7 +170,7 @@ class IcechunkStorage(StorageBackend):
         except (KeyError, FileNotFoundError):
             return False
 
-    def zarr_path(self, year: int, tile_name: str) -> str:
+    def zarr_path(self, year: int | str, tile_name: str) -> str:
         """Return the group path within Icechunk (not a file path)."""
         return f"{year}/{tile_name}"
 
