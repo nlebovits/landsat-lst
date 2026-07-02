@@ -60,8 +60,10 @@ climatology** (not the annual mean), which preserves the seasonal / hot signal.
 Validated on the 3-year AOI: seams removed, no artifacts, mean **41.0 °C** preserved.
 
 **Status: prototype only** in `scripts/season_aware_p95_test.py`. Productionizing into
-`pipeline.py` / `process_tile` is **deferred** pending 5-year evaluation and
-independent-reference validation.
+`pipeline.py` / `process_tile` is **deferred** pending 5-year evaluation. This is a
+public "conversation-starter" product, not a peer-reviewed claim, so independent-reference
+validation (MODIS / ECOSTRESS) is **recommended for added confidence, not a prerequisite
+for shipping**.
 
 ## Rejected alternatives
 
@@ -88,10 +90,11 @@ Recorded so they are not revisited:
 - **De-striping is not yet in the production path.** It must be moved into
   `pipeline.py` / `process_tile` before the global run.
 - Season-aware normalization is heavier-handed than pure bias removal: the monthly
-  reference also absorbs day-to-day weather, so it needs an **outlier cap** and, ideally,
-  **validation against MODIS / ECOSTRESS** before productionization.
-- Deferred: **5-year window evaluation** and independent-reference validation to confirm
-  the 3-year default and the de-striping approach.
+  reference also absorbs day-to-day weather, so it needs an **outlier cap** (required
+  hygiene). Independent-reference validation (MODIS / ECOSTRESS) is a **recommended
+  confidence check, not a blocker** — the method is a standard correction for a documented
+  ~1–5 K per-scene error and is unlikely to be challenged for this product's use.
+- Deferred (not gating): **5-year window evaluation** to confirm the 3-year default.
 
 ## References
 - [`docs/findings-destriping-and-multiyear.md`](../findings-destriping-and-multiyear.md)

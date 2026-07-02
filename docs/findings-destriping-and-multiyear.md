@@ -234,9 +234,12 @@ season-aware per-scene normalization.
    outlier scenes (e.g. the −66 °C scene) — a safeguard against the monthly
    reference over-absorbing day-to-day weather. Not yet needed visually, but cheap
    insurance.
-3. **Independent validation.** For peer-review defensibility, validate the debiased
-   P95 against an **independent LST reference** (MODIS LST, ECOSTRESS). We have only
-   self-consistency and visual checks so far.
+3. **Independent validation (recommended, not required).** Cross-checking the debiased
+   P95 against an **independent LST reference** (MODIS LST, ECOSTRESS) would add
+   confidence, but this is a public "conversation-starter" product, not a peer-reviewed
+   claim — the method is a standard correction for a documented ~1–5 K per-scene error
+   and is unlikely to be challenged for this use. So far we have self-consistency and
+   visual checks, which are sufficient to ship a v1.
 4. **Global-scale compute.** The 3-year default triples the per-tile compute vs.
    1 year; confirm the global run stays within budget, and re-decide 3yr vs 5yr on
    the basis of real high-latitude / cloudy tiles where coverage — not this benign
