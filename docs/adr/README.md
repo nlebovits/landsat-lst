@@ -11,6 +11,7 @@ ADRs are kept for history and link to their replacement.
 | [003](003-direct-zarr-architecture.md) | Direct Zarr writes + Icechunk versioning | Accepted |
 | [004](004-geozarr-multiscale-overviews.md) | GeoZarr multiscale overviews on Icechunk | Accepted |
 | [005](005-multiyear-monthly-qa-and-destriping.md) | Multi-year composites, monthly QA climatology, and de-striping | Accepted (de-striping deferred) |
+| [006](006-no-aster-gap-filling.md) | Leave ASTER GED coverage gaps empty | Accepted |
 
 ## Adding an ADR
 
