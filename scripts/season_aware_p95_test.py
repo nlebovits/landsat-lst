@@ -111,9 +111,9 @@ def _run(args: argparse.Namespace) -> int:
     from landsat_lst.zarr_writer import encode_lst_uint16  # noqa: PLC0415
 
     log = structlog.get_logger()
-    label = f"{args.year}-{args.end_year}"
-    bbox = (-61.1, -34.4, -60.1, -33.4)
-    out = Path(f"results/decision/percentile_test/lst_p95_seasonnorm_{label}_S30W065.tif")
+    window = f"{args.year}-{args.end_year}"
+    bbox = tuple(args.bbox)
+    out = Path(f"results/decision/percentile_test/lst_p95_seasonnorm_{window}_{args.label}.tif")
     out.parent.mkdir(parents=True, exist_ok=True)
 
     def load_lst() -> xr.DataArray:
@@ -134,7 +134,10 @@ def _run(args: argparse.Namespace) -> int:
             msg = "no scenes"
             raise ValueError(msg)
         patch_url = enable_pc_azure_refresh(items)
-        data = load_scenes(items, bbox, patch_url=patch_url)
+        # Tolerate the occasional transient Azure read failure across the ~1.9k
+        # scenes in a 5-year window; a dropped read becomes nodata rather than
+        # aborting the whole load (negligible vs a P95 over the full stack).
+        data = load_scenes(items, bbox, patch_url=patch_url, fail_on_error=False)
         return convert_to_celsius(apply_qa_mask(data)["lwir11"])
 
     cluster = LocalCluster(
@@ -144,7 +147,7 @@ def _run(args: argparse.Namespace) -> int:
         dashboard_address=":8787",
     )
     client = Client(cluster)
-    log.info("dask_ready", window=label, chunk=settings.load_chunk_size)
+    log.info("dask_ready", window=window, chunk=settings.load_chunk_size)
     try:
         lst = load_lst()
 
@@ -154,7 +157,17 @@ def _run(args: argparse.Namespace) -> int:
         p95 = p95.where(valid > 0, settings.nodata)
 
         log.info("computing")
-        p95, ov = p95.compute(), offset.compute().values
+        p95, ov, nobs = p95.compute(), offset.compute().values, valid.compute().values
+        # Coverage sanity check: with fail_on_error=False a dropped read is
+        # silently filled with nodata, so confirm we retained dense coverage
+        # (a low median / high zero_frac would mean reads failed en masse).
+        log.info(
+            "valid_coverage_obs_per_pixel",
+            min=int(nobs.min()),
+            median=int(np.median(nobs)),
+            max=int(nobs.max()),
+            zero_frac=round(float((nobs == 0).mean()), 3),
+        )
         log.info(
             "per_scene_offsets_degC",
             std=round(float(np.nanstd(ov)), 2),
@@ -188,6 +201,20 @@ def main() -> int:
     parser.add_argument("--selftest", action="store_true", help="run synthetic math check only")
     parser.add_argument("--year", type=int, default=2022)
     parser.add_argument("--end-year", type=int, default=2024)
+    parser.add_argument(
+        "--bbox",
+        type=float,
+        nargs=4,
+        metavar=("LON_MIN", "LAT_MIN", "LON_MAX", "LAT_MAX"),
+        default=[-61.1, -34.4, -60.1, -33.4],
+        help="AOI bbox in EPSG:4326 lon/lat order (default: Pergamino S30W065 sub-box)",
+    )
+    parser.add_argument(
+        "--label",
+        type=str,
+        default="S30W065",
+        help="Site label used in the output COG filename",
+    )
     args = parser.parse_args()
     if args.selftest:
         return _selftest()

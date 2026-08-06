@@ -73,6 +73,8 @@ def load_scenes(
     items: list,
     bbox: tuple[float, float, float, float],
     patch_url: Callable[[str], str] | None = None,
+    *,
+    fail_on_error: bool = True,
 ) -> xr.Dataset:
     """Load Landsat scenes as an xarray Dataset.
 
@@ -82,6 +84,12 @@ def load_scenes(
         patch_url: Optional per-asset URL transform applied by odc-stac before
             building the load graph. Used for Planetary Computer to rewrite blob
             hrefs to token-free ``/vsiaz/`` paths (auth via GDAL config).
+        fail_on_error: If True (default), odc-stac aborts the entire load when
+            any single scene read fails. If False, a failed read is filled with
+            nodata and the load continues. Set False for large multi-scene
+            composites (e.g. multi-year windows), where a transient Azure/S3
+            read blip is near-certain across hundreds of scenes and losing a
+            few observations is negligible against a P95 over the full stack.
 
     Returns:
         Dataset with thermal and QA bands.
@@ -96,6 +104,7 @@ def load_scenes(
         groupby="solar_day",
         bbox=bbox,
         patch_url=patch_url,
+        fail_on_error=fail_on_error,
     )
 
 
