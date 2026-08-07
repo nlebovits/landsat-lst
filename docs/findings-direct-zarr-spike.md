@@ -36,6 +36,7 @@ ds["lst_p50"].attrs  # scale_factor/add_offset are GONE
 
 ```python
 from pyproj import CRS
+
 ds.attrs["_CRS"] = CRS.from_epsg(4326).to_wkt()
 ds.attrs["crs"] = "EPSG:4326"  # human-readable backup
 ```
@@ -131,10 +132,10 @@ ds = xr.open_zarr(store)
 
 ```python
 # COG path (constrained):
-blocksize=512  # Must be multiple of 16
+blocksize = 512  # Must be multiple of 16
 
 # Direct Zarr path (unconstrained):
-chunks=(500, 500)  # Any size works
+chunks = (500, 500)  # Any size works
 ```
 
 **Implication:** If we pivot to direct Zarr, we regain the 500×500 chunk size that was originally preferred for even grid division.

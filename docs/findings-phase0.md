@@ -1,7 +1,7 @@
 # Phase 0 Findings: TDD Assumption Validation
 
-**Date:** 2026-05-07  
-**Status:** Complete  
+**Date:** 2026-05-07
+**Status:** Complete
 **Tests:** 35 passed
 
 ---
@@ -307,12 +307,14 @@ SCALE = 0.01
 OFFSET = -50.0
 NODATA_UINT16 = 0  # -50°C is outside valid LST range
 
+
 def encode_celsius_to_uint16(celsius: np.ndarray, nodata: float = -9999.0) -> np.ndarray:
     """Encode Celsius temperatures to uint16 with scale/offset."""
     valid = celsius != nodata
     dn = np.zeros_like(celsius, dtype=np.uint16)
     dn[valid] = np.round((celsius[valid] - OFFSET) / SCALE).clip(1, 65535).astype(np.uint16)
     return dn
+
 
 def decode_uint16_to_celsius(dn: np.ndarray) -> np.ndarray:
     """Decode uint16 to Celsius temperatures."""

@@ -28,14 +28,13 @@ import fsspec
 
 # Open native resolution (multiscale level "0") from Source Coop
 mapper = fsspec.get_mapper(
-    "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr",
-    anon=True
+    "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr", anon=True
 )
 ds = xr.open_zarr(mapper, group="0")
 
 # Read scale/offset from Zarr attributes
-scale = ds["lst_p95"].attrs["lst_scale_factor"]    # 0.01
-offset = ds["lst_p95"].attrs["lst_add_offset"]     # -50.0
+scale = ds["lst_p95"].attrs["lst_scale_factor"]  # 0.01
+offset = ds["lst_p95"].attrs["lst_add_offset"]  # -50.0
 
 # Decode to Celsius
 celsius = ds["lst_p95"] * scale + offset
@@ -135,10 +134,7 @@ mapper = fsspec.get_mapper(url, anon=True)
 ds = xr.open_zarr(mapper, group="0")
 
 # Spatial subset (only fetches required chunks)
-subset = ds.lst_p95.sel(
-    latitude=slice(42, 40),
-    longitude=slice(-74, -75)
-)
+subset = ds.lst_p95.sel(latitude=slice(42, 40), longitude=slice(-74, -75))
 
 # Decode uint16 to Celsius
 lst_celsius = subset * 0.01 + (-50.0)
@@ -153,8 +149,8 @@ zoomed-out / web rendering. The tile group's attributes describe the pyramid:
 ```python
 import zarr
 
-root = zarr.open_group(mapper, mode="r")          # the tile group
-print(root.attrs["multiscales"]["layout"])         # level layout + scale factors
+root = zarr.open_group(mapper, mode="r")  # the tile group
+print(root.attrs["multiscales"]["layout"])  # level layout + scale factors
 print(root.attrs["proj:code"], root.attrs["spatial:transform"])  # GeoZarr proj/spatial
 
 # Open a coarse overview (16x) instead of full resolution

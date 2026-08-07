@@ -53,8 +53,7 @@ import xarray as xr
 import fsspec
 
 mapper = fsspec.get_mapper(
-    "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst-test/sample.zarr/N40W075",
-    anon=True
+    "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst-test/sample.zarr/N40W075", anon=True
 )
 ds = xr.open_zarr(mapper)
 # Works correctly

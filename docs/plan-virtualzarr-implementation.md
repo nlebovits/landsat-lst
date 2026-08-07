@@ -24,6 +24,7 @@ This plan describes the implementation of the VirtualZarr + Icechunk virtual dat
 **End state:** Users can access the full Landsat LST datacube via:
 ```python
 import xarray as xr
+
 ds = xr.open_zarr("icechunk://source.coop/radiant-earth/landsat-lst")
 ```
 
@@ -124,6 +125,7 @@ from icechunk.distributed import merge_sessions
 @dataclass
 class StorageConfig:
     """Configuration for storage backends."""
+
     cog_bucket: str
     cog_prefix: str
     icechunk_bucket: str
@@ -176,11 +178,7 @@ class IcechunkStorage:
         finally:
             self._session = None
 
-    def commit(
-        self,
-        message: str,
-        worker_sessions: list[Session] | None = None
-    ) -> str:
+    def commit(self, message: str, worker_sessions: list[Session] | None = None) -> str:
         """Commit changes, merging worker sessions if provided."""
         if self._session is None:
             raise RuntimeError("No active session")
@@ -332,11 +330,13 @@ class TileYearJob:
         valid_count = (~lst_celsius.isnull()).sum(dim="time").astype("int16")
 
         nodata = -9999.0
-        composite = xr.Dataset({
-            "lst_p50": lst_p50.where(valid_count > 0, nodata).astype("float32"),
-            "lst_p95": lst_p95.where(valid_count > 0, nodata).astype("float32"),
-            "qa_count": valid_count,
-        })
+        composite = xr.Dataset(
+            {
+                "lst_p50": lst_p50.where(valid_count > 0, nodata).astype("float32"),
+                "lst_p95": lst_p95.where(valid_count > 0, nodata).astype("float32"),
+                "qa_count": valid_count,
+            }
+        )
         composite = composite.compute()
 
         # 6. Write COG
@@ -354,11 +354,7 @@ def generate_jobs(
     years: list[int],
 ) -> list[TileYearJob]:
     """Generate all jobs for given tiles and years."""
-    return [
-        TileYearJob(tile_id=t, year=y)
-        for t in tile_ids
-        for y in years
-    ]
+    return [TileYearJob(tile_id=t, year=y) for t in tile_ids for y in years]
 ```
 
 ### 1.3 COG Writer: `src/landsat_lst/cog.py`
@@ -407,9 +403,7 @@ def encode_celsius_to_uint16(celsius: np.ndarray) -> np.ndarray:
     """
     valid = celsius != LST_NODATA_CELSIUS
     dn = np.zeros_like(celsius, dtype=np.uint16)
-    dn[valid] = np.round(
-        (celsius[valid] - LST_OFFSET) / LST_SCALE
-    ).clip(1, 65535).astype(np.uint16)
+    dn[valid] = np.round((celsius[valid] - LST_OFFSET) / LST_SCALE).clip(1, 65535).astype(np.uint16)
     return dn
 
 
@@ -443,8 +437,7 @@ def write_cog(
     lat = ds["latitude"].values
     lon = ds["longitude"].values
     transform = rasterio.transform.from_bounds(
-        lon.min(), lat.min(), lon.max(), lat.max(),
-        data.shape[2], data.shape[1]
+        lon.min(), lat.min(), lon.max(), lat.max(), data.shape[2], data.shape[1]
     )
 
     # Write temp GeoTIFF
@@ -610,16 +603,18 @@ def run_parallel(
 
     with storage.writable_session() as session:
         # Map jobs to workers
-        results = list(tqdm(
-            process_tile_job.map(
-                jobs,
-                session=session,
-                cog_bucket=storage.config.cog_bucket,
-                retries=3,
-            ),
-            total=len(jobs),
-            desc="Processing tiles",
-        ))
+        results = list(
+            tqdm(
+                process_tile_job.map(
+                    jobs,
+                    session=session,
+                    cog_bucket=storage.config.cog_bucket,
+                    retries=3,
+                ),
+                total=len(jobs),
+                desc="Processing tiles",
+            )
+        )
 
         # Filter successful results
         worker_sessions = [r for r in results if r is not None]

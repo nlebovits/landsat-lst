@@ -80,6 +80,7 @@ Buffer the Natural Earth land polygons by **25km** before rasterizing. This:
 ```python
 COASTAL_BUFFER_METERS = 25_000  # 25km buffer
 
+
 def load_land_polygons(cache_dir=None, *, buffer_meters=COASTAL_BUFFER_METERS):
     land = gpd.read_file(NATURAL_EARTH_URL)
     land = land.to_crs("EPSG:4326")

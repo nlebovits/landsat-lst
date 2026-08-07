@@ -24,6 +24,7 @@ The goal is to enable analysis workflows like:
 
 ```python
 import xarray as xr
+
 ds = xr.open_zarr("icechunk://source.coop/radiant-earth/landsat-lst")
 ds.lst_p50.sel(time="2023", latitude=slice(45, 40), longitude=slice(-75, -70)).mean()
 ```
@@ -72,12 +73,14 @@ from obspec_utils.registry import ObjectStoreRegistry
 from obstore.store import from_url
 
 # Create registry for S3 access
-registry = ObjectStoreRegistry({
-    "s3://source-coop-radiant-earth/": from_url(
-        "s3://source-coop-radiant-earth/",
-        region="us-west-2",
-    )
-})
+registry = ObjectStoreRegistry(
+    {
+        "s3://source-coop-radiant-earth/": from_url(
+            "s3://source-coop-radiant-earth/",
+            region="us-west-2",
+        )
+    }
+)
 
 # Open COG as virtual dataset
 # IMPORTANT: ifd=0 is required for COGs with overviews to select full resolution
@@ -136,11 +139,13 @@ config.set_virtual_chunk_container(
 )
 
 # Credentials for virtual chunk container access
-credentials = ic.credentials.containers_credentials({
-    "s3://source-coop-radiant-earth/": ic.credentials.s3_credentials(
-        anonymous=True  # Source Cooperative is public
-    )
-})
+credentials = ic.credentials.containers_credentials(
+    {
+        "s3://source-coop-radiant-earth/": ic.credentials.s3_credentials(
+            anonymous=True  # Source Cooperative is public
+        )
+    }
+)
 
 # Create repository with virtual chunk authorization
 repo = ic.Repository.create(

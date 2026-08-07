@@ -133,9 +133,9 @@ The land mask is implemented as a hardcoded `frozenset` of 700 tile names in `ti
 ```python
 def qa_mask(qa: xr.DataArray) -> xr.DataArray:
     """Returns True for GOOD (usable) pixels."""
-    cloud = (qa >> 3) & 1        # bit 3: cloud
-    shadow = (qa >> 4) & 1       # bit 4: cloud shadow
-    snow = (qa >> 5) & 1         # bit 5: snow/ice
+    cloud = (qa >> 3) & 1  # bit 3: cloud
+    shadow = (qa >> 4) & 1  # bit 4: cloud shadow
+    snow = (qa >> 5) & 1  # bit 5: snow/ice
     return (cloud == 0) & (shadow == 0) & (snow == 0)
 ```
 
