@@ -163,6 +163,10 @@ The full-tile five-year run on Coiled remains the open risk item in #46.
 benchmarking. `compute_annual_composite` still applies no land mask unless one is supplied, so
 its documented contract from issue #26 is unchanged for existing callers.
 
+Seam removal was confirmed visually in QGIS on 2026-08-07, against the raw composite for the
+same window. The factor-2 and native-offset composites are visually identical, matching the
+measured result that no pixel differs between them by more than 0.1 °C.
+
 **The correction cools the P95 by about 4 °C.** Measured on a paired comparison at Pergamino
 over 2021–2025, on identical data: raw 45.12 °C against de-striped 41.12 °C, spatial correlation
 0.82, with coverage falling from 180.5 to 170.3 observations per pixel at 21.8% rejection.

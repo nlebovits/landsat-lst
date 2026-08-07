@@ -191,6 +191,17 @@ The spatial correlation of 0.82 cannot by itself distinguish "seams removed" fro
 damaged", since seams carry real spatial variance and removing them must lower correlation.
 Only visual inspection separates those, which is why the COG export exists.
 
+**QGIS verdict (2026-08-07): seams gone, and the native and factor-2 composites are visually
+identical.** That resolves the 0.82 in favour of "seams removed": the lost correlation is the
+seams themselves, not damaged signal. It also confirms the pixel statistics above, where zero
+pixels differ by more than 0.1 °C between the two de-striped composites.
+
+This is the check that matters most and it is the one no metric here performs. The lesson is
+already on the record in
+[findings-destriping-and-multiyear.md](findings-destriping-and-multiyear.md): an early
+column-based stripe metric reported the opposite conclusion because it assumed vertical seams,
+and the seams run diagonally at about 10°.
+
 ## Reproducing
 
 ```bash
