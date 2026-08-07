@@ -1,7 +1,8 @@
 # Destriping the LST P95 + Choosing a Multi-Year Window
 
 **Date:** 2026-07-02
-**Status:** Complete (investigation); season-aware normalization is a prototype pending productionization
+**Status:** Complete (investigation). Season-aware normalization was productionized in
+[ADR-007](adr/007-scene-normalization.md); it now ships in `landsat_lst.normalization`.
 **AOI:** ~1° box around tile S30W065 (Pergamino, Argentina), the constant `AOI_BBOX` in the diagnostic scripts, unless noted
 **Analysis:** `scripts/season_aware_p95_test.py` (and the fast multi-year / percentile diagnostics)
 
@@ -27,8 +28,9 @@ Two questions drove this investigation:
    geometry and residual per-scene atmospheric-correction error, *not* noise that
    averages out with more years. The winning fix is **improved QA masking + a
    physical-plausibility clamp + season-aware per-scene normalization**. The
-   season-aware step removes the seams while **preserving the hot signal**
-   (AOI mean stays ~41 °C).
+   season-aware step removes the seams and lands the AOI mean at ~41 °C. It was
+   originally described as preserving the hot signal; a later like-for-like
+   comparison showed it **cools the P95 by ~4 °C** (see the correction in Part 3).
 
 **Winning recipe: 3-year (or 5-year) P95 + improved QA masking + season-aware
 per-scene normalization.**
@@ -155,8 +157,8 @@ clamp** (`settings.lst_valid_min` / `lst_valid_max`, default **−50 / 80 °C**,
 `convert_to_celsius`) that drops the ~**−124 °C** DN=0 resampling artifacts near
 scene edges.
 
-- **Result:** removed **most** seams; **hot signal preserved** (mean **40.7** vs
-  **40.6** baseline).
+- **Result:** removed **most** seams; mean **40.7** vs **40.6** baseline (this pair *is*
+  like-for-like — same window, masking only).
 - **QGIS verdict:** "really close," but **residual edge seams remained.**
 
 ### 2. Season-aware per-scene normalization — **worked (chosen approach)**
@@ -168,16 +170,33 @@ expected value** (i.e. the atmospheric bias), leaving the seasonal cycle intact.
 - **Synthetic self-test:** recovers an injected per-scene bias — the fitted offset
   std matches the injected bias size (not the seasonal amplitude), and the seasonal
   amplitude is preserved.
-- **3-year AOI result:** mean **41.0 °C** (hot signal preserved), **seams gone, no
-  blocky artifacts** (QGIS-confirmed).
+- **3-year AOI result:** mean **41.0 °C**, **seams gone, no blocky artifacts**
+  (QGIS-confirmed).
 - **Caveat (honest):** on *real* data the monthly reference also absorbs
   **day-to-day weather**, so the per-scene offsets are larger than pure bias
   (**std ~12 °C**, with one outlier scene at **−66 °C**). It is a heavier-handed
-  correction than ideal, but the output is **visually clean and mean-preserving**.
-  If artifacts ever reappear, **cap the offset magnitude** to reject outlier scenes.
+  correction than ideal. If artifacts ever reappear, **cap the offset magnitude**
+  to reject outlier scenes.
 
-This is currently a **prototype** in `scripts/season_aware_p95_test.py` (function
-`seasonal_debias`), not yet in the production pipeline.
+> **CORRECTION (2026-08-07): this was described as "mean-preserving" and it is not.**
+> The 41.0 °C above was read against the 40.6 °C baseline from the percentile sweep, but
+> that baseline is a **single-year** composite while 41.0 is **three-year**. Widening the
+> window raises the P95 by roughly the amount de-striping lowers it, so the two effects
+> cancelled and hid each other.
+>
+> A paired comparison on identical data (2021–2025, same 390 scenes, same AOI) puts raw at
+> **45.12 °C** and de-striped at **41.12 °C**: a **4.0 °C** drop, spatial r = 0.82. The
+> de-striped figure itself reproduces (41.12 now vs 41.0 then); it was the baseline that
+> was wrong.
+>
+> The cooling is inherent, not a defect. The P95 samples each pixel's hottest observations,
+> which come from the largest positive-offset scenes — exactly the ones the correction
+> cools. See [findings-offset-subsampling.md](findings-offset-subsampling.md).
+
+This shipped as `landsat_lst.normalization.seasonal_debias`, called from
+`compute_annual_composite` under `settings.destripe`. The offset cap the note above
+anticipated is now part of it, and it **discards** an over-cap scene rather than
+bounding its offset. See [ADR-007](adr/007-scene-normalization.md).
 
 ---
 
@@ -221,7 +240,7 @@ removes only the deviation-from-expected.
 | Improved QA mask (dilated cloud + cirrus) | **In pipeline** | Shipped (`qa.py`) |
 | Physical-plausibility clamp (−50/80 °C) | **In pipeline** | Shipped (`config.py`, `convert_to_celsius`) |
 | Scene-level cloud filter | **Disabled** (redundant) | Confirmed (issue #34) |
-| Season-aware per-scene normalization | **Chosen approach** | **Prototype only** — `scripts/season_aware_p95_test.py` |
+| Season-aware per-scene normalization | **Chosen approach** | **In pipeline** — `normalization.py`, [ADR-007](adr/007-scene-normalization.md) |
 
 **Winning recipe:** 3-year (or 5-year) P95 + improved QA masking (+ clamp) +
 season-aware per-scene normalization.
@@ -230,13 +249,24 @@ season-aware per-scene normalization.
 
 ## Open questions / next steps
 
-1. **Productionize season-aware normalization** (tracked in #46). Currently only
-   `seasonal_debias` in `scripts/season_aware_p95_test.py`. **Recommended next step:** wire it into
-   `pipeline.py` / `process_tile` so production composites are debiased.
-2. **Offset-outlier cap.** Add a magnitude cap on per-scene offsets to reject
-   outlier scenes (e.g. the −66 °C scene) — a safeguard against the monthly
-   reference over-absorbing day-to-day weather. Not yet needed visually, but cheap
-   insurance.
+1. ~~**Productionize season-aware normalization**~~ (#46). Done: `normalization.py`,
+   wired into `compute_annual_composite`, defaulting on via `settings.destripe`.
+2. ~~**Offset-outlier cap**~~. Done, as a *rejection* rather than a clamp:
+   `settings.destripe_max_offset_c` drops the scene, default 15 °C.
+   Calibrated at Pergamino 2021–2025 (390 solar-day scenes) — see
+   [ADR-007](adr/007-scene-normalization.md) and
+   `results/decision/destripe_cap_calibration.json`.
+
+   Worth recording, because the earlier summary statistics were misleading: the
+   offsets are **not** a broad bell curve. 82.7% of scenes sit within ±15 °C with
+   a core σ of 5.71 and a median of −0.27, and the full-sample σ of 17.01 is
+   entirely tail-driven. Reasoning from that σ under an assumption of normality
+   predicts a 15 °C cap cuts deep into good data; it does not. Rejection is also
+   almost entirely one-sided (63 scenes below −15 °C, exactly 1 above), which is
+   the signature of undetected cloud rather than atmospheric bias.
+
+   Remaining: the AOI is mid-latitude cropland. Re-calibrate on a humid tropical
+   tile before the global build.
 3. **Independent validation (recommended, not required).** Cross-checking the debiased
    P95 against an **independent LST reference** (MODIS LST, ECOSTRESS) would add
    confidence, but this is a public "conversation-starter" product, not a peer-reviewed
@@ -264,7 +294,9 @@ uv run --extra analysis python \
 
 ## References
 
-- Prototype: `scripts/season_aware_p95_test.py` (`seasonal_debias`)
+- Production: `src/landsat_lst/normalization.py` (`seasonal_debias`, `scene_offsets`)
+- Original prototype: `scripts/season_aware_p95_test.py`
+- Cap calibration: `scripts/calibrate_destripe_cap.py`
 - QA masking + clamp: `src/landsat_lst/qa.py` (`create_qa_mask`,
   `convert_to_celsius`)
 - Clamp settings: `src/landsat_lst/config.py`

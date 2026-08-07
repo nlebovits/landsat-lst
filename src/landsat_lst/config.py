@@ -115,6 +115,49 @@ class Settings(BaseSettings):
         "high-DN saturation/fill artifacts without clipping real extreme heat.",
     )
 
+    # Season-aware per-scene normalization (de-striping). See issue #46, ADR-007.
+    destripe: bool = Field(
+        default=True,
+        description="Normalize each scene against a per-pixel monthly climatology "
+        "before compositing, removing the WRS-footprint seams caused by per-scene "
+        "atmospheric-correction bias. Disable to benchmark against raw composites.",
+    )
+    destripe_max_offset_c: float = Field(
+        default=15.0,
+        description="Discard a scene whose absolute offset exceeds this (degC) rather "
+        "than adjusting it. Calibrated at Pergamino 2021-2025 (ADR-007): the offset "
+        "distribution is a tight core (82.7% of scenes within +/-15, std 5.71) plus a "
+        "one-sided cold tail from undetected cloud, so 15 sits near 2.6 core sigma and "
+        "discards 21.8% of scenes, 63 cold against 1 warm. Re-run "
+        "scripts/calibrate_destripe_cap.py on a humid tropical tile before the global "
+        "build; the AOI behind this number is mid-latitude cropland.",
+    )
+    destripe_min_scene_pixels: int = Field(
+        default=500,
+        description="Coverage floor, in native-resolution pixels: discard a scene "
+        "covering less valid land than this. Counts from a coarse offset grid are "
+        "scaled up before comparison, so the threshold keeps one meaning whatever "
+        "destripe_offset_resolution_factor is set to.",
+    )
+    destripe_min_offset_samples: int = Field(
+        default=200,
+        description="Reliability floor, in offset-grid pixels: discard a scene whose "
+        "offset rests on fewer samples than this. Distinct from the coverage floor "
+        "because a coarse grid can leave a well-covered scene with too few samples "
+        "to place a median on.",
+    )
+    destripe_offset_resolution_factor: int = Field(
+        default=2,
+        description="Estimate per-scene offsets from a stack loaded at "
+        "resolution * factor, served from the source COGs' internal overviews "
+        "([2,4,8,16,32,64]). 1 keeps offsets at native resolution. Validated at "
+        "Pergamino: factor 2 reproduces native offsets to a median of 0.002 degC "
+        "(p99 0.063, max 0.188) with zero keep/reject flips, and 4 is the largest "
+        "that passes. Offset error grows linearly in the factor, so do not raise "
+        "this without re-running scripts/validate_offset_subsampling.py. The saving "
+        "caps out near 2x regardless, since the P95 still needs a native pass.",
+    )
+
     # Multiscale overviews (GeoZarr multiscales convention)
     pyramid_factors: list[int] = Field(
         default=[4, 16, 64],

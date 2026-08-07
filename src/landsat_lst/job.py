@@ -258,24 +258,45 @@ def run_distributed(
     return results
 
 
-def generate_jobs(years: Iterable[int]) -> list[ProcessingJob]:
-    """Generate all processing jobs for the given years.
+DEFAULT_WINDOW = (2021, 2025)
+"""Production window: the five most recent complete calendar years.
+
+Five years gives near-complete monthly coverage (the 1-year composite leaves
+~17% of pixels with no November observation; 3 years closes that to ~0%) while
+staying representative of present-day conditions. Storage is unchanged across
+window lengths, since the QA climatology is 12 bands regardless.
+"""
+
+
+def generate_jobs(
+    years: Iterable[int] | None = None,
+    *,
+    window: tuple[int, int] = DEFAULT_WINDOW,
+) -> list[ProcessingJob]:
+    """Generate processing jobs for every land tile.
 
     Uses the LAND_TILES set from tiling.py to skip ocean tiles.
 
     Args:
-        years: Years to process
+        years: Single-year windows to emit, one job per (year, tile). Pass this
+            only for benchmarking or backfill; production uses ``window``.
+        window: ``(start, end)`` inclusive multi-year window, emitting one job
+            per tile. Ignored when ``years`` is given.
 
     Returns:
-        List of ProcessingJob for all land tiles and years
+        List of ProcessingJob covering all land tiles.
     """
     from landsat_lst.tiling import LAND_TILES, parse_tile_name  # noqa: PLC0415
 
-    jobs = []
-    for year in years:
-        for tile_name in sorted(LAND_TILES):
-            tile = parse_tile_name(tile_name)
-            jobs.append(ProcessingJob(tile=tile, year=year))
+    tiles = [parse_tile_name(name) for name in sorted(LAND_TILES)]
 
-    log.info("jobs_generated", count=len(jobs), years=list(years))
+    if years is not None:
+        years = list(years)
+        jobs = [ProcessingJob(tile=tile, year=year) for year in years for tile in tiles]
+        log.info("jobs_generated", count=len(jobs), years=years)
+        return jobs
+
+    start, end = window
+    jobs = [ProcessingJob(tile=tile, year=start, end_year=end) for tile in tiles]
+    log.info("jobs_generated", count=len(jobs), window=f"{start}-{end}")
     return jobs

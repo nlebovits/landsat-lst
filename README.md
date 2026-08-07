@@ -4,10 +4,12 @@ Global Land Surface Temperature composites — annual or multi-year — from Lan
 
 ## Overview
 
-This pipeline produces annual or multi-year LST composites for municipal decision-makers analyzing urban heat. A composite pools *every* scene in its window (one year, e.g. `2024`, or a range, e.g. `2020-2024`) into a single percentile — multi-year windows fill cloud/orbit gaps and suppress scene-footprint striping. Output includes:
+This pipeline produces annual or multi-year LST composites for municipal decision-makers analyzing urban heat. A composite pools *every* scene in its window (one year, e.g. `2024`, or a range, e.g. `2021-2025`) into a single percentile — multi-year windows fill cloud/orbit gaps. **The production default is the five-year 2021–2025 window.** Output includes:
 
 - **lst_p95**: 95th percentile LST (°C), pooled across all scenes in the window
 - **qa_count**: 12-month climatology of valid-observation counts (`(month, latitude, longitude)`, one band per calendar month; month M = valid observations in calendar month M pooled across the window)
+
+Before compositing, each scene is shifted by a single scene-wide offset estimated against a per-pixel monthly climatology, which removes the seams that satellite footprint boundaries would otherwise leave in the composite. Scenes needing an implausibly large correction are discarded rather than adjusted, and `qa_count` counts only the observations that survive. [`docs/methodology.md`](docs/methodology.md) explains the choices; [ADR-007](docs/adr/007-scene-normalization.md) carries the measurements.
 
 Data is tiled on a 5° global grid and stored as **GeoZarr multiscale pyramids**
 (versioned with Icechunk), published with a STAC catalog. Each tile is a pyramid:
@@ -68,15 +70,26 @@ data-quality and performance settings:
 | `lst_valid_max` | `LST_LST_VALID_MAX` | `80.0` | Drop high-DN saturation/fill artifacts without clipping real extreme heat |
 | `load_chunk_size` | `LST_LOAD_CHUNK_SIZE` | `512` | odc-stac spatial (lat/lon) chunk; smaller (e.g. 256) cuts peak memory for the P95 quantile on multi-year / large-tile runs |
 | `max_cloud_cover` | `LST_MAX_CLOUD_COVER` | `100` | Scene-level cloud filter; 100 disables it and relies on pixel-level QA |
+| `destripe` | `LST_DESTRIPE` | `True` | Normalize each scene against a monthly climatology before compositing; disable to benchmark raw composites |
+| `destripe_max_offset_c` | `LST_DESTRIPE_MAX_OFFSET_C` | `15.0` | Discard a scene whose offset exceeds this rather than adjusting it. Calibrated at Pergamino ([ADR-007](docs/adr/007-scene-normalization.md)); re-check with `scripts/calibrate_destripe_cap.py` for other climates |
+| `destripe_min_scene_pixels` | `LST_DESTRIPE_MIN_SCENE_PIXELS` | `500` | Sparse floor when offsets are estimated at native resolution |
+| `destripe_min_offset_samples` | `LST_DESTRIPE_MIN_OFFSET_SAMPLES` | `200` | Sparse floor when offsets come from a coarse grid, stated in that grid's pixels |
+| `destripe_offset_resolution_factor` | `LST_DESTRIPE_OFFSET_RESOLUTION_FACTOR` | `2` | Estimate offsets from a stack loaded at `resolution × factor`, served from the source COGs' overviews. Cuts the offset pass from 20.2 GB to 5.1 GB. See [findings](docs/findings-offset-subsampling.md) |
 
 ## Usage
 
 ```bash
-# Process a single tile for one year
-landsat-lst process --year 2023 --tile N40W075
+# Process all land tiles for the production window (2021-2025)
+landsat-lst process
 
-# Process all tiles for a year
-landsat-lst process --year 2023
+# Process a single tile for the production window
+landsat-lst process --tile N40W075
+
+# Explicit window
+landsat-lst process --year 2021 --end-year 2025 --tile N40W075
+
+# Single year
+landsat-lst process --year 2023 --tile N40W075
 
 # List available tiles
 landsat-lst list-tiles
@@ -201,7 +214,7 @@ Key choices:
 - **Output format**: Zarr v3 with 500×500 chunks
 - **CRS**: EPSG:4326
 - **Tiling**: 5° × 5° grid
-- **Temporal**: Calendar-year or multi-year window composites (pooled P95)
+- **Temporal**: Multi-year window composites (pooled P95); production default 2021–2025
 - **Spatial**: Land only, ±60° latitude
 
 ## Known Limitations
@@ -306,10 +319,19 @@ Notable scripts in [`scripts/`](scripts/):
   writes GeoZarr pyramids + COGs and emits a `report.md` of gap/striping and measured
   compression metrics. Runs locally against Planetary Computer; `--no-frisky` forces
   plain Dask.
-- `season_aware_p95_test.py` — prototype of season-aware de-striping (per-scene bias
-  removal relative to a per-pixel monthly climatology). Not part of the production
-  pipeline — see [docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md)
-  and [docs/adr/005-multiyear-monthly-qa-and-destriping.md](docs/adr/005-multiyear-monthly-qa-and-destriping.md).
+- `season_aware_p95_test.py` — the original prototype of season-aware de-striping. The
+  method now ships in `landsat_lst.normalization`; this script remains as the standalone
+  driver the investigation used. See
+  [docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md)
+  and [ADR-007](docs/adr/007-scene-normalization.md).
+- `calibrate_destripe_cap.py` — sweeps candidate values of `destripe_max_offset_c` over a
+  single load and reports what fraction of scenes each would discard. Produced the shipped
+  15 °C default; re-run it for a climate unlike mid-latitude cropland.
+- `validate_offset_subsampling.py` — checks that offsets estimated from coarse overviews match
+  full-resolution ones, scene by scene. Produced the shipped
+  `destripe_offset_resolution_factor`; re-run before raising it.
+- `compare_destripe_composites.py` — builds the raw, natively de-striped, and coarse-offset P95
+  composites from one load and reports how far apart they are. `--cogs` writes them for QGIS.
 - `aster_gap_urban_analysis.py` — measures ASTER GED coverage gaps against GHS-SMOD to
   quantify how much urban land has no Surface Temperature. Needs the `analysis` extra
   and a NASA Earthdata login; see [Known Limitations](#known-limitations).

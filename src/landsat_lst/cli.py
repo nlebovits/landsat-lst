@@ -13,27 +13,54 @@ def main() -> None:
     """Landsat Land Surface Temperature annual composites."""
 
 
-@main.command()
-@click.option("--year", "-y", type=int, required=True, help="Year to process")
-@click.option("--tile", "-t", type=str, help="Specific tile to process (e.g., N40W075)")
-@click.option("--dry-run", is_flag=True, help="Show what would be processed without running")
-@click.option("--force", "-f", is_flag=True, help="Reprocess even if Zarr exists")
-def process(year: int, tile: str | None, dry_run: bool, force: bool) -> None:
-    """Process Landsat data to annual Zarr composites."""
-    from landsat_lst.job import generate_jobs, process_tile_job
+def _build_jobs(year: int | None, end_year: int | None, tile: str | None) -> list:
+    """Resolve CLI options into the job list to run.
+
+    Omitting ``--year`` selects the production window. Passing ``--year`` alone
+    keeps the single-year behavior that predates multi-year windows.
+    """
+    from landsat_lst.job import DEFAULT_WINDOW, generate_jobs
     from landsat_lst.models import ProcessingJob
     from landsat_lst.tiling import LAND_TILES, parse_tile_name
 
-    console.print(f"[bold]Processing year {year}[/bold]")
+    if year is None:
+        year, end_year = DEFAULT_WINDOW
 
     if tile:
         if tile not in LAND_TILES:
             console.print(f"[red]Warning: {tile} is not in the land tiles set[/red]")
-        tile_id = parse_tile_name(tile)
-        jobs = [ProcessingJob(tile=tile_id, year=year)]
+        return [ProcessingJob(tile=parse_tile_name(tile), year=year, end_year=end_year)]
+
+    if end_year:
+        return generate_jobs(window=(year, end_year))
+    return generate_jobs([year])
+
+
+@main.command()
+@click.option("--year", "-y", type=int, help="Start year. Omit to use the default window.")
+@click.option("--end-year", type=int, help="End year (inclusive) for a multi-year window")
+@click.option("--tile", "-t", type=str, help="Specific tile to process (e.g., N40W075)")
+@click.option("--dry-run", is_flag=True, help="Show what would be processed without running")
+@click.option("--force", "-f", is_flag=True, help="Reprocess even if Zarr exists")
+def process(
+    year: int | None,
+    end_year: int | None,
+    tile: str | None,
+    dry_run: bool,
+    force: bool,
+) -> None:
+    """Process Landsat data to Zarr composites.
+
+    With no --year, processes the production window (2021-2025). Passing --year
+    alone builds a single-year composite; add --end-year for a custom window.
+    """
+    from landsat_lst.job import process_tile_job
+
+    jobs = _build_jobs(year, end_year, tile)
+    console.print(f"[bold]Processing window {jobs[0].window_label}[/bold]")
+    if tile:
         console.print(f"  Tile: {tile}")
     else:
-        jobs = generate_jobs([year])
         console.print(f"  Tiles: {len(jobs)} land tiles")
 
     if force:
@@ -42,7 +69,7 @@ def process(year: int, tile: str | None, dry_run: bool, force: bool) -> None:
     if dry_run:
         console.print("[yellow]Dry run - no processing performed[/yellow]")
         for job in jobs[:5]:
-            console.print(f"    Would process: {job.tile.name} {job.year}")
+            console.print(f"    Would process: {job.tile.name} {job.window_label}")
         if len(jobs) > 5:
             console.print(f"    ... and {len(jobs) - 5} more")
         return
