@@ -19,10 +19,14 @@ missing input is a static auxiliary dataset rather than a measurement.
 
 `scripts/aster_gap_urban_analysis.py` measures the footprint against GHS-SMOD; the
 narrative and numbers live in
-[`docs/findings-aster-ged-gaps.md`](../findings-aster-ged-gaps.md). The gaps concentrate
-in southern Africa, the Sahara, Australia, and the persistently cloudy tropics, and they
-reach a substantial share of the land area in individual tiles: 23.3% of land in
-S25E030 (Durban) against 0.0% in S30W065 (Pergamino).
+[`docs/findings-aster-ged-gaps.md`](../findings-aster-ged-gaps.md). Across the global
+urban domain, 2.66% of land has no emissivity and a further 10.23% rests on one or two
+observations.
+
+The gaps follow persistent cloud, so they concentrate in the wet tropics: 12.07% of
+urban Southeast Asia and 11.62% of urban Amazonia, against 0.00% for the Sahara and
+Sahel and 0.30% for Australia. Deserts are the best-covered places in the product,
+because ASTER could see the ground on almost every pass.
 
 Alternative emissivity sources exist. ASTER GED v4.1 and the UW-Madison CAMEL combined
 emissivity database both offer broader coverage, and either could in principle be used
@@ -49,9 +53,10 @@ ASTER cloud cover, which correlates with climate and therefore with the very sig
 product measures. That bias would be invisible in the output and impossible to express
 in `qa_count`.
 
-**What it costs.** Users in affected regions get holes rather than estimates. For a tile
-like S25E030 that is a substantial fraction of the map, and no amount of reprocessing on
-our side will change it.
+**What it costs.** Users in affected regions get holes rather than estimates, and the
+burden falls unevenly. A city in Southeast Asia or Amazonia loses roughly one pixel in
+eight to gaps where a Saharan city loses none, and no amount of reprocessing on our side
+changes that.
 
 **What would reopen this.** A gap-filled product is a legitimate future variant, but as
 a separate, clearly labelled layer with its own provenance band, not as silent

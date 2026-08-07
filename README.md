@@ -208,6 +208,61 @@ Key choices:
 - **Temporal**: Calendar-year or multi-year window composites (pooled P95)
 - **Spatial**: Land only, ±60° latitude
 
+## Known Limitations
+
+### Permanent gaps from ASTER emissivity
+
+Landsat Collection 2 Level-2 Surface Temperature needs an emissivity value for
+every pixel and takes it from the ASTER Global Emissivity Dataset, built from
+clear-sky ASTER scenes acquired 2000–2008. Where ASTER never caught clear sky in
+those nine years, no emissivity exists, so USGS produces no Surface Temperature.
+Those pixels are empty in every year of the archive.
+
+**Nothing downstream fixes this.** Widening the compositing window closes cloud
+gaps, which is why multi-year pooling exists, but an emissivity gap survives
+every window length: the missing input is a static auxiliary dataset, not an
+observation.
+
+Measured against GHS-SMOD R2023A, **2.66% of the world's urban land has no
+emissivity** (80,397 km² of 3,027,063 km²), and **10.23% rests on one or two
+observations**. The global figure hides the spread, because gaps follow
+persistent cloud:
+
+| Region | Urban gap % |
+|---|---:|
+| Southeast Asia | 12.07 |
+| Amazonia | 11.62 |
+| Southern Africa | 8.36 |
+| Europe | 2.80 |
+| North America | 1.18 |
+| Australia | 0.30 |
+| Sahara and Sahel | 0.00 |
+
+Deserts are the best-covered places on Earth for this product; the wet tropics
+are the worst.
+
+**Detecting it.** An affected pixel reads `qa_count == 0` for all 12 months
+inside the land mask. That test alone conflates gaps with ocean, since
+`process_tile` zeroes `qa_count` over water, so use the land mask as the
+denominator:
+
+```python
+from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
+
+land = get_land_mask_for_bbox(
+    tile.bbox,
+    settings.resolution,
+    load_land_polygons(),
+    target_shape=shape,
+)
+gap = (composite["qa_count"].sum("month").to_numpy() == 0) & land
+```
+
+Full numbers and method in
+[docs/findings-aster-ged-gaps.md](docs/findings-aster-ged-gaps.md); the decision
+to leave gaps empty rather than fill them from another emissivity source is
+[ADR-006](docs/adr/006-no-aster-gap-filling.md).
+
 ## Development
 
 ```bash

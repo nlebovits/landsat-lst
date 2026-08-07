@@ -1,0 +1,53 @@
+{
+  "evaluated_classes": [
+    21,
+    22,
+    23,
+    30
+  ],
+  "all_evaluated": {
+    "land_km2": 3027063.0,
+    "gap_km2": 80397.0,
+    "low_confidence_km2": 309655.0,
+    "gap_pct": 2.6559407584183083,
+    "low_confidence_pct": 10.229552539871156
+  },
+  "urban": {
+    "land_km2": 3027063.0,
+    "gap_km2": 80397.0,
+    "low_confidence_km2": 309655.0,
+    "gap_pct": 2.6559407584183083,
+    "low_confidence_pct": 10.229552539871156
+  },
+  "by_class": {
+    "Suburban or peri-urban": {
+      "land_km2": 1834726.0,
+      "gap_km2": 43885.0,
+      "low_confidence_km2": 189332.0,
+      "gap_pct": 2.391910290691907,
+      "low_confidence_pct": 10.319361038105962
+    },
+    "Semi-dense urban cluster": {
+      "land_km2": 299799.0,
+      "gap_km2": 10206.0,
+      "low_confidence_km2": 32362.0,
+      "gap_pct": 3.4042808681816816,
+      "low_confidence_pct": 10.794565692347206
+    },
+    "Dense urban cluster": {
+      "land_km2": 294122.0,
+      "gap_km2": 7761.0,
+      "low_confidence_km2": 28881.0,
+      "gap_pct": 2.6387009472259813,
+      "low_confidence_pct": 9.81939467295884
+    },
+    "Urban centre": {
+      "land_km2": 598416.0,
+      "gap_km2": 18545.0,
+      "low_confidence_km2": 59080.0,
+      "gap_pct": 3.099014732226411,
+      "low_confidence_pct": 9.872730675650384
+    }
+  },
+  "notes": "Gap = ASTER GED NumObs == 0 over land, meaning no emissivity and therefore no Landsat C2 L2 Surface Temperature. Areas are km2 on the equal-area GHS-SMOD Mollweide grid. Only 1-degree cells containing the evaluated classes were fetched, so these figures are complete for those classes and no global land total can be derived from them."
+}

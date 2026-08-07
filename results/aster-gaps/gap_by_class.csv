@@ -1,0 +1,13 @@
+smod_class,smod_label,tier,km2
+21,Suburban or peri-urban,normal,1601509.0
+21,Suburban or peri-urban,low_confidence,189332.0
+21,Suburban or peri-urban,gap,43885.0
+22,Semi-dense urban cluster,normal,257231.0
+22,Semi-dense urban cluster,low_confidence,32362.0
+22,Semi-dense urban cluster,gap,10206.0
+23,Dense urban cluster,normal,257480.0
+23,Dense urban cluster,low_confidence,28881.0
+23,Dense urban cluster,gap,7761.0
+30,Urban centre,normal,520791.0
+30,Urban centre,low_confidence,59080.0
+30,Urban centre,gap,18545.0
