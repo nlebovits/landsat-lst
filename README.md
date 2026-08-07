@@ -223,6 +223,13 @@ gaps, which is why multi-year pooling exists, but an emissivity gap survives
 every window length: the missing input is a static auxiliary dataset, not an
 observation.
 
+![ASTER GED emissivity coverage: blue where data exists, white where it does not](docs/images/aster-ged-coverage-usgs.jpg)
+
+*Blue is available data, white is none. Figure by USGS, public domain, from
+[Landsat Collection 2 Surface Temperature data gaps due to missing ASTER
+GED](https://www.usgs.gov/landsat-missions/landsat-collection-2-surface-temperature-data-gaps-due-missing-aster-ged).
+This view is global land; the numbers below are urban land only.*
+
 Measured against GHS-SMOD R2023A, **2.66% of the world's urban land has no
 emissivity** (80,397 km² of 3,027,063 km²), and **10.23% rests on one or two
 observations**. Every figure here is urban land only. Averaging over every city

@@ -39,6 +39,21 @@ survive every window length, because the missing input is a static auxiliary
 dataset rather than a measurement. A user who widens their window to chase an
 emissivity gap is spending compute on nothing.
 
+### Where the gaps are
+
+![ASTER GED emissivity coverage: blue where data exists, white where it does not](images/aster-ged-coverage-usgs.jpg)
+
+*ASTER GED coverage. Blue is available data, white is none. Figure by USGS,
+public domain, from [Landsat Collection 2 Surface Temperature data gaps due to
+missing ASTER GED](https://www.usgs.gov/landsat-missions/landsat-collection-2-surface-temperature-data-gaps-due-missing-aster-ged).*
+
+This is a global land view and a binary one, so it is context rather than
+evidence for any number here; every figure in this document is urban land and
+comes from the per-pixel `NumObs` layer instead. It does corroborate the pattern
+independently. The Sahara, Arabian Peninsula, and Australia are solid blue,
+while white streaks cut through Amazonia, Indonesia, and Siberia along ASTER
+orbit tracks, and Antarctica and Greenland are absent entirely.
+
 ## Method
 
 **Gap definition.** ASTER GED ships an observation-count layer, so the
@@ -154,6 +169,7 @@ as `gap_tiers_smod_grid.tif`.
 ## References
 
 - [ADR-006: Leave ASTER GED coverage gaps empty](adr/006-no-aster-gap-filling.md)
+- [USGS: Landsat Collection 2 Surface Temperature data gaps due to missing ASTER GED](https://www.usgs.gov/landsat-missions/landsat-collection-2-surface-temperature-data-gaps-due-missing-aster-ged)
 - [ASTER GED product page (LP DAAC)](https://lpdaac.usgs.gov/products/ag1kmv003/)
 - [Landsat Collection 2 Level-2 Science Products](https://www.usgs.gov/landsat-missions/landsat-collection-2-level-2-science-products)
 - [GHS-SMOD R2023A](https://human-settlement.emergency.copernicus.eu/ghs_smod2023.php)
