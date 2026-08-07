@@ -59,15 +59,24 @@ QA ~18× compression). Monthly-over-single QA costs only ~107 GB compressed glob
 These per-scene-edge contaminants drive scene-footprint striping; masking removes them
 without touching the temperature signal.
 
-### 4. De-striping via season-aware per-scene normalization — chosen approach, productionization DEFERRED
+### 4. De-striping via season-aware per-scene normalization — chosen approach, now shipped
 
 The seams that survive masking are the per-scene atmospheric-correction residual
 (~1–5 K). The chosen fix de-biases **each scene** relative to a **per-pixel monthly
 climatology** (not the annual mean), which preserves the seasonal / hot signal.
-Validated on the 3-year AOI: seams removed, no artifacts, mean **41.0 °C** preserved.
+Validated on the 3-year AOI: seams removed, no artifacts, mean **41.0 °C**.
 
-**Status: prototype only** in `scripts/season_aware_p95_test.py`. Productionizing into
-`pipeline.py` / `process_tile` is **deferred** and tracked in #46. This is a
+> **Correction (2026-08-07):** "preserved" was wrong. That 41.0 was compared against a
+> **single-year** 40.6 °C baseline, and widening the window raises the P95 by about as much
+> as de-striping lowers it, so the effects cancelled. A paired 2021–2025 comparison gives raw
+> **45.12 °C** against de-striped **41.12 °C** — a **4.0 °C** drop, spatial r = 0.82. The
+> cooling is inherent to the method rather than a defect. See
+> [ADR-007](007-scene-normalization.md) and
+> [findings-offset-subsampling.md](../findings-offset-subsampling.md).
+
+**Status: shipped.** Productionized in `landsat_lst.normalization` under
+[ADR-007](007-scene-normalization.md), which adds the outlier-rejection policy this ADR
+left open. This is a
 public "conversation-starter" product, not a peer-reviewed claim, so independent-reference
 validation (MODIS / ECOSTRESS) is **recommended for added confidence, not a prerequisite
 for shipping**.
@@ -94,11 +103,12 @@ Recorded so they are not revisited:
   visible striping, before any normalization.
 
 ### Negative / Open questions
-- **De-striping is not yet in the production path.** It must be moved into
-  `pipeline.py` / `process_tile` before the global run.
 - Season-aware normalization is heavier-handed than pure bias removal: the monthly
-  reference also absorbs day-to-day weather, so it needs an **outlier cap** (required
-  hygiene). Independent-reference validation (MODIS / ECOSTRESS) is a **recommended
+  reference also absorbs day-to-day weather. The **outlier cap** this ADR called required
+  hygiene shipped in ADR-007 as a *rejection* rather than a clamp, calibrated to 15 °C.
+- It **cools the P95 by ~4 °C** (45.12 → 41.12 at the AOI, 2021–2025). Inherent to the
+  method, not a defect, but it changes what the number means: the result reads as heat
+  relative to a pixel's own monthly normal rather than as an absolute maximum. Independent-reference validation (MODIS / ECOSTRESS) is a **recommended
   confidence check, not a blocker** — the method is a standard correction for a documented
   ~1–5 K per-scene error and is unlikely to be challenged for this product's use.
 - 5-year is the default (WRI-aligned); 3-year is the lighter fallback. The main cost is

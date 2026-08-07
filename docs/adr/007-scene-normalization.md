@@ -163,6 +163,24 @@ The full-tile five-year run on Coiled remains the open risk item in #46.
 benchmarking. `compute_annual_composite` still applies no land mask unless one is supplied, so
 its documented contract from issue #26 is unchanged for existing callers.
 
+**The correction cools the P95 by about 4 °C.** Measured on a paired comparison at Pergamino
+over 2021–2025, on identical data: raw 45.12 °C against de-striped 41.12 °C, spatial correlation
+0.82, with coverage falling from 180.5 to 170.3 observations per pixel at 21.8% rejection.
+
+This is inherent to the method rather than a defect. The P95 samples each pixel's hottest
+observations, and those come from the scenes with the largest positive offsets — precisely the
+ones the correction cools. Of 305 retained scenes, 131 carry positive offsets averaging +4.12 °C.
+
+It does change what the number means. A de-striped P95 answers "how hot does this surface get
+relative to its own monthly normal", not "what is the hottest temperature observed here". That
+suits a product presented as an indicator of relative surface heat, but it belongs in
+user-facing documentation, not only here.
+
+Earlier records described the correction as mean-preserving. That was an artefact of comparing a
+three-year de-striped composite against a single-year baseline, where the window effect and the
+cooling happened to cancel. [ADR-005](005-multiyear-monthly-qa-and-destriping.md) and
+[findings-destriping-and-multiyear.md](../findings-destriping-and-multiyear.md) carry corrections.
+
 Published tiles built before this change carry the seams. They need reprocessing.
 
 Independent validation against MODIS or ECOSTRESS remains a recommended confidence check rather

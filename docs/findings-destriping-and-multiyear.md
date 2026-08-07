@@ -28,8 +28,9 @@ Two questions drove this investigation:
    geometry and residual per-scene atmospheric-correction error, *not* noise that
    averages out with more years. The winning fix is **improved QA masking + a
    physical-plausibility clamp + season-aware per-scene normalization**. The
-   season-aware step removes the seams while **preserving the hot signal**
-   (AOI mean stays ~41 °C).
+   season-aware step removes the seams and lands the AOI mean at ~41 °C. It was
+   originally described as preserving the hot signal; a later like-for-like
+   comparison showed it **cools the P95 by ~4 °C** (see the correction in Part 3).
 
 **Winning recipe: 3-year (or 5-year) P95 + improved QA masking + season-aware
 per-scene normalization.**
@@ -156,8 +157,8 @@ clamp** (`settings.lst_valid_min` / `lst_valid_max`, default **−50 / 80 °C**,
 `convert_to_celsius`) that drops the ~**−124 °C** DN=0 resampling artifacts near
 scene edges.
 
-- **Result:** removed **most** seams; **hot signal preserved** (mean **40.7** vs
-  **40.6** baseline).
+- **Result:** removed **most** seams; mean **40.7** vs **40.6** baseline (this pair *is*
+  like-for-like — same window, masking only).
 - **QGIS verdict:** "really close," but **residual edge seams remained.**
 
 ### 2. Season-aware per-scene normalization — **worked (chosen approach)**
@@ -169,13 +170,28 @@ expected value** (i.e. the atmospheric bias), leaving the seasonal cycle intact.
 - **Synthetic self-test:** recovers an injected per-scene bias — the fitted offset
   std matches the injected bias size (not the seasonal amplitude), and the seasonal
   amplitude is preserved.
-- **3-year AOI result:** mean **41.0 °C** (hot signal preserved), **seams gone, no
-  blocky artifacts** (QGIS-confirmed).
+- **3-year AOI result:** mean **41.0 °C**, **seams gone, no blocky artifacts**
+  (QGIS-confirmed).
 - **Caveat (honest):** on *real* data the monthly reference also absorbs
   **day-to-day weather**, so the per-scene offsets are larger than pure bias
   (**std ~12 °C**, with one outlier scene at **−66 °C**). It is a heavier-handed
-  correction than ideal, but the output is **visually clean and mean-preserving**.
-  If artifacts ever reappear, **cap the offset magnitude** to reject outlier scenes.
+  correction than ideal. If artifacts ever reappear, **cap the offset magnitude**
+  to reject outlier scenes.
+
+> **CORRECTION (2026-08-07): this was described as "mean-preserving" and it is not.**
+> The 41.0 °C above was read against the 40.6 °C baseline from the percentile sweep, but
+> that baseline is a **single-year** composite while 41.0 is **three-year**. Widening the
+> window raises the P95 by roughly the amount de-striping lowers it, so the two effects
+> cancelled and hid each other.
+>
+> A paired comparison on identical data (2021–2025, same 390 scenes, same AOI) puts raw at
+> **45.12 °C** and de-striped at **41.12 °C**: a **4.0 °C** drop, spatial r = 0.82. The
+> de-striped figure itself reproduces (41.12 now vs 41.0 then); it was the baseline that
+> was wrong.
+>
+> The cooling is inherent, not a defect. The P95 samples each pixel's hottest observations,
+> which come from the largest positive-offset scenes — exactly the ones the correction
+> cools. See [findings-offset-subsampling.md](findings-offset-subsampling.md).
 
 This shipped as `landsat_lst.normalization.seasonal_debias`, called from
 `compute_annual_composite` under `settings.destripe`. The offset cap the note above

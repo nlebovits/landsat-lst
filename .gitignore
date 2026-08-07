@@ -82,3 +82,5 @@ digest.txt
 results/
 # ...except small calibration artifacts that justify a shipped default.
 !results/decision/destripe_cap_calibration.json
+!results/decision/offset_subsampling_validation.json
+!results/decision/destripe_composite_comparison.json

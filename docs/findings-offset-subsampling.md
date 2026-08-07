@@ -139,6 +139,58 @@ The sparse guard is therefore stated on whichever grid the offset was estimated 
 path keeps `destripe_min_scene_pixels`, and a coarse path uses `destripe_min_offset_samples` on
 its own grid.
 
+## Composite comparison
+
+Offsets agreeing does not prove composites agree, so `scripts/compare_destripe_composites.py`
+builds all three P95 maps from one load: raw, de-striped with native offsets, and de-striped with
+factor-2 offsets. Pergamino, 2021–2025, 390 scenes.
+
+| composite | mean | median | p05 | p95 |
+|---|--:|--:|--:|--:|
+| raw | 45.12 | 45.23 | 41.35 | 48.56 |
+| de-striped, native offsets | 41.12 | 41.17 | 38.23 | 43.88 |
+| de-striped, factor-2 offsets | 41.12 | 41.17 | 38.23 | 43.88 |
+
+**Factor 2 is indistinguishable from native.** Mean delta −0.0015 °C, median |Δ| 0.0019, p99
+0.0085, max 0.0684, spatial correlation 0.999999, and **zero pixels** differ by more than 0.1 °C.
+Coverage is identical.
+
+That includes the differing scene sets. The two grids' sparse guards disagree on 14 scenes, but
+most are rejected by the cap anyway, so the final keep-sets differ by 2 of 390: native keeps 305,
+coarse keeps 307. Both extra scenes have a NaN native offset, meaning no valid native pixel
+existed to take a median over. Since the composite is built from the native stack, they
+contribute nothing either way, and the measured coverage delta of exactly 0.0 confirms it.
+
+## De-striping cools the P95 by 4 °C, and the old "mean-preserving" claim was wrong
+
+The paired comparison above is the first like-for-like measurement of what the correction does
+to the composite. It shifts the mean **45.12 → 41.12 °C, a drop of 4.0 °C**, with a spatial
+correlation of 0.82 against raw and coverage falling from 180.5 to 170.3 observations per pixel
+at 21.8% scene rejection.
+
+[findings-destriping-and-multiyear.md](findings-destriping-and-multiyear.md) and
+[ADR-005](adr/005-multiyear-monthly-qa-and-destriping.md) previously recorded the correction as
+"mean-preserving", citing a de-striped 3-year AOI mean of 41.0 °C against a 40.6 °C baseline.
+Those two numbers are not comparable: 40.6 came from the single-year percentile sweep and 41.0
+from a three-year window. Widening the window raises the P95, which happens to be about the size
+of the cooling, so the two effects cancelled and hid each other. The de-striped figure itself
+reproduces well — 41.12 here against 41.0 then — so it was the baseline that was wrong.
+
+The cooling is not a defect; it is what the correction does by construction. The P95 samples the
+hottest observations at each pixel, and those come from the scenes with the largest positive
+offsets, which are exactly the scenes the correction cools. Of the 305 retained scenes, 131 have
+positive offsets averaging +4.12 °C. Subtracting them lowers the hot tail by about that much,
+which matches the observed −4.0 °C.
+
+So the de-striped P95 answers "how hot does this surface get relative to its own monthly normal",
+not "what is the hottest temperature ever observed here". That is consistent with the stated
+purpose of the product as an indicator of relative surface heat, but it is a real change in what
+the numbers mean and it belongs in user-facing documentation rather than buried here.
+
+The spatial correlation of 0.82 cannot by itself distinguish "seams removed" from "signal
+damaged", since seams carry real spatial variance and removing them must lower correlation.
+Only visual inspection separates those, which is why the COG export exists.
+
 ## Reproducing
 
 ```bash

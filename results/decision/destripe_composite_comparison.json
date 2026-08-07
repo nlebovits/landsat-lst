@@ -1,0 +1,50 @@
+{
+  "window": "2021-2025",
+  "factor": 2,
+  "n_scenes": 390,
+  "kept_native": 305,
+  "kept_coarse": 307,
+  "keep_disagreements": 2,
+  "composites": [
+    {
+      "name": "raw",
+      "mean": 45.12,
+      "median": 45.229,
+      "p05": 41.348,
+      "p95": 48.555,
+      "valid_frac": 1.0
+    },
+    {
+      "name": "destriped_native",
+      "mean": 41.121,
+      "median": 41.173,
+      "p05": 38.231,
+      "p95": 43.879,
+      "valid_frac": 1.0
+    },
+    {
+      "name": "destriped_coarse_f2",
+      "mean": 41.12,
+      "median": 41.172,
+      "p05": 38.23,
+      "p95": 43.877,
+      "valid_frac": 1.0
+    }
+  ],
+  "coarse_vs_native": {
+    "mean_delta": -0.0015,
+    "median_abs": 0.0019,
+    "p99_abs": 0.0085,
+    "max_abs": 0.0684,
+    "frac_pixels_over_0.1C": 0.0,
+    "spatial_corr": 0.999999,
+    "coverage_delta_mean": 0.0
+  },
+  "destriped_vs_raw": {
+    "mean_shift": -3.999,
+    "spatial_corr": 0.8177,
+    "rejection_frac": 0.2179,
+    "coverage_mean_raw": 180.5,
+    "coverage_mean_destriped": 170.3
+  }
+}

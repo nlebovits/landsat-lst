@@ -78,6 +78,13 @@ scenes requiring implausibly large corrections are discarded rather than adjuste
 extreme offset instead of dropping the scene would leave most of the error in place while
 presenting the scene as corrected.
 
+One consequence deserves stating plainly. Because the composite reports the 95th percentile, it
+draws on each location's hottest observations, and those come disproportionately from scenes the
+correction identifies as warm-biased. Normalization therefore lowers the reported temperatures,
+by about 4 °C at the site where it has been measured. The values describe how hot a surface
+becomes relative to its own seasonal normal, rather than the hottest temperature ever recorded
+there.
+
 This reflects the intended use of the dataset: identifying persistent spatial patterns of
 relative surface heat rather than estimating the exact land surface temperature at any
 individual location. Land surface temperature is only one component of the human experience of
