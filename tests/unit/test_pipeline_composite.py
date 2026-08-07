@@ -138,6 +138,81 @@ class TestComputeAnnualComposite:
         assert int(result["qa_count"].sel(month=slice(1, 12)).values[:, 0, 0].sum()) == 0
 
 
+class TestFloorAnomalyGuard:
+    """Guard against P95 values landing on the encoding floor (issue #24).
+
+    DN 0 is fill and DN 1 decodes to -49.99 C. A hot-season P95 over land never
+    reaches that, so a pixel with observations that still produces such a value
+    is a failed retrieval and becomes nodata rather than a plausible-looking
+    temperature.
+    """
+
+    # lwir DN 21698 -> -49.9858 C, inside the DN 0/1 band the guard rejects.
+    LWIR_ON_FLOOR = 21698
+    # lwir DN 21705 -> -49.9619 C, cold but encodes to DN 3 and must survive.
+    LWIR_ABOVE_FLOOR = 21705
+
+    @pytest.fixture
+    def warm_scene(self) -> xr.Dataset:
+        """Clear-sky scene, uniformly warm, with room to plant anomalies."""
+        times = _monthly_times()
+        n_time, n_y, n_x = len(times), 5, 5
+        return xr.Dataset(
+            {
+                "lwir11": (
+                    ["time", "y", "x"],
+                    np.full((n_time, n_y, n_x), 44000.0, dtype=np.float32),
+                ),
+                "qa_pixel": (["time", "y", "x"], np.zeros((n_time, n_y, n_x), dtype=np.uint16)),
+            },
+            coords={"time": times, "y": np.arange(n_y), "x": np.arange(n_x)},
+        )
+
+    def test_floor_pixel_with_observations_becomes_nodata(self, warm_scene):
+        """A pixel whose P95 sits on the encoding floor is flagged as missing."""
+        warm_scene["lwir11"][:, 2, 2] = self.LWIR_ON_FLOOR
+
+        result = compute_annual_composite(warm_scene)
+
+        assert result["lst_p95"].values[2, 2] == -9999.0
+        # The pixel did have valid observations; only the value was rejected.
+        assert int(result["qa_count"].values[:, 2, 2].sum()) == len(warm_scene.time)
+
+    def test_neighbors_of_floor_pixel_are_untouched(self, warm_scene):
+        """The guard rejects one pixel without disturbing the surrounding data."""
+        warm_scene["lwir11"][:, 2, 2] = self.LWIR_ON_FLOOR
+
+        result = compute_annual_composite(warm_scene)
+
+        neighborhood = result["lst_p95"].values[1:4, 1:4]
+        surrounding = np.delete(neighborhood.ravel(), 4)  # drop the centre pixel
+        assert np.all(surrounding > 0), f"guard leaked into neighbors: {surrounding}"
+
+    def test_cold_but_encodable_pixel_survives(self, warm_scene):
+        """A value above the floor is kept, so the guard is not a blanket cold cut."""
+        warm_scene["lwir11"][:, 1, 1] = self.LWIR_ABOVE_FLOOR
+
+        result = compute_annual_composite(warm_scene)
+
+        assert result["lst_p95"].values[1, 1] == pytest.approx(-49.96, abs=0.01)
+
+    def test_rejected_pixel_encodes_to_fill(self, warm_scene):
+        """Composite and encoded output agree: the rejected pixel becomes DN 0."""
+        warm_scene["lwir11"][:, 2, 2] = self.LWIR_ON_FLOOR
+
+        result = compute_annual_composite(warm_scene)
+        encoded = encode_lst_uint16(result["lst_p95"])
+
+        assert encoded.values[2, 2] == 0
+        assert encoded.values[0, 0] != 0
+
+    def test_clean_scene_is_unaffected(self, warm_scene):
+        """With no anomalies present the guard changes nothing."""
+        result = compute_annual_composite(warm_scene)
+
+        assert np.all(result["lst_p95"].values > 0)
+
+
 class TestDaskComposite:
     """Tests for compute_annual_composite with Dask arrays."""
 

@@ -12,6 +12,7 @@ from landsat_lst.config import settings
 from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
 from landsat_lst.models import ProcessingJob
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
+from landsat_lst.zarr_writer import LST_MIN_TRUSTED_C
 
 # Planetary Computer URL prefix for conditional signing
 _PC_URL_PREFIX = "https://planetarycomputer.microsoft.com"
@@ -147,6 +148,15 @@ def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
 
     lst_p95 = lst.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
     lst_p95 = lst_p95.where(total_valid > 0, settings.nodata)
+
+    # Guard against a pixel that has observations yet still produces a P95 on
+    # the encoding floor (DN 0 or DN 1). Writing it would resurface the
+    # isolated -49.99 C anomalies of issue #24, so flag it as missing here and
+    # keep the composite consistent with the encoded output. Gating on
+    # total_valid keeps the existing nodata sentinel distinguishable from a
+    # genuine bad retrieval.
+    anomalous = (total_valid > 0) & (lst_p95 < LST_MIN_TRUSTED_C)
+    lst_p95 = lst_p95.where(~anomalous, settings.nodata)
 
     return xr.Dataset(
         {
