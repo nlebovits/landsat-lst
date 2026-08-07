@@ -137,3 +137,16 @@ tile count from 1,728 to 700.
 Ocean pixels are excluded using Natural Earth land polygons with a conservative 25 km coastal
 buffer that preserves barrier islands, estuaries, and other coastal landforms. See
 [findings-land-mask-buffer.md](findings-land-mask-buffer.md).
+
+## Output grid
+
+Every tile is cut from one global grid at 3,600 pixels per degree, roughly 30 m at the equator,
+in EPSG:4326. The grid is 1,296,000 by 432,000 pixels, and a 5-degree tile is exactly 18,000 by
+18,000. Pixel density is an integer rather than a rounded resolution, so tiles share pixel edges
+exactly and adjacent tiles abut with no gap or overlap.
+
+That property matters for the overviews. Coarsening blocks are cut from the global array rather
+than from a tile, which keeps block boundaries aligned across what used to be tile edges. A tile
+would not support this on its own: 18,000 divides by 4 and by 16 but not by 64, so a per-tile
+64x overview would trim its edge and shift block phase against its neighbour. The global grid
+divides cleanly by all three. See [ADR-008](adr/008-global-mosaic-topology.md).

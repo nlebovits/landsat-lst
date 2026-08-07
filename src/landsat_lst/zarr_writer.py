@@ -60,7 +60,8 @@ LST_MIN_TRUSTED_DN: int = 2
 # Anything below encodes to DN 0 or DN 1 and is treated as missing.
 LST_MIN_TRUSTED_C: float = LST_OFFSET + LST_MIN_TRUSTED_DN * LST_SCALE
 
-# Zarr chunking (500x500 divides 18,500 evenly = 37 chunks)
+# Zarr chunking. 500 divides an 18,000 px tile into 36 chunks with no partial
+# edge chunk, and divides the global grid (1,296,000 x 432,000) evenly too.
 DEFAULT_CHUNKS: tuple[int, int] = (500, 500)
 
 # Type alias for output target

@@ -14,6 +14,7 @@ from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
 from landsat_lst.models import ProcessingJob
 from landsat_lst.normalization import offset_diagnostics, seasonal_debias
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
+from landsat_lst.tiling import geobox_for_bbox
 from landsat_lst.zarr_writer import LST_MIN_TRUSTED_C
 
 log = structlog.get_logger()
@@ -106,7 +107,6 @@ def load_scenes(
         Dataset with thermal and QA bands.
     """
     csize = settings.load_chunk_size
-    resolution = settings.resolution * resolution_factor
 
     # Averaging only helps the thermal band, and only when coarsening. qa_pixel
     # is a bitfield and must be sampled, never interpolated -- averaging bit
@@ -118,14 +118,15 @@ def load_scenes(
         {"lwir11": "average", "qa_pixel": "nearest"} if resolution_factor > 1 else "nearest"
     )
 
+    # An explicit geobox rather than crs/resolution/bbox: odc-stac would anchor
+    # the grid to this bbox, which is what left neighbouring tiles misregistered
+    # by a fraction of a pixel. See ADR-008.
     return stac_load(
         items,
         bands=["lwir11", "qa_pixel"],
-        crs=settings.crs,
-        resolution=resolution,
+        geobox=geobox_for_bbox(bbox, resolution_factor),
         chunks={"time": 10, "latitude": csize, "longitude": csize},
         groupby="solar_day",
-        bbox=bbox,
         patch_url=patch_url,
         fail_on_error=fail_on_error,
         resampling=resampling,
@@ -139,9 +140,9 @@ def _build_land_mask(
 ) -> xr.DataArray:
     """Rasterize the Natural Earth land mask onto a grid's exact coordinates.
 
-    ``target_shape`` is passed explicitly because odc-stac rounds differently
-    from the int() truncation the resolution-derived shape would use, so the
-    mask would otherwise be off by a pixel.
+    ``target_shape`` comes from the loaded array rather than from the bbox, so
+    the mask matches whatever grid the caller actually has, including the
+    zoomed-out grid used for offset estimation.
 
     Both rasterio and odc-stac use north-down (descending latitude), so the
     rasterized array needs no flip.

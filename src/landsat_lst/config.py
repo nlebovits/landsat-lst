@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # STAC endpoint presets
@@ -88,10 +88,22 @@ class Settings(BaseSettings):
         "Set to 100 to disable scene-level filtering and rely on pixel-level QA.",
     )
 
-    resolution: float = Field(
-        default=0.00027778,
-        description="Output resolution in degrees (~30m at equator)",
+    pixels_per_degree: int = Field(
+        default=3600,
+        description="Pixel density of the global grid, in pixels per degree (~30m at the "
+        "equator). An integer rather than a resolution float so the global grid, and "
+        "every tile cut from it, come out with a whole number of pixels. The earlier "
+        "0.00027778 truncated 1/3600 and left each tile anchored to its own bbox, "
+        "overshooting its eastern edge by ~0.5px and misregistering against its "
+        "neighbour by ~0.14px. See ADR-008.",
     )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def resolution(self) -> float:
+        """Output resolution in degrees, derived from :attr:`pixels_per_degree`."""
+        return 1.0 / self.pixels_per_degree
+
     crs: str = Field(
         default="EPSG:4326",
         description="Output coordinate reference system",
@@ -205,6 +217,32 @@ class Settings(BaseSettings):
         default=3,
         description="Number of retries for Coiled worker failures",
     )
+
+    @model_validator(mode="after")
+    def _grid_must_be_integral(self) -> "Settings":
+        """Reject any grid where the globe or a tile lands on a fractional pixel.
+
+        Every tile is cut from one global array (ADR-008), so a fractional pixel
+        count anywhere means tiles stop sharing a grid and seams reappear. An
+        integer ``pixels_per_degree`` already guarantees this for whole-degree
+        spans; what remains is a fractional ``tile_size_degrees`` or latitude
+        bound, which this catches at import rather than deep inside a write.
+        """
+        spans = {
+            "global longitude span (360 deg)": 360.0,
+            "global latitude span": self.max_latitude - self.min_latitude,
+            "tile size": self.tile_size_degrees,
+        }
+        for label, degrees in spans.items():
+            pixels = degrees * self.pixels_per_degree
+            if pixels != int(pixels):
+                msg = (
+                    f"{label} of {degrees} deg is {pixels} pixels at "
+                    f"{self.pixels_per_degree} px/deg, which is not a whole number. "
+                    "Tiles would not share a grid."
+                )
+                raise ValueError(msg)
+        return self
 
 
 settings = Settings()

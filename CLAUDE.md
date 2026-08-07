@@ -91,6 +91,24 @@ multi-year windows — it pools whatever scenes it is given.)
 
 ---
 
+## Output grid — one shared grid, always
+
+`settings.pixels_per_degree` (3600) is the grid definition; `settings.resolution` is a
+**derived property** (`1/3600`), not a settable field. Do not reintroduce a resolution float:
+the old `0.00027778` truncated 1/3600 and left every tile anchored to its own bbox, overshooting
+its eastern edge by 0.484 px and misregistering ~0.14 px against its neighbour.
+
+Load scenes through `tiling.geobox_for_bbox(bbox, factor)` and pass `geobox=` to `stac_load`.
+Never pass `crs` + `resolution` + `bbox` — odc-stac anchors the grid to the bbox, which is
+exactly the bug above.
+
+Numbers worth remembering: global grid 1,296,000 × 432,000; a 5° tile is 18,000² = 2⁴·3²·5³.
+That divides by 4 and 16 but **not** by 64, which is why overviews belong to the global array
+and not to a tile. See [ADR-008](docs/adr/008-global-mosaic-topology.md).
+
+Beware `int()` on a resolution-derived span: `int(5 / (1/3600))` is 17999, not 18000. Use
+`round()`.
+
 ## Data Quality
 
 LST values should be in reasonable ranges:
