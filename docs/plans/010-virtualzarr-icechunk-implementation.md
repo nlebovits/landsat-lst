@@ -21,6 +21,7 @@ Implement virtual Zarr datacube access over COGs using VirtualZarr and Icechunk,
 
 ```python
 import xarray as xr
+
 ds = xr.open_zarr("icechunk://source.coop/radiant-earth/landsat-lst")
 ds.lst_p50.sel(latitude=slice(45, 40), longitude=slice(-75, -70)).mean()
 ```
@@ -128,9 +129,11 @@ from obspec_utils.registry import ObjectStoreRegistry
 import icechunk as ic
 import xarray as xr
 
+
 def create_registry(storage: StorageBackend) -> ObjectStoreRegistry:
     """Create ObjectStoreRegistry for COG access."""
     ...
+
 
 def open_tile_virtual(
     cog_url: str,
@@ -145,25 +148,27 @@ def open_tile_virtual(
     )
 
     # Rename bands from numeric to meaningful names
-    vds = vds.rename({'0': 'lst_p50', '1': 'lst_p95', '2': 'qa_count'})
+    vds = vds.rename({"0": "lst_p50", "1": "lst_p95", "2": "qa_count"})
 
     # Assign coordinates based on tile name
     vds = assign_tile_coords(vds, tile_name)
 
     return vds
 
+
 def assign_tile_coords(vds: xr.Dataset, tile_name: str) -> xr.Dataset:
     """Add lat/lon coordinates based on tile name (e.g., N40W075)."""
     from landsat_lst.tiling import parse_tile_name
 
     lat_start, lon_start = parse_tile_name(tile_name)
-    n_lat, n_lon = vds.sizes['y'], vds.sizes['x']
+    n_lat, n_lon = vds.sizes["y"], vds.sizes["x"]
 
     # 5° tiles, north-to-south latitude, west-to-east longitude
     lat = np.linspace(lat_start + 5, lat_start, n_lat)
     lon = np.linspace(lon_start, lon_start + 5, n_lon)
 
-    return vds.assign_coords(latitude=('y', lat), longitude=('x', lon))
+    return vds.assign_coords(latitude=("y", lat), longitude=("x", lon))
+
 
 def create_icechunk_repo(
     storage: StorageBackend,
@@ -180,15 +185,18 @@ def create_icechunk_repo(
         )
     )
 
-    credentials = ic.credentials.containers_credentials({
-        container_prefix: storage.virtual_chunk_credentials(),  # New method
-    })
+    credentials = ic.credentials.containers_credentials(
+        {
+            container_prefix: storage.virtual_chunk_credentials(),  # New method
+        }
+    )
 
     return ic.Repository.create(
         icechunk_storage,
         config=config,
         authorize_virtual_chunk_access=credentials,
     )
+
 
 def create_virtual_datacube(
     tile_paths: list[str],
@@ -206,11 +214,11 @@ def create_virtual_datacube(
     ]
 
     # Concatenate spatially
-    combined = xr.concat(vds_list, dim='y', combine_attrs='override')
+    combined = xr.concat(vds_list, dim="y", combine_attrs="override")
 
     # Add time coordinate
     combined = combined.assign_coords(time=pd.Timestamp(f"{year}-01-01"))
-    combined = xr.concat([combined], dim='time')  # Wrap in time dim
+    combined = xr.concat([combined], dim="time")  # Wrap in time dim
 
     # Write to Icechunk
     container_prefix = storage.cog_container_prefix()
@@ -234,6 +242,7 @@ Add methods to `StorageBackend` ABC and implementations:
 ```python
 # storage.py additions
 
+
 class StorageBackend(ABC):
     @abstractmethod
     def virtual_chunk_store(self) -> ic.storage.Store:
@@ -247,6 +256,7 @@ class StorageBackend(ABC):
     def cog_container_prefix(self) -> str:
         """Return URL prefix for COG container (e.g., s3://bucket/)."""
 
+
 class LocalStorage(StorageBackend):
     def virtual_chunk_store(self) -> ic.storage.Store:
         return ic.storage.local_filesystem_store(str(self.output_dir))
@@ -256,6 +266,7 @@ class LocalStorage(StorageBackend):
 
     def cog_container_prefix(self) -> str:
         return f"file://{self.output_dir}/"
+
 
 class S3Storage(StorageBackend):
     def virtual_chunk_store(self) -> ic.storage.Store:
@@ -276,6 +287,7 @@ class S3Storage(StorageBackend):
 
 ```python
 # cli.py addition
+
 
 @app.command()
 def virtualize(
@@ -318,6 +330,7 @@ def virtualize(
 ```python
 # tests/integration/test_virtual_datacube.py
 
+
 def test_virtual_datacube_creation(tmp_path):
     """Test end-to-end virtual datacube creation and access."""
     # Create test COGs
@@ -333,9 +346,7 @@ def test_virtual_datacube_creation(tmp_path):
     )
 
     # Verify access
-    credentials = ic.credentials.containers_credentials({
-        f"file://{tmp_path}/": None
-    })
+    credentials = ic.credentials.containers_credentials({f"file://{tmp_path}/": None})
     repo = ic.Repository.open(
         storage.icechunk_storage(),
         authorize_virtual_chunk_access=credentials,

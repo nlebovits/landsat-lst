@@ -28,7 +28,7 @@ import rioxarray  # noqa: F401 - needed for .rio accessor
 import xarray as xr
 import zarr
 from pyproj import CRS
-from zarr.codecs import BloscCname, BloscCodec
+from zarr.codecs import BloscCodec
 
 from landsat_lst.config import settings
 
@@ -280,7 +280,10 @@ def _compressors() -> tuple:
         return ()
     return (
         BloscCodec(
-            cname=BloscCname(settings.compression_codec),
+            # Pass the codec name as a plain string. zarr 3.3 made BloscCname
+            # non-callable and deprecated member access in favour of strings,
+            # while 3.2 already accepted a string here, so this works on both.
+            cname=settings.compression_codec,
             clevel=settings.compression_level,
         ),
     )

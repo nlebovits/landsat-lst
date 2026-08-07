@@ -65,6 +65,9 @@ output/
 !tests/fixtures/**/*.tif
 tests/fixtures/data/
 data/*.gpkg
+# Reference datasets cached by scripts/aster_gap_urban_analysis.py
+data/ghsl/
+data/aster_ged/
 .serena/
 
 # Environment

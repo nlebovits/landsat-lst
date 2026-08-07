@@ -28,14 +28,13 @@ import fsspec
 
 # Open native resolution (multiscale level "0") from Source Coop
 mapper = fsspec.get_mapper(
-    "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr",
-    anon=True
+    "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr", anon=True
 )
 ds = xr.open_zarr(mapper, group="0")
 
 # Read scale/offset from Zarr attributes
-scale = ds["lst_p95"].attrs["lst_scale_factor"]    # 0.01
-offset = ds["lst_p95"].attrs["lst_add_offset"]     # -50.0
+scale = ds["lst_p95"].attrs["lst_scale_factor"]  # 0.01
+offset = ds["lst_p95"].attrs["lst_add_offset"]  # -50.0
 
 # Decode to Celsius
 celsius = ds["lst_p95"] * scale + offset
@@ -135,10 +134,7 @@ mapper = fsspec.get_mapper(url, anon=True)
 ds = xr.open_zarr(mapper, group="0")
 
 # Spatial subset (only fetches required chunks)
-subset = ds.lst_p95.sel(
-    latitude=slice(42, 40),
-    longitude=slice(-74, -75)
-)
+subset = ds.lst_p95.sel(latitude=slice(42, 40), longitude=slice(-74, -75))
 
 # Decode uint16 to Celsius
 lst_celsius = subset * 0.01 + (-50.0)
@@ -153,8 +149,8 @@ zoomed-out / web rendering. The tile group's attributes describe the pyramid:
 ```python
 import zarr
 
-root = zarr.open_group(mapper, mode="r")          # the tile group
-print(root.attrs["multiscales"]["layout"])         # level layout + scale factors
+root = zarr.open_group(mapper, mode="r")  # the tile group
+print(root.attrs["multiscales"]["layout"])  # level layout + scale factors
 print(root.attrs["proj:code"], root.attrs["spatial:transform"])  # GeoZarr proj/spatial
 
 # Open a coarse overview (16x) instead of full resolution
@@ -208,6 +204,68 @@ Key choices:
 - **Temporal**: Calendar-year or multi-year window composites (pooled P95)
 - **Spatial**: Land only, ±60° latitude
 
+## Known Limitations
+
+### Permanent gaps from ASTER emissivity
+
+Landsat Collection 2 Level-2 Surface Temperature needs an emissivity value for
+every pixel and takes it from the ASTER Global Emissivity Dataset, built from
+clear-sky ASTER scenes acquired 2000–2008. Where ASTER never caught clear sky in
+those nine years, no emissivity exists, so USGS produces no Surface Temperature.
+Those pixels are empty in every year of the archive.
+
+**Nothing downstream fixes this.** Widening the compositing window closes cloud
+gaps, which is why multi-year pooling exists, but an emissivity gap survives
+every window length: the missing input is a static auxiliary dataset, not an
+observation.
+
+![ASTER GED emissivity coverage: blue where data exists, white where it does not](docs/images/aster-ged-coverage-usgs.jpg)
+
+*Blue is available data, white is none. Figure by USGS, public domain, from
+[Landsat Collection 2 Surface Temperature data gaps due to missing ASTER
+GED](https://www.usgs.gov/landsat-missions/landsat-collection-2-surface-temperature-data-gaps-due-missing-aster-ged).
+This view is global land; the numbers below are urban land only.*
+
+Measured against GHS-SMOD R2023A, **2.66% of the world's urban land has no
+emissivity** (80,397 km² of 3,027,063 km²), and **10.23% rests on one or two
+observations**. Every figure here is urban land only. Averaging over every city
+on Earth hides the spread, because gaps follow persistent cloud:
+
+| Region | Urban gap % |
+|---|---:|
+| Southeast Asia | 12.07 |
+| Amazonia | 11.62 |
+| Southern Africa | 8.36 |
+| Europe | 2.80 |
+| North America | 1.18 |
+| Australia | 0.30 |
+| Sahara and Sahel | 0.00 |
+
+Deserts are the best-covered places on Earth for this product; the wet tropics
+are the worst.
+
+**Detecting it.** An affected pixel reads `qa_count == 0` for all 12 months
+inside the land mask. That test alone conflates gaps with ocean, since
+`process_tile` zeroes `qa_count` over water, so use the land mask as the
+denominator:
+
+```python
+from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
+
+land = get_land_mask_for_bbox(
+    tile.bbox,
+    settings.resolution,
+    load_land_polygons(),
+    target_shape=shape,
+)
+gap = (composite["qa_count"].sum("month").to_numpy() == 0) & land
+```
+
+Full numbers and method in
+[docs/findings-aster-ged-gaps.md](docs/findings-aster-ged-gaps.md); the decision
+to leave gaps empty rather than fill them from another emissivity source is
+[ADR-006](docs/adr/006-no-aster-gap-filling.md).
+
 ## Development
 
 ```bash
@@ -233,7 +291,8 @@ uv run prek install
 `uv sync --all-extras` installs everything; individual extras can be installed on
 their own:
 
-- `analysis` — `matplotlib` for figure generation in analysis/findings writeups.
+- `analysis` — `matplotlib` for figure generation in analysis/findings writeups, plus
+  `h5py` and `earthaccess` for the ASTER GED gap analysis.
 - `frisky` — experimental Rust reimplementation of the Dask scheduler
   ([getfrisky.dev](https://getfrisky.dev)). Kept behind a fallback: the multi-year
   decision driver uses it when installed but reverts to plain Dask otherwise
@@ -251,6 +310,9 @@ Notable scripts in [`scripts/`](scripts/):
   removal relative to a per-pixel monthly climatology). Not part of the production
   pipeline — see [docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md)
   and [docs/adr/005-multiyear-monthly-qa-and-destriping.md](docs/adr/005-multiyear-monthly-qa-and-destriping.md).
+- `aster_gap_urban_analysis.py` — measures ASTER GED coverage gaps against GHS-SMOD to
+  quantify how much urban land has no Surface Temperature. Needs the `analysis` extra
+  and a NASA Earthdata login; see [Known Limitations](#known-limitations).
 
 ## License
 

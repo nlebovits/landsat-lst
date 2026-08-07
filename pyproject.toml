@@ -54,6 +54,10 @@ analysis = [
     # Figure generation for analysis writeups (e.g. findings docs).
     # geopandas/rasterio/pandas/dask are already core deps.
     "matplotlib>=3.8.0",
+    # ASTER GED coverage-gap analysis: HDF5 granule reads plus NASA Earthdata
+    # search/download. See scripts/aster_gap_urban_analysis.py.
+    "h5py>=3.10.0",
+    "earthaccess>=0.15.0",
 ]
 frisky = [
     # Experimental Rust reimplementation of the Dask scheduler. Optional: the
@@ -149,6 +153,12 @@ known-first-party = ["landsat_lst"]
 ]
 "src/landsat_lst/cli.py" = [
     "PLC0415", # lazy imports for CLI performance
+]
+"scripts/aster_gap_urban_analysis.py" = [
+    # Lazy imports are load-bearing here: h5py/earthaccess/matplotlib live in the
+    # optional `analysis` extra, and the pipeline must be imported only after
+    # settings.stac_url is pointed at Planetary Computer.
+    "PLC0415",
 ]
 
 # ============================================================================

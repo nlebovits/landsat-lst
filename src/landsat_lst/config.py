@@ -125,7 +125,10 @@ class Settings(BaseSettings):
     )
 
     # Compression (Zarr v3 codec)
-    compression_codec: str = Field(
+    # Literal rather than str so an unsupported codec fails at settings load
+    # instead of deep inside the Zarr write, and so the value satisfies the
+    # codec name type BloscCodec expects.
+    compression_codec: Literal["lz4", "lz4hc", "blosclz", "snappy", "zlib", "zstd"] = Field(
         default="zstd",
         description="Blosc compression codec name (e.g. 'zstd', 'lz4', 'blosclz').",
     )
