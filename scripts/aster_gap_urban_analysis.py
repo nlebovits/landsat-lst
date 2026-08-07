@@ -111,7 +111,12 @@ H5_LWMAP = "Land Water Map/LWmap"
 H5_LAT = "Geolocation/Latitude"
 H5_LON = "Geolocation/Longitude"
 
-LWMAP_LAND = 1
+# LWmap codes land as 0 and water as 1, with -9999 as fill. Verified against the
+# granules themselves rather than assumed: an all-inland cell (28N 77E, Delhi) is
+# 0 everywhere, and in a coastal cell (35N 139E, Tokyo) the 1-valued pixels carry
+# mean elevation 0.7 m and mean NDVI 1.0 against 242 m and 44 for the 0-valued
+# ones. Anything that is not 0 therefore drops out as non-land.
+LWMAP_LAND = 0
 
 # Tier codes written to the mosaic. 0 doubles as nodata, so water and
 # unevaluated pixels drop out of every count.
@@ -134,6 +139,10 @@ GHSL_DIR = DATA_DIR / "ghsl"
 ASTER_DIR = DATA_DIR / "aster_ged"
 OUT_DIR = Path("results/aster-gaps")
 
+# Granules are tiny (~0.46 MB) but each fetch pays an LP DAAC auth redirect, so
+# throughput is latency-bound rather than bandwidth-bound. earthaccess defaults to 8.
+DOWNLOAD_THREADS = 32
+
 # Ordinal blue ramp, validated light-mode: severity reads light -> dark.
 COLOR_LOW_CONFIDENCE = "#5598e7"
 COLOR_GAP = "#104281"
@@ -154,7 +163,7 @@ def classify_tiers(num_obs: np.ndarray, lwmap: np.ndarray) -> np.ndarray:
 
     Args:
         num_obs: Clear-sky ASTER observation count per pixel.
-        lwmap: Land water map, 1 = land, 2 = water.
+        lwmap: Land water map, 0 = land, 1 = water, -9999 = fill.
 
     Returns:
         uint8 array of TIER_* codes; TIER_NODATA over water.
@@ -370,7 +379,7 @@ def _require_credentials(earthaccess: Any) -> None:
     )
 
 
-def download_granules(granules: list[Any]) -> list[Path]:
+def download_granules(granules: list[Any], threads: int = DOWNLOAD_THREADS) -> list[Path]:
     """Download granules that are not already on disk; return every local path."""
     import earthaccess
 
@@ -378,9 +387,14 @@ def download_granules(granules: list[Any]) -> list[Path]:
     existing = {p.name for p in ASTER_DIR.glob("*.h5")}
     pending = [g for g in granules if _granule_filename(g) not in existing]
 
-    log.info("aster_download", pending=len(pending), cached=len(granules) - len(pending))
+    log.info(
+        "aster_download",
+        pending=len(pending),
+        cached=len(granules) - len(pending),
+        threads=threads,
+    )
     if pending:
-        earthaccess.download(pending, str(ASTER_DIR))
+        earthaccess.download(pending, str(ASTER_DIR), threads=threads)
 
     wanted = {_granule_filename(g) for g in granules}
     return sorted(p for p in ASTER_DIR.glob("*.h5") if p.name in wanted)
@@ -443,18 +457,26 @@ def build_tier_mosaic(granule_paths: list[Path], smod_path: Path, out_path: Path
     out_path.parent.mkdir(parents=True, exist_ok=True)
     log.info("mosaic_build", granules=len(granule_paths), path=str(out_path))
 
-    with rasterio.open(out_path, "w+", **profile) as dst:
-        for index, path in enumerate(granule_paths, start=1):
-            _burn_granule(dst, path, dst_crs, dst_transform, dst_shape)
-            if index % 500 == 0:
-                log.info("mosaic_progress", done=index, total=len(granule_paths))
+    # Accumulate in memory (650 MB as uint8) and write once. Burning granules
+    # straight into an open dataset cannot work here: the granules arrive in
+    # filename order, which is not the destination's block order, and GDAL
+    # cannot rewrite a compressed tile once it has been flushed, so scattered
+    # read-modify-write drops most of what it writes.
+    mosaic = np.zeros(dst_shape, dtype=np.uint8)
+    for index, path in enumerate(granule_paths, start=1):
+        _burn_granule(mosaic, path, dst_crs, dst_transform, dst_shape)
+        if index % 500 == 0:
+            log.info("mosaic_progress", done=index, total=len(granule_paths))
 
-    log.info("mosaic_ready", path=str(out_path))
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(mosaic, 1)
+
+    log.info("mosaic_ready", path=str(out_path), valid_px=int(np.count_nonzero(mosaic)))
     return out_path
 
 
 def _burn_granule(
-    dst: rasterio.io.DatasetWriter,
+    mosaic: np.ndarray,
     path: Path,
     dst_crs: Any,
     dst_transform: Affine,
@@ -477,7 +499,7 @@ def _burn_granule(
         src_transform=src_transform,
         src_crs="EPSG:4326",
         src_nodata=TIER_NODATA,
-        dst_transform=dst.window_transform(window),
+        dst_transform=rasterio.windows.transform(window, dst_transform),
         dst_crs=dst_crs,
         dst_nodata=TIER_NODATA,
         resampling=Resampling.nearest,
@@ -487,8 +509,9 @@ def _burn_granule(
 
     # Windows overlap slightly at cell edges after the Mollweide bbox padding;
     # keep whatever a neighbouring granule already wrote.
-    prior = dst.read(1, window=window)
-    dst.write(np.where(patch != TIER_NODATA, patch, prior), 1, window=window)
+    row0, col0 = int(window.row_off), int(window.col_off)
+    view = mosaic[row0 : row0 + patch.shape[0], col0 : col0 + patch.shape[1]]
+    np.copyto(view, patch, where=patch != TIER_NODATA)
 
 
 def crosstab_tiers(tier_path: Path, smod_path: Path) -> pd.DataFrame:
@@ -791,6 +814,15 @@ def parse_args() -> argparse.Namespace:
         help="Run the pipeline for one 5-degree tile and compare against the prediction.",
     )
     parser.add_argument("--validate-year", type=int, default=2024, help="Year for --validate-tile.")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=DOWNLOAD_THREADS,
+        help=(
+            f"Concurrent granule downloads (default: {DOWNLOAD_THREADS}). Fetches are "
+            "latency-bound on the LP DAAC auth redirect, so concurrency drives throughput."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=OUT_DIR, help="Output directory.")
     return parser.parse_args()
 
@@ -807,7 +839,7 @@ def main() -> None:
     cells = urban_cell_set(smod_path, classes)
 
     granules = search_aster_granules(cells)
-    paths = download_granules(granules)
+    paths = download_granules(granules, threads=args.threads)
     log.info("granules_local", count=len(paths))
 
     tier_path = build_tier_mosaic(paths, smod_path, args.output / "gap_tiers_smod_grid.tif")

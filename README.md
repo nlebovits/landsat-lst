@@ -233,7 +233,8 @@ uv run prek install
 `uv sync --all-extras` installs everything; individual extras can be installed on
 their own:
 
-- `analysis` — `matplotlib` for figure generation in analysis/findings writeups.
+- `analysis` — `matplotlib` for figure generation in analysis/findings writeups, plus
+  `h5py` and `earthaccess` for the ASTER GED gap analysis.
 - `frisky` — experimental Rust reimplementation of the Dask scheduler
   ([getfrisky.dev](https://getfrisky.dev)). Kept behind a fallback: the multi-year
   decision driver uses it when installed but reverts to plain Dask otherwise
@@ -251,6 +252,9 @@ Notable scripts in [`scripts/`](scripts/):
   removal relative to a per-pixel monthly climatology). Not part of the production
   pipeline — see [docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md)
   and [docs/adr/005-multiyear-monthly-qa-and-destriping.md](docs/adr/005-multiyear-monthly-qa-and-destriping.md).
+- `aster_gap_urban_analysis.py` — measures ASTER GED coverage gaps against GHS-SMOD to
+  quantify how much urban land has no Surface Temperature. Needs the `analysis` extra
+  and a NASA Earthdata login; see [Known Limitations](#known-limitations).
 
 ## License
 

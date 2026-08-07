@@ -27,7 +27,7 @@ pytestmark = pytest.mark.unit
 
 def test_classify_tiers_by_observation_count():
     num_obs = np.array([[0, 1, 2, 3, 50]])
-    lwmap = np.ones_like(num_obs)
+    lwmap = np.full_like(num_obs, aga.LWMAP_LAND)
 
     tiers = aga.classify_tiers(num_obs, lwmap)
 
@@ -44,19 +44,24 @@ def test_classify_tiers_by_observation_count():
 
 
 def test_classify_tiers_excludes_water():
-    """Water must never be counted as a gap, however few observations it has."""
-    num_obs = np.array([[0, 0]])
-    lwmap = np.array([[1, 2]])
+    """Water must never be counted as a gap, however few observations it has.
+
+    LWmap codes land as 0 and water as 1. Getting this backwards silently
+    inverts the whole analysis, so pin the real codes rather than a sentinel.
+    """
+    num_obs = np.array([[0, 0, 0]])
+    lwmap = np.array([[0, 1, -9999]])
 
     tiers = aga.classify_tiers(num_obs, lwmap)
 
-    assert tiers[0, 0] == aga.TIER_GAP
-    assert tiers[0, 1] == aga.TIER_NODATA
+    assert tiers[0, 0] == aga.TIER_GAP  # land
+    assert tiers[0, 1] == aga.TIER_NODATA  # water
+    assert tiers[0, 2] == aga.TIER_NODATA  # fill
 
 
 def test_classify_tiers_treats_negative_fill_as_gap():
     num_obs = np.array([[-9999, 4]])
-    lwmap = np.ones_like(num_obs)
+    lwmap = np.full_like(num_obs, aga.LWMAP_LAND)
 
     tiers = aga.classify_tiers(num_obs, lwmap)
 
@@ -207,7 +212,7 @@ def test_read_granule_tiers_builds_whole_degree_transform(tmp_path):
     size = 100
     num_obs = np.full((size, size), 7, dtype=np.int16)
     num_obs[0, 0] = 0
-    lwmap = np.ones((size, size), dtype=np.int8)
+    lwmap = np.full((size, size), aga.LWMAP_LAND, dtype=np.int16)
     # Pixel centres sit half a pixel inside the 154-155E, 12-11S cell.
     lat = np.linspace(-11.005, -11.995, size)
     lon = np.linspace(154.005, 154.995, size)
