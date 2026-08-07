@@ -232,3 +232,53 @@ def test_read_granule_tiers_builds_whole_degree_transform(tmp_path):
     assert transform.f == pytest.approx(-11.0)
     assert transform.a == pytest.approx(0.01)
     assert transform.e == pytest.approx(-0.01)
+
+
+# --- predicted gap ----------------------------------------------------------
+
+
+def _write_granule(path: Path, north: int, west: int, gap_rows: int) -> None:
+    """Write a synthetic AG1km granule whose first `gap_rows` rows are gaps."""
+    h5py = pytest.importorskip("h5py")
+
+    size = 100
+    num_obs = np.full((size, size), 7, dtype=np.int16)
+    num_obs[:gap_rows, :] = 0
+    lwmap = np.full((size, size), aga.LWMAP_LAND, dtype=np.int16)
+    lat = np.linspace(north - 0.005, north - 0.995, size)
+    lon = np.linspace(west + 0.005, west + 0.995, size)
+
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset(aga.H5_NUM_OBS, data=num_obs)
+        h5.create_dataset(aga.H5_LWMAP, data=lwmap)
+        h5.create_dataset(aga.H5_LAT, data=lat)
+        h5.create_dataset(aga.H5_LON, data=lon)
+
+
+def test_predicted_gap_stays_inside_the_granule_footprint(tmp_path, monkeypatch):
+    """Area with no granule must stay false.
+
+    Reprojecting with a src_nodata the source never contains floods the whole
+    destination with that sentinel, which ORs every pixel true and reports the
+    entire tile as a gap.
+    """
+    monkeypatch.setattr(aga, "ASTER_DIR", tmp_path)
+    # One cell of a 2x2-degree bbox, gaps in the top tenth of that cell.
+    _write_granule(tmp_path / "AG1km.v003.1.0.0010.h5", north=1, west=0, gap_rows=10)
+
+    predicted = aga._predicted_gap_for_bbox((0.0, 0.0, 2.0, 2.0), (200, 200))
+
+    assert predicted.dtype == np.bool_
+    # The granule covers 0-1E, 0-1S -> the lower-left quadrant of the bbox.
+    assert not predicted[:100, :].any()  # northern half has no granule
+    assert not predicted[:, 100:].any()  # eastern half has no granule
+    # Gaps occupy the top tenth of that quadrant, so ~10 rows of the 100.
+    assert 0 < predicted.sum() < 200 * 200 * 0.10
+
+
+def test_predicted_gap_is_empty_without_granules(tmp_path, monkeypatch):
+    monkeypatch.setattr(aga, "ASTER_DIR", tmp_path)
+
+    predicted = aga._predicted_gap_for_bbox((0.0, 0.0, 2.0, 2.0), (50, 50))
+
+    assert not predicted.any()

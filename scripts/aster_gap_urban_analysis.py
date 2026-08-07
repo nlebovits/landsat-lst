@@ -754,19 +754,37 @@ def _predicted_gap_for_bbox(
             if path is None:
                 continue
             tiers, src_transform = read_granule_tiers(path)
-            patch = np.zeros(shape, dtype=np.uint8)
+
+            # Reproject the tier codes rather than a derived boolean. TIER_NODATA
+            # is 0 and genuinely means "no data", so uncovered destination area
+            # stays 0 instead of being flooded with a sentinel. Passing a
+            # src_nodata that the boolean mask never contains makes GDAL fill
+            # everything outside the granule with that value, which ORs the whole
+            # grid to true and reports every pixel as a gap.
+            window = window_from_bounds(
+                *rasterio.transform.array_bounds(*tiers.shape, src_transform),
+                transform=dst_transform,
+            )
+            window = window.round_offsets().round_lengths()
+            window = window.intersection(Window(0, 0, width, height))
+            if window.width <= 0 or window.height <= 0:
+                continue
+
+            patch = np.zeros((int(window.height), int(window.width)), dtype=np.uint8)
             reproject(
-                source=(tiers == TIER_GAP).astype(np.uint8),
+                source=tiers,
                 destination=patch,
                 src_transform=src_transform,
                 src_crs="EPSG:4326",
-                dst_transform=dst_transform,
+                src_nodata=TIER_NODATA,
+                dst_transform=rasterio.windows.transform(window, dst_transform),
                 dst_crs="EPSG:4326",
+                dst_nodata=TIER_NODATA,
                 resampling=Resampling.nearest,
-                src_nodata=255,
-                dst_nodata=0,
             )
-            out |= patch
+            row0, col0 = int(window.row_off), int(window.col_off)
+            view = out[row0 : row0 + patch.shape[0], col0 : col0 + patch.shape[1]]
+            view |= (patch == TIER_GAP).astype(np.uint8)
 
     return out.astype(bool)
 
