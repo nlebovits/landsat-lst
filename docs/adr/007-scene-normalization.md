@@ -139,13 +139,25 @@ that a handful of outlier scenes barely move it.
 
 ## Consequences
 
-The correction costs one extra full traversal of the stack. Offsets must be materialized before
-the time axis can be subset, so `scene_offsets` forces an eager reduction on top of the later
-percentile pass. On a five-year window that is a second read of a large number of scenes, which
-is the main compute risk in the distributed run. The calibration run gives a first measurement:
-the offset pass alone took about 9.5 minutes for a 1-degree AOI with 390 solar-day scenes on 8
-local workers. A 5-degree tile covers 25 times that area, so the full-tile five-year run needs
-to be distributed and remains the open risk item in #46.
+The correction costs an extra traversal of the stack. Offsets must be materialized before the
+time axis can be subset, so `scene_offsets` forces an eager reduction on top of the later
+percentile pass. Measured on the calibration run, that pass alone took about 9.5 minutes for a
+1-degree AOI with 390 solar-day scenes, and a 5-degree tile covers 25 times the area.
+
+Most of that is recovered by estimating offsets from a coarse read.
+`settings.destripe_offset_resolution_factor = 2` loads the offset stack at twice the pixel size,
+served from the source COGs' internal overviews, cutting that pass from 20.2 GB to 5.1 GB and
+the pipeline from 40.4 GB to 25.3 GB per composite. Validated at Pergamino: factor 2 reproduces
+native offsets to a median of 0.002 °C (p99 0.063, max 0.188) with zero keep/reject flips.
+
+Two things about that are worth carrying forward. Subsampling **after** loading does not help,
+because dask materializes each chunk before discarding it, so only a coarser `resolution=`
+reduces bytes fetched. And offset error grows **linearly** in the factor rather than plateauing,
+so the aggressive factors are unavailable and the ceiling on this optimization is 2× regardless,
+since the P95 still needs its native pass. See
+[findings-offset-subsampling.md](../findings-offset-subsampling.md).
+
+The full-tile five-year run on Coiled remains the open risk item in #46.
 
 `settings.destripe` defaults to True and exists so raw composites stay reachable for
 benchmarking. `compute_annual_composite` still applies no land mask unless one is supplied, so

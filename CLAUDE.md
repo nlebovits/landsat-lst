@@ -137,6 +137,19 @@ Consequences worth remembering:
   evidence behind each P95 value, not raw data availability.
 - Offsets are estimated over **land only**. `process_tile` builds the land mask
   before compositing and passes it to `compute_annual_composite(land_mask=...)`.
+- Offsets are estimated from a **coarse read** (`destripe_offset_resolution_factor`,
+  default 2) served from the source COGs' overviews. Do **not** "optimize" this
+  by striding or `.coarsen()`-ing the loaded array: that cuts compute but not
+  I/O, because dask materializes each chunk before discarding it. Only a coarser
+  `resolution=` on `stac_load` reduces bytes fetched. Offset error grows linearly
+  in the factor, so raising it requires re-running
+  `scripts/validate_offset_subsampling.py`; the ceiling is ~2× regardless, since
+  the P95 still needs a native pass.
+- `destripe_min_scene_pixels` applies on the **native** path;
+  `destripe_min_offset_samples` applies on a **coarse** path. A coarse valid-pixel
+  count cannot be scaled back to a native one — averaging spreads data across
+  nodata, so coarse loading over-reports coverage (1 valid native pixel read as
+  13 at factor 8).
 - `destripe_max_offset_c` (15.0 °C) is **calibrated**, not guessed — Pergamino
   2021-2025, 390 solar-day scenes. The offset distribution is a tight core
   (82.7% within ±15 °C, std 5.71) plus a one-sided cold tail from undetected

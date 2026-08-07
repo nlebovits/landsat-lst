@@ -147,13 +147,15 @@ class Settings(BaseSettings):
         "to place a median on.",
     )
     destripe_offset_resolution_factor: int = Field(
-        default=1,
+        default=2,
         description="Estimate per-scene offsets from a stack loaded at "
         "resolution * factor, served from the source COGs' internal overviews "
-        "([2,4,8,16,32,64]). 1 keeps offsets at native resolution. The offset is a "
-        "single scalar per scene, so spatial detail buys nothing, and a coarse read "
-        "cuts bytes fetched rather than merely compute. Validate a new value against "
-        "scripts/validate_offset_subsampling.py before shipping it.",
+        "([2,4,8,16,32,64]). 1 keeps offsets at native resolution. Validated at "
+        "Pergamino: factor 2 reproduces native offsets to a median of 0.002 degC "
+        "(p99 0.063, max 0.188) with zero keep/reject flips, and 4 is the largest "
+        "that passes. Offset error grows linearly in the factor, so do not raise "
+        "this without re-running scripts/validate_offset_subsampling.py. The saving "
+        "caps out near 2x regardless, since the P95 still needs a native pass.",
     )
 
     # Multiscale overviews (GeoZarr multiscales convention)
