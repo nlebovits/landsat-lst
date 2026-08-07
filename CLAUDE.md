@@ -137,9 +137,14 @@ Consequences worth remembering:
   evidence behind each P95 value, not raw data availability.
 - Offsets are estimated over **land only**. `process_tile` builds the land mask
   before compositing and passes it to `compute_annual_composite(land_mask=...)`.
-- `destripe_max_offset_c` (15.0 °C) is **provisional**. Calibrate it with
-  `scripts/calibrate_destripe_cap.py`, which sweeps candidate caps over one load
-  and reports the rejection fraction for each.
+- `destripe_max_offset_c` (15.0 °C) is **calibrated**, not guessed — Pergamino
+  2021-2025, 390 solar-day scenes. The offset distribution is a tight core
+  (82.7% within ±15 °C, std 5.71) plus a one-sided cold tail from undetected
+  cloud, so 15 °C sits near 2.6 core-σ and rejects 21.8% (63 cold scenes vs 1
+  warm). Do **not** reason about this cap from the full-sample std (17.01) —
+  it is entirely tail-driven and implies a much harsher cut than reality.
+  Re-run `scripts/calibrate_destripe_cap.py` on a humid tropical tile before
+  the global build; the calibration AOI is mid-latitude cropland.
 
 See [docs/adr/007-scene-normalization.md](docs/adr/007-scene-normalization.md),
 [docs/methodology.md](docs/methodology.md), and

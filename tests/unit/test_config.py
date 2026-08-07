@@ -45,7 +45,7 @@ class TestSettings:
         assert settings.destripe is False
 
     def test_destripe_cap_from_env(self, monkeypatch):
-        """The cap is provisional, so it must be tunable without a code change."""
+        """The cap is climate-dependent, so it must be tunable without a code change."""
         monkeypatch.setenv("LST_DESTRIPE_MAX_OFFSET_C", "8.5")
         settings = Settings()
         assert settings.destripe_max_offset_c == 8.5

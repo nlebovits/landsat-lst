@@ -111,8 +111,9 @@ def seasonal_debias(
 def offset_diagnostics(offset: xr.DataArray, keep: xr.DataArray) -> dict[str, float]:
     """Summarize the offset distribution and what rejection removed.
 
-    The rejection fraction is the number that matters: the cap is provisional
-    until a real tile shows how much of the stack it actually discards.
+    The rejection fraction is the number that matters. Log it per tile: the cap
+    was calibrated on mid-latitude cropland, and a tile whose rejection fraction
+    departs sharply from the ~22% seen there is telling you something.
     """
     values = np.asarray(offset.values, dtype="float64")
     finite = values[np.isfinite(values)]

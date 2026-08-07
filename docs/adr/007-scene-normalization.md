@@ -75,29 +75,60 @@ artifact the correction exists to remove.
 If every scene is rejected, the pipeline raises rather than emitting an empty composite. That is
 a failure worth surfacing, not a tile to publish as nodata.
 
-### The cap is provisional
+### The cap: 15 C, calibrated
 
-`destripe_max_offset_c` ships at 15.0 C and is **not yet calibrated**. Measured offsets at
-Pergamino, across three prototype runs, were:
+`destripe_max_offset_c` is 15.0 C, set from a measured distribution rather than a standard
+deviation. `scripts/calibrate_destripe_cap.py` loads a window once, computes the offsets once,
+and sweeps candidate caps over the result. Run against Pergamino for 2021-2025: 757 STAC items,
+390 solar-day scenes, of which 23 (5.9%) fall below the sparse-pixel floor regardless of cap.
 
-| Window | std | min | max |
+The distribution is not a broad bell curve, which is what the summary statistics from earlier
+runs suggested. It is a tight core plus a one-sided cold tail:
+
+| Offset range (C) | Scenes | Share |
+|---|--:|--:|
+| below -50 | 19 | 5.1% |
+| -50 to -30 | 10 | 2.7% |
+| -30 to -20 | 15 | 4.1% |
+| -20 to -15 | 19 | 5.1% |
+| -15 to -5 | 66 | 17.9% |
+| -5 to +5 | 202 | 54.7% |
+| +5 to +15 | 37 | 10.0% |
+| above +15 | 1 | 0.3% |
+
+Restricted to |offset| < 15, the core holds 82.7% of scenes with a standard deviation of 5.71 C
+and a median of -0.27 C. The full-sample standard deviation of 17.01 is entirely tail-driven.
+This matters, because reasoning from that number under an assumption of normality suggests a
+15 C cap would cut deep into good data. It does not. A 15 C cap sits at roughly 2.6 core sigma.
+
+The rejection is also almost entirely one-sided: 63 scenes fall below -15 C and exactly one rises
+above it, at +15.55. That asymmetry is the signature of undetected cloud, which reads cold, rather
+than of atmospheric-correction bias, which has no reason to prefer a direction. Discarding those
+scenes removes contaminated observations rather than trimming real variability.
+
+Cap sweep, same run:
+
+| Cap (C) | Kept | Rejected | Rejected share |
 |---|--:|--:|--:|
-| 1-year (n=87) | 10.97 | -30.27 | +15.82 |
-| 3-year | 12.34 | -66.06 | +16.41 |
-| 5-year | 12.88 | -73.02 | +16.92 |
+| 5.0 | 202 | 188 | 48.2% |
+| 10.0 | 270 | 120 | 30.8% |
+| 12.5 | 290 | 100 | 25.6% |
+| **15.0** | **305** | **85** | **21.8%** |
+| 20.0 | 325 | 65 | 16.7% |
+| 25.0 | 338 | 52 | 13.3% |
+| 30.0 | 340 | 50 | 12.8% |
 
-The distribution is asymmetric. The warm side sits near +16 C in every run, while the cold tail
-runs to -73 C, which is the signature of undetected cloud rather than atmospheric bias. The
-spread is genuinely broad rather than one outlier inflating the standard deviation: a lone -73
-among roughly 674 scenes would contribute only about 2.8 to sigma. Much of that width is real
-day-to-day weather that a monthly reference cannot absorb.
+15.0 C discards 21.8% of scenes, of which 5.9 points are the sparse floor and the rest is the
+cold tail. The five-year window carries a median of 13 to 16 valid observations per pixel per
+month, so roughly 10 to 12 survive, which is ample. Loosening to 20 or 25 C would retain scenes
+20 to 25 C colder than their own monthly norm, which is not a plausible scene-wide surface
+signal in this landscape.
 
-At sigma near 12.9, a 15 C cap could reject a substantial share of scenes. That is tolerable
-under the guiding principle and leaves ample coverage, since the five-year window carries a
-median of 13 to 16 valid observations per pixel per month. It is still a number that must be
-measured rather than assumed. `scripts/calibrate_destripe_cap.py` loads a window once, computes
-the offsets once, and sweeps candidate caps from 5 to 30 C over the result, reporting the
-rejection fraction for each. Run it before treating the default as settled.
+The tail is continuous rather than cleanly separated, so any cut point is a judgment. This one is
+recorded so it can be revisited: the calibration output, including every per-scene offset, is in
+`results/decision/destripe_cap_calibration.json`. The AOI is a single mid-latitude agricultural
+site, so a humid tropical tile may well behave differently and is worth a second calibration run
+before the global build.
 
 ### Single-pass climatology
 
@@ -111,7 +142,10 @@ that a handful of outlier scenes barely move it.
 The correction costs one extra full traversal of the stack. Offsets must be materialized before
 the time axis can be subset, so `scene_offsets` forces an eager reduction on top of the later
 percentile pass. On a five-year window that is a second read of a large number of scenes, which
-is the main compute risk in the distributed run.
+is the main compute risk in the distributed run. The calibration run gives a first measurement:
+the offset pass alone took about 9.5 minutes for a 1-degree AOI with 390 solar-day scenes on 8
+local workers. A 5-degree tile covers 25 times that area, so the full-tile five-year run needs
+to be distributed and remains the open risk item in #46.
 
 `settings.destripe` defaults to True and exists so raw composites stay reachable for
 benchmarking. `compute_annual_composite` still applies no land mask unless one is supplied, so

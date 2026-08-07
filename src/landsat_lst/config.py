@@ -124,11 +124,13 @@ class Settings(BaseSettings):
     )
     destripe_max_offset_c: float = Field(
         default=15.0,
-        description="PROVISIONAL, pending calibration on a real tile. Discard a scene "
-        "whose absolute offset exceeds this (degC) rather than adjusting it. Measured "
-        "offsets at Pergamino: std 11-13, max +17, with a cold tail to -73 (undetected "
-        "cloud). At std ~12.9 this may reject a large share of scenes, so confirm the "
-        "realized rejection fraction before treating the default as settled.",
+        description="Discard a scene whose absolute offset exceeds this (degC) rather "
+        "than adjusting it. Calibrated at Pergamino 2021-2025 (ADR-007): the offset "
+        "distribution is a tight core (82.7% of scenes within +/-15, std 5.71) plus a "
+        "one-sided cold tail from undetected cloud, so 15 sits near 2.6 core sigma and "
+        "discards 21.8% of scenes, 63 cold against 1 warm. Re-run "
+        "scripts/calibrate_destripe_cap.py on a humid tropical tile before the global "
+        "build; the AOI behind this number is mid-latitude cropland.",
     )
     destripe_min_scene_pixels: int = Field(
         default=500,

@@ -71,7 +71,7 @@ data-quality and performance settings:
 | `load_chunk_size` | `LST_LOAD_CHUNK_SIZE` | `512` | odc-stac spatial (lat/lon) chunk; smaller (e.g. 256) cuts peak memory for the P95 quantile on multi-year / large-tile runs |
 | `max_cloud_cover` | `LST_MAX_CLOUD_COVER` | `100` | Scene-level cloud filter; 100 disables it and relies on pixel-level QA |
 | `destripe` | `LST_DESTRIPE` | `True` | Normalize each scene against a monthly climatology before compositing; disable to benchmark raw composites |
-| `destripe_max_offset_c` | `LST_DESTRIPE_MAX_OFFSET_C` | `15.0` | Discard a scene whose offset exceeds this rather than adjusting it. **Provisional** — calibrate with `scripts/calibrate_destripe_cap.py` |
+| `destripe_max_offset_c` | `LST_DESTRIPE_MAX_OFFSET_C` | `15.0` | Discard a scene whose offset exceeds this rather than adjusting it. Calibrated at Pergamino ([ADR-007](docs/adr/007-scene-normalization.md)); re-check with `scripts/calibrate_destripe_cap.py` for other climates |
 | `destripe_min_scene_pixels` | `LST_DESTRIPE_MIN_SCENE_PIXELS` | `500` | Discard a scene with fewer valid land pixels; its offset is too sparsely estimated to trust |
 
 ## Usage
@@ -323,8 +323,8 @@ Notable scripts in [`scripts/`](scripts/):
   [docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md)
   and [ADR-007](docs/adr/007-scene-normalization.md).
 - `calibrate_destripe_cap.py` — sweeps candidate values of `destripe_max_offset_c` over a
-  single load and reports what fraction of scenes each would discard. The shipped default
-  (15 °C) is provisional until this has been run on a real tile.
+  single load and reports what fraction of scenes each would discard. Produced the shipped
+  15 °C default; re-run it for a climate unlike mid-latitude cropland.
 - `aster_gap_urban_analysis.py` — measures ASTER GED coverage gaps against GHS-SMOD to
   quantify how much urban land has no Surface Temperature. Needs the `analysis` extra
   and a NASA Earthdata login; see [Known Limitations](#known-limitations).

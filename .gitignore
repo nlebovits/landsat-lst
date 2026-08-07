@@ -80,3 +80,5 @@ digest.txt
 
 # Decision-run outputs (large COGs + icechunk repo)
 results/
+# ...except small calibration artifacts that justify a shipped default.
+!results/decision/destripe_cap_calibration.json

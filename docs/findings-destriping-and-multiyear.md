@@ -236,10 +236,21 @@ season-aware per-scene normalization.
 1. ~~**Productionize season-aware normalization**~~ (#46). Done: `normalization.py`,
    wired into `compute_annual_composite`, defaulting on via `settings.destripe`.
 2. ~~**Offset-outlier cap**~~. Done, as a *rejection* rather than a clamp:
-   `settings.destripe_max_offset_c` drops the scene. **The value is still
-   provisional.** At σ ≈ 12.9 °C a 15 °C cap may discard a large share of scenes,
-   so run `scripts/calibrate_destripe_cap.py` on a real tile and set the default
-   from the measured rejection fraction.
+   `settings.destripe_max_offset_c` drops the scene, default 15 °C.
+   Calibrated at Pergamino 2021–2025 (390 solar-day scenes) — see
+   [ADR-007](adr/007-scene-normalization.md) and
+   `results/decision/destripe_cap_calibration.json`.
+
+   Worth recording, because the earlier summary statistics were misleading: the
+   offsets are **not** a broad bell curve. 82.7% of scenes sit within ±15 °C with
+   a core σ of 5.71 and a median of −0.27, and the full-sample σ of 17.01 is
+   entirely tail-driven. Reasoning from that σ under an assumption of normality
+   predicts a 15 °C cap cuts deep into good data; it does not. Rejection is also
+   almost entirely one-sided (63 scenes below −15 °C, exactly 1 above), which is
+   the signature of undetected cloud rather than atmospheric bias.
+
+   Remaining: the AOI is mid-latitude cropland. Re-calibrate on a humid tropical
+   tile before the global build.
 3. **Independent validation (recommended, not required).** Cross-checking the debiased
    P95 against an **independent LST reference** (MODIS LST, ECOSTRESS) would add
    confidence, but this is a public "conversation-starter" product, not a peer-reviewed
