@@ -20,11 +20,11 @@ Measured against GHS-SMOD R2023A, **2.66% of the world's urban land has no
 emissivity at all** (80,397 km² of 3,027,063 km²), and a further **10.23% rests
 on one or two observations** (309,655 km²).
 
-The distribution matters more than the global figure. Gaps track persistent
-cloud, so they concentrate in the wet tropics and are close to absent in
-deserts: **12.07% of urban Southeast Asia and 11.62% of urban Amazonia against
-0.00% of the Sahara and Sahel**. A global average of 2.66% understates the
-problem badly for the cities that have it.
+Where that urban land sits matters more than the worldwide average. Gaps track
+persistent cloud, so they concentrate in the wet tropics and are close to absent
+in deserts: **12.07% of urban Southeast Asia and 11.62% of urban Amazonia
+against 0.00% of the urban Sahara and Sahel**. Averaged over every city on
+Earth, 2.66% badly understates the problem for the cities that have it.
 
 ## Problem
 
@@ -70,10 +70,11 @@ neighbour, never the reverse. Mollweide is equal-area, so at 1 km one pixel is
 one km² and a pixel count converts to area without cosine weighting. SMOD itself
 is never resampled, so its class codes stay exact.
 
-**Scope.** Only 1° cells containing urban land were fetched, 8,770 granules of
-the 24,873 in the collection. Every urban pixel therefore sits inside a fetched
-cell and the urban denominators are complete. The global land figure is *not*
-measurable this way; USGS reports 96.3% global land coverage for GED v3.
+**Scope.** Every figure here is urban. The denominator is always GHS-SMOD
+classes 21, 22, 23, and 30, and rural and water classes are dropped from the
+outputs rather than reported partially. Only 1° cells containing urban land were
+fetched, 8,770 granules of the 24,873 in the collection, so every urban pixel
+sits inside a fetched cell and the urban denominators are complete.
 
 ## Results
 

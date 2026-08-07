@@ -225,8 +225,8 @@ observation.
 
 Measured against GHS-SMOD R2023A, **2.66% of the world's urban land has no
 emissivity** (80,397 km² of 3,027,063 km²), and **10.23% rests on one or two
-observations**. The global figure hides the spread, because gaps follow
-persistent cloud:
+observations**. Every figure here is urban land only. Averaging over every city
+on Earth hides the spread, because gaps follow persistent cloud:
 
 | Region | Urban gap % |
 |---|---:|
