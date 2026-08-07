@@ -34,8 +34,10 @@ class TestLandMask:
         mask = get_land_mask_for_bbox(bbox, settings.resolution, land_polygons)
 
         # Mask shape should match expected tile dimensions
-        expected_width = int((bbox[2] - bbox[0]) / settings.resolution)
-        expected_height = int((bbox[3] - bbox[1]) / settings.resolution)
+        # round(), not int(): 1/3600 has no exact float, so a 5-degree span
+        # divides to 17999.999999999996 and truncation loses a pixel.
+        expected_width = round((bbox[2] - bbox[0]) / settings.resolution)
+        expected_height = round((bbox[3] - bbox[1]) / settings.resolution)
         assert mask.shape == (expected_height, expected_width)
 
         # Convert lat/lon to pixel indices
@@ -141,8 +143,8 @@ class TestMaskOrientation:
         mask = get_land_mask_for_bbox(bbox, settings.resolution, land_polygons)
 
         west, south, east, north = bbox
-        width = int((east - west) / settings.resolution)
-        height = int((north - south) / settings.resolution)
+        width = round((east - west) / settings.resolution)
+        height = round((north - south) / settings.resolution)
         transform = rasterio.transform.from_bounds(west, south, east, north, width, height)
 
         # Manhattan - definitely land

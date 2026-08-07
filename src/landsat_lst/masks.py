@@ -82,9 +82,8 @@ def get_land_mask_for_bbox(
         resolution: Pixel resolution in degrees.
         land_polygons: GeoDataFrame of land polygons.
         target_shape: Optional (height, width) to match exactly. If provided,
-            overrides resolution-based calculation to ensure alignment with
-            the target raster (e.g., odc-stac output which may use different
-            rounding).
+            overrides the resolution-based calculation, so the mask lines up
+            with a grid that was built elsewhere.
 
     Returns:
         Boolean numpy array where True indicates land.
@@ -94,8 +93,11 @@ def get_land_mask_for_bbox(
     if target_shape is not None:
         height, width = target_shape
     else:
-        width = int((east - west) / resolution)
-        height = int((north - south) / resolution)
+        # Round rather than truncate. The resolution is 1/3600, which no float
+        # represents exactly, so a 5-degree span divides to 17999.999999999996
+        # and int() would silently drop a pixel row and column.
+        width = round((east - west) / resolution)
+        height = round((north - south) / resolution)
 
     transform = rasterio.transform.from_bounds(west, south, east, north, width, height)
 

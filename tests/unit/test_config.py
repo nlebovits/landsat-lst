@@ -1,5 +1,8 @@
 """Unit tests for configuration settings."""
 
+import pytest
+from pydantic import ValidationError
+
 from landsat_lst.config import Settings
 
 
@@ -22,10 +25,24 @@ class TestSettings:
         settings = Settings(max_cloud_cover=20)
         assert settings.max_cloud_cover == 20
 
-    def test_resolution_default(self):
-        """Verify default resolution is ~30m in degrees (0.00027778°)."""
+    def test_resolution_is_exactly_one_over_pixels_per_degree(self):
+        """Resolution derives from an integer pixel density, not a rounded float."""
         settings = Settings()
-        assert settings.resolution == 0.00027778
+        assert settings.pixels_per_degree == 3600
+        assert settings.resolution == 1.0 / 3600
+
+    def test_grid_is_integral(self):
+        """The globe and a tile both land on whole pixels (ADR-008)."""
+        settings = Settings()
+        ppd = settings.pixels_per_degree
+        assert 360.0 * ppd == 1_296_000
+        assert (settings.max_latitude - settings.min_latitude) * ppd == 432_000
+        assert settings.tile_size_degrees * ppd == 18_000
+
+    def test_fractional_grid_is_rejected(self):
+        """A tile size that lands mid-pixel fails at construction, not at write time."""
+        with pytest.raises(ValidationError, match="not a whole number"):
+            Settings(tile_size_degrees=0.00015)
 
     def test_collection_default(self):
         """Verify default collection is landsat-c2-l2."""

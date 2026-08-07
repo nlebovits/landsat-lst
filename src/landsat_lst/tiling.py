@@ -29,6 +29,8 @@ Result: 700 land tiles vs 1,728 total = 59.5% reduction in processing.
 import math
 from collections.abc import Iterator
 
+from odc.geo.geobox import GeoBox
+
 from landsat_lst.config import settings
 from landsat_lst.models import TileId
 
@@ -739,6 +741,70 @@ LAND_TILES: frozenset[str] = frozenset(
         "S55W075",
     }
 )
+
+
+def global_geobox() -> GeoBox:
+    """The single grid every tile and every overview level is cut from.
+
+    ``pixels_per_degree`` is an integer, so this comes out at exactly
+    1,296,000 x 432,000 px and divides cleanly by every pyramid factor in
+    ``settings.pyramid_factors`` (20,250 x 6,750 at 64x). A 5-degree tile is
+    18,000 px, which divides by 4 and 16 but not by 64 -- the reason overviews
+    belong to the global array rather than to a tile. See ADR-008.
+    """
+    return GeoBox.from_bbox(
+        (-180.0, settings.min_latitude, 180.0, settings.max_latitude),
+        crs=settings.crs,
+        resolution=settings.resolution,
+        tight=True,
+    )
+
+
+def geobox_for_bbox(
+    bbox: tuple[float, float, float, float],
+    resolution_factor: int = 1,
+) -> GeoBox:
+    """Cut the grid for ``bbox`` out of :func:`global_geobox`.
+
+    Pixel origin comes from the global grid, not from ``bbox``, so adjacent
+    areas share pixel edges exactly. Deriving the grid from the bbox instead is
+    what left tile N40W075 overshooting its own eastern boundary by 0.484 px and
+    sitting 0.14 px off its neighbour (ADR-008).
+
+    Args:
+        bbox: Bounding box as (west, south, east, north), in degrees.
+        resolution_factor: Zoom out by this factor, for reads that need no
+            spatial detail (per-scene offset estimation). Powers of two land on
+            a stored COG overview.
+
+    Returns:
+        A GeoBox aligned to the global grid.
+
+    Raises:
+        ValueError: If ``bbox`` falls outside the global grid's latitude bounds.
+    """
+    west, south, east, north = bbox
+    if south < settings.min_latitude or north > settings.max_latitude:
+        msg = (
+            f"bbox latitudes ({south}, {north}) fall outside the global grid "
+            f"({settings.min_latitude}, {settings.max_latitude})"
+        )
+        raise ValueError(msg)
+
+    ppd = settings.pixels_per_degree
+    col0 = round((west + 180.0) * ppd)
+    col1 = round((east + 180.0) * ppd)
+    # Latitude descends north-down, so row 0 is the northern edge of the grid.
+    row0 = round((settings.max_latitude - north) * ppd)
+    row1 = round((settings.max_latitude - south) * ppd)
+
+    geobox = global_geobox()[row0:row1, col0:col1]
+    return geobox.zoom_out(resolution_factor) if resolution_factor > 1 else geobox
+
+
+def tile_geobox(tile: TileId, resolution_factor: int = 1) -> GeoBox:
+    """Cut a tile's grid out of :func:`global_geobox`."""
+    return geobox_for_bbox(tile.bbox, resolution_factor)
 
 
 def generate_land_tiles(

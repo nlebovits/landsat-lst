@@ -57,6 +57,9 @@ multi-array commits) and add GeoZarr metadata + overviews on top.
 
 ## Data Organization
 
+> Superseded by [ADR-008](008-global-mosaic-topology.md). Levels become single global
+> arrays with only land chunks materialized; the per-tile groups below are retired.
+
 ```
 icechunk://source-coop-radiant-earth/landsat-lst/
 ├── (Icechunk metadata: branches, commits, snapshots)
@@ -88,10 +91,14 @@ icechunk://source-coop-radiant-earth/landsat-lst/
 
 ## Open Questions (deferred)
 
-- **Per-tile pyramids vs a global sparse mosaic** for the web layer — see issue #41.
-  This ADR's per-tile pyramids validate the mechanics; the global topology is undecided.
+- ~~**Per-tile pyramids vs a global sparse mosaic** for the web layer~~ — settled in
+  [ADR-008](008-global-mosaic-topology.md): one global sparse mosaic, with tiles as work
+  partitions. The per-tile pyramids here validated the mechanics, and the layout below is
+  superseded. The `multiscales` convention maps one level to one asset, so per-tile
+  pyramids cannot form a single global layer.
 - **Consumption stack** (icechunk-js client vs xpublish-tiles proxy vs a derived
-  plain-GeoZarr/COG export) — see issue #42.
+  plain-GeoZarr/COG export) — see issue #42. ADR-008 eliminates the per-tile variants of
+  those options; neither reader mosaics across stores.
 
 ## References
 - PR #40 (implementation + smoke tests)

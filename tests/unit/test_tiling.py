@@ -2,12 +2,17 @@
 
 import pytest
 
+from landsat_lst.config import settings
+from landsat_lst.models import TileId
 from landsat_lst.tiling import (
     LAND_TILES,
     generate_global_tiles,
     generate_land_tiles,
+    geobox_for_bbox,
+    global_geobox,
     parse_tile_name,
     tile_from_point,
+    tile_geobox,
     tiles_intersecting_bbox,
 )
 
@@ -177,3 +182,78 @@ class TestParseTileName:
         """Should raise ValueError for wrong length."""
         with pytest.raises(ValueError, match="Invalid tile name"):
             parse_tile_name("N40W75")  # Missing leading zero
+
+
+class TestGlobalGeobox:
+    """The shared grid every tile is cut from. See ADR-008."""
+
+    def test_global_grid_is_exact(self):
+        """Integer pixels-per-degree gives whole-pixel global dimensions."""
+        assert global_geobox().shape == (432_000, 1_296_000)
+
+    def test_divides_by_every_pyramid_factor(self):
+        """Overviews of the global array never trim, at any configured factor."""
+        height, width = global_geobox().shape
+        for factor in settings.pyramid_factors:
+            assert height % factor == 0, f"{height} not divisible by {factor}"
+            assert width % factor == 0, f"{width} not divisible by {factor}"
+
+    def test_tile_does_not_divide_by_coarsest_factor(self):
+        """Why overviews belong to the global array rather than to a tile.
+
+        18,000 = 2^4 * 3^2 * 5^3, so a 5-degree tile divides by 4 and 16 but
+        not by 64. Coarsening per-tile would trim 16 px and shift block phase
+        between neighbours; coarsening the global array does neither.
+        """
+        tile_px = int(settings.tile_size_degrees * settings.pixels_per_degree)
+        assert tile_px == 18_000
+        assert tile_px % 4 == 0
+        assert tile_px % 16 == 0
+        assert tile_px % 64 != 0
+
+
+class TestTileGeobox:
+    def test_tile_is_whole_pixels(self):
+        assert tile_geobox(TileId(lat=40, lon=-75)).shape == (18_000, 18_000)
+
+    def test_tile_bbox_is_exact(self):
+        box = tile_geobox(TileId(lat=40, lon=-75)).boundingbox
+        assert (box.left, box.bottom, box.right, box.top) == (-75.0, 35.0, -70.0, 40.0)
+
+    def test_adjacent_tiles_are_contiguous(self):
+        """One pixel step across a shared edge, with no gap and no overlap.
+
+        The pre-ADR-008 grid overshot the shared edge by 0.484 px and sat
+        0.14 px off its neighbour, because each tile anchored to its own bbox.
+        """
+        west = tile_geobox(TileId(lat=40, lon=-75))
+        east = tile_geobox(TileId(lat=40, lon=-70))
+        lon_west = west.coordinates["longitude"].values
+        lon_east = east.coordinates["longitude"].values
+        step = lon_west[1] - lon_west[0]
+        assert (lon_east[0] - lon_west[-1]) == pytest.approx(step, rel=1e-9)
+
+    def test_vertically_adjacent_tiles_are_contiguous(self):
+        north = tile_geobox(TileId(lat=40, lon=-75))
+        south = tile_geobox(TileId(lat=35, lon=-75))
+        lat_north = north.coordinates["latitude"].values
+        lat_south = south.coordinates["latitude"].values
+        step = lat_north[1] - lat_north[0]
+        assert (lat_south[0] - lat_north[-1]) == pytest.approx(step, rel=1e-9)
+
+    def test_zoomed_out_tile_matches_offset_factor(self):
+        """The offset-estimation grid stays whole-pixel at the default factor."""
+        factor = settings.destripe_offset_resolution_factor
+        expected = 18_000 // factor
+        assert tile_geobox(TileId(lat=40, lon=-75), factor).shape == (expected, expected)
+
+    def test_sub_tile_bbox_snaps_to_the_global_grid(self):
+        """An arbitrary AOI still lands on global pixel edges, not its own."""
+        box = geobox_for_bbox((-60.6, -34.0, -60.4, -33.8)).boundingbox
+        assert (box.left, box.bottom, box.right, box.top) == pytest.approx(
+            (-60.6, -34.0, -60.4, -33.8), abs=1e-9
+        )
+
+    def test_bbox_outside_latitude_bounds_raises(self):
+        with pytest.raises(ValueError, match="outside the global grid"):
+            geobox_for_bbox((-75.0, -80.0, -70.0, -75.0))

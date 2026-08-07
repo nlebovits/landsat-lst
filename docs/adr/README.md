@@ -13,6 +13,7 @@ ADRs are kept for history and link to their replacement.
 | [005](005-multiyear-monthly-qa-and-destriping.md) | Multi-year composites, monthly QA climatology, and de-striping | Accepted (de-striping settled in [007](007-scene-normalization.md)) |
 | [006](006-no-aster-gap-filling.md) | Leave ASTER GED coverage gaps empty | Accepted |
 | [007](007-scene-normalization.md) | Per-scene normalization against a monthly climatology; discard uncorrectable scenes | Accepted |
+| [008](008-global-mosaic-topology.md) | Global sparse mosaic for the pyramid, and one shared tile grid | Accepted |
 
 ## Adding an ADR
 
