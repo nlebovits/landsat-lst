@@ -46,6 +46,20 @@ LST_OFFSET: float = -50.0
 LST_NODATA_FLOAT: float = -9999.0
 LST_FILL_VALUE: int = 0
 
+# DN 0 is reserved for fill, so the encodable range is 1..65535.
+LST_MIN_DN: int = 1
+LST_MAX_DN: int = 65535
+
+# Lowest DN carrying a physically meaningful LST. DN 0 is fill, and DN 1 is
+# reachable only from values sitting on the encoding floor (-49.99 C). A
+# hot-season P95 over land between 60S and 60N never gets that cold, so DN 1
+# marks a failed retrieval rather than a real temperature. See issue #24.
+LST_MIN_TRUSTED_DN: int = 2
+
+# Coldest Celsius value the pipeline will keep: the bottom of the DN 2 bucket.
+# Anything below encodes to DN 0 or DN 1 and is treated as missing.
+LST_MIN_TRUSTED_C: float = LST_OFFSET + LST_MIN_TRUSTED_DN * LST_SCALE
+
 # Zarr chunking (500x500 divides 18,500 evenly = 37 chunks)
 DEFAULT_CHUNKS: tuple[int, int] = (500, 500)
 
@@ -59,6 +73,14 @@ def encode_lst_uint16(data: xr.DataArray) -> xr.DataArray:
     Formula: dn = (celsius - offset) / scale
     Decode:  celsius = dn * scale + offset
 
+    Values outside the encodable range become fill (DN 0) rather than being
+    clipped to the nearest representable DN. Clipping would turn an
+    out-of-range value such as -124 C into a believable -49.99 C, which is
+    exactly how the isolated anomaly pixels in issue #24 were produced.
+    ``convert_to_celsius`` already drops implausible observations, so anything
+    arriving here out of range signals a defect and is better recorded as
+    missing than as a plausible temperature.
+
     Args:
         data: LST values in Celsius (float32), nodata=-9999.0
 
@@ -68,8 +90,10 @@ def encode_lst_uint16(data: xr.DataArray) -> xr.DataArray:
     # Convert celsius to DN: dn = (celsius - offset) / scale
     dn = (data - LST_OFFSET) / LST_SCALE
 
-    # Clamp to valid uint16 range (1-65535, reserve 0 for fill value)
-    dn = dn.clip(1, 65535)
+    # Out-of-range values (including NaN, which fails both comparisons) become
+    # fill. DN 0 is reserved for fill, so the floor is 1.
+    in_range = (dn >= LST_MIN_DN) & (dn <= LST_MAX_DN)
+    dn = xr.where(in_range, dn, LST_FILL_VALUE)
 
     # Set nodata pixels to fill value (0)
     dn = xr.where(data == LST_NODATA_FLOAT, LST_FILL_VALUE, dn)

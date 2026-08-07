@@ -85,6 +85,40 @@ def test_encode_lst_uint16_nodata():
 
 
 @pytest.mark.integration
+def test_encode_lst_uint16_out_of_range_becomes_fill():
+    """Out-of-range values become fill instead of being clipped (issue #24).
+
+    Clipping turned an impossible -124 C into a believable -49.99 C, which is
+    how the isolated anomaly pixels of issue #24 reached the output. Values
+    that cannot be represented are recorded as missing instead.
+    """
+    data = xr.DataArray(
+        np.array([-124.0, -50.0, 700.0, 25.0]),
+        dims=["x"],
+    )
+
+    encoded = encode_lst_uint16(data)
+
+    assert encoded.values[0] == 0  # below the encodable floor
+    assert encoded.values[1] == 0  # collides with the fill value
+    assert encoded.values[2] == 0  # above the uint16 ceiling
+    assert encoded.values[3] != 0  # ordinary value is untouched
+
+
+@pytest.mark.integration
+def test_encode_lst_uint16_never_reports_floor_temperature():
+    """No input decodes to -49.99 C, the signature of the issue #24 anomaly."""
+    data = xr.DataArray(
+        np.array([-200.0, -124.0, -60.0, -50.0, -49.995]),
+        dims=["x"],
+    )
+
+    decoded = encode_lst_uint16(data).values * LST_SCALE + LST_OFFSET
+
+    assert not np.any(np.isclose(decoded, -49.99)), f"floor value resurfaced: {decoded}"
+
+
+@pytest.mark.integration
 def test_write_zarr_creates_store(tmp_path):
     """Test that write_zarr creates a valid Zarr store."""
     from pathlib import Path
