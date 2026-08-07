@@ -1,7 +1,8 @@
 # Destriping the LST P95 + Choosing a Multi-Year Window
 
 **Date:** 2026-07-02
-**Status:** Complete (investigation); season-aware normalization is a prototype pending productionization
+**Status:** Complete (investigation). Season-aware normalization was productionized in
+[ADR-007](adr/007-scene-normalization.md); it now ships in `landsat_lst.normalization`.
 **AOI:** ~1° box around tile S30W065 (Pergamino, Argentina), the constant `AOI_BBOX` in the diagnostic scripts, unless noted
 **Analysis:** `scripts/season_aware_p95_test.py` (and the fast multi-year / percentile diagnostics)
 
@@ -176,8 +177,10 @@ expected value** (i.e. the atmospheric bias), leaving the seasonal cycle intact.
   correction than ideal, but the output is **visually clean and mean-preserving**.
   If artifacts ever reappear, **cap the offset magnitude** to reject outlier scenes.
 
-This is currently a **prototype** in `scripts/season_aware_p95_test.py` (function
-`seasonal_debias`), not yet in the production pipeline.
+This shipped as `landsat_lst.normalization.seasonal_debias`, called from
+`compute_annual_composite` under `settings.destripe`. The offset cap the note above
+anticipated is now part of it, and it **discards** an over-cap scene rather than
+bounding its offset. See [ADR-007](adr/007-scene-normalization.md).
 
 ---
 
@@ -221,7 +224,7 @@ removes only the deviation-from-expected.
 | Improved QA mask (dilated cloud + cirrus) | **In pipeline** | Shipped (`qa.py`) |
 | Physical-plausibility clamp (−50/80 °C) | **In pipeline** | Shipped (`config.py`, `convert_to_celsius`) |
 | Scene-level cloud filter | **Disabled** (redundant) | Confirmed (issue #34) |
-| Season-aware per-scene normalization | **Chosen approach** | **Prototype only** — `scripts/season_aware_p95_test.py` |
+| Season-aware per-scene normalization | **Chosen approach** | **In pipeline** — `normalization.py`, [ADR-007](adr/007-scene-normalization.md) |
 
 **Winning recipe:** 3-year (or 5-year) P95 + improved QA masking (+ clamp) +
 season-aware per-scene normalization.
@@ -230,13 +233,13 @@ season-aware per-scene normalization.
 
 ## Open questions / next steps
 
-1. **Productionize season-aware normalization** (tracked in #46). Currently only
-   `seasonal_debias` in `scripts/season_aware_p95_test.py`. **Recommended next step:** wire it into
-   `pipeline.py` / `process_tile` so production composites are debiased.
-2. **Offset-outlier cap.** Add a magnitude cap on per-scene offsets to reject
-   outlier scenes (e.g. the −66 °C scene) — a safeguard against the monthly
-   reference over-absorbing day-to-day weather. Not yet needed visually, but cheap
-   insurance.
+1. ~~**Productionize season-aware normalization**~~ (#46). Done: `normalization.py`,
+   wired into `compute_annual_composite`, defaulting on via `settings.destripe`.
+2. ~~**Offset-outlier cap**~~. Done, as a *rejection* rather than a clamp:
+   `settings.destripe_max_offset_c` drops the scene. **The value is still
+   provisional.** At σ ≈ 12.9 °C a 15 °C cap may discard a large share of scenes,
+   so run `scripts/calibrate_destripe_cap.py` on a real tile and set the default
+   from the measured rejection fraction.
 3. **Independent validation (recommended, not required).** Cross-checking the debiased
    P95 against an **independent LST reference** (MODIS LST, ECOSTRESS) would add
    confidence, but this is a public "conversation-starter" product, not a peer-reviewed
@@ -264,7 +267,9 @@ uv run --extra analysis python \
 
 ## References
 
-- Prototype: `scripts/season_aware_p95_test.py` (`seasonal_debias`)
+- Production: `src/landsat_lst/normalization.py` (`seasonal_debias`, `scene_offsets`)
+- Original prototype: `scripts/season_aware_p95_test.py`
+- Cap calibration: `scripts/calibrate_destripe_cap.py`
 - QA masking + clamp: `src/landsat_lst/qa.py` (`create_qa_mask`,
   `convert_to_celsius`)
 - Clamp settings: `src/landsat_lst/config.py`

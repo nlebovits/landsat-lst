@@ -45,17 +45,22 @@ These functions apply the full pipeline including:
 
 ### Single- and multi-year windows
 
+**The production window is 2021–2025** (`job.DEFAULT_WINDOW`). `generate_jobs()`
+with no arguments emits one five-year job per land tile.
+
 `ProcessingJob` takes an optional `end_year`. When set, `datetime_range` spans
 `[year, end_year]` and `compute_annual_composite()` pools **every** scene in the
 window into one P95 (never average per-year P95s — percentile-of-percentiles is
-wrong). `window_label` (`"2024"` or `"2020-2024"`) keys the output storage group
+wrong). `window_label` (`"2024"` or `"2021-2025"`) keys the output storage group
 and COG filenames. `end_year=None` is a single-year composite (backward compatible).
 
 ### Correct Usage
 
 ```python
-# Option 1: CLI (single year; recommended for batch processing)
-landsat-lst process --year 2024 --tile N40W075
+# Option 1: CLI. No --year runs the 2021-2025 production window.
+landsat-lst process --tile N40W075
+landsat-lst process --year 2021 --end-year 2025 --tile N40W075
+landsat-lst process --year 2024 --tile N40W075   # single year
 
 # Option 2: Python API (single or multi-year)
 from landsat_lst.pipeline import process_tile
@@ -65,21 +70,24 @@ from landsat_lst.tiling import parse_tile_name
 job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2024)
 composite = process_tile(job)  # ✅ Includes land mask
 
-# Multi-year window 2020-2024 (pooled P95)
-job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2020, end_year=2024)
+# Multi-year window 2021-2025 (pooled P95)
+job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2021, end_year=2025)
 composite = process_tile(job)  # ✅ Includes land mask
 
 # Option 3: Distributed (Coiled)
 from landsat_lst.job import run_distributed, generate_jobs
-jobs = generate_jobs([2024])
-results = run_distributed(jobs)  # ✅ Includes land mask
+jobs = generate_jobs()              # 700 tiles x 2021-2025
+results = run_distributed(jobs)     # ✅ Includes land mask
 ```
 
 ### DO NOT use `compute_annual_composite()` directly
 
-This low-level function does NOT apply land masking. Only use it for
-benchmarking or when you explicitly don't want ocean masking. (Despite the
-name, it also handles multi-year windows — it pools whatever scenes it is given.)
+This low-level function applies land masking only when you hand it one
+(`compute_annual_composite(data, land_mask=...)`). `process_tile` always does.
+Calling it bare gives you an unmasked composite whose de-striping offsets were
+estimated over ocean as well as land. Only use it for benchmarking or when you
+explicitly don't want ocean masking. (Despite the name, it also handles
+multi-year windows — it pools whatever scenes it is given.)
 
 ---
 
@@ -104,18 +112,38 @@ If you see values like -124°C, the data didn't load correctly (DN=0 → invalid
   the DN=0 fill (not caught by the exact `!= 0` test), plus high-DN saturation junk.
 - **`qa_count` is a 12-month climatology** (`(month, latitude, longitude)`, `uint8`),
   not a single annual count: month M = valid observations in calendar month M pooled
-  across the window. It exports as a 12-band monthly COG (`cog.py`).
+  across the window. It exports as a 12-band monthly COG (`cog.py`). It counts only
+  observations that survive de-striping, so it reports the evidence behind each P95
+  value rather than raw data availability.
 
-### De-striping (season-aware normalization) — PROTOTYPE, NOT IN PRODUCTION
+### De-striping (season-aware normalization) — IN PRODUCTION
 
-Season-aware per-scene bias normalization is the **chosen** de-striping approach,
-but it currently lives **only** in the prototype `scripts/season_aware_p95_test.py`
-and is **NOT wired into the production pipeline** (`process_tile` / `compute_annual_composite`).
-Production instead relies on stricter QA masking, the plausibility clamp, and
-multi-year pooling to suppress striping. Do not describe season-aware normalization
-as a production feature. See
-[docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md)
-and [docs/adr/005-multiyear-monthly-qa-and-destriping.md](docs/adr/005-multiyear-monthly-qa-and-destriping.md).
+`normalization.seasonal_debias` runs inside `compute_annual_composite` whenever
+`settings.destripe` is on (the default). It shifts each scene by one scene-wide
+offset estimated against a per-pixel **monthly** climatology, so the seasonal
+cycle survives. An annual reference was tried and cooled the composite from
+40.6 °C to 29.8 °C — do not reintroduce it.
+
+**Discard, never clamp.** Scenes whose offset exceeds
+`settings.destripe_max_offset_c`, or that have fewer than
+`settings.destripe_min_scene_pixels` valid land pixels, are removed from the
+stack entirely. Bounding an offset would leave most of the error in place while
+presenting the scene as corrected. The guiding principle for this dataset is to
+prefer honest omission over questionable correction.
+
+Consequences worth remembering:
+
+- `qa_count` is computed from the **surviving** stack, so counts describe the
+  evidence behind each P95 value, not raw data availability.
+- Offsets are estimated over **land only**. `process_tile` builds the land mask
+  before compositing and passes it to `compute_annual_composite(land_mask=...)`.
+- `destripe_max_offset_c` (15.0 °C) is **provisional**. Calibrate it with
+  `scripts/calibrate_destripe_cap.py`, which sweeps candidate caps over one load
+  and reports the rejection fraction for each.
+
+See [docs/adr/007-scene-normalization.md](docs/adr/007-scene-normalization.md),
+[docs/methodology.md](docs/methodology.md), and
+[docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md).
 
 ---
 

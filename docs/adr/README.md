@@ -10,8 +10,9 @@ ADRs are kept for history and link to their replacement.
 | [002](002-virtualzarr-icechunk-integration.md) | VirtualZarr + Icechunk integration | ⚠️ Superseded by [003](003-direct-zarr-architecture.md) |
 | [003](003-direct-zarr-architecture.md) | Direct Zarr writes + Icechunk versioning | Accepted |
 | [004](004-geozarr-multiscale-overviews.md) | GeoZarr multiscale overviews on Icechunk | Accepted |
-| [005](005-multiyear-monthly-qa-and-destriping.md) | Multi-year composites, monthly QA climatology, and de-striping | Accepted (de-striping deferred) |
+| [005](005-multiyear-monthly-qa-and-destriping.md) | Multi-year composites, monthly QA climatology, and de-striping | Accepted (de-striping settled in [007](007-scene-normalization.md)) |
 | [006](006-no-aster-gap-filling.md) | Leave ASTER GED coverage gaps empty | Accepted |
+| [007](007-scene-normalization.md) | Per-scene normalization against a monthly climatology; discard uncorrectable scenes | Accepted |
 
 ## Adding an ADR
 

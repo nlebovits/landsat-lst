@@ -31,3 +31,21 @@ class TestSettings:
         """Verify default collection is landsat-c2-l2."""
         settings = Settings()
         assert settings.collection == "landsat-c2-l2"
+
+    def test_destripe_defaults(self):
+        """De-striping is on by default (issue #46, ADR-007)."""
+        settings = Settings()
+        assert settings.destripe is True
+        assert settings.destripe_max_offset_c == 15.0
+        assert settings.destripe_min_scene_pixels == 500
+
+    def test_destripe_can_be_disabled(self):
+        """The flag exists so raw composites stay reachable for benchmarking."""
+        settings = Settings(destripe=False)
+        assert settings.destripe is False
+
+    def test_destripe_cap_from_env(self, monkeypatch):
+        """The cap is provisional, so it must be tunable without a code change."""
+        monkeypatch.setenv("LST_DESTRIPE_MAX_OFFSET_C", "8.5")
+        settings = Settings()
+        assert settings.destripe_max_offset_c == 8.5

@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from landsat_lst.config import settings
 from landsat_lst.pipeline import compute_annual_composite
 from landsat_lst.zarr_writer import LST_OFFSET, LST_SCALE, encode_lst_uint16
 
@@ -146,6 +147,16 @@ class TestFloorAnomalyGuard:
     is a failed retrieval and becomes nodata rather than a plausible-looking
     temperature.
     """
+
+    @pytest.fixture(autouse=True)
+    def _no_destripe(self, monkeypatch):
+        """De-striping is orthogonal to the floor guard.
+
+        These fixtures use a 5x5 grid, far below ``destripe_min_scene_pixels``,
+        so every scene would be discarded as too sparse to estimate an offset
+        from. De-striping has its own tests in test_destripe_normalization.py.
+        """
+        monkeypatch.setattr(settings, "destripe", False)
 
     # lwir DN 21698 -> -49.9858 C, inside the DN 0/1 band the guard rejects.
     LWIR_ON_FLOOR = 21698

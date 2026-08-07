@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from landsat_lst.job import (
+    DEFAULT_WINDOW,
     JobResult,
     _write_to_icechunk_with_retry,
     generate_jobs,
@@ -237,6 +238,30 @@ class TestGenerateJobs:
 
         tile_names = [j.tile.name for j in jobs]
         assert tile_names == sorted(tile_names)
+
+    def test_defaults_to_the_production_window(self):
+        """With no years, emit one multi-year job per tile (issue #46)."""
+        jobs = generate_jobs()
+
+        assert len(jobs) == 700
+        assert DEFAULT_WINDOW == (2021, 2025)
+        assert all(j.year == 2021 and j.end_year == 2025 for j in jobs)
+        assert all(j.window_label == "2021-2025" for j in jobs)
+
+    def test_custom_window(self):
+        """An explicit window produces one job per tile, not one per year."""
+        jobs = generate_jobs(window=(2022, 2024))
+
+        assert len(jobs) == 700
+        assert all(j.window_label == "2022-2024" for j in jobs)
+
+    def test_years_override_window(self):
+        """Passing years keeps the single-year behavior for backfill."""
+        jobs = generate_jobs([2023], window=(2021, 2025))
+
+        assert len(jobs) == 700
+        assert all(j.end_year is None for j in jobs)
+        assert all(j.window_label == "2023" for j in jobs)
 
 
 class TestProcessTileJobFailure:

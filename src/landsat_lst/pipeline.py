@@ -5,14 +5,18 @@ from collections.abc import Callable
 
 import numpy as np
 import pystac_client
+import structlog
 import xarray as xr
 from odc.stac import stac_load
 
 from landsat_lst.config import settings
 from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
 from landsat_lst.models import ProcessingJob
+from landsat_lst.normalization import offset_diagnostics, seasonal_debias
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 from landsat_lst.zarr_writer import LST_MIN_TRUSTED_C
+
+log = structlog.get_logger()
 
 # Planetary Computer URL prefix for conditional signing
 _PC_URL_PREFIX = "https://planetarycomputer.microsoft.com"
@@ -108,7 +112,39 @@ def load_scenes(
     )
 
 
-def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
+def _build_land_mask(
+    bbox: tuple[float, float, float, float],
+    latitude: xr.DataArray,
+    longitude: xr.DataArray,
+) -> xr.DataArray:
+    """Rasterize the Natural Earth land mask onto a grid's exact coordinates.
+
+    ``target_shape`` is passed explicitly because odc-stac rounds differently
+    from the int() truncation the resolution-derived shape would use, so the
+    mask would otherwise be off by a pixel.
+
+    Both rasterio and odc-stac use north-down (descending latitude), so the
+    rasterized array needs no flip.
+    """
+    land_polygons = load_land_polygons()
+    land_mask = get_land_mask_for_bbox(
+        bbox,
+        settings.resolution,
+        land_polygons,
+        target_shape=(len(latitude), len(longitude)),
+    )
+    return xr.DataArray(
+        land_mask,
+        dims=["latitude", "longitude"],
+        coords={"latitude": latitude, "longitude": longitude},
+    )
+
+
+def compute_annual_composite(
+    data: xr.Dataset,
+    *,
+    land_mask: xr.DataArray | None = None,
+) -> xr.Dataset:
     """Compute an LST P95 composite with a per-month observation count.
 
     The P95 is pooled across *every* time step in ``data``. For a multi-year
@@ -120,13 +156,23 @@ def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
     valid (cloud-free, QA-passing) observations in month M pooled across all
     years in the window. Dims ``(month, latitude, longitude)``, always 12
     months (missing months filled 0), dtype ``uint8`` (counts stay well under
-    255 even for a 5-year window).
+    255 even for a 5-year window). It counts only observations that reach the
+    composite, so scenes dropped by de-striping are excluded.
 
-    WARNING: This function does NOT apply land masking. For production output
-    that excludes ocean pixels, use process_tile() instead. See issue #26.
+    When ``settings.destripe`` is on, each scene is shifted by a single
+    scene-wide offset before compositing and scenes whose offset is implausible
+    are discarded. See ``normalization.seasonal_debias`` and issue #46.
+
+    WARNING: Land masking happens only when ``land_mask`` is supplied. For
+    production output that excludes ocean pixels, use process_tile() instead,
+    which always supplies one. See issue #26.
 
     Args:
         data: Dataset with thermal and QA bands across time.
+        land_mask: Optional boolean land mask on ``(latitude, longitude)``.
+            Applied before de-biasing so per-scene offsets are estimated over
+            land only; ocean is thermally stable and would otherwise damp the
+            estimate on coastal tiles.
 
     Returns:
         Dataset with ``lst_p95`` ``(latitude, longitude)`` and ``qa_count``
@@ -139,6 +185,17 @@ def compute_annual_composite(data: xr.Dataset) -> xr.Dataset:
     masked = apply_qa_mask(data)
 
     lst = convert_to_celsius(masked["lwir11"])
+
+    if land_mask is not None:
+        lst = lst.where(land_mask)
+
+    if settings.destripe:
+        lst, offset, keep = seasonal_debias(
+            lst,
+            max_offset_c=settings.destripe_max_offset_c,
+            min_scene_pixels=settings.destripe_min_scene_pixels,
+        )
+        log.info("destripe_offsets_degC", **offset_diagnostics(offset, keep))
 
     # notnull() (not ~np.isnan) so the result stays a typed xarray DataArray.
     valid_mask = lst.notnull()
@@ -204,30 +261,32 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
 
         patch_url = enable_pc_azure_refresh(items)
 
-    data = load_scenes(items, job.tile.bbox, patch_url=patch_url)
+    # A 5-year window pulls ~1900 scenes, so at least one transient read failure
+    # is near-certain. Fill that scene with nodata rather than aborting the load;
+    # a handful of dropped observations costs almost nothing against a P95 over
+    # the full stack. The coverage check below is what makes this safe.
+    data = load_scenes(items, job.tile.bbox, patch_url=patch_url, fail_on_error=False)
 
-    composite = compute_annual_composite(data)
+    # Built before the composite so de-striping estimates each scene's offset
+    # over land only. Ocean is thermally stable and would damp the estimate on
+    # coastal tiles.
+    land_mask_da = _build_land_mask(job.tile.bbox, data.latitude, data.longitude)
 
-    # Apply land mask to exclude ocean/water pixels (Natural Earth 10m)
-    # Pass target_shape to ensure mask matches composite dimensions exactly
-    # (odc-stac may use different rounding than int() truncation)
-    land_polygons = load_land_polygons()
-    target_shape = (len(composite.latitude), len(composite.longitude))
-    land_mask = get_land_mask_for_bbox(
-        job.tile.bbox,
-        settings.resolution,
-        land_polygons,
-        target_shape=target_shape,
+    composite = compute_annual_composite(data, land_mask=land_mask_da)
+
+    # Silent nodata fill is otherwise undetectable: a low median or a high zero
+    # fraction means reads failed en masse rather than occasionally.
+    obs = composite["qa_count"].sum(dim="month").values
+    log.info(
+        "valid_coverage_obs_per_pixel",
+        tile=job.tile.name,
+        window=job.window_label,
+        min=int(obs.min()),
+        median=int(np.median(obs)),
+        max=int(obs.max()),
+        zero_frac=round(float((obs == 0).mean()), 3),
     )
-    # Both rasterio and odc-stac use north-down (descending latitude), no flip needed
-    land_mask_da = xr.DataArray(
-        land_mask,
-        dims=["latitude", "longitude"],
-        coords={
-            "latitude": composite.latitude,
-            "longitude": composite.longitude,
-        },
-    )
+
     composite["lst_p95"] = composite["lst_p95"].where(land_mask_da)
     # Zero out ocean in the per-month counts too (broadcasts over the month dim);
     # keeps qa_count uint8 and makes ocean compress away.

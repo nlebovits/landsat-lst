@@ -59,7 +59,7 @@ def _selftest() -> int:
         [f"{y}-{m:02d}-{d:02d}" for y in (2022, 2023, 2024) for m in range(1, 13) for d in (5, 20)]
     )
     ny = nx = 40
-    doy = times.dayofyear  # ty: ignore[unresolved-attribute].values.astype("float64")
+    doy = times.dayofyear.values.astype("float64")  # ty: ignore[unresolved-attribute]
     season = 15 * np.sin(2 * np.pi * (doy - 15) / 365)  # +-15 degC seasonal swing
     spatial = rng.normal(0, 3, (ny, nx))  # real spatial pattern
     bias = rng.normal(0, 2, len(times))  # per-scene atmospheric bias (std 2)

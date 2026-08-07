@@ -1,7 +1,9 @@
 # ADR-005: Multi-Year Composites, Monthly QA Climatology, and De-striping
 
-**Status:** Accepted (multi-year windows, monthly QA, QA masking + physical clamp);
-**Deferred** (season-aware de-striping — prototype only, not yet in the pipeline)
+**Status:** Accepted (multi-year windows, monthly QA, QA masking + physical clamp).
+Season-aware de-striping is no longer deferred: it was productionized in
+[ADR-007](007-scene-normalization.md), which adds the scene-rejection policy this
+ADR left open.
 **Date:** 2026-07-02
 **Authors:** @nlebovits
 

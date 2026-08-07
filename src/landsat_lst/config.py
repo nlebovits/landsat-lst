@@ -115,6 +115,27 @@ class Settings(BaseSettings):
         "high-DN saturation/fill artifacts without clipping real extreme heat.",
     )
 
+    # Season-aware per-scene normalization (de-striping). See issue #46, ADR-007.
+    destripe: bool = Field(
+        default=True,
+        description="Normalize each scene against a per-pixel monthly climatology "
+        "before compositing, removing the WRS-footprint seams caused by per-scene "
+        "atmospheric-correction bias. Disable to benchmark against raw composites.",
+    )
+    destripe_max_offset_c: float = Field(
+        default=15.0,
+        description="PROVISIONAL, pending calibration on a real tile. Discard a scene "
+        "whose absolute offset exceeds this (degC) rather than adjusting it. Measured "
+        "offsets at Pergamino: std 11-13, max +17, with a cold tail to -73 (undetected "
+        "cloud). At std ~12.9 this may reject a large share of scenes, so confirm the "
+        "realized rejection fraction before treating the default as settled.",
+    )
+    destripe_min_scene_pixels: int = Field(
+        default=500,
+        description="Discard a scene with fewer valid land pixels than this; its "
+        "offset is too sparsely estimated to trust.",
+    )
+
     # Multiscale overviews (GeoZarr multiscales convention)
     pyramid_factors: list[int] = Field(
         default=[4, 16, 64],
