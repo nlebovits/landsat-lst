@@ -134,8 +134,26 @@ class Settings(BaseSettings):
     )
     destripe_min_scene_pixels: int = Field(
         default=500,
-        description="Discard a scene with fewer valid land pixels than this; its "
-        "offset is too sparsely estimated to trust.",
+        description="Coverage floor, in native-resolution pixels: discard a scene "
+        "covering less valid land than this. Counts from a coarse offset grid are "
+        "scaled up before comparison, so the threshold keeps one meaning whatever "
+        "destripe_offset_resolution_factor is set to.",
+    )
+    destripe_min_offset_samples: int = Field(
+        default=200,
+        description="Reliability floor, in offset-grid pixels: discard a scene whose "
+        "offset rests on fewer samples than this. Distinct from the coverage floor "
+        "because a coarse grid can leave a well-covered scene with too few samples "
+        "to place a median on.",
+    )
+    destripe_offset_resolution_factor: int = Field(
+        default=1,
+        description="Estimate per-scene offsets from a stack loaded at "
+        "resolution * factor, served from the source COGs' internal overviews "
+        "([2,4,8,16,32,64]). 1 keeps offsets at native resolution. The offset is a "
+        "single scalar per scene, so spatial detail buys nothing, and a coarse read "
+        "cuts bytes fetched rather than merely compute. Validate a new value against "
+        "scripts/validate_offset_subsampling.py before shipping it.",
     )
 
     # Multiscale overviews (GeoZarr multiscales convention)

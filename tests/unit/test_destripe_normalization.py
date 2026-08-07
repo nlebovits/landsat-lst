@@ -17,7 +17,7 @@ import pytest
 import xarray as xr
 
 from landsat_lst.config import settings
-from landsat_lst.normalization import offset_diagnostics, seasonal_debias
+from landsat_lst.normalization import offset_diagnostics, scene_offsets, seasonal_debias
 from landsat_lst.pipeline import compute_annual_composite
 
 # Comfortably above destripe_min_scene_pixels (500) so grid size never drives
@@ -318,3 +318,133 @@ class TestDaskDebias:
 
         assert not bool(keep.values[4])
         assert debiased.sizes["time"] == len(times) - 1
+
+
+def _smooth_stack(*, bias: np.ndarray | None = None, seed: int = 11) -> xr.DataArray:
+    """Seasonal stack whose spatial field is smooth rather than white noise.
+
+    Subsampling is only expected to be faithful when the field it samples has
+    spatial structure, which real LST does. A white-noise field would make
+    decimation a small random sample and the median correspondingly noisy, so a
+    test built on one would measure sampling error rather than the property
+    under test.
+    """
+    rng = np.random.default_rng(seed)
+    times = _times()
+    doy = pd.DatetimeIndex(times).dayofyear.values.astype("float64")
+
+    yy, xx = np.meshgrid(
+        np.linspace(0, 2 * np.pi, GRID), np.linspace(0, 2 * np.pi, GRID), indexing="ij"
+    )
+    spatial = 4.0 * np.sin(yy) * np.cos(xx)
+    season = 15.0 * np.sin(2 * np.pi * (doy - 15) / 365)
+    noise = rng.normal(0, 0.2, (len(times), GRID, GRID))
+
+    data = 25.0 + season[:, None, None] + spatial[None, :, :] + noise
+    if bias is not None:
+        data = data + bias[:, None, None]
+    return xr.DataArray(
+        data,
+        dims=["time", "latitude", "longitude"],
+        coords={
+            "time": times,
+            "latitude": np.linspace(-33.4, -34.4, GRID),
+            "longitude": np.linspace(-61.1, -60.1, GRID),
+        },
+    )
+
+
+class TestCoarseOffsetEstimation:
+    """Offsets estimated from a coarser grid (issue #46).
+
+    The offset is one scalar per scene, so it does not need a full-resolution
+    climatology. Estimating it from the source COGs' overviews cuts bytes read,
+    which post-load subsampling cannot do.
+    """
+
+    def test_strided_offsets_match_full_resolution(self):
+        """A 4x-decimated grid recovers the same per-scene offsets."""
+        rng = np.random.default_rng(5)
+        times = _times()
+        bias = rng.normal(0, 3.0, len(times))
+        lst = _smooth_stack(bias=bias)
+        coarse = lst.isel(latitude=slice(None, None, 4), longitude=slice(None, None, 4))
+
+        full_offset, _ = scene_offsets(lst)
+        coarse_offset, _ = scene_offsets(coarse)
+
+        np.testing.assert_allclose(coarse_offset.values, full_offset.values, atol=0.15)
+
+    def test_offset_source_drives_the_correction(self):
+        """Offsets come from offset_source; the output keeps lst's own grid."""
+        times = _times()
+        bias = np.zeros(len(times))
+        bias[7] = -40.0
+        lst = _smooth_stack(bias=bias)
+        coarse = lst.isel(latitude=slice(None, None, 4), longitude=slice(None, None, 4))
+
+        debiased, offset, keep = seasonal_debias(
+            lst,
+            max_offset_c=15.0,
+            min_scene_pixels=1,
+            min_offset_samples=1,
+            offset_source=coarse,
+        )
+
+        # Output resolution is lst's, not the coarse grid's.
+        assert debiased.sizes["latitude"] == GRID
+        assert debiased.sizes["longitude"] == GRID
+        # The coarse grid still saw the wrecked scene.
+        assert not bool(keep.values[7])
+        assert offset.values[7] < -30
+
+    def test_misaligned_offset_source_raises(self):
+        """A source covering different scenes is rejected, not broadcast."""
+        lst = _smooth_stack()
+        coarse = lst.isel(time=slice(0, 10), latitude=slice(None, None, 4))
+
+        with pytest.raises(ValueError, match="does not share"):
+            seasonal_debias(lst, max_offset_c=15.0, min_scene_pixels=1, offset_source=coarse)
+
+    def test_sparse_guard_uses_the_estimation_grid(self):
+        """With a coarse source the floor is min_offset_samples, not min_scene_pixels.
+
+        A coarse valid-pixel count cannot be scaled back to a native one:
+        averaging spreads data across nodata, so coarse loading over-reports
+        coverage. Each grid therefore states its own floor.
+        """
+        lst = _smooth_stack()
+        coarse = lst.isel(latitude=slice(None, None, 4), longitude=slice(None, None, 4))
+        n_coarse = coarse.sizes["latitude"] * coarse.sizes["longitude"]
+
+        # min_scene_pixels far above the coarse pixel count is ignored, so
+        # nothing is rejected for sparseness.
+        _, _, keep = seasonal_debias(
+            lst,
+            max_offset_c=99.0,
+            min_scene_pixels=10 * n_coarse,
+            min_offset_samples=1,
+            offset_source=coarse,
+        )
+        assert bool(keep.values.all())
+
+        # The coarse floor is what bites.
+        with pytest.raises(ValueError, match=r"All .* scenes rejected"):
+            seasonal_debias(
+                lst,
+                max_offset_c=99.0,
+                min_scene_pixels=1,
+                min_offset_samples=n_coarse + 1,
+                offset_source=coarse,
+            )
+
+    def test_native_path_is_unchanged(self):
+        """Without offset_source, min_offset_samples has no effect."""
+        lst = _smooth_stack()
+
+        base = seasonal_debias(lst, max_offset_c=15.0, min_scene_pixels=500)
+        with_arg = seasonal_debias(
+            lst, max_offset_c=15.0, min_scene_pixels=500, min_offset_samples=10**9
+        )
+
+        np.testing.assert_array_equal(base[2].values, with_arg[2].values)

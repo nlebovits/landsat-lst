@@ -33,6 +33,11 @@ def _spatial_dims(lst: xr.DataArray) -> list[str]:
     return [str(d) for d in lst.dims if d != _TIME_DIM]
 
 
+def _pixel_count(lst: xr.DataArray) -> int:
+    """Pixels in one time slice."""
+    return int(np.prod([lst.sizes[d] for d in _spatial_dims(lst)]))
+
+
 def scene_offsets(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
     """Estimate one scalar offset per scene, plus each scene's valid-pixel count.
 
@@ -63,6 +68,8 @@ def seasonal_debias(
     *,
     max_offset_c: float,
     min_scene_pixels: int,
+    min_offset_samples: int = 0,
+    offset_source: xr.DataArray | None = None,
 ) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
     """De-bias each scene against a per-pixel monthly climatology.
 
@@ -70,17 +77,24 @@ def seasonal_debias(
     through with a zero offset, so nothing downstream sees a scene whose
     correction was not applied.
 
-    Note this forces an eager reduction: the offsets must be materialized
-    before the time axis can be subset, which costs one full traversal of
-    ``lst`` on top of the later percentile pass.
+    The offset is one scalar per scene, so it does not need a full-resolution
+    climatology to estimate. Passing a coarser ``offset_source`` computes it
+    from far fewer pixels; the correction still applies at ``lst``'s own
+    resolution, since a constant has no resolution.
 
     Args:
         lst: Celsius LST with dims ``(time, latitude, longitude)`` and a
             datetime ``time`` coordinate. Apply the land mask before calling,
             so offsets are estimated over land only.
         max_offset_c: Discard a scene whose absolute offset exceeds this.
-        min_scene_pixels: Discard a scene with fewer valid pixels than this;
-            its offset is too sparsely estimated to trust.
+        min_scene_pixels: Sparse floor when estimating at native resolution,
+            in ``lst`` pixels. Ignored when ``offset_source`` is given.
+        min_offset_samples: Sparse floor when estimating from a coarse
+            ``offset_source``, in that grid's pixels. Replaces rather than
+            supplements ``min_scene_pixels``, because a coarse valid-pixel
+            count cannot be scaled back to a native one (see below).
+        offset_source: Optional coarser stack to estimate offsets from. Must
+            share ``lst``'s time coordinate. Defaults to ``lst`` itself.
 
     Returns:
         ``(debiased, offset, keep)``. ``debiased`` covers only the surviving
@@ -88,17 +102,41 @@ def seasonal_debias(
         so callers can report what was rejected and why.
 
     Raises:
-        ValueError: If no scene survives rejection.
+        ValueError: If no scene survives rejection, or if ``offset_source``
+            does not align with ``lst`` in time.
     """
-    offset, n_valid = scene_offsets(lst)
+    source = lst if offset_source is None else offset_source
 
-    keep = offset.notnull() & (n_valid >= min_scene_pixels) & (np.abs(offset) <= max_offset_c)
+    if offset_source is not None and not lst.time.equals(offset_source.time):
+        msg = (
+            "offset_source does not share lst's time coordinate "
+            f"({offset_source.sizes.get('time')} vs {lst.sizes.get('time')} steps). "
+            "Both stacks must come from the same items and groupby."
+        )
+        raise ValueError(msg)
+
+    offset, n_valid = scene_offsets(source)
+
+    # The sparse guard is stated on whichever grid the offset was estimated on,
+    # because that is the grid the median actually rests on.
+    #
+    # A coarse count cannot be scaled back up to stand in for the native one.
+    # Coarse loading inflates apparent validity: GDAL's average ignores nodata,
+    # so a block holding one valid fine pixel still yields a valid coarse pixel,
+    # and qa_pixel is nearest-sampled independently of it. Measured at Pergamino,
+    # a scene with exactly 1 valid native pixel reported 13 valid pixels at
+    # factor 8 -- scaling that by 64 would claim 816 and wave through a scene the
+    # native path rejects outright. See docs/findings-offset-subsampling.md.
+    floor = min_scene_pixels if offset_source is None else min_offset_samples
+
+    keep = offset.notnull() & (n_valid >= floor) & (np.abs(offset) <= max_offset_c)
 
     kept_idx = np.flatnonzero(np.asarray(keep.values))
     if kept_idx.size == 0:
         msg = (
             f"All {keep.sizes['time']} scenes rejected by de-striping "
-            f"(max_offset_c={max_offset_c}, min_scene_pixels={min_scene_pixels}). "
+            f"(max_offset_c={max_offset_c}, min_scene_pixels={min_scene_pixels}, "
+            f"min_offset_samples={min_offset_samples}). "
             "Refusing to emit an empty composite."
         )
         raise ValueError(msg)

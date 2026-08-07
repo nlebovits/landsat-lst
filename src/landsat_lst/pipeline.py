@@ -79,6 +79,7 @@ def load_scenes(
     patch_url: Callable[[str], str] | None = None,
     *,
     fail_on_error: bool = True,
+    resolution_factor: int = 1,
 ) -> xr.Dataset:
     """Load Landsat scenes as an xarray Dataset.
 
@@ -94,21 +95,40 @@ def load_scenes(
             composites (e.g. multi-year windows), where a transient Azure/S3
             read blip is near-certain across hundreds of scenes and losing a
             few observations is negligible against a P95 over the full stack.
+        resolution_factor: Load at ``resolution * factor`` instead of native.
+            The source COGs carry internal overviews at [2, 4, 8, 16, 32, 64],
+            so a coarser request is served from an overview and reads roughly
+            ``factor**2`` fewer bytes. Use powers of two to land on a stored
+            level. Intended for per-scene statistics that need no spatial
+            detail; never for the composite itself.
 
     Returns:
         Dataset with thermal and QA bands.
     """
     csize = settings.load_chunk_size
+    resolution = settings.resolution * resolution_factor
+
+    # Averaging only helps the thermal band, and only when coarsening. qa_pixel
+    # is a bitfield and must be sampled, never interpolated -- averaging bit
+    # flags yields values that decode to nonsense. (USGS built these overviews
+    # with nearest/mode, verified by confirming a decimated read introduces no
+    # values absent from the full-resolution vocabulary.) "nearest" for both is
+    # odc-stac's own default, so the factor=1 path is unchanged.
+    resampling: dict[str, str] | str = (
+        {"lwir11": "average", "qa_pixel": "nearest"} if resolution_factor > 1 else "nearest"
+    )
+
     return stac_load(
         items,
         bands=["lwir11", "qa_pixel"],
         crs=settings.crs,
-        resolution=settings.resolution,
+        resolution=resolution,
         chunks={"time": 10, "latitude": csize, "longitude": csize},
         groupby="solar_day",
         bbox=bbox,
         patch_url=patch_url,
         fail_on_error=fail_on_error,
+        resampling=resampling,
     )
 
 
@@ -144,6 +164,8 @@ def compute_annual_composite(
     data: xr.Dataset,
     *,
     land_mask: xr.DataArray | None = None,
+    offset_source: xr.Dataset | None = None,
+    offset_land_mask: xr.DataArray | None = None,
 ) -> xr.Dataset:
     """Compute an LST P95 composite with a per-month observation count.
 
@@ -190,10 +212,22 @@ def compute_annual_composite(
         lst = lst.where(land_mask)
 
     if settings.destripe:
+        # The offset is one scalar per scene, so it can be estimated from a
+        # coarse stack read off the source COGs' overviews. That cuts bytes
+        # read, which post-load subsampling cannot do: dask must materialize a
+        # whole chunk before discarding most of it.
+        source = None
+        if offset_source is not None:
+            source = convert_to_celsius(apply_qa_mask(offset_source)["lwir11"])
+            if offset_land_mask is not None:
+                source = source.where(offset_land_mask)
+
         lst, offset, keep = seasonal_debias(
             lst,
             max_offset_c=settings.destripe_max_offset_c,
             min_scene_pixels=settings.destripe_min_scene_pixels,
+            min_offset_samples=settings.destripe_min_offset_samples,
+            offset_source=source,
         )
         log.info("destripe_offsets_degC", **offset_diagnostics(offset, keep))
 
@@ -272,7 +306,30 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
     # coastal tiles.
     land_mask_da = _build_land_mask(job.tile.bbox, data.latitude, data.longitude)
 
-    composite = compute_annual_composite(data, land_mask=land_mask_da)
+    # A coarse second load for the de-striping offsets. Reading from the source
+    # overviews costs ~factor**2 fewer bytes than a second native-resolution
+    # pass, and the offset is a per-scene scalar that gains nothing from detail.
+    offset_source = None
+    offset_land_mask = None
+    factor = settings.destripe_offset_resolution_factor
+    if settings.destripe and factor > 1:
+        offset_source = load_scenes(
+            items,
+            job.tile.bbox,
+            patch_url=patch_url,
+            fail_on_error=False,
+            resolution_factor=factor,
+        )
+        offset_land_mask = _build_land_mask(
+            job.tile.bbox, offset_source.latitude, offset_source.longitude
+        )
+
+    composite = compute_annual_composite(
+        data,
+        land_mask=land_mask_da,
+        offset_source=offset_source,
+        offset_land_mask=offset_land_mask,
+    )
 
     # Silent nodata fill is otherwise undetectable: a low median or a high zero
     # fraction means reads failed en masse rather than occasionally.
