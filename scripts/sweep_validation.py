@@ -29,10 +29,10 @@ from dask.diagnostics import ProgressBar
 from dask.distributed import Client, LocalCluster
 from odc.stac import stac_load
 
+from landsat_lst.cog import cog_export
 from landsat_lst.config import settings
+from landsat_lst.encoding import encode_lst_uint16
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
-from landsat_lst.storage import IcechunkStorage
-from landsat_lst.zarr_writer import write_zarr
 
 # Suppress benign warnings
 warnings.filterwarnings("ignore", message=".*NotGeoreferencedWarning.*")
@@ -237,15 +237,18 @@ def run_single_config(
         # Validate P50
         p50_valid, _ = validate_p50(composite)
 
-        # Write to Icechunk (separate dir per config)
+        # Write the COG pair (separate dir per config) so the benchmark carries the
+        # same write payload production does.
         config_output = output_dir / f"chunk{chunk_size}_workers{workers}"
         config_output.mkdir(parents=True, exist_ok=True)
-        icechunk_path = config_output / "icechunk"
 
-        storage = IcechunkStorage.from_local(icechunk_path)
-        session = storage.writable_session()
-        write_zarr(composite, session, group="sweep/test")
-        session.commit(f"Sweep: chunk={chunk_size}, workers={workers}")
+        native = xr.Dataset(
+            {
+                "lst_p95": encode_lst_uint16(composite["lst_p95"]),
+                "qa_count": composite["qa_count"].astype(np.uint8),
+            }
+        )
+        cog_export(native, config_output / "lst_p95.tif", config_output / "qa_count.tif")
 
         # Get memory
         _, peak_memory = tracemalloc.get_traced_memory()

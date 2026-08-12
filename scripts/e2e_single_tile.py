@@ -92,7 +92,8 @@ class ProfileResult:
     total_duration_secs: float = 0.0
     scene_count: int = 0
     output_path: str = ""
-    commit_id: str | None = None
+    lst_cog: Path | None = None
+    qa_cog: Path | None = None
     peak_memory_mb: float = 0.0
     success: bool = False
     error: str | None = None
@@ -114,8 +115,8 @@ class ProfileResult:
                 f"Output: {self.output_path}",
             ]
         )
-        if self.commit_id:
-            lines.append(f"Icechunk commit: {self.commit_id[:12]}")
+        if self.qa_cog:
+            lines.append(f"QA COG: {self.qa_cog}")
         lines.extend(
             [
                 "",
@@ -186,11 +187,13 @@ def setup_dask_cluster(workers: int, threads: int, memory: str):
 
 def run_pipeline(tile_name: str, year: int, output_dir: Path) -> ProfileResult:
     """Run the full pipeline with profiling instrumentation."""
+    import xarray as xr  # noqa: PLC0415
+
+    from landsat_lst.cog import cog_export  # noqa: PLC0415
+    from landsat_lst.encoding import encode_lst_uint16  # noqa: PLC0415
     from landsat_lst.models import ProcessingJob  # noqa: PLC0415
     from landsat_lst.pipeline import process_tile  # noqa: PLC0415
-    from landsat_lst.storage import IcechunkStorage  # noqa: PLC0415
     from landsat_lst.tiling import parse_tile_name  # noqa: PLC0415
-    from landsat_lst.zarr_writer import write_zarr  # noqa: PLC0415
 
     result = ProfileResult(tile=tile_name, year=year)
     total_start = time.perf_counter()
@@ -213,22 +216,23 @@ def run_pipeline(tile_name: str, year: int, output_dir: Path) -> ProfileResult:
             stage.extra["nbytes"] = f"{composite.nbytes / 1e6:.2f} MB"
             stage.extra["scene_count"] = result.scene_count
 
-        # Write to Icechunk
-        with timed_stage("icechunk_write", result) as stage:
-            icechunk_path = output_dir / "icechunk"
-            storage = IcechunkStorage.from_local(icechunk_path)
+        # Encode to the published uint16 contract and write both COGs.
+        with timed_stage("cog_write", result) as stage:
+            native = xr.Dataset(
+                {
+                    "lst_p95": encode_lst_uint16(composite["lst_p95"]),
+                    "qa_count": composite["qa_count"],
+                }
+            )
+            item_dir = output_dir / f"lst-p95-{job.window_label}" / tile_name
+            lst_cog, qa_cog = cog_export(
+                native, item_dir / "lst_p95.tif", item_dir / "qa_count.tif"
+            )
 
-            session = storage.writable_session()
-            group_path = storage.zarr_path(year, tile_name)
-
-            write_zarr(composite, session, group=group_path)
-
-            commit_msg = f"E2E test: {tile_name} for {year}"
-            commit_id = session.commit(commit_msg)
-
-            result.output_path = str(icechunk_path / group_path)
-            result.commit_id = commit_id
-            stage.extra["commit_id"] = commit_id[:12]
+            result.lst_cog, result.qa_cog = lst_cog, qa_cog
+            result.output_path = str(lst_cog)
+            stage.extra["lst_mb"] = round(lst_cog.stat().st_size / 1e6, 1)
+            stage.extra["qa_mb"] = round(qa_cog.stat().st_size / 1e6, 1)
 
         result.success = True
 
@@ -241,54 +245,63 @@ def run_pipeline(tile_name: str, year: int, output_dir: Path) -> ProfileResult:
     return result
 
 
-def verify_output(result: ProfileResult, output_dir: Path) -> None:
-    """Verify the written GeoZarr multiscale pyramid can be read back correctly."""
-    import xarray as xr  # noqa: PLC0415
-    import zarr  # noqa: PLC0415
+def verify_output(result: ProfileResult) -> None:
+    """Verify both COGs are valid, carry overviews, and embed their statistics.
 
-    from landsat_lst.storage import IcechunkStorage  # noqa: PLC0415
+    Statistics are read with ``GDAL_PAM_ENABLED=NO`` so a ``.aux.xml`` sidecar cannot
+    satisfy the check. A published COG has to answer for itself, because a consumer
+    reading it over HTTPS never sees the sidecar.
+    """
+    import rasterio  # noqa: PLC0415
+    from rio_cogeo.cogeo import cog_validate  # noqa: PLC0415
 
-    log.info("verification_start")
+    log.info("verification_start", lst_cog=str(result.lst_cog), qa_cog=str(result.qa_cog))
 
-    icechunk_path = output_dir / "icechunk"
-    storage = IcechunkStorage.from_local(icechunk_path)
-    session = storage.readonly_session()
+    assert result.lst_cog is not None, "No LST COG recorded"
+    assert result.qa_cog is not None, "No QA COG recorded"
 
-    # Parent group carries the GeoZarr multiscales + proj/spatial conventions.
-    parent_path = f"{result.year}/{result.tile}"
-    parent = zarr.open_group(session.store, path=parent_path, mode="r")
-    assert "multiscales" in parent.attrs, "Missing multiscales attribute on parent group"
-    assert "proj:code" in parent.attrs, "Missing proj:code (GeoZarr) attribute"
-    assert "spatial:transform" in parent.attrs, "Missing spatial:transform (GeoZarr) attribute"
-    layout = parent.attrs["multiscales"]["layout"]
-    level_names = [entry["asset"] for entry in layout]
-    log.info("multiscales_levels", levels=level_names)
+    for path in (result.lst_cog, result.qa_cog):
+        is_valid, errors, warnings_ = cog_validate(str(path))
+        assert is_valid, f"{path.name} is not a valid COG: {errors}"
+        if warnings_:
+            log.warning("cog_validate_warnings", cog=path.name, warnings=warnings_)
 
-    # Native data lives in level group "0".
-    ds = xr.open_zarr(session.store, group=f"{parent_path}/0")
+    # gdalinfo-style structural checks, with PAM off so nothing comes from a sidecar.
+    with rasterio.Env(GDAL_PAM_ENABLED="NO"):
+        with rasterio.open(result.lst_cog) as src:
+            assert src.count == 1, f"LST COG has {src.count} bands, expected 1"
+            assert src.dtypes[0] == "uint16", f"LST COG dtype is {src.dtypes[0]}"
+            assert src.nodata == 0, f"LST COG nodata is {src.nodata}, expected 0"
+            assert src.scales[0] != 1.0, "LST COG carries no band scale"
+            lst_overviews = src.overviews(1)
+            assert lst_overviews, "LST COG has no overviews"
+            lst_tags = src.tags(1)
+            assert "STATISTICS_MINIMUM" in lst_tags, "LST COG has no embedded band statistics"
+            log.info(
+                "lst_cog_verified",
+                shape=(src.height, src.width),
+                overviews=lst_overviews,
+                scale=src.scales[0],
+                offset=src.offsets[0],
+                stats_min=lst_tags.get("STATISTICS_MINIMUM"),
+                stats_max=lst_tags.get("STATISTICS_MAXIMUM"),
+            )
 
-    log.info(
-        "verification_complete",
-        variables=list(ds.data_vars),
-        shape=dict(ds.sizes),
-        lst_p95_dtype=str(ds["lst_p95"].dtype),
-        lst_p95_range=f"[{int(ds['lst_p95'].min().values)}, {int(ds['lst_p95'].max().values)}]",
-        qa_count_max=int(ds["qa_count"].max().values),
-    )
+        with rasterio.open(result.qa_cog) as src:
+            assert src.count == 12, f"QA COG has {src.count} bands, expected 12"
+            assert src.dtypes[0] == "uint8", f"QA COG dtype is {src.dtypes[0]}"
+            assert src.nodata is None, "QA COG must not set nodata: 0 is a real count"
+            qa_overviews = src.overviews(1)
+            assert qa_overviews, "QA COG has no overviews"
+            assert "STATISTICS_MINIMUM" in src.tags(1), "QA COG has no embedded band statistics"
+            log.info(
+                "qa_cog_verified",
+                shape=(src.height, src.width),
+                overviews=qa_overviews,
+                band_names=[src.descriptions[i] for i in range(src.count)],
+            )
 
-    # Check attributes
-    assert "lst_scale_factor" in ds["lst_p95"].attrs, "Missing scale_factor attribute"
-    assert "_CRS" in ds.attrs, "Missing _CRS attribute"
-
-    # Each overview level should be readable and coarser than native.
-    native_h = ds.sizes["latitude"]
-    for name in level_names:
-        if name == "0":
-            continue
-        lvl = xr.open_zarr(session.store, group=f"{parent_path}/{name}")
-        assert lvl.sizes["latitude"] < native_h, f"Level {name} not coarser than native"
-
-    log.info("verification_passed", commit_id=result.commit_id[:12] if result.commit_id else None)
+    log.info("verification_passed")
 
 
 def main():
@@ -362,7 +375,7 @@ def main():
 
         # Verify output if successful
         if result.success:
-            verify_output(result, args.output_dir)
+            verify_output(result)
 
         # Exit code
         sys.exit(0 if result.success else 1)

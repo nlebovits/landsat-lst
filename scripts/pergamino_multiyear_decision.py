@@ -2,11 +2,9 @@
 """Decision run: 1yr / 3yr / 5yr P95 composites for Pergamino (tile S30W065).
 
 Purpose: decide whether multi-year P95 composites meaningfully reduce striping and
-cloud gaps versus a single year. For each window we produce:
-
-  - a GeoZarr multiscale pyramid on Icechunk (lst_p95 uint16 + qa_count uint8, the
-    latter a 12-month climatology of valid-observation counts), and
-  - QGIS-ready COGs (single-band LST + 12-band monthly QA).
+cloud gaps versus a single year. For each window we produce the published COG pair:
+a single-band uint16 LST COG and a 12-band uint8 monthly QA COG, the latter a
+climatology of valid-observation counts.
 
 We also emit ``results/decision/report.md`` with per-window gap/striping metrics and
 the **measured** compression ratio, then re-derive the global storage estimate from it.
@@ -38,11 +36,10 @@ from landsat_lst.config import STAC_PLANETARY_COMPUTER, settings
 settings.stac_url = STAC_PLANETARY_COMPUTER
 
 from landsat_lst.cog import cog_export  # noqa: E402
+from landsat_lst.encoding import encode_lst_uint16  # noqa: E402
 from landsat_lst.models import ProcessingJob  # noqa: E402
 from landsat_lst.pipeline import process_tile  # noqa: E402
-from landsat_lst.storage import IcechunkStorage  # noqa: E402
 from landsat_lst.tiling import parse_tile_name  # noqa: E402
-from landsat_lst.zarr_writer import write_zarr  # noqa: E402
 
 log = structlog.get_logger()
 
@@ -54,7 +51,6 @@ TILE_NAME = "S30W065"  # 5-degree tile containing Pergamino, Argentina (-33.9, -
 AOI_BBOX = (-61.1, -34.4, -60.1, -33.4)  # (west, south, east, north)
 
 OUT_DIR = Path("results/decision")
-ICECHUNK_DIR = OUT_DIR / "icechunk"
 
 # (year, end_year|None, label) for each composite window.
 WINDOWS: list[tuple[int, int | None]] = [
@@ -63,9 +59,10 @@ WINDOWS: list[tuple[int, int | None]] = [
     (2020, 2024),  # 5-year
 ]
 
-# Global extrapolation constants (see plan). 5-degree tiles, 30 m pixels.
+# Global extrapolation constant (see plan). 5-degree tiles, 30 m pixels.
+# No separate overview term: the measured ratios divide native uncompressed bytes by a
+# COG file size that already contains its internal overviews.
 GLOBAL_LAND_PIXELS = 1.656e11  # ~149 Mkm2 land / (30 m)^2
-PYRAMID_OVERHEAD = 1.0 + 1 / 16 + 1 / 256 + 1 / 4096  # factors [4,16,64] ~= 1.0667
 
 
 @dataclass
@@ -118,33 +115,27 @@ def setup_client(use_frisky: bool = True):
     return cluster, client, scheduler
 
 
-def _stored_bytes(store, path: str) -> int:
-    """Compressed on-disk bytes of a committed Zarr array (native level)."""
-    import zarr  # noqa: PLC0415
+def _cog_ratio(path: Path) -> float:
+    """Uncompressed native bytes over the COG's on-disk size.
+
+    The file size includes the internal overviews, so the ratio describes the
+    artifact that actually gets published rather than the native band alone.
+    """
+    import rasterio  # noqa: PLC0415
 
     try:
-        arr = zarr.open_array(store, path=path, mode="r")
-        nb = arr.nbytes_stored
-        return int(nb() if callable(nb) else nb)
+        with rasterio.open(path) as src:
+            itemsize = np.dtype(src.dtypes[0]).itemsize
+            uncompressed = src.width * src.height * src.count * itemsize
+        return uncompressed / path.stat().st_size
     except Exception as e:  # measurement is best-effort, never fail the run
-        log.warning("stored_bytes_failed", path=path, error=str(e))
-        return 0
+        log.warning("cog_ratio_failed", path=str(path), error=str(e))
+        return 0.0
 
 
-def measure_compression(store, group: str, native: xr.Dataset) -> tuple[float, float]:
-    """Native-level compression ratio per variable, read from the committed store.
-
-    Compares each array's compressed ``nbytes_stored`` to its uncompressed size --
-    no extra write. Returns ``(lst_ratio, qa_ratio)`` = uncompressed / compressed.
-    """
-    npix = int(native.sizes["latitude"]) * int(native.sizes["longitude"])
-    lst_uncompressed = npix * 2  # uint16
-    qa_uncompressed = npix * int(native.sizes["month"])  # uint8 x 12
-    lst_stored = _stored_bytes(store, f"{group}/0/lst_p95")
-    qa_stored = _stored_bytes(store, f"{group}/0/qa_count")
-    lst_ratio = lst_uncompressed / lst_stored if lst_stored else 0.0
-    qa_ratio = qa_uncompressed / qa_stored if qa_stored else 0.0
-    return lst_ratio, qa_ratio
+def measure_compression(lst_cog: Path, qa_cog: Path) -> tuple[float, float]:
+    """Compression ratio per COG. Returns ``(lst_ratio, qa_ratio)``."""
+    return _cog_ratio(lst_cog), _cog_ratio(qa_cog)
 
 
 def composite_for_bbox(job: ProcessingJob, bbox: tuple[float, float, float, float]) -> xr.Dataset:
@@ -218,7 +209,6 @@ def compute_metrics(composite: xr.Dataset, res: WindowResult) -> None:
 def process_window(
     year: int,
     end_year: int | None,
-    storage: IcechunkStorage,
     bbox: tuple[float, float, float, float] | None,
 ) -> WindowResult:
     """Full pipeline + COG + metrics for one window.
@@ -245,20 +235,19 @@ def process_window(
         # Metrics from the in-memory float composite (before encoding).
         compute_metrics(composite, res)
 
-        # Write GeoZarr multiscale pyramid to the shared icechunk repo.
-        session = storage.writable_session()
-        group = storage.zarr_path(job.window_label, job.tile.name)
-        write_zarr(composite, session, group=group)
-        commit = session.commit(f"decision run {job.tile.name} {job.window_label}")
-        log.info("icechunk_committed", group=group, commit=commit[:12])
-
-        # Read native level back (encoded DN/counts): measure compression + export COGs.
-        rs = storage.readonly_session()
-        native = xr.open_zarr(rs.store, group=f"{group}/0")
-        res.lst_ratio, res.qa_ratio = measure_compression(rs.store, group, native)
-        lst_cog = OUT_DIR / f"lst_{res.label}_{job.tile.name}.tif"
-        qa_cog = OUT_DIR / f"qa_count_{res.label}_{job.tile.name}.tif"
-        cog_export(native, lst_cog, qa_cog)
+        # Encode to the published uint16 contract, export both COGs, measure them.
+        native = xr.Dataset(
+            {
+                "lst_p95": encode_lst_uint16(composite["lst_p95"]),
+                "qa_count": composite["qa_count"],
+            }
+        )
+        lst_cog, qa_cog = cog_export(
+            native,
+            OUT_DIR / f"lst_{res.label}_{job.tile.name}.tif",
+            OUT_DIR / f"qa_count_{res.label}_{job.tile.name}.tif",
+        )
+        res.lst_ratio, res.qa_ratio = measure_compression(lst_cog, qa_cog)
         res.lst_cog, res.qa_cog = str(lst_cog), str(qa_cog)
 
     except Exception as e:  # record and continue to next window
@@ -315,7 +304,7 @@ def write_report(results: list[WindowResult]) -> Path:
         lines.append(f"| {r.label} |{cells}")
     lines.append("")
 
-    lines.append("## Measured compression (native level)\n")
+    lines.append("## Measured compression (COG, overviews included)\n")
     lines.append("| Window | LST ratio | QA ratio |")
     lines.append("|---|--:|--:|")
     for r in ok:
@@ -325,7 +314,7 @@ def write_report(results: list[WindowResult]) -> Path:
     )
 
     # Global extrapolation with MEASURED ratios.
-    px = GLOBAL_LAND_PIXELS * PYRAMID_OVERHEAD
+    px = GLOBAL_LAND_PIXELS
     lst_c = _gb(px * 2 / lst_ratio) if lst_ratio else 0.0
     qa1_c = _gb(px * 1 / qa_ratio) if qa_ratio else 0.0
     lines.append("## Global land storage estimate (measured ratios)\n")
@@ -381,12 +370,11 @@ def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     cluster, client, _scheduler = setup_client(use_frisky=not args.no_frisky)
-    storage = IcechunkStorage.from_local(ICECHUNK_DIR)
 
     results: list[WindowResult] = []
     try:
         for year, end_year in selected:
-            results.append(process_window(year, end_year, storage, bbox))
+            results.append(process_window(year, end_year, bbox))
     finally:
         client.close()
         cluster.close()

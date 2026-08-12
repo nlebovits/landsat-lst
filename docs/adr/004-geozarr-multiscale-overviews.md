@@ -1,8 +1,14 @@
 # ADR-004: GeoZarr Multiscale Overviews on Icechunk
 
-**Status:** Accepted
+**Status:** ⚠️ Superseded by [ADR-009](009-cog-output-and-stac-catalog.md)
 **Date:** 2026-06-19
 **Authors:** @nlebovits
+
+> **Superseded (2026-08-12) by [ADR-009](009-cog-output-and-stac-catalog.md).** Overviews now live
+> inside each COG rather than in sibling Zarr groups, so no convention has to describe the
+> pyramid. Decision 4 below survives the move: ADR-009 keeps fill-masked coarsening for `lst_p95`
+> and, for the same reason, keeps real zeros in the `qa_count` average. The record below is kept
+> for history.
 
 ## Context
 
