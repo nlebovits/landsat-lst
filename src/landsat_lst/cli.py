@@ -153,12 +153,22 @@ def catalog() -> None:
     default=None,
     help="PNG to register as the thumbnail, instead of rendering one from the tiles",
 )
+@click.option(
+    "--metadata-only",
+    is_flag=True,
+    help=(
+        "Write a JSON-only staging tree: read every COG header but do not "
+        "copy or download the COGs beside their items. For s3:// sources "
+        "whose COGs already sit at their published paths."
+    ),
+)
 def catalog_build(
     source: str,
     out: str,
     window: str | None,
     tiles: str | None,
     thumbnail: str | None,
+    metadata_only: bool,
 ) -> None:
     """Build a Portolan-compliant STAC catalog from finished per-tile COGs."""
     from landsat_lst.catalog import build_catalog
@@ -167,8 +177,20 @@ def catalog_build(
     spec = DEFAULT_SPEC if window is None else spec_for_window(window)
     wanted = tuple(name.strip() for name in tiles.split(",")) if tiles else None
     console.print(f"[bold]Building catalog for {spec.window}[/bold] from {source}")
-    root = build_catalog(source, out, spec, tiles=wanted, thumbnail=thumbnail)
+    root = build_catalog(
+        source,
+        out,
+        spec,
+        tiles=wanted,
+        thumbnail=thumbnail,
+        place_assets=not metadata_only,
+    )
     console.print(f"  Wrote [green]{root}[/green]")
+    if metadata_only:
+        console.print(
+            "  [yellow]Metadata-only tree: validator byte checks will skip "
+            "the COGs. Sample real tiles locally for byte coverage.[/yellow]"
+        )
 
 
 def _print_report(report: Report, unaccepted: set[str]) -> None:

@@ -106,3 +106,36 @@ def test_half_a_tile_refuses_to_build(tmp_path: Path) -> None:
     (source / "qa_count_2021-2025_N40W075.tif").unlink()
     with pytest.raises(IncompleteTileError, match="N40W075"):
         build_catalog(source, tmp_path / "catalog")
+
+
+class TestMetadataOnlyBuild:
+    """``place_assets=False`` stages metadata without materialising the COGs.
+
+    This is the S3 shape of the publication runbook: the COGs already sit at
+    their published paths, so the staging tree carries everything except them.
+    The validator then skips the COG byte checks silently, which is intended
+    and is why the accepted set here is smaller than the full-build baseline:
+    PTL-DAT-010 needs bytes to fire.
+    """
+
+    @pytest.fixture(scope="class")
+    def staged(self, tmp_path_factory: pytest.TempPathFactory) -> Path:
+        root = tmp_path_factory.mktemp("metadata-only")
+        source = write_source_tree(root / "cogs", TILES)
+        thumbnail = write_thumbnail(root / "thumbnail.png")
+        return build_catalog(source, root / "catalog", thumbnail=thumbnail, place_assets=False)
+
+    def test_no_cog_lands_in_the_tree(self, staged: Path) -> None:
+        assert list(staged.rglob("*.tif")) == []
+
+    def test_items_still_carry_the_header_facts(self, staged: Path) -> None:
+        """The numbers come from the source headers even when files stay put."""
+        item_path = staged / DEFAULT_SPEC.collection_id / TILES[0] / f"{TILES[0]}.json"
+        assert item_path.is_file()
+
+    def test_validates_clean_with_byte_checks_skipped(self, staged: Path) -> None:
+        report = validate_catalog(staged)
+        assert report.errors == [], [f"{f.rule_id} {f.path}: {f.message}" for f in report.errors]
+        warning_ids = {f.rule_id for f in report.warnings}
+        assert warning_ids == {"PTL-AST-003"}
+        assert not unaccepted_warnings(report)

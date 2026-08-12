@@ -8,8 +8,8 @@ not the code.
 **Target:** `s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/`, readable at
 `https://data.source.coop/nlebovits/landsat-lst/`.
 
-**Two decisions are still open.** Both are described under [Open prerequisites](#open-prerequisites)
-and both block S3 and S5. Read that section before scheduling anything.
+The two prerequisites that once blocked S3 and S5 are resolved and recorded under
+[Resolved prerequisites](#resolved-prerequisites). Nothing blocks the sequence except running it.
 
 ---
 
@@ -27,43 +27,25 @@ and both block S3 and S5. Read that section before scheduling anything.
 
 ---
 
-## Open prerequisites
+## Resolved prerequisites
 
-### The processing layout and the catalog layout are not the same
+Two gaps blocked S3 and S5 when this runbook was first written. Both are closed in code.
 
-`StorageBackend.cog_key` writes `{window}/{tile}/{product}_{window}_{tile}.tif` under
-`settings.s3_prefix`. The catalog places the same file at
-`{collection_id}/{tile}/{product}_{window}_{tile}.tif`, and `collection_id` is
-`lst-p95-{window}`, not `{window}`. A tile S2 writes to
-`landsat-lst/2021-2025/N40W075/lst_p95_2021-2025_N40W075.tif` has to appear at
-`nlebovits/landsat-lst/lst-p95-2021-2025/N40W075/lst_p95_2021-2025_N40W075.tif` for the published
-item to resolve.
+### The processing layout is the catalog layout
 
-One recursive server-side copy maps the whole tree, because the two layouts agree below their
-first path segment:
+`StorageBackend.cog_key` writes `lst-p95-{window}/{tile}/{product}_{window}_{tile}.tif`, the
+exact path the published item declares. The leading segment duplicates
+`catalog.spec.spec_for_window(window).collection_id` rather than importing it, so workers do not
+pay for the catalog stack; a unit test (`TestCatalogLayoutContract`) pins the two together and
+fails the build if either side drifts. Point S2's processing at the destination bucket and
+prefix, and the COGs land at their published paths. S5 then syncs metadata only.
 
-```bash
-aws s3 cp --recursive \
-  s3://source-coop-radiant-earth/landsat-lst/2021-2025/ \
-  s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/lst-p95-2021-2025/
-```
+### `catalog build --metadata-only` writes a JSON-only staging tree
 
-Both buckets are in `us-west-2` and the copy is server side, so the bytes never reach a local
-machine and there is no egress charge. Decide before S2 whether to run that copy or to point
-processing at the destination bucket directly. Pointing processing at the destination still needs
-the prefix rewrite, because `cog_key` inserts the bare window label.
-
-### `catalog build` materialises the COGs beside the items
-
-`catalog.scan.place_file` downloads each source COG into the tree it is building. Against an
-`s3://` source that means the full dataset lands on the machine running the build, which is the
-egress the whole design avoids. A JSON-only staging tree is not reachable through the current
-builder without paying for that download.
-
-Resolve it one of two ways before S3. Give the builder a mode that records assets it does not
-copy, or run S3 against a working directory that already holds the COGs. Do not work around it by
-building the full tree and deleting the `.tif` files afterwards. The download has already been
-paid for by then.
+The builder still reads every COG header from the source, so all the numbers the items carry
+come from the files. It does not copy or download the COGs beside their items. Use it for S3
+against the `s3://` source. A validator run over the resulting tree silently skips the COG byte
+checks, which is the intended S4 behavior. Sample real tiles into the tree for byte coverage.
 
 ---
 
@@ -124,17 +106,19 @@ and it belongs in an issue rather than in a third retry.
 
 ## S3. Build the catalog
 
-Build against the finished COGs, into a staging tree that holds metadata only. Read
-[Open prerequisites](#open-prerequisites) first, because the builder does not yet do this without
-downloading the assets.
+Build against the finished COGs, into a staging tree that holds metadata only. The
+`--metadata-only` flag reads every COG header without downloading a single asset.
 
 ```bash
 landsat-lst catalog build \
-  --source s3://source-coop-radiant-earth/landsat-lst \
+  --source s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst \
   --out ./staging \
   --window 2021-2025 \
-  --thumbnail ./thumbnail.png
+  --metadata-only
 ```
+
+The thumbnail renders from each COG's coarsest overview over `/vsis3`, a few kilobytes per tile.
+Pass `--thumbnail` instead to reuse one rendered earlier.
 
 The builder reads each COG's header for its footprint, shape, and band statistics, which is a
 range read of a few kilobytes per file. Those reads are unavoidable. The catalog states what is in

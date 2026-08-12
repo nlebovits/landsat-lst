@@ -5,12 +5,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from landsat_lst.storage import PRODUCTS, LocalStorage, S3Storage, get_storage
+from landsat_lst.storage import (
+    PRODUCTS,
+    LocalStorage,
+    S3Storage,
+    collection_prefix,
+    get_storage,
+)
 
 
 def _write_asset(root: Path, window: str, tile: str, product: str) -> Path:
     """Create one asset file under ``root`` at the canonical key."""
-    path = root / window / tile / f"{product}_{window}_{tile}.tif"
+    path = root / collection_prefix(window) / tile / f"{product}_{window}_{tile}.tif"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"tif")
     return path
@@ -23,7 +29,7 @@ class TestCogKey:
         storage = LocalStorage(output_dir=tmp_path)
 
         assert storage.cog_key("2021-2025", "N40W075", "lst_p95") == (
-            "2021-2025/N40W075/lst_p95_2021-2025_N40W075.tif"
+            "lst-p95-2021-2025/N40W075/lst_p95_2021-2025_N40W075.tif"
         )
 
     def test_backends_agree_on_layout(self, tmp_path):
@@ -137,17 +143,17 @@ class TestS3Storage:
         paginator.paginate.return_value = [
             {
                 "Contents": [
-                    {"Key": "p/2024/N40W075/lst_p95_2024_N40W075.tif"},
-                    {"Key": "p/2024/N40W075/qa_count_2024_N40W075.tif"},
+                    {"Key": "p/lst-p95-2024/N40W075/lst_p95_2024_N40W075.tif"},
+                    {"Key": "p/lst-p95-2024/N40W075/qa_count_2024_N40W075.tif"},
                 ]
             },
-            {"Contents": [{"Key": "p/2024/N45W075/lst_p95_2024_N45W075.tif"}]},
+            {"Contents": [{"Key": "p/lst-p95-2024/N45W075/lst_p95_2024_N45W075.tif"}]},
         ]
         mock_client.get_paginator.return_value = paginator
         storage._client = mock_client
 
         assert storage.list_completed("2024") == {"N40W075"}
-        paginator.paginate.assert_called_once_with(Bucket="b", Prefix="p/2024/")
+        paginator.paginate.assert_called_once_with(Bucket="b", Prefix="p/lst-p95-2024/")
         mock_client.head_object.assert_not_called()
 
     def test_list_completed_handles_empty_prefix(self):
@@ -179,3 +185,28 @@ class TestGetStorage:
             mock_settings.s3_region = "us-west-2"
 
             assert isinstance(get_storage(), S3Storage)
+
+
+class TestCatalogLayoutContract:
+    """The storage layout IS the published catalog layout.
+
+    storage.collection_prefix duplicates catalog.spec's collection id rather
+    than importing it, so workers do not pay for the catalog stack. This test
+    is the contract that keeps the two from drifting: if either side changes,
+    the published COG paths and the STAC item hrefs disagree and publication
+    stops being a metadata-only sync.
+    """
+
+    def test_prefix_matches_the_collection_id(self):
+        from landsat_lst.catalog.spec import spec_for_window
+        from landsat_lst.storage import collection_prefix
+
+        for window in ("2021-2025", "2024"):
+            assert collection_prefix(window) == spec_for_window(window).collection_id
+
+    def test_key_starts_with_the_collection_id(self, tmp_path):
+        from landsat_lst.catalog.spec import spec_for_window
+
+        storage = LocalStorage(output_dir=tmp_path)
+        key = storage.cog_key("2021-2025", "N40W075", "lst_p95")
+        assert key.startswith(spec_for_window("2021-2025").collection_id + "/")
