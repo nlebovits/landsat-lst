@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pystac
 
@@ -32,6 +33,10 @@ from landsat_lst.catalog.spec import (
     FILE_EXTENSION_URI,
     CatalogSpec,
 )
+from landsat_lst.catalog.thumbnail import generate_thumbnail
+
+if TYPE_CHECKING:
+    from landsat_lst.catalog.scan import TilePair
 
 __all__ = ["CatalogSpec", "build_catalog"]
 
@@ -53,19 +58,21 @@ def _write_docs(root: Path, collection_dir: Path, spec: CatalogSpec) -> None:
         path.write_text(text, encoding="utf-8")
 
 
-def _thumbnail_asset(collection_dir: Path, provided: Path | None) -> pystac.Asset | None:
-    """The collection thumbnail, if one has been rendered for this collection.
+def _thumbnail_asset(
+    collection_dir: Path, provided: Path | None, pairs: list[TilePair], spec: CatalogSpec
+) -> pystac.Asset:
+    """The collection thumbnail, rendered from the tiles unless one is handed in.
 
-    A thumbnail handed in is copied into place; otherwise an existing
-    ``thumbnail.png`` beside the collection is picked up, so re-running a build
-    over a catalog that already has one keeps it registered.
+    A thumbnail handed in is copied into place; otherwise the global mosaic is
+    drawn from the same COGs the items describe, so the preview cannot fall out
+    of step with the coverage the catalog reports.
     """
     dest = collection_dir / _THUMBNAIL_NAME
     if provided is not None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(provided, dest)
-    if not dest.is_file():
-        return None
+    else:
+        generate_thumbnail(pairs, dest, spec)
     return pystac.Asset(
         href=f"./{_THUMBNAIL_NAME}",
         title="Collection preview",
@@ -75,16 +82,14 @@ def _thumbnail_asset(collection_dir: Path, provided: Path | None) -> pystac.Asse
     )
 
 
-def _attach_thumbnail(collection: pystac.Collection, asset: pystac.Asset | None) -> None:
+def _attach_thumbnail(collection: pystac.Collection, asset: pystac.Asset) -> None:
     """Register the thumbnail and the extension its ``file:size`` needs."""
-    if asset is None:
-        return
     collection.add_asset("thumbnail", asset)
     if FILE_EXTENSION_URI not in collection.stac_extensions:
         collection.stac_extensions.append(FILE_EXTENSION_URI)
 
 
-def _place_assets(collection_dir: Path, pairs: list, items: list[pystac.Item]) -> None:
+def _place_assets(collection_dir: Path, pairs: list[TilePair], items: list[pystac.Item]) -> None:
     """Copy or link every tile's COGs into the directory of its item."""
     for pair, item in zip(pairs, items, strict=True):
         tile_dir = collection_dir / item.id
@@ -107,7 +112,7 @@ def build_catalog(
         spec: Naming and policy decisions. Defaults to the production dataset.
         tiles: Restrict the catalog to these tile names.
         thumbnail: PNG to register as the collection thumbnail. When omitted,
-            an existing ``thumbnail.png`` beside the collection is used.
+            the global mosaic preview is rendered from the tiles themselves.
 
     Returns:
         The catalog root directory.
@@ -129,7 +134,9 @@ def build_catalog(
 
     collection_dir = root / spec.collection_id
     _place_assets(collection_dir, pairs, items)
-    _attach_thumbnail(collection, _thumbnail_asset(collection_dir, _as_path(thumbnail)))
+    _attach_thumbnail(
+        collection, _thumbnail_asset(collection_dir, _as_path(thumbnail), pairs, spec)
+    )
 
     # --- items.parquet mirror -------------------------------------------
     # Written from the same in-memory items the JSON below is written from,

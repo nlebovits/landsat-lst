@@ -21,6 +21,7 @@ from landsat_lst.catalog.spec import (
     LST_ASSET_KEY,
     QA_ASSET_KEY,
     RASTER_EXTENSION_URI,
+    RENDER_EXTENSION_URI,
 )
 from landsat_lst.encoding import LST_FILL_VALUE, LST_OFFSET, LST_SCALE
 from landsat_lst.tiling import parse_tile_name, tile_geobox
@@ -43,6 +44,10 @@ _ENCODING_PROPERTIES: dict[str, Any] = {
     "lst:units": "celsius",
     "lst:nodata": LST_FILL_VALUE,
 }
+
+#: Key of the one render this dataset publishes. The percentile composite is
+#: the thing worth looking at; the monthly counts are evidence, not a map.
+RENDER_KEY = "lst"
 
 _LST_TITLE = "Land surface temperature, 95th percentile"
 _QA_TITLE = "Valid observation count per calendar month"
@@ -136,6 +141,30 @@ def _qa_bands(header: CogHeader) -> list[dict[str, Any]]:
     ]
 
 
+# Render v2.0.0 keeps every rendering field inside a ``renders`` object -- on an
+# item that object is ``properties.renders``, and the schema *requires* it of
+# any item declaring the extension. There are no ``render:*`` asset fields to
+# set: a render names the assets it draws instead, which is how this one points
+# at the percentile composite and leaves the monthly counts alone.
+def renders_for(spec: CatalogSpec) -> dict[str, Any]:
+    """The one render a client should draw, in decoded Celsius.
+
+    The collection declares the same object over its ``item_assets``, so a
+    browser that never opens an item still knows how to draw the tiles.
+    """
+    low, high = spec.rescale
+    return {
+        RENDER_KEY: {
+            "title": _LST_TITLE,
+            "assets": [LST_ASSET_KEY],
+            "colormap_name": spec.colormap,
+            # The band declares raster:scale and raster:offset, so the range a
+            # client stretches over is the temperature, not the stored DN.
+            "rescale": [[low, high]],
+        }
+    }
+
+
 def _asset(
     header: CogHeader, title: str, roles: list[str], bands: list[dict[str, Any]]
 ) -> pystac.Asset:
@@ -161,9 +190,10 @@ def build_item(pair: TilePair, spec: CatalogSpec) -> pystac.Item:
             "title": f"{pair.tile} land surface temperature, {spec.window}",
             "start_datetime": spec.start_datetime,
             "end_datetime": spec.end_datetime,
+            "renders": renders_for(spec),
             **_ENCODING_PROPERTIES,
         },
-        stac_extensions=[FILE_EXTENSION_URI, RASTER_EXTENSION_URI],
+        stac_extensions=[FILE_EXTENSION_URI, RASTER_EXTENSION_URI, RENDER_EXTENSION_URI],
     )
     item.add_asset(LST_ASSET_KEY, _asset(pair.lst, _LST_TITLE, ["data"], _lst_bands(pair.lst)))
     item.add_asset(

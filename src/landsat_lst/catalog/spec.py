@@ -21,6 +21,11 @@ FILE_EXTENSION_URI = "https://stac-extensions.github.io/file/v2.1.0/schema.json"
 #: Declared by items because their asset bands carry ``raster:*`` fields.
 RASTER_EXTENSION_URI = "https://stac-extensions.github.io/raster/v2.0.0/schema.json"
 
+#: Declared by items because their properties carry a ``renders`` object. In
+#: v2.0.0 the rendering fields live only inside that object -- there are no
+#: ``render:*`` asset fields -- and an item declaring this URI must carry it.
+RENDER_EXTENSION_URI = "https://stac-extensions.github.io/render/v2.0.0/schema.json"
+
 #: The exact media type a Portolan validator recognises as a COG.
 COG_MEDIA_TYPE = "image/tiff; application=geotiff; profile=cloud-optimized"
 
@@ -31,6 +36,13 @@ QA_ASSET_KEY = "qa_count"
 DEFAULT_WINDOW = "2021-2025"
 SOURCE_COOP_SLUG = "nlebovits/landsat-lst"
 SOURCE_COOP_READ_BASE = "https://data.source.coop/nlebovits/landsat-lst/"
+
+#: Display range in decoded Celsius, shared by the preview image and the render
+#: extension. A hot-season 95th percentile runs from a few degrees over boreal
+#: forest to the low fifties over desert, so the low end sits at freezing rather
+#: than at the encoding floor: starting at -50 C would spend two thirds of the
+#: colormap on temperatures the dataset never reports.
+_RESCALE_CELSIUS = (0.0, 55.0)
 
 _USGS_URL = "https://www.usgs.gov/landsat-missions/landsat-collection-2-level-2-science-products"
 _MAINTAINER_URL = "https://github.com/nlebovits/landsat-lst"
@@ -74,6 +86,7 @@ class CatalogSpec:
     license: str
     providers: tuple[ProviderSpec, ...]
     colormap: str
+    rescale: tuple[float, float]
     source_coop_slug: str
     read_base_url: str
 
@@ -143,6 +156,7 @@ def spec_for_window(window: str = DEFAULT_WINDOW) -> CatalogSpec:
             ),
         ),
         colormap="inferno",
+        rescale=_RESCALE_CELSIUS,
         source_coop_slug=SOURCE_COOP_SLUG,
         read_base_url=SOURCE_COOP_READ_BASE,
     )

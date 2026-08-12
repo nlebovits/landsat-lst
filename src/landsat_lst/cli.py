@@ -148,7 +148,11 @@ def catalog() -> None:
 @click.option("--out", default="./catalog", help="Directory to write the catalog into")
 @click.option("--window", default=None, help="Observation window label, e.g. 2021-2025")
 @click.option("--tiles", default=None, help="Comma-separated tile names to include")
-@click.option("--thumbnail", default=None, help="PNG to register as the collection thumbnail")
+@click.option(
+    "--thumbnail",
+    default=None,
+    help="PNG to register as the thumbnail, instead of rendering one from the tiles",
+)
 def catalog_build(
     source: str,
     out: str,

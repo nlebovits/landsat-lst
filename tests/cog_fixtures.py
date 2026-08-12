@@ -109,12 +109,8 @@ def _write_cog(
     return path
 
 
-def write_lst_cog(path: Path, bounds: tuple[float, float, float, float], seed: int = 0) -> Path:
-    """A single-band uint16 percentile composite, DN 0 as fill."""
-    rng = np.random.default_rng(seed)
-    celsius = rng.uniform(20.0, 45.0, size=(1, FIXTURE_SIZE, FIXTURE_SIZE))
-    data = ((celsius - LST_OFFSET) / LST_SCALE).astype(np.uint16)
-    data[0, 0, :4] = LST_FILL_VALUE  # a little fill, so valid percent is not 100
+def _write_lst(path: Path, data: np.ndarray, bounds: tuple[float, float, float, float]) -> Path:
+    """One percentile-composite COG, carrying the production encoding tags."""
     return _write_cog(
         path,
         data,
@@ -124,6 +120,29 @@ def write_lst_cog(path: Path, bounds: tuple[float, float, float, float], seed: i
         scales=(LST_SCALE,),
         offsets=(LST_OFFSET,),
     )
+
+
+def write_lst_cog(path: Path, bounds: tuple[float, float, float, float], seed: int = 0) -> Path:
+    """A single-band uint16 percentile composite, DN 0 as fill."""
+    rng = np.random.default_rng(seed)
+    celsius = rng.uniform(20.0, 45.0, size=(1, FIXTURE_SIZE, FIXTURE_SIZE))
+    data = ((celsius - LST_OFFSET) / LST_SCALE).astype(np.uint16)
+    data[0, 0, :4] = LST_FILL_VALUE  # a little fill, so valid percent is not 100
+    return _write_lst(path, data, bounds)
+
+
+def write_flat_lst_cog(
+    path: Path, bounds: tuple[float, float, float, float], celsius: float | None
+) -> Path:
+    """One temperature everywhere, or nothing but fill when ``celsius`` is None.
+
+    A composite with a single known value is what lets a thumbnail test name
+    the colour a pixel must have, rather than re-deriving it from the raster it
+    is supposed to be checking.
+    """
+    dn = LST_FILL_VALUE if celsius is None else round((celsius - LST_OFFSET) / LST_SCALE)
+    data = np.full((1, FIXTURE_SIZE, FIXTURE_SIZE), dn, dtype=np.uint16)
+    return _write_lst(path, data, bounds)
 
 
 def write_qa_cog(path: Path, bounds: tuple[float, float, float, float], seed: int = 0) -> Path:

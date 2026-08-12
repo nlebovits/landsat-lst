@@ -106,10 +106,15 @@ collection rather than a mutation of this one.
 - **`items.parquet`** mirrors the item metadata as stac-geoparquet, so a consumer can filter 700
   items with one query instead of fetching 700 JSON documents.
 - **A thumbnail** ships with the collection, because a catalog entry with no picture gets skipped.
+  It is generated rather than curated: a global mosaic at four pixels to the degree, each tile read
+  from its coarsest overview, uncovered ground left transparent. A preview drawn from the published
+  tiles cannot claim coverage the collection does not have.
 - **No `styles/` directory.** Raster styling is incubating in the Portolan spec, and the STAC
   render extension's colorize-from-source path already covers this case. The LST COG carries its
   scale, offset, and band statistics, so a client has everything it needs to build a ramp from the
-  file. A style document would restate that and then drift from it.
+  file. A style document would restate that and then drift from it. Items declare render v2.0.0 and
+  carry the ramp in `properties.renders` -- v2 defines no `render:*` asset fields, so a render names
+  the assets it draws -- with the colormap and the 0-55 C stretch the thumbnail itself used.
 
 ## Consequences
 

@@ -11,11 +11,13 @@ from typing import TYPE_CHECKING, Any
 
 import pystac
 
+from landsat_lst.catalog.items import renders_for
 from landsat_lst.catalog.spec import (
     COG_MEDIA_TYPE,
     LST_ASSET_KEY,
     PORTOLAN_SCHEMA_URI,
     QA_ASSET_KEY,
+    RENDER_EXTENSION_URI,
 )
 
 if TYPE_CHECKING:
@@ -84,9 +86,13 @@ def build_collection(items: list[pystac.Item], spec: CatalogSpec) -> pystac.Coll
         extent=pystac.Extent(_spatial_extent(items), _temporal_extent(spec)),
         license=spec.license,
         providers=[pystac.Provider.from_dict(p.to_dict()) for p in spec.providers],
-        stac_extensions=[PORTOLAN_SCHEMA_URI],
+        stac_extensions=[PORTOLAN_SCHEMA_URI, RENDER_EXTENSION_URI],
     )
     collection.item_assets = _item_assets()
+    # Render v2.0.0 puts a collection's rendering fields in a top-level
+    # ``renders`` object, and requires one of any collection declaring the
+    # extension. It is the same render the items carry, over the same asset key.
+    collection.extra_fields["renders"] = renders_for(spec)
     _add_doc_links(collection)
     for item in items:
         collection.add_item(item, title=item.properties["title"])
