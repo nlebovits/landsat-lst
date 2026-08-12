@@ -91,8 +91,8 @@ landsat-lst catalog build \
 landsat-lst catalog validate ./rehearsal-catalog
 ```
 
-Expect zero errors and exactly the accepted warning set, `PTL-AST-003`, `PTL-DAT-010`, and
-`PTL-MIR-001`. Any other warning id fails the gate and the command exits non-zero. Open one COG in
+Expect zero errors and exactly the accepted warning set, `PTL-AST-003` and `PTL-DAT-010`. Any
+other warning id fails the gate and the command exits non-zero. Open one COG in
 QGIS and confirm the composite reads in Celsius and lands in the range the tile deserves.
 
 Go back to the pipeline, not forward to S2, if the rehearsal turns up anything.
@@ -150,9 +150,9 @@ Every pass here is offline. The schemas ship inside the `rashid` wheel and the d
 relative hrefs inside the tree.
 
 **A missing asset skips its byte checks silently.** On a staging tree with no `.tif` files the
-report comes back with zero errors and only two warnings, `PTL-AST-003` and `PTL-MIR-001`.
-`PTL-DAT-010` disappears, and its absence is the tell: the byte pass had nothing to read. Do not
-read that clean report as evidence the COGs are sound. It is evidence they were not examined.
+report comes back with zero errors and only `PTL-AST-003`. `PTL-DAT-010` disappears, and its
+absence is the tell: the byte pass had nothing to read. Do not read that clean report as evidence
+the COGs are sound. It is evidence they were not examined.
 
 Dial the coverage up by placing a sample of real COGs into the staging tree at the paths the items
 declare, then validating again. Every tile whose bytes are present gets checksummed, sized, and

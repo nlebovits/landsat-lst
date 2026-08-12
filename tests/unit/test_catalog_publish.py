@@ -171,7 +171,7 @@ class TestSkipUnchanged:
         assert {upload.key for upload in skipped} == {
             f"{PREFIX}{path.relative_to(built_catalog).as_posix()}"
             for path in built_catalog.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".tif", ".png"}
+            if path.is_file() and path.suffix.lower() in {".tif", ".png", ".parquet"}
         }
         assert not any(upload.key.endswith(".tif") for upload in planned)
 
