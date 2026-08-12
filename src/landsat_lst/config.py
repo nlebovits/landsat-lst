@@ -41,13 +41,15 @@ class Settings(BaseSettings):
         description="Local output directory for COGs (used when storage_backend='local')",
     )
 
-    # S3 storage (production)
+    # S3 storage (production). The defaults are the Source Coop publication
+    # target that the runbook, the publish tests, and the June e2e run all
+    # use; the old "source-coop-radiant-earth" bucket never existed.
     s3_bucket: str = Field(
-        default="source-coop-radiant-earth",
+        default="us-west-2.opendata.source.coop",
         description="S3 bucket for COG storage",
     )
     s3_prefix: str = Field(
-        default="landsat-lst",
+        default="nlebovits/landsat-lst",
         description="S3 key prefix for COGs",
     )
     s3_region: str = Field(
