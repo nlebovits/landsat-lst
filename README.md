@@ -114,26 +114,49 @@ job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2020, end_year=2024)
 composite = process_tile(job)
 ```
 
-### Distributed Processing (Coiled)
+### Distributed Processing (Coiled Batch)
 
-For production-scale processing, the pipeline runs on [Coiled](https://coiled.io) with AWS:
+Production runs go through [Coiled Batch](https://docs.coiled.io/user_guide/batch.html): one tile
+per task, one plain process per VM, no shared scheduler (see
+[ADR-010](docs/adr/010-coiled-batch-for-distributed-runs.md)).
 
 ```bash
 # Ensure AWS SSO session is active
 aws sso login --profile radiant-earth
 
-# Run E2E test for a single tile over the production window
-uv run python scripts/e2e_coiled_s3.py --tile N40W075
+# Submit every land tile for the production window; returns immediately
+landsat-lst process --distributed
 
-# A single year instead
-uv run python scripts/e2e_coiled_s3.py --tile N40W075 --year 2024 --end-year 2024
+# Or a few tiles, waiting for them to finish
+landsat-lst process --distributed --wait -t N40W075 -t S05W060
 
-# Dry run (show config without processing)
-uv run python scripts/e2e_coiled_s3.py --dry-run
+# Dry run (show the job list without submitting)
+landsat-lst process --distributed --dry-run
 ```
 
-Both COGs are uploaded to Source Cooperative S3, and the script verifies that each
-object exists and that the LST asset opens over HTTPS before printing its URLs.
+Submission prints a run id and hands the run to Coiled. Closing the shell does not affect it.
+Watch progress on the Coiled dashboard or with `coiled batch status <cluster-id>`, then build the
+run manifest:
+
+```bash
+landsat-lst reconcile <run-id>
+```
+
+The manifest records per-tile status, duration, scene count, and peak memory under
+`settings.manifest_dir`. Completion comes from the S3 listing, so a resumed run reprocesses only
+the tiles missing an asset.
+
+### Verifying published tiles
+
+A bucket listing proves two objects exist. It does not prove someone can read them:
+
+```bash
+landsat-lst verify -t N40W075 --urls
+```
+
+Each COG is opened unauthenticated over the public read host, and its dtype, shape, nodata, scale,
+offset, and overview levels are printed. A tile that reads only with credentials fails here. The
+command exits non-zero if any tile fails.
 
 ## Data Access
 

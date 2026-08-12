@@ -1,11 +1,16 @@
 """Per-run JSON manifests for distributed batch runs.
 
-Each :func:`landsat_lst.job.run_distributed` call writes one manifest to
+Each :func:`landsat_lst.batch.reconcile_run` call writes one manifest to
 ``settings.manifest_dir / f"{run_id}.json"``. The manifest is the durable
 record of a paid run: which tiles completed, skipped, or failed (and why),
 plus the per-tile duration, scene count, and peak memory that a costed
 validation run needs to project the price of the global build. Coiled's own
 dashboard forgets; this file does not.
+
+A manifest is written after the run rather than during it. Nothing has to
+survive on the submitting machine while tiles are computing, so a closed laptop
+costs a manifest that has not been generated yet, never a manifest that was
+lost.
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ def write_run_manifest(
     window: str,
     started_at: datetime,
     retries: int,
+    cluster_id: int | None = None,
+    job_id: int | None = None,
     out_dir: Path | None = None,
 ) -> Path:
     """Write the manifest for one distributed run and return its path.
@@ -39,6 +46,9 @@ def write_run_manifest(
         window: Window label the run covered (``"2021-2025"`` or ``"multi"``).
         started_at: UTC timestamp taken before task submission.
         retries: Per-task retry budget the run was configured with.
+        cluster_id: Coiled cluster the batch job ran on, for log retrieval
+            after the fact. ``None`` when every tile was already complete.
+        job_id: Coiled batch job id, for the same reason.
         out_dir: Manifest directory (default ``settings.manifest_dir``).
     """
     out_dir = out_dir or settings.manifest_dir
@@ -49,11 +59,14 @@ def write_run_manifest(
         "window": window,
         "started_at": started_at.isoformat(),
         "finished_at": datetime.now(tz=UTC).isoformat(),
+        "cluster_id": cluster_id,
+        "job_id": job_id,
         "config": {
             "region": settings.coiled_region,
             "vm_types": settings.coiled_vm_types,
             "spot_policy": settings.coiled_spot_policy,
-            "n_workers": settings.coiled_n_workers,
+            "max_workers": settings.coiled_max_workers,
+            "job_timeout": settings.coiled_job_timeout,
             "retries": retries,
             "s3_bucket": settings.s3_bucket,
             "s3_prefix": settings.s3_prefix,

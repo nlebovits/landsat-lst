@@ -196,7 +196,9 @@ class Settings(BaseSettings):
     # the default adaptive scaling (n_workers=[0, 500]) has no cost ceiling.
     coiled_retries: int = Field(
         default=3,
-        description="Number of retries for Coiled worker failures",
+        description="Number of retries per batch task. Covers spot preemption "
+        "and transient object-store failures; a tile that fails deterministically "
+        "burns all three and then reports.",
     )
     coiled_region: str = Field(
         default="us-west-2",
@@ -204,25 +206,27 @@ class Settings(BaseSettings):
         "source bucket and the output bucket, or every read pays egress.",
     )
     coiled_vm_types: list[str] = Field(
-        default=["r6i.xlarge", "m6i.2xlarge"],
-        description="Candidate worker instance types, in preference order. "
-        "Both carry 32 GiB: the pipeline peaks ~25 GB per composite and is "
-        "I/O bound, so buy memory, not cores.",
+        default=["r6i.2xlarge", "m6i.4xlarge"],
+        description="Candidate VM types for batch tasks, in preference order. "
+        "Both carry 64 GiB. The pipeline is I/O bound, so buy memory, not "
+        "cores; 32 GiB (r6i.xlarge) OOMed a heavy tile at 28.77 GiB in run "
+        "2021-2025-20260812T142408Z.",
     )
     coiled_spot_policy: Literal["on-demand", "spot", "spot_with_fallback"] = Field(
         default="spot_with_fallback",
         description="Instance purchase strategy. Spot preemption is safe: "
         "tile writes are idempotent via the two-asset existence check.",
     )
-    coiled_n_workers: int = Field(
+    coiled_max_workers: int = Field(
         default=4,
-        description="Fixed worker count. A hard cap, not adaptive bounds, so "
-        "a batch can never scale past what was budgeted.",
+        description="Ceiling on VMs running batch tasks at once. Coiled gives "
+        "each task its own VM and queues the rest, so this is the cost cap: a "
+        "700-tile job never runs 700 machines.",
     )
-    coiled_keepalive: str = Field(
-        default="5 minutes",
-        description="How long idle workers survive after the batch ends. "
-        "Short by design; restarting a cluster is cheaper than idle VMs.",
+    coiled_job_timeout: str = Field(
+        default="6 hours",
+        description="Wall-clock budget per batch task. A tile that runs past "
+        "this is stuck, not slow; the timeout stops it from billing all night.",
     )
     aws_profile: str = Field(
         default="radiant-earth",

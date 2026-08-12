@@ -1,5 +1,6 @@
 """Unit tests for job orchestration module."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,7 +11,6 @@ from landsat_lst.job import (
     _is_transient,
     generate_jobs,
     process_tile_job,
-    run_distributed,
 )
 from landsat_lst.models import ProcessingJob, TileId
 from landsat_lst.storage import LocalStorage
@@ -289,181 +289,80 @@ class TestIsTransient:
         assert _is_transient(self._client_error(status, code)) is expected
 
 
-class _FakeCoiledFunction:
-    """Stand-in for the object coiled.function() wraps a callable into."""
+class TestRunRecord:
+    """A batch VM reports for itself; these records are all reconciliation gets."""
 
-    def __init__(self, fn, drop_tiles=()):
-        self.fn = fn
-        self.drop_tiles = set(drop_tiles)
+    def _run(self, job, storage, run_id):
+        with (
+            patch("landsat_lst.job.process_tile") as mock_process,
+            patch("landsat_lst.job._encode_native") as mock_encode,
+            patch("landsat_lst.job.cog_export") as mock_export,
+        ):
+            composite = MagicMock()
+            composite.attrs = {"scene_count": 412}
+            mock_process.return_value = composite
+            mock_encode.return_value = MagicMock()
+            mock_export.return_value = (MagicMock(), MagicMock())
+            return process_tile_job(job, storage=storage, run_id=run_id)
 
-    def map(self, jobs, forces, retries=None, errors="raise"):
-        return [
-            self.fn(job, force)
-            for job, force in zip(jobs, forces, strict=True)
-            if job.tile.name not in self.drop_tiles
-        ]
+    def test_no_record_without_a_run_id(self, sample_job, mock_storage):
+        self._run(sample_job, mock_storage, None)
 
+        mock_storage.write_text.assert_not_called()
 
-@pytest.fixture
-def fake_coiled(monkeypatch):
-    """Install a coiled stub; returns dict capturing decorator kwargs."""
-    import sys
-    import types
+    def test_completed_record_carries_costing_metrics(self, sample_job, mock_storage):
+        result = self._run(sample_job, mock_storage, "run-1")
 
-    captured: dict = {}
+        key, text = mock_storage.write_text.call_args.args
+        assert key == mock_storage.run_record_key("run-1", "N40W075")
+        record = json.loads(text)
+        assert record["status"] == "completed"
+        assert record["scene_count"] == 412
+        assert record["duration_s"] == result.duration_s
+        assert record["peak_rss_mb"] is not None
 
-    def function(**kwargs):
-        captured.update(kwargs)
+    def test_failed_record_carries_the_error(self, sample_job, mock_storage):
+        with patch("landsat_lst.job.process_tile") as mock_process:
+            mock_process.side_effect = ValueError("No scenes found")
+            process_tile_job(sample_job, storage=mock_storage, run_id="run-1")
 
-        def deco(fn):
-            return _FakeCoiledFunction(fn, drop_tiles=captured.pop("_drop_tiles", ()))
+        record = json.loads(mock_storage.write_text.call_args.args[1])
+        assert record["status"] == "failed"
+        assert "No scenes found" in record["error"]
 
-        return deco
+    def test_skipped_tile_still_reports(self, sample_job, mock_storage):
+        """A resumed tile must appear in the manifest, not vanish from it."""
+        mock_storage.cog_exists.return_value = True
 
-    fake = types.ModuleType("coiled")
-    fake.function = function
-    monkeypatch.setitem(sys.modules, "coiled", fake)
-    # Static creds so _worker_environ never reaches for boto3/SSO in tests.
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-key")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
-    return captured
+        process_tile_job(sample_job, storage=mock_storage, run_id="run-1")
 
+        record = json.loads(mock_storage.write_text.call_args.args[1])
+        assert record["status"] == "skipped"
 
-@pytest.fixture
-def manifest_dir(tmp_path, monkeypatch):
-    from landsat_lst.config import settings
+    def test_transient_failure_writes_nothing(self, sample_job, mock_storage):
+        """The retry on a fresh VM writes the record; a doomed attempt must not."""
+        with (
+            patch("landsat_lst.job.process_tile") as mock_process,
+            pytest.raises(TimeoutError),
+        ):
+            mock_process.side_effect = TimeoutError("read timed out")
+            process_tile_job(sample_job, storage=mock_storage, run_id="run-1")
 
-    monkeypatch.setattr(settings, "manifest_dir", tmp_path / "runs")
-    return tmp_path / "runs"
+        mock_storage.write_text.assert_not_called()
 
+    def test_unwritable_record_does_not_fail_an_uploaded_tile(self, sample_job, mock_storage):
+        mock_storage.write_text.side_effect = OSError("bucket on fire")
 
-def _jobs(*tiles: str) -> list[ProcessingJob]:
-    from landsat_lst.tiling import parse_tile_name
+        result = self._run(sample_job, mock_storage, "run-1")
 
-    return [ProcessingJob(tile=parse_tile_name(t), year=2021, end_year=2025) for t in tiles]
+        assert result.status == "completed"
 
+    def test_record_roundtrips(self, sample_job, mock_storage):
+        result = self._run(sample_job, mock_storage, "run-1")
 
-class TestRunDistributed:
-    """Tests for the hardened Coiled driver (all mocked, no cluster)."""
+        restored = JobResult.from_record(json.loads(mock_storage.write_text.call_args.args[1]))
 
-    def _stub_worker(self, monkeypatch):
-        def fake_process(job, force=False):
-            return JobResult(job=job, status="completed", duration_s=1.0)
-
-        monkeypatch.setattr("landsat_lst.job.process_tile_job", fake_process)
-
-    def test_resume_filters_completed_tiles(self, fake_coiled, manifest_dir, monkeypatch):
-        self._stub_worker(monkeypatch)
-        storage = MagicMock()
-        storage.list_completed.return_value = {"N40W075"}
-
-        jobs = _jobs("N40W075", "S05W060", "N60W150")
-        results = run_distributed(jobs, storage=storage)
-
-        storage.list_completed.assert_called_once_with("2021-2025")
-        by_status = {r.job.tile.name: r.status for r in results}
-        assert by_status == {
-            "N40W075": "skipped",
-            "S05W060": "completed",
-            "N60W150": "completed",
-        }
-
-    def test_force_bypasses_resume(self, fake_coiled, manifest_dir, monkeypatch):
-        self._stub_worker(monkeypatch)
-        storage = MagicMock()
-
-        results = run_distributed(_jobs("N40W075"), force=True, storage=storage)
-
-        storage.list_completed.assert_not_called()
-        assert [r.status for r in results] == ["completed"]
-
-    def test_missing_results_marked_failed(self, fake_coiled, manifest_dir, monkeypatch):
-        """A task dropped by errors='skip' is reconciled as failed."""
-        self._stub_worker(monkeypatch)
-        storage = MagicMock()
-        storage.list_completed.return_value = set()
-        fake_coiled["_drop_tiles"] = {"S05W060"}
-
-        results = run_distributed(_jobs("N40W075", "S05W060"), storage=storage)
-
-        by_status = {r.job.tile.name: r.status for r in results}
-        assert by_status["N40W075"] == "completed"
-        assert by_status["S05W060"] == "failed"
-        failed = next(r for r in results if r.status == "failed")
-        assert "retries" in failed.error
-
-    def test_coiled_kwargs_pinned(self, fake_coiled, manifest_dir, monkeypatch):
-        """Region, scaling, spot policy, and environ must never be defaults."""
-        self._stub_worker(monkeypatch)
-        storage = MagicMock()
-        storage.list_completed.return_value = set()
-
-        run_distributed(_jobs("N40W075"), storage=storage, run_id="test-run")
-
-        assert fake_coiled["region"] == "us-west-2"
-        assert fake_coiled["n_workers"] == 4
-        assert fake_coiled["spot_policy"] == "spot_with_fallback"
-        assert fake_coiled["vm_type"] == ["r6i.xlarge", "m6i.2xlarge"]
-        assert fake_coiled["name"] == "lst-test-run"
-        assert fake_coiled["tags"] == {"project": "landsat-lst", "run_id": "test-run"}
-        environ = fake_coiled["environ"]
-        assert environ["LST_STORAGE_BACKEND"] == "s3"
-        assert environ["AWS_REQUEST_PAYER"] == "requester"
-        assert environ["AWS_ACCESS_KEY_ID"] == "test-key"
-
-    def test_stac_url_not_forwarded(self, fake_coiled, manifest_dir, monkeypatch):
-        """A local Planetary Computer override must not leak onto AWS workers."""
-        self._stub_worker(monkeypatch)
-        monkeypatch.setenv("LST_STAC_URL", "https://planetarycomputer.example")
-        monkeypatch.setenv("LST_S3_BUCKET", "custom-bucket")
-        storage = MagicMock()
-        storage.list_completed.return_value = set()
-
-        run_distributed(_jobs("N40W075"), storage=storage)
-
-        environ = fake_coiled["environ"]
-        assert "LST_STAC_URL" not in environ
-        assert environ["LST_S3_BUCKET"] == "custom-bucket"
-
-    def test_no_cluster_when_nothing_to_run(self, fake_coiled, manifest_dir, monkeypatch):
-        """A fully-completed window must not pay for a cluster at all."""
-        self._stub_worker(monkeypatch)
-        storage = MagicMock()
-        storage.list_completed.return_value = {"N40W075"}
-
-        results = run_distributed(_jobs("N40W075"), storage=storage)
-
-        assert [r.status for r in results] == ["skipped"]
-        assert "region" not in fake_coiled  # coiled.function never invoked
-
-    def test_writes_manifest(self, fake_coiled, manifest_dir, monkeypatch):
-        import json
-
-        self._stub_worker(monkeypatch)
-        storage = MagicMock()
-        storage.list_completed.return_value = set()
-
-        run_distributed(_jobs("N40W075"), storage=storage, run_id="manifest-run")
-
-        payload = json.loads((manifest_dir / "manifest-run.json").read_text())
-        assert payload["run_id"] == "manifest-run"
-        assert payload["counts"]["completed"] == 1
-
-    def test_worker_task_pins_threaded_scheduler(self, fake_coiled, manifest_dir, monkeypatch):
-        """The tile graph must compute on the worker's own threads, never on
-        the shared cluster scheduler (scheduler-connection-lost regression)."""
-        import dask
-
-        captured = {}
-
-        def fake_process(job, force=False):
-            captured["scheduler"] = dask.config.get("scheduler", None)
-            return JobResult(job=job, status="completed")
-
-        monkeypatch.setattr("landsat_lst.job.process_tile_job", fake_process)
-        storage = MagicMock()
-        storage.list_completed.return_value = set()
-
-        run_distributed(_jobs("N40W075"), storage=storage)
-
-        assert captured["scheduler"] == "threads"
+        assert restored.job == result.job
+        assert restored.status == result.status
+        assert restored.scene_count == result.scene_count
+        assert restored.lst_key == result.lst_key

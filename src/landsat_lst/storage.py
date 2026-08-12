@@ -15,6 +15,13 @@ import, which would drag the whole catalog stack into every worker.
 Both assets must be present for a tile to count as done: a tile with one
 uploaded asset is a half-written tile and has to be rebuilt, so
 :meth:`StorageBackend.cog_exists` always checks both.
+
+Each backend also stores small per-tile **run records** under ``_runs/``, one
+JSON object per tile per run. A distributed run has no live driver to collect
+results, so the VM that processes a tile writes its own duration, scene count,
+peak memory, and error there; :func:`landsat_lst.batch.reconcile_run` reads them
+back. The prefix is a sibling of the collection directories and is invisible to
+the catalog, which only ever reads ``lst-p95-*``.
 """
 
 from __future__ import annotations
@@ -27,6 +34,9 @@ from landsat_lst.config import settings
 
 #: The two assets that together make one complete tile-window output.
 PRODUCTS: tuple[str, str] = ("lst_p95", "qa_count")
+
+#: Prefix for per-tile run records, a sibling of the collection directories.
+RUN_RECORD_PREFIX = "_runs"
 
 
 def collection_prefix(window: str) -> str:
@@ -59,6 +69,18 @@ class StorageBackend(ABC):
         """
         return f"{collection_prefix(window)}/{tile}/{product}_{window}_{tile}.tif"
 
+    def run_record_key(self, run_id: str, tile: str) -> str:
+        """Backend-relative key for one tile's run record.
+
+        Args:
+            run_id: Run token the record belongs to.
+            tile: Tile name (``"N40W075"``).
+
+        Returns:
+            ``_runs/{run_id}/{tile}.json``
+        """
+        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.json"
+
     @abstractmethod
     def cog_exists(self, window: str, tile: str) -> bool:
         """Whether **both** assets for this tile-window are already stored."""
@@ -70,6 +92,19 @@ class StorageBackend(ABC):
     @abstractmethod
     def list_completed(self, window: str) -> set[str]:
         """Tile names in ``window`` that have both assets stored."""
+
+    @abstractmethod
+    def write_text(self, key: str, text: str) -> None:
+        """Store ``text`` at ``key``, replacing whatever was there."""
+
+    @abstractmethod
+    def read_text(self, key: str) -> str | None:
+        """Read ``key``, or return ``None`` when it does not exist.
+
+        A missing key is an ordinary outcome, not an error: a tile whose VM was
+        killed before it could report leaves no record, and reconciliation has
+        to distinguish that from a read failure.
+        """
 
 
 class LocalStorage(StorageBackend):
@@ -98,6 +133,15 @@ class LocalStorage(StorageBackend):
             for d in collection_dir.iterdir()
             if d.is_dir() and self.cog_exists(window, d.name)
         }
+
+    def write_text(self, key: str, text: str) -> None:
+        dest = self.output_dir / key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text)
+
+    def read_text(self, key: str) -> str | None:
+        path = self.output_dir / key
+        return path.read_text() if path.is_file() else None
 
 
 class S3Storage(StorageBackend):
@@ -157,6 +201,25 @@ class S3Storage(StorageBackend):
             for tile in {key[len(prefix) :].split("/")[0] for key in seen}
             if all(self._full_key(self.cog_key(window, tile, p)) in seen for p in PRODUCTS)
         }
+
+    def write_text(self, key: str, text: str) -> None:
+        self.client.put_object(
+            Bucket=self.bucket,
+            Key=self._full_key(key),
+            Body=text.encode(),
+            ContentType="application/json",
+        )
+
+    def read_text(self, key: str) -> str | None:
+        from botocore.exceptions import ClientError  # noqa: PLC0415
+
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=self._full_key(key))
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                return None
+            raise
+        return response["Body"].read().decode()
 
 
 def get_storage() -> StorageBackend:

@@ -15,6 +15,7 @@ ADRs are kept for history and link to their replacement.
 | [007](007-scene-normalization.md) | Per-scene normalization against a monthly climatology; discard uncorrectable scenes | Accepted |
 | [008](008-global-mosaic-topology.md) | Global sparse mosaic for the pyramid, and one shared tile grid | Shared-grid decision accepted; mosaic decision ⚠️ superseded by [009](009-cog-output-and-stac-catalog.md) |
 | [009](009-cog-output-and-stac-catalog.md) | Per-tile COGs in a Portolan STAC catalog, retiring the Zarr output | Accepted |
+| [010](010-coiled-batch-for-distributed-runs.md) | Coiled Batch for distributed runs, replacing Coiled Functions | Accepted |
 
 ## Adding an ADR
 

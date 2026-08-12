@@ -2,7 +2,11 @@
 
 This module implements the retry/resume strategy from ADR-001 Section 16:
 - Idempotent asset check: skip tiles whose COGs are already stored
-- Coiled worker retry: recover from transient failures
+- Retry: transient failures escape so the batch task retries on a fresh VM
+
+:func:`process_tile_job` is the whole unit of work one machine performs, whether
+that machine is a laptop or a Coiled Batch VM. Submission and reconciliation of
+a distributed run live in :mod:`landsat_lst.batch`.
 
 Usage:
     from landsat_lst.job import process_tile_job, run_batch
@@ -14,12 +18,12 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -57,6 +61,46 @@ class JobResult:
     duration_s: float | None = None
     scene_count: int | None = None
     peak_rss_mb: float | None = None
+
+    def to_record(self) -> dict:
+        """Serialize to the JSON object a batch task leaves in storage.
+
+        The job is written as its three constructor fields rather than as a
+        ``model_dump``, so a record round-trips without relying on pydantic
+        ignoring the computed fields a dump would also emit.
+        """
+        return {
+            "tile": self.job.tile.name,
+            "year": self.job.year,
+            "end_year": self.job.end_year,
+            "status": self.status,
+            "lst_key": self.lst_key,
+            "qa_key": self.qa_key,
+            "error": self.error,
+            "duration_s": self.duration_s,
+            "scene_count": self.scene_count,
+            "peak_rss_mb": self.peak_rss_mb,
+        }
+
+    @classmethod
+    def from_record(cls, record: dict) -> JobResult:
+        """Rebuild a result from :meth:`to_record` output."""
+        from landsat_lst.tiling import parse_tile_name  # noqa: PLC0415
+
+        return cls(
+            job=ProcessingJob(
+                tile=parse_tile_name(record["tile"]),
+                year=record["year"],
+                end_year=record["end_year"],
+            ),
+            status=record["status"],
+            lst_key=record.get("lst_key"),
+            qa_key=record.get("qa_key"),
+            error=record.get("error"),
+            duration_s=record.get("duration_s"),
+            scene_count=record.get("scene_count"),
+            peak_rss_mb=record.get("peak_rss_mb"),
+        )
 
 
 def _peak_rss_mb() -> float | None:
@@ -198,27 +242,50 @@ def _write_cogs(
     return lst_key, qa_key
 
 
+def _write_run_record(result: JobResult, storage: StorageBackend, run_id: str, logger) -> None:
+    """Leave this tile's outcome in storage for later reconciliation.
+
+    A batch run has no live driver holding the results, so each task reports
+    for itself. Reconciliation still takes tile completion from the COG
+    listing; the record supplies what a listing cannot know -- duration, scene
+    count, peak memory, and the error text behind a failure.
+
+    A record that cannot be written must not fail a tile whose COGs are already
+    safely uploaded, so the write is logged and swallowed.
+    """
+    try:
+        storage.write_text(
+            storage.run_record_key(run_id, result.job.tile.name),
+            json.dumps(result.to_record(), indent=2),
+        )
+    except Exception as e:
+        logger.warning("run_record_write_failed", run_id=run_id, error=str(e))
+
+
 def process_tile_job(
     job: ProcessingJob,
     *,
     force: bool = False,
     storage: StorageBackend | None = None,
+    run_id: str | None = None,
 ) -> JobResult:
     """Process a single tile-window job with retry/resume support.
 
-    This is the main entry point for tile processing. It implements:
+    This is the main entry point for tile processing, and the unit of work one
+    Coiled Batch VM runs. It implements:
+
     1. Idempotent check: skip if both COGs exist (unless force=True)
     2. Pipeline: query STAC, load scenes, compute composite
     3. COG export: uint16 LST DN + 12-band monthly QA, uploaded to storage
-
-    The @coiled.function decorator enables distributed execution.
-    Use with retries parameter for transient failure recovery:
-        results = process_tile_job.map(jobs, retries=3)
+    4. Run record: the outcome written back to storage, when ``run_id`` is set
 
     Args:
         job: Processing job specification (tile + window)
         force: If True, reprocess even if the COGs exist
         storage: Storage backend (defaults to configured backend)
+        run_id: Distributed run this tile belongs to. When set, the outcome is
+            written to ``_runs/{run_id}/{tile}.json`` for
+            :func:`landsat_lst.batch.reconcile_run` to collect.
 
     Returns:
         JobResult with status and asset keys
@@ -229,7 +296,10 @@ def process_tile_job(
     # Layer 1: Idempotent check
     if not force and storage.cog_exists(job.window_label, job.tile.name):
         logger.info("tile_skipped", reason="cogs_exist")
-        return JobResult(job=job, status="skipped")
+        result = JobResult(job=job, status="skipped")
+        if run_id:
+            _write_run_record(result, storage, run_id, logger)
+        return result
 
     start = time.monotonic()
     try:
@@ -242,7 +312,7 @@ def process_tile_job(
 
         duration = time.monotonic() - start
         logger.info("tile_completed", lst_key=lst_key, qa_key=qa_key, duration_s=duration)
-        return JobResult(
+        result = JobResult(
             job=job,
             status="completed",
             lst_key=lst_key,
@@ -254,17 +324,23 @@ def process_tile_job(
 
     except Exception as e:
         if _is_transient(e):
-            # Re-raise so Coiled's task retries reschedule the tile; the
-            # idempotency check above makes a retry after partial upload safe.
+            # Re-raise so the batch task's retries reschedule the tile on a
+            # fresh VM; the idempotency check above makes a retry after a
+            # partial upload safe.
             logger.warning("tile_transient_failure", error=str(e))
             raise
         logger.exception("tile_failed", error=str(e))
-        return JobResult(
+        result = JobResult(
             job=job,
             status="failed",
             error=str(e),
             duration_s=time.monotonic() - start,
+            peak_rss_mb=_peak_rss_mb(),
         )
+
+    if run_id:
+        _write_run_record(result, storage, run_id, logger)
+    return result
 
 
 def run_batch(
@@ -275,7 +351,7 @@ def run_batch(
 ) -> list[JobResult]:
     """Run a batch of tile-year jobs sequentially (local execution).
 
-    For distributed execution, use run_distributed() instead.
+    For distributed execution, use :func:`landsat_lst.batch.submit_batch` instead.
 
     Args:
         jobs: Iterable of processing jobs
@@ -315,157 +391,6 @@ def _split_completed(
         else:
             to_run.append(job)
     return to_run, skipped
-
-
-def _submit_to_coiled(
-    to_run: list[ProcessingJob], *, force: bool, retries: int, run_id: str
-) -> list[JobResult]:
-    """Map jobs over a pinned, tagged Coiled cluster and collect results."""
-    import coiled  # noqa: PLC0415
-
-    @coiled.function(
-        name=f"lst-{run_id}",
-        region=settings.coiled_region,
-        vm_type=settings.coiled_vm_types,
-        spot_policy=settings.coiled_spot_policy,
-        n_workers=settings.coiled_n_workers,
-        keepalive=settings.coiled_keepalive,
-        environ=_worker_environ(),
-        tags={"project": "landsat-lst", "run_id": run_id},
-    )
-    def _distributed_process(job: ProcessingJob, force: bool) -> JobResult:
-        # Inside a Coiled task the cluster's own dask client is ambient, so an
-        # unqualified compute() would submit the tile's whole scene graph back
-        # to the shared scheduler -- three tiles at once crushed it
-        # (scheduler-connection-lost, run 2021-2025-20260812T150618Z). Pin the
-        # threaded scheduler so each tile computes on its own VM's cores.
-        import dask  # noqa: PLC0415
-
-        with dask.config.set(scheduler="threads"):
-            return process_tile_job(job, force=force)
-
-    # errors="skip" drops tasks that still fail after Coiled's retries; the
-    # caller reconciles those tiles as failed instead of aborting the whole
-    # batch on its last error.
-    return list(
-        _distributed_process.map(
-            to_run,
-            [force] * len(to_run),
-            retries=retries,
-            errors="skip",
-        )
-    )
-
-
-def _reconcile_dropped(
-    to_run: list[ProcessingJob], results: list[JobResult], retries: int
-) -> list[JobResult]:
-    """Mark tiles absent from the results as failed-after-retries."""
-    returned = {(r.job.window_label, r.job.tile.name) for r in results}
-    return [
-        JobResult(
-            job=job,
-            status="failed",
-            error=f"task failed after {retries} retries (see Coiled cluster logs)",
-        )
-        for job in to_run
-        if (job.window_label, job.tile.name) not in returned
-    ]
-
-
-def run_distributed(
-    jobs: list[ProcessingJob],
-    *,
-    force: bool = False,
-    retries: int | None = None,
-    run_id: str | None = None,
-    storage: StorageBackend | None = None,
-) -> list[JobResult]:
-    """Run jobs distributed across Coiled workers with automatic retries.
-
-    This is the production entry point for global processing. The cluster is
-    pinned to ``settings.coiled_region`` with a fixed worker count, spot
-    instances with on-demand fallback, and cost-attribution tags; workers
-    receive AWS credentials and ``LST_*`` config through ``environ`` so they
-    write to S3 rather than their own ephemeral disk.
-
-    Already-completed tiles are filtered out with one storage listing per
-    window before any task is submitted, so a resumed run pays for exactly the
-    tiles that are missing. Every run writes a JSON manifest to
-    ``settings.manifest_dir / f"{run_id}.json"`` recording per-tile status,
-    duration, scene count, and peak memory.
-
-    Args:
-        jobs: List of processing jobs
-        force: If True, reprocess even if the COGs exist
-        retries: Number of retries per job (default from settings)
-        run_id: Manifest and cluster name token; generated from the window
-            and UTC timestamp when omitted
-        storage: Storage backend used for the resume listing (default from
-            :func:`get_storage`)
-
-    Returns:
-        List of JobResult for each job, including skipped and failed ones
-
-    Raises:
-        ImportError: If Coiled is not configured
-        RuntimeError: If no AWS credentials can be resolved for the workers
-    """
-    try:
-        import coiled  # noqa: F401, PLC0415
-    except ImportError as e:
-        msg = "Coiled is required for distributed execution. Install with: pip install coiled"
-        raise ImportError(msg) from e
-
-    from landsat_lst.manifest import write_run_manifest  # noqa: PLC0415
-
-    retries = settings.coiled_retries if retries is None else retries
-    storage = storage or get_storage()
-
-    started_at = datetime.now(tz=UTC)
-    windows = sorted({job.window_label for job in jobs})
-    window = windows[0] if len(windows) == 1 else "multi"
-    run_id = run_id or f"{window}-{started_at:%Y%m%dT%H%M%SZ}"
-
-    to_run, skipped_results = (jobs, []) if force else _split_completed(jobs, storage)
-
-    log.info(
-        "distributed_batch_start",
-        run_id=run_id,
-        job_count=len(jobs),
-        to_run=len(to_run),
-        already_completed=len(skipped_results),
-        retries=retries,
-        force=force,
-        region=settings.coiled_region,
-        vm_types=settings.coiled_vm_types,
-        spot_policy=settings.coiled_spot_policy,
-        n_workers=settings.coiled_n_workers,
-    )
-
-    results: list[JobResult] = []
-    if to_run:
-        results = _submit_to_coiled(to_run, force=force, retries=retries, run_id=run_id)
-
-    all_results = skipped_results + results + _reconcile_dropped(to_run, results, retries)
-    manifest_path = write_run_manifest(
-        all_results,
-        run_id=run_id,
-        window=window,
-        started_at=started_at,
-        retries=retries,
-    )
-
-    log.info(
-        "distributed_batch_complete",
-        run_id=run_id,
-        completed=sum(1 for r in all_results if r.status == "completed"),
-        skipped=sum(1 for r in all_results if r.status == "skipped"),
-        failed=sum(1 for r in all_results if r.status == "failed"),
-        manifest=str(manifest_path),
-    )
-
-    return all_results
 
 
 DEFAULT_WINDOW = (2021, 2025)

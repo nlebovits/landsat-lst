@@ -1,0 +1,478 @@
+"""Unit tests for the Coiled Batch submission and reconciliation driver.
+
+Every test stubs the ``coiled`` module: nothing here starts a cluster, and the
+storage backend is always :class:`LocalStorage` under ``tmp_path``.
+"""
+
+import json
+import sys
+import types
+from unittest.mock import MagicMock
+
+import pytest
+
+from landsat_lst.batch import (
+    BatchSubmission,
+    _task_command,
+    load_submission,
+    reconcile_run,
+    submission_path,
+    submit_batch,
+    wait_for_batch,
+)
+from landsat_lst.models import ProcessingJob
+from landsat_lst.storage import PRODUCTS, LocalStorage, collection_prefix
+from landsat_lst.tiling import parse_tile_name
+
+
+def _jobs(*tiles: str, year: int = 2021, end_year: int | None = 2025):
+    return [ProcessingJob(tile=parse_tile_name(t), year=year, end_year=end_year) for t in tiles]
+
+
+def _finish_tile(root, window: str, tile: str) -> None:
+    """Write both COGs for one tile, the only proof of completion that counts."""
+    for product in PRODUCTS:
+        path = root / collection_prefix(window) / tile / f"{product}_{window}_{tile}.tif"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"tif")
+
+
+@pytest.fixture
+def storage(tmp_path):
+    return LocalStorage(output_dir=tmp_path / "cogs")
+
+
+@pytest.fixture
+def runs_dir(tmp_path, monkeypatch):
+    """Point settings.manifest_dir at a scratch directory."""
+    from landsat_lst.config import settings
+
+    path = tmp_path / "runs"
+    monkeypatch.setattr(settings, "manifest_dir", path)
+    return path
+
+
+@pytest.fixture
+def fake_coiled(monkeypatch):
+    """Install a coiled stub. Returns the dict of captured batch_run kwargs."""
+    captured: dict = {}
+    state: dict = {"jobs": []}
+
+    def batch_run(**kwargs):
+        captured.update(kwargs)
+        return {"cluster_id": 4242, "cluster_name": kwargs.get("name"), "job_id": 77}
+
+    fake = types.ModuleType("coiled")
+    fake.batch_run = batch_run
+
+    def status(cluster):
+        state["queried_cluster"] = cluster
+        return state["jobs"]
+
+    def wait_for_job_done(job_id, timeout=None):
+        state["waited_on"] = (job_id, timeout)
+        return "done (success)"
+
+    fake_batch = types.ModuleType("coiled.batch")
+    fake_batch.status = status
+    fake_batch.wait_for_job_done = wait_for_job_done
+    fake.batch = fake_batch
+
+    monkeypatch.setitem(sys.modules, "coiled", fake)
+    monkeypatch.setitem(sys.modules, "coiled.batch", fake_batch)
+    # Static creds so _worker_environ never reaches for boto3/SSO in tests.
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+
+    captured["_state"] = state
+    return captured
+
+
+def _set_tasks(fake_coiled, *tasks: dict) -> None:
+    """Install the per-task state coiled.batch.status will report."""
+    fake_coiled["_state"]["jobs"] = [{"tasks": list(tasks)}]
+
+
+def _task(index: int, *, state="done", exit_code=0, start=None, stop=None) -> dict:
+    return {
+        "array_task_id": index,
+        "state": state,
+        "exit_code": exit_code,
+        "start": start,
+        "stop": stop,
+    }
+
+
+class TestTaskCommand:
+    """The command string is the entire contract with the VM."""
+
+    def test_multi_year_window(self):
+        command = _task_command(run_id="r1", year=2021, end_year=2025, force=False)
+
+        assert command == (
+            "python -m landsat_lst.cli process --run-id r1 --year 2021 "
+            '--end-year 2025 --tile "$COILED_BATCH_TASK_INPUT"'
+        )
+
+    def test_single_year_omits_end_year(self):
+        command = _task_command(run_id="r1", year=2024, end_year=None, force=False)
+
+        assert "--end-year" not in command
+        assert "--year 2024" in command
+
+    def test_force_is_forwarded(self):
+        command = _task_command(run_id="r1", year=2021, end_year=2025, force=True)
+
+        assert "--force" in command
+
+    def test_task_input_is_not_expanded_locally(self):
+        """The tile placeholder must survive as a literal for bash on the VM."""
+        command = _task_command(run_id="r1", year=2021, end_year=2025, force=False)
+
+        assert '"$COILED_BATCH_TASK_INPUT"' in command
+
+    def test_run_id_is_quoted(self):
+        """A run id is generated, but the command must not be shell-injectable."""
+        command = _task_command(run_id="r1; rm -rf /", year=2021, end_year=None, force=False)
+
+        assert "'r1; rm -rf /'" in command
+
+
+class TestSubmit:
+    def test_pins_every_coiled_knob(self, fake_coiled, runs_dir, storage):
+        submit_batch(_jobs("N40W075"), storage=storage, run_id="test-run")
+
+        assert fake_coiled["region"] == "us-west-2"
+        assert fake_coiled["vm_type"] == ["r6i.2xlarge", "m6i.4xlarge"]
+        assert fake_coiled["spot_policy"] == "spot_with_fallback"
+        assert fake_coiled["max_workers"] == 4
+        assert fake_coiled["max_retries"] == 3
+        assert fake_coiled["job_timeout"] == "6 hours"
+        assert fake_coiled["name"] == "lst-test-run"
+        assert fake_coiled["tag"] == {"project": "landsat-lst", "run_id": "test-run"}
+        assert fake_coiled["forward_aws_credentials"] is False
+
+    def test_task_array_maps_over_tiles(self, fake_coiled, runs_dir, storage):
+        submit_batch(_jobs("N40W075", "S05W060"), storage=storage, run_id="r")
+
+        assert fake_coiled["map_over_values"] == ["N40W075", "S05W060"]
+        assert fake_coiled["command"][:2] == ["bash", "-c"]
+
+    def test_forwards_worker_environment(self, fake_coiled, runs_dir, storage, monkeypatch):
+        monkeypatch.setenv("LST_S3_BUCKET", "custom-bucket")
+        monkeypatch.setenv("LST_STAC_URL", "https://planetarycomputer.example")
+
+        submit_batch(_jobs("N40W075"), storage=storage, run_id="r")
+
+        env = fake_coiled["env"]
+        assert env["LST_STORAGE_BACKEND"] == "s3"
+        assert env["AWS_REQUEST_PAYER"] == "requester"
+        assert env["AWS_ACCESS_KEY_ID"] == "test-key"
+        assert env["LST_S3_BUCKET"] == "custom-bucket"
+        # A local Planetary Computer override must not leak onto AWS VMs.
+        assert "LST_STAC_URL" not in env
+
+    def test_resume_filters_completed_tiles(self, fake_coiled, runs_dir, storage):
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+
+        submission = submit_batch(_jobs("N40W075", "S05W060"), storage=storage, run_id="r")
+
+        assert submission.submitted_tiles == ["S05W060"]
+        assert submission.skipped_tiles == ["N40W075"]
+        assert fake_coiled["map_over_values"] == ["S05W060"]
+
+    def test_force_bypasses_resume(self, fake_coiled, runs_dir, storage):
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+
+        submission = submit_batch(_jobs("N40W075"), force=True, storage=storage, run_id="r")
+
+        assert submission.submitted_tiles == ["N40W075"]
+        assert "--force" in fake_coiled["command"][2]
+
+    def test_no_cluster_when_everything_is_done(self, fake_coiled, runs_dir, storage):
+        """A finished window must not pay for a cluster at all."""
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+
+        submission = submit_batch(_jobs("N40W075"), storage=storage, run_id="r")
+
+        assert submission.cluster_id is None
+        assert "region" not in fake_coiled  # batch_run never called
+
+    def test_writes_submission_record(self, fake_coiled, runs_dir, storage):
+        submit_batch(_jobs("N40W075"), storage=storage, run_id="r")
+
+        payload = json.loads((runs_dir / "r.submission.json").read_text())
+        assert payload["cluster_id"] == 4242
+        assert payload["job_id"] == 77
+        assert payload["submitted_tiles"] == ["N40W075"]
+        assert payload["window"] == "2021-2025"
+
+    def test_submission_record_roundtrips(self, fake_coiled, runs_dir, storage):
+        submitted = submit_batch(_jobs("N40W075"), storage=storage, run_id="r")
+
+        assert load_submission("r") == submitted
+        assert submission_path("r") == runs_dir / "r.submission.json"
+
+    def test_generated_run_id_carries_the_window(self, fake_coiled, runs_dir, storage):
+        submission = submit_batch(_jobs("N40W075"), storage=storage)
+
+        assert submission.run_id.startswith("2021-2025-")
+
+    def test_rejects_mixed_windows(self, fake_coiled, runs_dir, storage):
+        jobs = _jobs("N40W075") + _jobs("S05W060", year=2024, end_year=None)
+
+        with pytest.raises(ValueError, match="one window per call"):
+            submit_batch(jobs, storage=storage)
+
+    def test_rejects_empty_job_list(self, fake_coiled, runs_dir, storage):
+        with pytest.raises(ValueError, match="No jobs"):
+            submit_batch([], storage=storage)
+
+
+class TestReconcile:
+    def _submit(self, fake_coiled, storage, *tiles: str):
+        return submit_batch(_jobs(*tiles), storage=storage, run_id="r")
+
+    def test_completion_comes_from_the_cog_listing(self, fake_coiled, runs_dir, storage):
+        self._submit(fake_coiled, storage, "N40W075", "S05W060")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0), _task(1))
+
+        results = reconcile_run("r", storage=storage)
+
+        assert {r.job.tile.name: r.status for r in results} == {
+            "N40W075": "completed",
+            "S05W060": "failed",
+        }
+        assert fake_coiled["_state"]["queried_cluster"] == 4242
+
+    def test_zero_exit_without_cogs_is_a_failure(self, fake_coiled, runs_dir, storage):
+        """A clean exit that produced no bytes is not a completed tile."""
+        self._submit(fake_coiled, storage, "N40W075")
+        _set_tasks(fake_coiled, _task(0, state="done", exit_code=0))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.status == "failed"
+        assert "no COGs written" in result.error
+
+    def test_records_supply_the_costing_metrics(self, fake_coiled, runs_dir, storage):
+        self._submit(fake_coiled, storage, "N40W075")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        storage.write_text(
+            storage.run_record_key("r", "N40W075"),
+            json.dumps(
+                {
+                    "tile": "N40W075",
+                    "year": 2021,
+                    "end_year": 2025,
+                    "status": "completed",
+                    "lst_key": "lst-p95-2021-2025/N40W075/lst_p95_2021-2025_N40W075.tif",
+                    "qa_key": "lst-p95-2021-2025/N40W075/qa_count_2021-2025_N40W075.tif",
+                    "error": None,
+                    "duration_s": 1834.2,
+                    "scene_count": 907,
+                    "peak_rss_mb": 41200.0,
+                }
+            ),
+        )
+        _set_tasks(fake_coiled, _task(0))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.status == "completed"
+        assert result.duration_s == 1834.2
+        assert result.scene_count == 907
+        assert result.peak_rss_mb == 41200.0
+        assert result.lst_key.endswith("lst_p95_2021-2025_N40W075.tif")
+
+    def test_record_error_explains_a_failure(self, fake_coiled, runs_dir, storage):
+        self._submit(fake_coiled, storage, "N40W075")
+        storage.write_text(
+            storage.run_record_key("r", "N40W075"),
+            json.dumps(
+                {
+                    "tile": "N40W075",
+                    "year": 2021,
+                    "end_year": 2025,
+                    "status": "failed",
+                    "error": "No scenes found for the window",
+                    "duration_s": 12.0,
+                }
+            ),
+        )
+        _set_tasks(fake_coiled, _task(0, state="error", exit_code=1))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.status == "failed"
+        assert result.error == "No scenes found for the window"
+        assert result.duration_s == 12.0
+
+    def test_task_state_explains_a_tile_with_no_record(self, fake_coiled, runs_dir, storage):
+        """A VM killed before it could report still has to be explained."""
+        self._submit(fake_coiled, storage, "N40W075")
+        _set_tasks(fake_coiled, _task(0, state="error", exit_code=137))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert "exited 137" in result.error
+
+    def test_tile_never_scheduled_is_explained(self, fake_coiled, runs_dir, storage):
+        self._submit(fake_coiled, storage, "N40W075")
+        _set_tasks(fake_coiled)
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert "never have been scheduled" in result.error
+
+    def test_completed_tile_without_a_record_still_carries_keys(
+        self, fake_coiled, runs_dir, storage
+    ):
+        """The manifest is the catalog's shopping list; keys cannot be null."""
+        self._submit(fake_coiled, storage, "N40W075")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.lst_key == "lst-p95-2021-2025/N40W075/lst_p95_2021-2025_N40W075.tif"
+        assert result.qa_key == "lst-p95-2021-2025/N40W075/qa_count_2021-2025_N40W075.tif"
+
+    def test_duration_falls_back_to_task_timings(self, fake_coiled, runs_dir, storage):
+        self._submit(fake_coiled, storage, "N40W075")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(
+            fake_coiled,
+            _task(0, start="2026-08-12T14:00:00+00:00", stop="2026-08-12T14:30:00+00:00"),
+        )
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.duration_s == 1800.0
+
+    def test_one_failed_tile_does_not_abort_the_others(self, fake_coiled, runs_dir, storage):
+        self._submit(fake_coiled, storage, "N40W075", "S05W060", "N60W150")
+        for tile in ("N40W075", "N60W150"):
+            _finish_tile(storage.output_dir, "2021-2025", tile)
+        _set_tasks(fake_coiled, _task(0), _task(1, state="error", exit_code=1), _task(2))
+
+        results = reconcile_run("r", storage=storage)
+
+        assert sum(1 for r in results if r.status == "completed") == 2
+        assert sum(1 for r in results if r.status == "failed") == 1
+
+    def test_skipped_tiles_stay_in_the_manifest(self, fake_coiled, runs_dir, storage):
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        submit_batch(_jobs("N40W075", "S05W060"), storage=storage, run_id="r")
+        _finish_tile(storage.output_dir, "2021-2025", "S05W060")
+        _set_tasks(fake_coiled, _task(0))
+
+        results = reconcile_run("r", storage=storage)
+
+        assert {r.job.tile.name: r.status for r in results} == {
+            "S05W060": "completed",
+            "N40W075": "skipped",
+        }
+
+    def test_writes_the_manifest(self, fake_coiled, runs_dir, storage):
+        self._submit(fake_coiled, storage, "N40W075")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        reconcile_run("r", storage=storage)
+
+        payload = json.loads((runs_dir / "r.json").read_text())
+        assert payload["run_id"] == "r"
+        assert payload["cluster_id"] == 4242
+        assert payload["job_id"] == 77
+        assert payload["counts"]["completed"] == 1
+
+    def test_is_repeatable(self, fake_coiled, runs_dir, storage):
+        """Reconciling twice must not change the verdict."""
+        self._submit(fake_coiled, storage, "N40W075")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        first = reconcile_run("r", storage=storage)
+        second = reconcile_run("r", storage=storage)
+
+        assert [r.status for r in first] == [r.status for r in second]
+
+    def test_survives_coiled_being_unreachable(self, fake_coiled, runs_dir, storage, monkeypatch):
+        """S3 still knows what finished when the control plane does not answer."""
+        self._submit(fake_coiled, storage, "N40W075")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+
+        def explode(cluster):
+            msg = f"coiled unreachable for cluster {cluster}"
+            raise ConnectionError(msg)
+
+        monkeypatch.setattr(sys.modules["coiled.batch"], "status", explode)
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.status == "completed"
+
+    def test_unreadable_record_does_not_stop_reconciliation(self, fake_coiled, runs_dir, storage):
+        self._submit(fake_coiled, storage, "N40W075")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        storage.write_text(storage.run_record_key("r", "N40W075"), "{not json")
+        _set_tasks(fake_coiled, _task(0))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.status == "completed"
+
+    def test_unknown_run_id_is_a_clear_error(self, fake_coiled, runs_dir, storage):
+        with pytest.raises(FileNotFoundError, match="No submission record"):
+            reconcile_run("never-submitted", storage=storage)
+
+
+class TestWait:
+    def test_returns_final_state(self, fake_coiled, runs_dir, storage):
+        submit_batch(_jobs("N40W075"), storage=storage, run_id="r")
+
+        assert wait_for_batch("r", timeout_s=30) == "done (success)"
+        assert fake_coiled["_state"]["waited_on"] == (77, 30)
+
+    def test_nothing_to_wait_for(self, fake_coiled, runs_dir, storage):
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        submit_batch(_jobs("N40W075"), storage=storage, run_id="r")
+
+        assert wait_for_batch("r") is None
+
+
+def test_submission_dashboard_url():
+    submission = BatchSubmission(
+        run_id="r",
+        window="2021-2025",
+        cluster_id=4242,
+        job_id=77,
+        submitted_at="2026-08-12T14:00:00+00:00",
+        submitted_tiles=["N40W075"],
+        year=2021,
+        end_year=2025,
+    )
+
+    assert submission.dashboard_url == "https://cloud.coiled.io/clusters/4242"
+
+
+def test_missing_coiled_is_reported_clearly(runs_dir, storage, monkeypatch):
+    monkeypatch.setitem(sys.modules, "coiled", None)
+
+    with pytest.raises(ImportError, match="Coiled is required"):
+        submit_batch(_jobs("N40W075"), storage=storage)
+
+
+def test_credentials_are_resolved_only_when_a_cluster_starts(
+    fake_coiled, runs_dir, storage, monkeypatch
+):
+    """A no-op resume must not demand an SSO login."""
+    _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+    environ = MagicMock(side_effect=RuntimeError("should not be called"))
+    monkeypatch.setattr("landsat_lst.batch._worker_environ", environ)
+
+    submit_batch(_jobs("N40W075"), storage=storage, run_id="r")
+
+    environ.assert_not_called()

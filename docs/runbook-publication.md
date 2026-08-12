@@ -74,8 +74,18 @@ landsat-lst catalog validate ./rehearsal-catalog
 ```
 
 Expect zero errors and exactly the accepted warning set, `PTL-AST-003` and `PTL-DAT-010`. Any
-other warning id fails the gate and the command exits non-zero. Open one COG in
-QGIS and confirm the composite reads in Celsius and lands in the range the tile deserves.
+other warning id fails the gate and the command exits non-zero.
+
+Then check the published objects the way a consumer meets them, unauthenticated over HTTPS:
+
+```bash
+landsat-lst verify -t N40W075 -t S05E035 -t N55E010 --urls
+```
+
+This opens each COG over the public read host and prints its dtype, shape, nodata, scale, offset,
+and overview levels. A tile that reads only with credentials fails here, which a bucket listing
+would have called complete. Paste one of the printed URLs into QGIS and confirm the composite
+reads in Celsius and lands in the range the tile deserves.
 
 Go back to the pipeline, not forward to S2, if the rehearsal turns up anything.
 
@@ -86,20 +96,35 @@ scene counts, and multiply out. The costing sweeps this runbook waits on are tha
 
 ## S2. Global run with resume
 
-```python
-from landsat_lst.job import generate_jobs, run_distributed
-from landsat_lst.storage import get_storage
-
-storage = get_storage()
-done = storage.list_completed("2021-2025")
-jobs = [job for job in generate_jobs() if job.tile.name not in done]
-run_distributed(jobs)
+```bash
+landsat-lst process --distributed
 ```
 
-`list_completed` reads one paginated listing and returns only the tiles that carry both assets, so
-a tile that died between its two uploads is reprocessed rather than published half-finished. Run
-the same three lines again after any interruption. It is the resume mechanism, and it is cheap
-enough to be the normal way to start.
+Each tile runs as one process on its own VM through Coiled Batch, capped at
+`settings.coiled_max_workers` machines at once (ADR-010). The command prints a run id and returns.
+The run belongs to Coiled from that point on, so closing the shell, losing the network, or
+rebooting the laptop does not touch it.
+
+Submission filters completed tiles first. `list_completed` reads one paginated listing and returns
+only the tiles that carry both assets, so a tile that died between its two uploads is reprocessed
+rather than published half-finished. Re-running the same command after any interruption is the
+resume mechanism, and it is cheap enough to be the normal way to start.
+
+Watch progress on the Coiled dashboard, or:
+
+```bash
+coiled batch status <cluster-id>
+```
+
+When the run finishes, build the manifest:
+
+```bash
+landsat-lst reconcile <run-id>
+```
+
+Reconciliation takes completion from the S3 listing, per-tile duration, scene count, and peak
+memory from the run records each VM wrote under `_runs/{run_id}/`, and the reason for any tile
+with no output from Coiled's task state. It is safe to run early and safe to run twice.
 
 Expect failures at the tail. A tile that fails twice is a data problem, not a scheduling problem,
 and it belongs in an issue rather than in a third retry.
