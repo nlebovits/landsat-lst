@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,7 +22,7 @@ def main() -> None:
     """Landsat Land Surface Temperature annual composites."""
 
 
-def _build_jobs(year: int | None, end_year: int | None, tile: str | None) -> list:
+def _build_jobs(year: int | None, end_year: int | None, tiles: tuple[str, ...]) -> list:
     """Resolve CLI options into the job list to run.
 
     Omitting ``--year`` selects the production window. Passing ``--year`` alone
@@ -34,10 +35,14 @@ def _build_jobs(year: int | None, end_year: int | None, tile: str | None) -> lis
     if year is None:
         year, end_year = DEFAULT_WINDOW
 
-    if tile:
-        if tile not in LAND_TILES:
-            console.print(f"[red]Warning: {tile} is not in the land tiles set[/red]")
-        return [ProcessingJob(tile=parse_tile_name(tile), year=year, end_year=end_year)]
+    if tiles:
+        for tile in tiles:
+            if tile not in LAND_TILES:
+                console.print(f"[red]Warning: {tile} is not in the land tiles set[/red]")
+        return [
+            ProcessingJob(tile=parse_tile_name(tile), year=year, end_year=end_year)
+            for tile in tiles
+        ]
 
     if end_year:
         return generate_jobs(window=(year, end_year))
@@ -47,27 +52,46 @@ def _build_jobs(year: int | None, end_year: int | None, tile: str | None) -> lis
 @main.command()
 @click.option("--year", "-y", type=int, help="Start year. Omit to use the default window.")
 @click.option("--end-year", type=int, help="End year (inclusive) for a multi-year window")
-@click.option("--tile", "-t", type=str, help="Specific tile to process (e.g., N40W075)")
+@click.option(
+    "--tile",
+    "-t",
+    "tiles",
+    type=str,
+    multiple=True,
+    help="Tile to process (e.g., N40W075); repeatable",
+)
 @click.option("--dry-run", is_flag=True, help="Show what would be processed without running")
 @click.option("--force", "-f", is_flag=True, help="Reprocess even if the COGs exist")
+@click.option(
+    "--distributed",
+    "-d",
+    is_flag=True,
+    help="Run on Coiled workers instead of locally (writes a run manifest)",
+)
+@click.option("--limit", type=int, help="Process at most N tiles from the job list")
 def process(
+    *,
     year: int | None,
     end_year: int | None,
-    tile: str | None,
+    tiles: tuple[str, ...],
     dry_run: bool,
     force: bool,
+    distributed: bool,
+    limit: int | None,
 ) -> None:
     """Process Landsat data to COG composites.
 
     With no --year, processes the production window (2021-2025). Passing --year
     alone builds a single-year composite; add --end-year for a custom window.
+    With --distributed, jobs run on Coiled in settings.coiled_region and a JSON
+    manifest is written under settings.manifest_dir.
     """
-    from landsat_lst.job import process_tile_job
-
-    jobs = _build_jobs(year, end_year, tile)
+    jobs = _build_jobs(year, end_year, tiles)
+    if limit is not None:
+        jobs = jobs[:limit]
     console.print(f"[bold]Processing window {jobs[0].window_label}[/bold]")
-    if tile:
-        console.print(f"  Tile: {tile}")
+    if tiles:
+        console.print(f"  Tiles: {', '.join(tiles)}")
     else:
         console.print(f"  Tiles: {len(jobs)} land tiles")
 
@@ -76,13 +100,23 @@ def process(
 
     if dry_run:
         console.print("[yellow]Dry run - no processing performed[/yellow]")
+        mode = "on Coiled" if distributed else "locally"
         for job in jobs[:5]:
-            console.print(f"    Would process: {job.tile.name} {job.window_label}")
+            console.print(f"    Would process {mode}: {job.tile.name} {job.window_label}")
         if len(jobs) > 5:
             console.print(f"    ... and {len(jobs) - 5} more")
         return
 
-    # Process tiles
+    if distributed:
+        _process_distributed(jobs, force=force)
+    else:
+        _process_local(jobs, force=force)
+
+
+def _process_local(jobs: list, *, force: bool) -> None:
+    """Process jobs sequentially in this process with a progress bar."""
+    from landsat_lst.job import process_tile_job
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -113,6 +147,40 @@ def process(
     console.print(f"  Skipped: [yellow]{skipped}[/yellow]")
     if failed:
         console.print(f"  Failed: [red]{failed}[/red]")
+
+
+def _process_distributed(jobs: list, *, force: bool) -> None:
+    """Dispatch jobs to Coiled and report the manifest.
+
+    No per-tile progress bar: the Coiled dashboard is the live progress UI;
+    the manifest is the durable record.
+    """
+    from datetime import datetime
+
+    from landsat_lst.config import settings
+    from landsat_lst.job import run_distributed
+
+    window = jobs[0].window_label if jobs else "empty"
+    run_id = f"{window}-{datetime.now(tz=UTC):%Y%m%dT%H%M%SZ}"
+    console.print(f"  Run id: {run_id}")
+    console.print(f"  Region: {settings.coiled_region}  Workers: {settings.coiled_n_workers}")
+    console.print("  Progress: https://cloud.coiled.io (cluster lst-" + run_id + ")")
+
+    results = run_distributed(jobs, force=force, run_id=run_id)
+
+    completed = sum(1 for r in results if r.status == "completed")
+    skipped = sum(1 for r in results if r.status == "skipped")
+    failed = sum(1 for r in results if r.status == "failed")
+
+    console.print("\n[bold]Results:[/bold]")
+    console.print(f"  Completed: [green]{completed}[/green]")
+    console.print(f"  Skipped: [yellow]{skipped}[/yellow]")
+    if failed:
+        console.print(f"  Failed: [red]{failed}[/red]")
+        for r in results:
+            if r.status == "failed":
+                console.print(f"    [red]{r.job.tile.name}: {r.error}[/red]")
+    console.print(f"  Manifest: {settings.manifest_dir / (run_id + '.json')}")
 
 
 @main.command()

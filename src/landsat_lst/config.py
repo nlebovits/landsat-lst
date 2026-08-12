@@ -189,10 +189,47 @@ class Settings(BaseSettings):
         description="Memory limit per Dask worker",
     )
 
-    # Coiled retry settings
+    # Coiled distributed execution. Every knob is pinned here rather than left
+    # to Coiled defaults: an unpinned region reads Landsat cross-region, and
+    # the default adaptive scaling (n_workers=[0, 500]) has no cost ceiling.
     coiled_retries: int = Field(
         default=3,
         description="Number of retries for Coiled worker failures",
+    )
+    coiled_region: str = Field(
+        default="us-west-2",
+        description="Cloud region for Coiled workers. Must match the Landsat "
+        "source bucket and the output bucket, or every read pays egress.",
+    )
+    coiled_vm_types: list[str] = Field(
+        default=["r6i.xlarge", "m6i.2xlarge"],
+        description="Candidate worker instance types, in preference order. "
+        "Both carry 32 GiB: the pipeline peaks ~25 GB per composite and is "
+        "I/O bound, so buy memory, not cores.",
+    )
+    coiled_spot_policy: Literal["on-demand", "spot", "spot_with_fallback"] = Field(
+        default="spot_with_fallback",
+        description="Instance purchase strategy. Spot preemption is safe: "
+        "tile writes are idempotent via the two-asset existence check.",
+    )
+    coiled_n_workers: int = Field(
+        default=4,
+        description="Fixed worker count. A hard cap, not adaptive bounds, so "
+        "a batch can never scale past what was budgeted.",
+    )
+    coiled_keepalive: str = Field(
+        default="5 minutes",
+        description="How long idle workers survive after the batch ends. "
+        "Short by design; restarting a cluster is cheaper than idle VMs.",
+    )
+    aws_profile: str = Field(
+        default="radiant-earth",
+        description="AWS profile whose (SSO) credentials are frozen and "
+        "forwarded to Coiled workers for S3 writes.",
+    )
+    manifest_dir: Path = Field(
+        default=Path("results/runs"),
+        description="Directory for per-run JSON manifests of distributed runs.",
     )
 
     @model_validator(mode="after")
