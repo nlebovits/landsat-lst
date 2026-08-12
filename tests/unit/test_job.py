@@ -448,3 +448,22 @@ class TestRunDistributed:
         payload = json.loads((manifest_dir / "manifest-run.json").read_text())
         assert payload["run_id"] == "manifest-run"
         assert payload["counts"]["completed"] == 1
+
+    def test_worker_task_pins_threaded_scheduler(self, fake_coiled, manifest_dir, monkeypatch):
+        """The tile graph must compute on the worker's own threads, never on
+        the shared cluster scheduler (scheduler-connection-lost regression)."""
+        import dask
+
+        captured = {}
+
+        def fake_process(job, force=False):
+            captured["scheduler"] = dask.config.get("scheduler", None)
+            return JobResult(job=job, status="completed")
+
+        monkeypatch.setattr("landsat_lst.job.process_tile_job", fake_process)
+        storage = MagicMock()
+        storage.list_completed.return_value = set()
+
+        run_distributed(_jobs("N40W075"), storage=storage)
+
+        assert captured["scheduler"] == "threads"
