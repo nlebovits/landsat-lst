@@ -6,14 +6,15 @@ ADRs are kept for history and link to their replacement.
 
 | ADR | Title | Status |
 |-----|-------|--------|
-| [001](001-architecture-decisions.md) | Pipeline architecture decisions (data source, CRS, tiling, temporal scope, QA, encoding) | Accepted |
+| [001](001-architecture-decisions.md) | Pipeline architecture decisions (data source, CRS, tiling, temporal scope, QA, encoding) | Accepted (§11 output format restored to COG by [009](009-cog-output-and-stac-catalog.md)) |
 | [002](002-virtualzarr-icechunk-integration.md) | VirtualZarr + Icechunk integration | ⚠️ Superseded by [003](003-direct-zarr-architecture.md) |
-| [003](003-direct-zarr-architecture.md) | Direct Zarr writes + Icechunk versioning | Accepted |
-| [004](004-geozarr-multiscale-overviews.md) | GeoZarr multiscale overviews on Icechunk | Accepted |
+| [003](003-direct-zarr-architecture.md) | Direct Zarr writes + Icechunk versioning | ⚠️ Superseded by [009](009-cog-output-and-stac-catalog.md) |
+| [004](004-geozarr-multiscale-overviews.md) | GeoZarr multiscale overviews on Icechunk | ⚠️ Superseded by [009](009-cog-output-and-stac-catalog.md) |
 | [005](005-multiyear-monthly-qa-and-destriping.md) | Multi-year composites, monthly QA climatology, and de-striping | Accepted (de-striping settled in [007](007-scene-normalization.md)) |
 | [006](006-no-aster-gap-filling.md) | Leave ASTER GED coverage gaps empty | Accepted |
 | [007](007-scene-normalization.md) | Per-scene normalization against a monthly climatology; discard uncorrectable scenes | Accepted |
-| [008](008-global-mosaic-topology.md) | Global sparse mosaic for the pyramid, and one shared tile grid | Accepted |
+| [008](008-global-mosaic-topology.md) | Global sparse mosaic for the pyramid, and one shared tile grid | Shared-grid decision accepted; mosaic decision ⚠️ superseded by [009](009-cog-output-and-stac-catalog.md) |
+| [009](009-cog-output-and-stac-catalog.md) | Per-tile COGs in a Portolan STAC catalog, retiring the Zarr output | Accepted |
 
 ## Adding an ADR
 

@@ -118,4 +118,4 @@ Recorded so they are not revisited:
 - [`docs/findings-destriping-and-multiyear.md`](../findings-destriping-and-multiyear.md)
   (narrative: measurements, plots, full alternative sweep)
 - `scripts/season_aware_p95_test.py` (de-striping prototype)
-- [ADR-004](004-geozarr-multiscale-overviews.md) (output layout this composite writes into)
+- [ADR-009](009-cog-output-and-stac-catalog.md) (output layout this composite writes into)

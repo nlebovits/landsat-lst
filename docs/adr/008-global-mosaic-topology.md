@@ -1,8 +1,17 @@
 # ADR-008: Build the pyramid on one global sparse mosaic, not on 700 per-tile pyramids
 
-**Status:** Accepted
+**Status:** Partly superseded by [ADR-009](009-cog-output-and-stac-catalog.md). The shared-grid
+decision stands.
 **Date:** 2026-08-07
 **Authors:** @nlebovits
+
+> **Partly superseded (2026-08-12) by [ADR-009](009-cog-output-and-stac-catalog.md).** The mosaic
+> decision below is superseded: the output is per-tile COGs cataloged as one STAC collection, and
+> no global array is written. **The shared-global-grid clause is retained in full.** Tiles are
+> still windows cut from one 1,296,000 × 432,000 grid at exactly 1/3600 degrees, loaded through
+> `tiling.geobox_for_bbox`, and that is what makes the COG collection mosaicable at all. The
+> "nothing in the consumption stack mosaics" finding was true of Zarr readers and does not carry
+> to raster clients, which mosaic a collection of co-gridded COGs routinely. See ADR-009.
 
 ## Context
 
@@ -70,6 +79,9 @@ coarsest level. The divisibility problem belongs to the tile, not to the pyramid
 
 ## Decision
 
+> Superseded by [ADR-009](009-cog-output-and-stac-catalog.md), except for the shared-grid
+> requirement two paragraphs below, which ADR-009 depends on and keeps.
+
 **Write one global sparse mosaic per window. Tiles become work partitions, not storage units.**
 
 Each level is a single array spanning the full global extent, with only land chunks
@@ -123,6 +135,10 @@ Issue #42 narrows. Its Option A, a client reading per-tile stores directly, is e
 the same finding that eliminates Option A here: neither `icechunk-js` nor `xpublish-tiles`
 mosaics across stores. What remains open there is whether the mosaic is served by a proxy or
 read directly, and whether a derived plain-Zarr or COG export is needed for portolan.
+
+> **Answered by [ADR-009](009-cog-output-and-stac-catalog.md) (2026-08-12).** The COG is not a
+> derived export. It is the primary and only output, published as a Portolan STAC collection, and
+> no proxy stands between the data and the reader. Issue #42 closes with it.
 
 ## References
 - Issue #41 (this decision); issue #42 (consumption stack, still open)

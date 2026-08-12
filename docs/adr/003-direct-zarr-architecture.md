@@ -1,9 +1,14 @@
 # ADR-003: Architecture Pivot to Direct Zarr Writes
 
-**Status:** Accepted
+**Status:** ⚠️ Superseded by [ADR-009](009-cog-output-and-stac-catalog.md)
 **Date:** 2026-05-08
 **Authors:** @nlebovits
 **Supersedes:** ADR-002 (VirtualZarr + Icechunk Integration)
+
+> **Superseded (2026-08-12) by [ADR-009](009-cog-output-and-stac-catalog.md).** The output is
+> per-tile COGs in a Portolan STAC catalog, and the Zarr and Icechunk write path is deleted. The
+> constraint that motivated this pivot, a chunk size satisfying both GDAL and VirtualZarr, ceased
+> to apply the moment this same ADR removed VirtualZarr. The record below is kept for history.
 
 ## Context
 

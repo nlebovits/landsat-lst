@@ -1,90 +1,131 @@
-"""Unit tests for storage abstraction module."""
+"""Unit tests for the COG storage abstraction."""
 
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from landsat_lst.storage import IcechunkStorage, LocalStorage, S3Storage, get_storage
+from landsat_lst.storage import (
+    PRODUCTS,
+    LocalStorage,
+    S3Storage,
+    collection_prefix,
+    get_storage,
+)
+
+
+def _write_asset(root: Path, window: str, tile: str, product: str) -> Path:
+    """Create one asset file under ``root`` at the canonical key."""
+    path = root / collection_prefix(window) / tile / f"{product}_{window}_{tile}.tif"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"tif")
+    return path
+
+
+class TestCogKey:
+    """The key layout is shared by every backend."""
+
+    def test_key_format(self, tmp_path):
+        storage = LocalStorage(output_dir=tmp_path)
+
+        assert storage.cog_key("2021-2025", "N40W075", "lst_p95") == (
+            "lst-p95-2021-2025/N40W075/lst_p95_2021-2025_N40W075.tif"
+        )
+
+    def test_backends_agree_on_layout(self, tmp_path):
+        """A catalog built against one backend must resolve against the other."""
+        local = LocalStorage(output_dir=tmp_path)
+        s3 = S3Storage(bucket="b", prefix="p", region="r")
+
+        assert local.cog_key("2024", "N40W075", "qa_count") == s3.cog_key(
+            "2024", "N40W075", "qa_count"
+        )
 
 
 class TestLocalStorage:
     """Tests for local filesystem storage backend."""
 
-    def test_zarr_path_creates_directory(self, tmp_path):
-        """Should create parent directory for Zarr path."""
+    def test_cog_exists_true_when_both_assets_present(self, tmp_path):
+        storage = LocalStorage(output_dir=tmp_path)
+        for product in PRODUCTS:
+            _write_asset(tmp_path, "2024", "N40W075", product)
+
+        assert storage.cog_exists("2024", "N40W075") is True
+
+    def test_cog_exists_false_when_only_one_asset(self, tmp_path):
+        """A half-uploaded tile is not done -- it has to be rebuilt."""
+        storage = LocalStorage(output_dir=tmp_path)
+        _write_asset(tmp_path, "2024", "N40W075", "lst_p95")
+
+        assert storage.cog_exists("2024", "N40W075") is False
+
+    def test_cog_exists_false_when_nothing_written(self, tmp_path):
         storage = LocalStorage(output_dir=tmp_path)
 
-        path = storage.zarr_path(2023, "N40W075")
+        assert storage.cog_exists("2024", "N40W075") is False
 
-        assert path == str(tmp_path / "2023" / "N40W075.zarr")
-        assert (tmp_path / "2023").exists()
+    def test_upload_copies_to_key(self, tmp_path):
+        storage = LocalStorage(output_dir=tmp_path / "out")
+        src = tmp_path / "src.tif"
+        src.write_bytes(b"payload")
 
-    def test_zarr_exists_true(self, tmp_path):
-        """Should return True when Zarr exists."""
+        key = storage.cog_key("2024", "N40W075", "lst_p95")
+        storage.upload(src, key)
+
+        assert (tmp_path / "out" / key).read_bytes() == b"payload"
+
+    def test_list_completed_only_returns_whole_tiles(self, tmp_path):
         storage = LocalStorage(output_dir=tmp_path)
-        zarr_path = tmp_path / "2023" / "N40W075.zarr"
-        zarr_path.parent.mkdir(parents=True)
-        zarr_path.mkdir()  # Zarr stores are directories
+        for product in PRODUCTS:
+            _write_asset(tmp_path, "2024", "N40W075", product)
+        _write_asset(tmp_path, "2024", "N45W075", "lst_p95")  # half-written
 
-        assert storage.zarr_exists(2023, "N40W075") is True
+        assert storage.list_completed("2024") == {"N40W075"}
 
-    def test_zarr_exists_false(self, tmp_path):
-        """Should return False when Zarr doesn't exist."""
+    def test_list_completed_empty_for_unknown_window(self, tmp_path):
         storage = LocalStorage(output_dir=tmp_path)
 
-        assert storage.zarr_exists(2023, "N40W075") is False
+        assert storage.list_completed("1999") == set()
 
 
 class TestS3Storage:
     """Tests for S3 storage backend."""
 
-    def test_zarr_path_returns_s3_url(self):
-        """Should return S3 URL for Zarr path."""
-        storage = S3Storage(
-            bucket="test-bucket",
-            prefix="landsat-lst",
-            region="us-west-2",
+    def test_upload_prefixes_key(self):
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        storage._client = MagicMock()
+
+        storage.upload(Path("/tmp/src.tif"), "2024/N40W075/lst_p95_2024_N40W075.tif")
+
+        storage._client.upload_file.assert_called_once_with(
+            "/tmp/src.tif",
+            "b",
+            "p/2024/N40W075/lst_p95_2024_N40W075.tif",
         )
 
-        path = storage.zarr_path(2023, "N40W075")
-
-        assert path == "s3://test-bucket/landsat-lst/2023/N40W075.zarr"
-
-    def test_zarr_key_format(self):
-        """Should format Zarr key correctly."""
-        storage = S3Storage(bucket="b", prefix="p", region="r")
-
-        key = storage._zarr_key(2023, "N40W075")
-
-        assert key == "p/2023/N40W075.zarr"
-
-    def test_zarr_exists_true(self):
-        """Should return True when head_object succeeds for .zmetadata."""
+    def test_cog_exists_true_when_both_heads_succeed(self):
         storage = S3Storage(bucket="b", prefix="p", region="r")
         mock_client = MagicMock()
         mock_client.head_object.return_value = {}
         storage._client = mock_client
 
-        assert storage.zarr_exists(2023, "N40W075") is True
-        mock_client.head_object.assert_called_once_with(
-            Bucket="b",
-            Key="p/2023/N40W075.zarr/.zmetadata",
-        )
+        assert storage.cog_exists("2024", "N40W075") is True
+        assert mock_client.head_object.call_count == len(PRODUCTS)
 
-    def test_zarr_exists_false_on_404(self):
-        """Should return False on 404 error for both .zmetadata and zarr.json."""
+    def test_cog_exists_false_when_only_one_asset(self):
+        """Missing qa_count means the tile is incomplete, whatever lst_p95 says."""
         from botocore.exceptions import ClientError
 
         storage = S3Storage(bucket="b", prefix="p", region="r")
         mock_client = MagicMock()
-        mock_client.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
+        missing = ClientError({"Error": {"Code": "404"}}, "HeadObject")
+        mock_client.head_object.side_effect = [{}, missing]
         storage._client = mock_client
 
-        assert storage.zarr_exists(2023, "N40W075") is False
+        assert storage.cog_exists("2024", "N40W075") is False
 
-    def test_zarr_exists_raises_other_errors(self):
-        """Should raise non-404 errors."""
+    def test_cog_exists_raises_other_errors(self):
+        """A 403 is a broken credential, not an absent object."""
         from botocore.exceptions import ClientError
 
         storage = S3Storage(bucket="b", prefix="p", region="r")
@@ -93,86 +134,79 @@ class TestS3Storage:
         storage._client = mock_client
 
         with pytest.raises(ClientError):
-            storage.zarr_exists(2023, "N40W075")
+            storage.cog_exists("2024", "N40W075")
 
+    def test_list_completed_pages_once_and_filters_partials(self):
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        mock_client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": "p/lst-p95-2024/N40W075/lst_p95_2024_N40W075.tif"},
+                    {"Key": "p/lst-p95-2024/N40W075/qa_count_2024_N40W075.tif"},
+                ]
+            },
+            {"Contents": [{"Key": "p/lst-p95-2024/N45W075/lst_p95_2024_N45W075.tif"}]},
+        ]
+        mock_client.get_paginator.return_value = paginator
+        storage._client = mock_client
 
-class TestIcechunkStorage:
-    """Tests for Icechunk storage backend."""
+        assert storage.list_completed("2024") == {"N40W075"}
+        paginator.paginate.assert_called_once_with(Bucket="b", Prefix="p/lst-p95-2024/")
+        mock_client.head_object.assert_not_called()
 
-    def test_from_local_creates_repo(self, tmp_path):
-        """Should create repository from local path."""
-        storage = IcechunkStorage.from_local(tmp_path / "icechunk")
+    def test_list_completed_handles_empty_prefix(self):
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        mock_client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{}]  # no Contents key at all
+        mock_client.get_paginator.return_value = paginator
+        storage._client = mock_client
 
-        assert storage.repo is not None
-        assert (tmp_path / "icechunk").exists()
-
-    def test_zarr_path_returns_group_format(self, tmp_path):
-        """Should return group path format (not filesystem path)."""
-        storage = IcechunkStorage.from_local(tmp_path / "icechunk")
-
-        path = storage.zarr_path(2023, "N40W075")
-
-        assert path == "2023/N40W075"
-
-    def test_zarr_exists_false_initially(self, tmp_path):
-        """Should return False for non-existent group."""
-        storage = IcechunkStorage.from_local(tmp_path / "icechunk")
-
-        assert storage.zarr_exists(2023, "N40W075") is False
-
-    def test_writable_session_returns_session(self, tmp_path):
-        """Should return writable session with store."""
-        storage = IcechunkStorage.from_local(tmp_path / "icechunk")
-
-        session = storage.writable_session()
-
-        assert hasattr(session, "store")
-        assert hasattr(session, "commit")
-
-    def test_readonly_session_returns_session(self, tmp_path):
-        """Should return readonly session."""
-        storage = IcechunkStorage.from_local(tmp_path / "icechunk")
-
-        session = storage.readonly_session()
-
-        assert hasattr(session, "store")
+        assert storage.list_completed("2024") == set()
 
 
 class TestGetStorage:
     """Tests for storage factory function."""
 
     def test_returns_local_by_default(self):
-        """Should return LocalStorage when backend is 'local' and icechunk disabled."""
         with patch("landsat_lst.storage.settings") as mock_settings:
-            mock_settings.use_icechunk = False
             mock_settings.storage_backend = "local"
             mock_settings.output_dir = Path("/tmp/test")
 
-            storage = get_storage()
-
-            assert isinstance(storage, LocalStorage)
+            assert isinstance(get_storage(), LocalStorage)
 
     def test_returns_s3_when_configured(self):
-        """Should return S3Storage when backend is 's3' and icechunk disabled."""
         with patch("landsat_lst.storage.settings") as mock_settings:
-            mock_settings.use_icechunk = False
             mock_settings.storage_backend = "s3"
             mock_settings.s3_bucket = "test-bucket"
             mock_settings.s3_prefix = "test-prefix"
             mock_settings.s3_region = "us-west-2"
 
-            storage = get_storage()
+            assert isinstance(get_storage(), S3Storage)
 
-            assert isinstance(storage, S3Storage)
 
-    def test_returns_icechunk_local_when_enabled(self, tmp_path):
-        """Should return IcechunkStorage for local when use_icechunk=True."""
-        with patch("landsat_lst.storage.settings") as mock_settings:
-            mock_settings.use_icechunk = True
-            mock_settings.storage_backend = "local"
-            mock_settings.output_dir = tmp_path
-            mock_settings.icechunk_prefix = "icechunk"
+class TestCatalogLayoutContract:
+    """The storage layout IS the published catalog layout.
 
-            storage = get_storage()
+    storage.collection_prefix duplicates catalog.spec's collection id rather
+    than importing it, so workers do not pay for the catalog stack. This test
+    is the contract that keeps the two from drifting: if either side changes,
+    the published COG paths and the STAC item hrefs disagree and publication
+    stops being a metadata-only sync.
+    """
 
-            assert isinstance(storage, IcechunkStorage)
+    def test_prefix_matches_the_collection_id(self):
+        from landsat_lst.catalog.spec import spec_for_window
+        from landsat_lst.storage import collection_prefix
+
+        for window in ("2021-2025", "2024"):
+            assert collection_prefix(window) == spec_for_window(window).collection_id
+
+    def test_key_starts_with_the_collection_id(self, tmp_path):
+        from landsat_lst.catalog.spec import spec_for_window
+
+        storage = LocalStorage(output_dir=tmp_path)
+        key = storage.cog_key("2021-2025", "N40W075", "lst_p95")
+        assert key.startswith(spec_for_window("2021-2025").collection_id + "/")

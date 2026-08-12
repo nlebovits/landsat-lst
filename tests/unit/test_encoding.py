@@ -1,8 +1,8 @@
 """Unit tests for the LST uint16 encoding contract.
 
-Ported from tests/integration/test_zarr_writer.py so the encoding tests
-survive the removal of the Zarr write path. These run as unit tests: the
-encoder is pure numpy/xarray and needs no I/O.
+These live apart from any writer so the contract is tested once rather than
+per output format. They run as unit tests: the encoder is pure numpy/xarray
+and needs no I/O.
 """
 
 import numpy as np

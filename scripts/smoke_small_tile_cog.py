@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Smoke test: full pipeline on a SMALL bbox -> GeoZarr multiscale icechunk -> COG.
+"""Smoke test: full pipeline on a SMALL bbox -> COG pair.
 
 Runs locally against Planetary Computer (no AWS egress) on a small slice of Pergamino,
 Argentina -- cheap enough to confirm the whole chain works end to end without
 recomputing a 5-degree tile:
 
     STAC query -> scene load -> annual P95 composite
-      -> write_zarr (GeoZarr multiscale pyramid, Blosc, atomic icechunk commit)
-      -> read native level back
-      -> derive a Cloud-Optimized GeoTIFF (COG) from lst_p95
+      -> uint16 encoding
+      -> cog_export (single-band LST COG + 12-band monthly QA COG)
 
 Uses the lower-level pipeline functions with a custom bbox (not process_tile, which is
 fixed to 5-degree tiles). No land mask -- Pergamino is fully inland.
@@ -19,18 +18,11 @@ Usage:
 
 from __future__ import annotations
 
-import shutil
-import tempfile
 from pathlib import Path
 
-import icechunk as ic
 import pystac_client
 import rasterio
-import rioxarray  # noqa: F401 - .rio accessor
 import xarray as xr
-import zarr
-from rio_cogeo.cogeo import cog_translate, cog_validate
-from rio_cogeo.profiles import cog_profiles
 
 from landsat_lst.config import STAC_PLANETARY_COMPUTER, settings
 
@@ -38,22 +30,22 @@ from landsat_lst.config import STAC_PLANETARY_COMPUTER, settings
 settings.stac_url = STAC_PLANETARY_COMPUTER
 
 from landsat_lst.azure_auth import enable_pc_azure_refresh  # noqa: E402
-from landsat_lst.encoding import LST_OFFSET, LST_SCALE  # noqa: E402
+from landsat_lst.cog import cog_export  # noqa: E402
+from landsat_lst.encoding import encode_lst_uint16  # noqa: E402
 from landsat_lst.pipeline import compute_annual_composite, load_scenes  # noqa: E402
-from landsat_lst.zarr_writer import write_zarr  # noqa: E402
 
 # A small (~0.2 deg, ~700px at 30m) slice of Pergamino, Argentina.
 BBOX = (-60.60, -33.95, -60.40, -33.75)
 YEAR = 2024
-GROUP = f"{YEAR}/PERGAMINO_SMALL"
 OUT_DIR = Path("output/smoke_small")
-COG_PATH = OUT_DIR / "pergamino_small_lst_p95_cog.tif"
+LST_COG = OUT_DIR / "pergamino_small_lst_p95.tif"
+QA_COG = OUT_DIR / "pergamino_small_qa_count.tif"
 
 
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"endpoint={settings.stac_url}")
-    print(f"bbox={BBOX} year={YEAR} factors={settings.pyramid_factors}")
+    print(f"bbox={BBOX} year={YEAR}")
 
     # --- STAC query + load + composite (Planetary Computer) ------------------
     catalog = pystac_client.Client.open(settings.stac_url)
@@ -82,51 +74,23 @@ def main() -> int:
         f"qa_max={int(composite['qa_count'].max())}"
     )
 
-    # --- Write GeoZarr multiscale pyramid to a local icechunk repo -----------
-    repo = ic.Repository.open_or_create(ic.local_filesystem_storage(str(OUT_DIR / "icechunk")))
-    session = repo.writable_session("main")
-    write_zarr(composite, session, group=GROUP)
-    commit_id = session.commit("small-tile smoke")
-    print(f"icechunk commit: {commit_id[:12]}")
-
-    rs = repo.readonly_session("main")
-    parent = zarr.open_group(rs.store, path=GROUP, mode="r")
-    levels = [e["asset"] for e in parent.attrs["multiscales"]["layout"]]
-    print(f"multiscale levels: {levels}  (proj={parent.attrs['proj:code']})")
-
-    # --- Derive a COG from native-resolution lst_p95 (rio-cogeo) -------------
-    ds = xr.open_zarr(rs.store, group=f"{GROUP}/0")
-    da = (
-        ds["lst_p95"]
-        .rio.write_crs("EPSG:4326")
-        .rio.set_spatial_dims(x_dim="longitude", y_dim="latitude")
-        .rio.write_nodata(0)
+    # --- Encode to the published uint16 contract, then export both COGs ------
+    native = xr.Dataset(
+        {
+            "lst_p95": encode_lst_uint16(composite["lst_p95"]),
+            "qa_count": composite["qa_count"],
+        }
     )
+    cog_export(native, LST_COG, QA_COG)
 
-    scratch = Path(tempfile.mkdtemp(prefix="lst_cog_"))
-    try:
-        src_tif = scratch / "src.tif"
-        da.rio.to_raster(src_tif)  # plain GeoTIFF source for cog_translate
-        # Embed GDAL band scale/offset so viewers (QGIS, gdalinfo) auto-decode the
-        # uint16 DN to Celsius: value = DN * scale + offset.
-        with rasterio.open(src_tif, "r+") as src:
-            src.scales = (LST_SCALE,)
-            src.offsets = (LST_OFFSET,)
-        cog_translate(
-            str(src_tif),
-            str(COG_PATH),
-            cog_profiles.get("deflate"),
-            overview_resampling="average",
-            nodata=0,
-            quiet=True,
-        )
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-
-    is_valid, errors, warnings = cog_validate(str(COG_PATH))
-    print(f"wrote COG: {COG_PATH}  (decode: degC = DN*{LST_SCALE} + ({LST_OFFSET}))")
-    print(f"cog_validate: valid={is_valid} errors={errors} warnings={warnings}")
-    assert is_valid, f"output is not a valid COG: {errors}"
+    for path in (LST_COG, QA_COG):
+        with rasterio.open(path) as src:
+            print(
+                f"{path.name}: {src.count}x{src.width}x{src.height} {src.dtypes[0]} "
+                f"overviews={src.overviews(1)} nodata={src.nodata} "
+                f"scales={src.scales} offsets={src.offsets}"
+            )
+    print(f"COGs written to {OUT_DIR}")
     return 0
 
 

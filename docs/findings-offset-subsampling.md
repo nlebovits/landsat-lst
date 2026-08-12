@@ -18,9 +18,10 @@ number.
 
 ## Subsampling a loaded array does not help
 
-The obvious approach is to stride or coarsen the array after loading, which is the idiom already
-used in `zarr_writer.build_overviews()`. It cuts compute but **not** I/O: dask must materialize
-each source chunk before discarding most of it, so the bytes still cross the network.
+The obvious approach is to stride or coarsen the array after loading, which is the idiom overview
+building uses when it averages an already-materialized array down a level. It cuts compute but
+**not** I/O: dask must materialize each source chunk before discarding most of it, so the bytes
+still cross the network.
 
 At roughly 20 GB per full-resolution pass over 9.5 minutes, the work is network-bound. Only a
 coarser `resolution=` on `stac_load` reduces bytes fetched, because GDAL then serves the request
@@ -189,7 +190,7 @@ the numbers mean and it belongs in user-facing documentation rather than buried 
 
 The spatial correlation of 0.82 cannot by itself distinguish "seams removed" from "signal
 damaged", since seams carry real spatial variance and removing them must lower correlation.
-Only visual inspection separates those, which is why the COG export exists.
+Only visual inspection separates those, so the composites were opened in QGIS side by side.
 
 **QGIS verdict (2026-08-07): seams gone, and the native and factor-2 composites are visually
 identical.** That resolves the 0.82 in favour of "seams removed": the lost correlation is the

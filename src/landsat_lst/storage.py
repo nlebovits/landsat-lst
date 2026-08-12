@@ -1,39 +1,75 @@
-"""Storage abstraction for local, S3, and Icechunk Zarr backends.
+"""Storage abstraction for COG outputs, on local disk or S3.
 
-Supports three storage modes:
-- LocalStorage: Plain Zarr stores on local filesystem (testing)
-- S3Storage: Plain Zarr stores on S3 (production without versioning)
-- IcechunkStorage: Versioned Zarr in Icechunk repository (production with versioning)
+Two backends:
 
-See ADR-003 for architecture details.
+- :class:`LocalStorage`: writes under ``settings.output_dir`` (testing).
+- :class:`S3Storage`: writes under ``s3://{bucket}/{prefix}`` (production).
+
+Each tile-window produces **two** assets, ``lst_p95`` and ``qa_count``, laid out
+as ``lst-p95-{window}/{tile}/{product}_{window}_{tile}.tif``. The leading
+segment is the published collection id, so the pipeline writes every COG at the
+exact path the STAC catalog will declare and publication syncs metadata only.
+A test pins this prefix to ``catalog.spec.spec_for_window`` rather than an
+import, which would drag the whole catalog stack into every worker.
+
+Both assets must be present for a tile to count as done: a tile with one
+uploaded asset is a half-written tile and has to be rebuilt, so
+:meth:`StorageBackend.cog_exists` always checks both.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path  # noqa: TC003 - used at runtime in type hints
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from landsat_lst.config import settings
 
-if TYPE_CHECKING:
-    import icechunk as ic
+#: The two assets that together make one complete tile-window output.
+PRODUCTS: tuple[str, str] = ("lst_p95", "qa_count")
+
+
+def collection_prefix(window: str) -> str:
+    """The published collection id for one window, e.g. ``lst-p95-2021-2025``.
+
+    Must match ``catalog.spec.spec_for_window(window).collection_id``; the
+    contract is asserted by a unit test instead of an import so workers do not
+    pay for the catalog stack.
+    """
+    return f"lst-p95-{window}"
 
 
 class StorageBackend(ABC):
-    """Abstract base class for storage backends."""
+    """Abstract base class for COG storage backends."""
 
-    @abstractmethod
-    def zarr_exists(self, year: int | str, tile_name: str) -> bool:
-        """Check if a Zarr store already exists for this tile/window.
+    def cog_key(self, window: str, tile: str, product: str) -> str:
+        """Backend-relative key for one asset.
 
-        ``year`` is a window label: an ``int`` year (``2024``) or a multi-year
-        range string (``"2020-2024"``); it is the top-level group/prefix.
+        Concrete rather than abstract because the layout is the contract shared
+        by every backend: if local and S3 disagreed on it, a catalog built from
+        one would not resolve against the other.
+
+        Args:
+            window: Window label (``"2024"`` or ``"2021-2025"``).
+            tile: Tile name (``"N40W075"``).
+            product: Asset name, one of :data:`PRODUCTS`.
+
+        Returns:
+            ``lst-p95-{window}/{tile}/{product}_{window}_{tile}.tif``
         """
+        return f"{collection_prefix(window)}/{tile}/{product}_{window}_{tile}.tif"
 
     @abstractmethod
-    def zarr_path(self, year: int | str, tile_name: str) -> str:
-        """Return the path/URL where a Zarr store should be written."""
+    def cog_exists(self, window: str, tile: str) -> bool:
+        """Whether **both** assets for this tile-window are already stored."""
+
+    @abstractmethod
+    def upload(self, local: Path, key: str) -> None:
+        """Store ``local`` at ``key`` (as returned by :meth:`cog_key`)."""
+
+    @abstractmethod
+    def list_completed(self, window: str) -> set[str]:
+        """Tile names in ``window`` that have both assets stored."""
 
 
 class LocalStorage(StorageBackend):
@@ -43,20 +79,29 @@ class LocalStorage(StorageBackend):
         self.output_dir = output_dir or settings.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def zarr_exists(self, year: int | str, tile_name: str) -> bool:
-        return self._zarr_dir(year, tile_name).exists()
+    def cog_exists(self, window: str, tile: str) -> bool:
+        return all(
+            (self.output_dir / self.cog_key(window, tile, product)).exists() for product in PRODUCTS
+        )
 
-    def zarr_path(self, year: int | str, tile_name: str) -> str:
-        path = self._zarr_dir(year, tile_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return str(path)
+    def upload(self, local: Path, key: str) -> None:
+        dest = self.output_dir / key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(local.read_bytes())
 
-    def _zarr_dir(self, year: int | str, tile_name: str) -> Path:
-        return self.output_dir / str(year) / f"{tile_name}.zarr"
+    def list_completed(self, window: str) -> set[str]:
+        collection_dir = self.output_dir / collection_prefix(window)
+        if not collection_dir.is_dir():
+            return set()
+        return {
+            d.name
+            for d in collection_dir.iterdir()
+            if d.is_dir() and self.cog_exists(window, d.name)
+        }
 
 
 class S3Storage(StorageBackend):
-    """S3 storage for production (plain Zarr, no versioning)."""
+    """S3 storage for production."""
 
     def __init__(
         self,
@@ -77,129 +122,45 @@ class S3Storage(StorageBackend):
             self._client = boto3.client("s3", region_name=self.region)
         return self._client
 
-    def zarr_exists(self, year: int | str, tile_name: str) -> bool:
+    def _full_key(self, key: str) -> str:
+        """Resolve a backend-relative key against the bucket prefix."""
+        return f"{self.prefix}/{key}"
+
+    def _head(self, key: str) -> bool:
+        """Whether one object exists, distinguishing 404 from a real failure."""
         from botocore.exceptions import ClientError  # noqa: PLC0415
 
         try:
-            # Check for .zmetadata or zarr.json to verify Zarr store exists
-            self.client.head_object(
-                Bucket=self.bucket,
-                Key=f"{self._zarr_key(year, tile_name)}/.zmetadata",
-            )
-            return True
+            self.client.head_object(Bucket=self.bucket, Key=self._full_key(key))
         except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                # Try zarr.json for Zarr v3
-                try:
-                    self.client.head_object(
-                        Bucket=self.bucket,
-                        Key=f"{self._zarr_key(year, tile_name)}/zarr.json",
-                    )
-                    return True
-                except ClientError as e2:
-                    if e2.response["Error"]["Code"] == "404":
-                        return False
-                    raise
+            if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                return False
             raise
+        return True
 
-    def zarr_path(self, year: int | str, tile_name: str) -> str:
-        return f"s3://{self.bucket}/{self._zarr_key(year, tile_name)}"
+    def cog_exists(self, window: str, tile: str) -> bool:
+        return all(self._head(self.cog_key(window, tile, product)) for product in PRODUCTS)
 
-    def _zarr_key(self, year: int | str, tile_name: str) -> str:
-        return f"{self.prefix}/{year}/{tile_name}.zarr"
+    def upload(self, local: Path, key: str) -> None:
+        self.client.upload_file(str(local), self.bucket, self._full_key(key))
 
-
-class IcechunkStorage(StorageBackend):
-    """Icechunk repository storage for versioned Zarr writes.
-
-    All tiles are stored in a single repository as GeoZarr multiscale pyramids
-    (see ADR-004). The tile group carries GeoZarr proj/spatial/multiscales metadata;
-    native data lives in level subgroup ``0`` and overviews in ``1``/``2``/``3``:
-
-        /{year}/{tile_name}/        # GeoZarr multiscales + proj/spatial attrs
-            0/                      # native resolution
-                lst_p95/
-                qa_count/
-            1/ 2/ 3/                # 4x / 16x / 64x overviews
-
-    Each tile write is a single commit (native + all overviews), enabling
-    time-travel and audit trail.
-    """
-
-    def __init__(self, repo: ic.Repository):
-        self._repo = repo
-
-    @classmethod
-    def from_local(cls, path: Path) -> IcechunkStorage:
-        """Create IcechunkStorage with local filesystem backend."""
-        import icechunk as ic  # noqa: PLC0415
-
-        path.mkdir(parents=True, exist_ok=True)
-        storage = ic.local_filesystem_storage(str(path))
-        repo = ic.Repository.open_or_create(storage)
-        return cls(repo)
-
-    @classmethod
-    def from_s3(
-        cls,
-        bucket: str,
-        prefix: str,
-        region: str,
-    ) -> IcechunkStorage:
-        """Create IcechunkStorage with S3 backend."""
-        import icechunk as ic  # noqa: PLC0415
-
-        storage = ic.s3_storage(
-            bucket=bucket,
-            prefix=prefix,
-            region=region,
-            from_env=True,
-        )
-        repo = ic.Repository.open_or_create(storage)
-        return cls(repo)
-
-    def zarr_exists(self, year: int | str, tile_name: str) -> bool:
-        """Check if tile-year group exists in repository."""
-        import zarr  # noqa: PLC0415
-
-        try:
-            session = self._repo.readonly_session("main")
-            group_path = f"{year}/{tile_name}"
-            zarr.open_group(session.store, path=group_path, mode="r")
-            return True
-        except (KeyError, FileNotFoundError):
-            return False
-
-    def zarr_path(self, year: int | str, tile_name: str) -> str:
-        """Return the group path within Icechunk (not a file path)."""
-        return f"{year}/{tile_name}"
-
-    def writable_session(self) -> ic.Session:
-        """Get a writable session for the main branch."""
-        return self._repo.writable_session("main")
-
-    def readonly_session(self) -> ic.Session:
-        """Get a readonly session for reading."""
-        return self._repo.readonly_session("main")
-
-    @property
-    def repo(self) -> ic.Repository:
-        """Access the underlying repository."""
-        return self._repo
+    def list_completed(self, window: str) -> set[str]:
+        """One paginated listing of the window prefix, rather than 2N head requests."""
+        prefix = self._full_key(f"{collection_prefix(window)}/")
+        seen: set[str] = set()
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                seen.add(obj["Key"])
+        return {
+            tile
+            for tile in {key[len(prefix) :].split("/")[0] for key in seen}
+            if all(self._full_key(self.cog_key(window, tile, p)) in seen for p in PRODUCTS)
+        }
 
 
 def get_storage() -> StorageBackend:
     """Factory function to get the configured storage backend."""
-    if settings.use_icechunk:
-        if settings.storage_backend == "s3":
-            return IcechunkStorage.from_s3(
-                bucket=settings.s3_bucket,
-                prefix=f"{settings.s3_prefix}/{settings.icechunk_prefix}",
-                region=settings.s3_region,
-            )
-        icechunk_path = settings.output_dir / settings.icechunk_prefix
-        return IcechunkStorage.from_local(icechunk_path)
-
     if settings.storage_backend == "s3":
         return S3Storage()
     return LocalStorage()

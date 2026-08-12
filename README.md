@@ -11,10 +11,11 @@ This pipeline produces annual or multi-year LST composites for municipal decisio
 
 Before compositing, each scene is shifted by a single scene-wide offset estimated against a per-pixel monthly climatology, which removes the seams that satellite footprint boundaries would otherwise leave in the composite. Scenes needing an implausibly large correction are discarded rather than adjusted, and `qa_count` counts only the observations that survive. [`docs/methodology.md`](docs/methodology.md) explains the choices; [ADR-007](docs/adr/007-scene-normalization.md) carries the measurements.
 
-Data is tiled on a 5° global grid and stored as **GeoZarr multiscale pyramids**
-(versioned with Icechunk), published with a STAC catalog. Each tile is a pyramid:
-native resolution in level group `0` and coarsened overviews in `1`/`2`/`3` — see
-[Data Access](#data-access) and [ADR-004](docs/adr/004-geozarr-multiscale-overviews.md).
+Data is tiled on a 5° global grid and published as **Cloud-Optimized GeoTIFFs**, two
+per tile, cataloged as a single [Portolan](https://github.com/portolan-sdi/portolan-spec)
+STAC collection. Every tile is a window cut from one shared global grid, so the whole
+collection mosaics in QGIS, GDAL, TiTiler, or odc-stac without any reprojection step.
+See [Data Access](#data-access) and [ADR-009](docs/adr/009-cog-output-and-stac-catalog.md).
 
 ## Architecture
 
@@ -22,35 +23,33 @@ Design decisions are recorded as ADRs in [`docs/adr/`](docs/adr/README.md).
 
 ## Data Encoding
 
-LST bands are stored as **uint16** to reduce file size by 50%. To convert back to Celsius:
+LST is stored as **uint16** to halve the file size. The scale and offset are embedded as
+GDAL band metadata, so QGIS, `gdalinfo`, and rioxarray all report the decoding rule
+without being told. Most readers apply it for you:
 
 ```python
-import xarray as xr
-import fsspec
+import rioxarray
 
-# Open native resolution (multiscale level "0") from Source Coop
-mapper = fsspec.get_mapper(
-    "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr", anon=True
-)
-ds = xr.open_zarr(mapper, group="0")
+da = rioxarray.open_rasterio("lst_p95.tif", masked=True)
 
-# Read scale/offset from Zarr attributes
-scale = ds["lst_p95"].attrs["lst_scale_factor"]  # 0.01
-offset = ds["lst_p95"].attrs["lst_add_offset"]  # -50.0
-
-# Decode to Celsius
-celsius = ds["lst_p95"] * scale + offset
+# The decoding rule travels with the file.
+scale, offset = da.rio.scales[0], da.rio.offsets[0]  # 0.01, -50.0
+celsius = da * scale + offset
 ```
 
 **Quick decode (if you know the constants):**
 ```python
-celsius = ds["lst_p95"] * 0.01 + (-50.0)  # fill_value=0 is nodata
+celsius = dn * 0.01 + (-50.0)  # DN 0 is nodata
 ```
 
-| Variable | Name | Scale | Offset | Units |
-|----------|------|-------|--------|-------|
-| lst_p95 | 95th percentile LST | 0.01 | -50.0 | celsius |
-| qa_count | Valid observations per calendar month (uint8, 12 bands: `month` × lat × lon) | — | — | count |
+| Asset | Name | Dtype | Scale | Offset | Nodata | Units |
+|-------|------|-------|-------|--------|--------|-------|
+| lst_p95 | 95th percentile LST | uint16, 1 band | 0.01 | -50.0 | 0 | celsius |
+| qa_count | Valid observations per calendar month | uint8, 12 bands (Jan..Dec) | — | — | none | count |
+
+`qa_count` sets no nodata on purpose. A value of 0 means no valid observation survived
+de-striping that month, which is the number you need to diagnose a gap, so it stays
+visible rather than being masked away.
 
 ## Installation
 
@@ -100,7 +99,7 @@ landsat-lst list-tiles
 A `ProcessingJob` accepts an optional `end_year` to pool every scene across a
 multi-year window into a single P95 (percentiles are computed on the pooled
 scenes, never averaged across per-year P95s). The window label
-(`2024` or `2020-2024`) keys the output storage group and COG filenames:
+(`2024` or `2020-2024`) names the STAC collection the tile's COGs are published into:
 
 ```python
 from landsat_lst.models import ProcessingJob
@@ -110,7 +109,7 @@ from landsat_lst.tiling import parse_tile_name
 # Single year (backward compatible)
 job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2024)
 
-# Five-year window 2020-2024 -> group/COGs keyed "2020-2024"
+# Five-year window 2020-2024 -> collection "lst-p95-2020-2024"
 job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2020, end_year=2024)
 composite = process_tile(job)
 ```
@@ -123,87 +122,130 @@ For production-scale processing, the pipeline runs on [Coiled](https://coiled.io
 # Ensure AWS SSO session is active
 aws sso login --profile radiant-earth
 
-# Run E2E test for a single tile
-uv run python scripts/e2e_coiled_s3.py --tile N40W075 --year 2024
+# Run E2E test for a single tile over the production window
+uv run python scripts/e2e_coiled_s3.py --tile N40W075
+
+# A single year instead
+uv run python scripts/e2e_coiled_s3.py --tile N40W075 --year 2024 --end-year 2024
 
 # Dry run (show config without processing)
 uv run python scripts/e2e_coiled_s3.py --dry-run
 ```
 
-Output is written to Source Cooperative S3.
+Both COGs are uploaded to Source Cooperative S3, and the script verifies that each
+object exists and that the LST asset opens over HTTPS before printing its URLs.
 
 ## Data Access
 
-Each tile is stored as an independent GeoZarr multiscale pyramid on Source Cooperative.
-The tile store is a group of resolution levels — open level `0` for native resolution:
+The output is one Portolan STAC collection per window, one item per tile, and two COG
+assets per item. Once published on Source Cooperative the layout is:
 
-```python
-import xarray as xr
-import fsspec
-
-# Access a specific tile at native resolution (level "0")
-url = "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr"
-mapper = fsspec.get_mapper(url, anon=True)
-ds = xr.open_zarr(mapper, group="0")
-
-# Spatial subset (only fetches required chunks)
-subset = ds.lst_p95.sel(latitude=slice(42, 40), longitude=slice(-74, -75))
-
-# Decode uint16 to Celsius
-lst_celsius = subset * 0.01 + (-50.0)
+```
+nlebovits/landsat-lst/
+├── catalog.json
+└── lst-p95-2021-2025/
+    ├── collection.json
+    ├── items.parquet          # stac-geoparquet mirror of every item
+    ├── thumbnail.png
+    └── N40W075/
+        ├── N40W075.json       # STAC item
+        ├── lst_p95.tif        # uint16, 1 band
+        └── qa_count.tif       # uint8, 12 bands (Jan..Dec)
 ```
 
-#### Multiscale overviews (GeoZarr)
+Every asset is a window cut from one shared global grid at exactly 1/3600°, so tiles
+line up pixel for pixel and any number of them can be treated as a single raster.
 
-Each tile group follows the GeoZarr `multiscales` convention: native resolution is
-level `0`, with coarsened overviews in `1` (4x), `2` (16x), `3` (64x) for fast
-zoomed-out / web rendering. The tile group's attributes describe the pyramid:
-
-```python
-import zarr
-
-root = zarr.open_group(mapper, mode="r")  # the tile group
-print(root.attrs["multiscales"]["layout"])  # level layout + scale factors
-print(root.attrs["proj:code"], root.attrs["spatial:transform"])  # GeoZarr proj/spatial
-
-# Open a coarse overview (16x) instead of full resolution
-overview = xr.open_zarr(mapper, group="2")
-```
-
-### QGIS Access
-
-For QGIS users without native Zarr support, use rioxarray to convert to GeoTIFF:
+### Python
 
 ```python
 import rioxarray
-import fsspec
 
-url = "s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/2023/N40W075.zarr"
-ds = xr.open_zarr(fsspec.get_mapper(url, anon=True), group="0")
-ds["lst_p95"].rio.to_raster("lst_subset.tif")
-# Open lst_subset.tif in QGIS
+# Once published:
+url = "https://data.source.coop/nlebovits/landsat-lst/lst-p95-2021-2025/N40W075/lst_p95.tif"
+
+# Range requests: only the bytes for the requested window are fetched.
+da = rioxarray.open_rasterio(url, masked=True)
+subset = da.rio.clip_box(minx=-75, miny=40, maxx=-74, maxy=41)
+celsius = subset * da.rio.scales[0] + da.rio.offsets[0]
 ```
 
-See [docs/adr/003-direct-zarr-architecture.md](docs/adr/003-direct-zarr-architecture.md) for architecture details.
+For many tiles at once, load the STAC collection instead of the files:
 
-### COG export
+```python
+import odc.stac
+import pystac_client
 
-QGIS-ready Cloud-Optimized GeoTIFFs are produced by the reusable
-[`landsat_lst.cog`](src/landsat_lst/cog.py) module (`cog_export`), which derives
-two COGs from a native-resolution composite level:
+catalog = pystac_client.Client.open("https://data.source.coop/nlebovits/landsat-lst")
+items = list(catalog.get_collection("lst-p95-2021-2025").get_items())
+mosaic = odc.stac.load(items, bands=["lst_p95"], chunks={})
+```
 
-- a **single-band LST COG** with GDAL scale/offset embedded, so viewers auto-decode
-  DN to Celsius (`degC = DN * 0.01 - 50`); and
-- a **12-band monthly QA COG** (one `qa_count` band per calendar month, no nodata so
-  a value of 0 = "no valid observations that month" stays visible for gap diagnosis).
+### QGIS
+
+No plugin and no download. In QGIS, choose **Layer > Add Layer > Add Raster Layer**, set
+the source type to **Protocol: HTTP(S)**, and paste the asset URL. QGIS reads the
+overviews for the current zoom and applies the embedded scale and offset, so the layer
+shows Celsius immediately.
+
+### gdalinfo
+
+```bash
+gdalinfo /vsicurl/https://data.source.coop/nlebovits/landsat-lst/\
+lst-p95-2021-2025/N40W075/lst_p95.tif
+```
+
+The report shows the block size, the overview levels, the band scale and offset, and the
+embedded statistics. Statistics are written into the file rather than a `.aux.xml`
+sidecar, so a reader working over HTTPS gets them too.
+
+### Producing COGs from a composite
+
+[`landsat_lst.cog`](src/landsat_lst/cog.py) writes the same pair the pipeline publishes.
+It takes a composite already encoded to the uint16 contract in
+[`landsat_lst.encoding`](src/landsat_lst/encoding.py):
 
 ```python
 import xarray as xr
 from landsat_lst.cog import cog_export
+from landsat_lst.encoding import encode_lst_uint16
+from landsat_lst.models import ProcessingJob
+from landsat_lst.pipeline import process_tile
+from landsat_lst.tiling import parse_tile_name
 
-native = xr.open_zarr(store, group="2020-2024/0")  # decoded native level
-cog_export(native, "lst.tif", "qa_monthly.tif")
+job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2021, end_year=2025)
+composite = process_tile(job).compute()
+
+native = xr.Dataset(
+    {
+        "lst_p95": encode_lst_uint16(composite["lst_p95"]),
+        "qa_count": composite["qa_count"],
+    }
+)
+cog_export(native, "lst_p95.tif", "qa_count.tif")
 ```
+
+### Publishing the catalog
+
+```bash
+landsat-lst catalog build \
+  --source s3://bucket/prefix \
+  --out ./catalog
+landsat-lst catalog validate ./catalog
+landsat-lst catalog publish ./catalog \
+  --remote s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/ \
+  --dry-run
+```
+
+`publish` uploads each object with the media type its extension declares, re-sends JSON
+and markdown every time, and skips an asset whose remote size already matches. Add
+`--live --live-base-url https://data.source.coop/nlebovits/landsat-lst/` to `validate`
+to probe the hosting server for range support, CORS, and Content-Length once the tree is
+up.
+
+The dataset is not published yet. The operational sequence, including the two decisions
+still open, is written down in
+[`docs/runbook-publication.md`](docs/runbook-publication.md).
 
 ## Architecture
 
@@ -211,9 +253,9 @@ See [docs/adr/001-architecture-decisions.md](docs/adr/001-architecture-decisions
 
 Key choices:
 - **Data source**: Earth Search (Landsat C2 L2)
-- **Output format**: Zarr v3 with 500×500 chunks
+- **Output format**: COG with 512×512 blocks, published as a Portolan STAC catalog ([ADR-009](docs/adr/009-cog-output-and-stac-catalog.md))
 - **CRS**: EPSG:4326
-- **Tiling**: 5° × 5° grid
+- **Tiling**: 5° × 5° grid on one shared global grid at 1/3600° ([ADR-008](docs/adr/008-global-mosaic-topology.md))
 - **Temporal**: Multi-year window composites (pooled P95); production default 2021–2025
 - **Spatial**: Land only, ±60° latitude
 
@@ -316,9 +358,11 @@ their own:
 Notable scripts in [`scripts/`](scripts/):
 
 - `pergamino_multiyear_decision.py` — multi-window (1/3/5-year) decision driver that
-  writes GeoZarr pyramids + COGs and emits a `report.md` of gap/striping and measured
-  compression metrics. Runs locally against Planetary Computer; `--no-frisky` forces
+  writes the COG pair per window and emits a `report.md` of gap/striping and measured
+  compression metrics. Runs locally against Planetary Computer. `--no-frisky` forces
   plain Dask.
+- `smoke_small_tile_cog.py` — runs the whole chain on a ~0.2° slice of Pergamino, which is
+  cheap enough to confirm STAC query through COG export without recomputing a 5° tile.
 - `season_aware_p95_test.py` — the original prototype of season-aware de-striping. The
   method now ships in `landsat_lst.normalization`; this script remains as the standalone
   driver the investigation used. See

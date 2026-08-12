@@ -8,7 +8,6 @@ Key assumptions tested:
 2. odc.stac loading behavior (bands, dtype, CRS)
 3. QA pixel bit structure for cloud/shadow/snow masking
 4. Thermal band scale/offset for temperature conversion
-5. Icechunk repository creation
 
 Note: Uses Microsoft Planetary Computer (free, no requester-pays).
 """
@@ -316,22 +315,3 @@ class TestTemperatureConversionAssumptions:
 
         assert -60 < min_temp < 60, f"Min temp out of range: {min_temp}°C"
         assert -30 < max_temp < 80, f"Max temp out of range: {max_temp}°C"
-
-
-# =============================================================================
-# Icechunk Assumption Tests
-# =============================================================================
-
-
-@pytest.mark.slow
-@pytest.mark.assumption
-class TestIcechunkAssumptions:
-    """Validate Icechunk storage basics."""
-
-    def test_create_local_repository(self, tmp_path):
-        """Can create local Icechunk repository."""
-        import icechunk
-
-        storage = icechunk.local_filesystem_storage(str(tmp_path / "icechunk"))
-        repo = icechunk.Repository.create(storage)
-        assert repo is not None

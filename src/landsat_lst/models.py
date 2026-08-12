@@ -85,11 +85,16 @@ class ProcessingJob(BaseModel):
             return str(self.year)
         return f"{self.year}-{self.end_year}"
 
-    @computed_field
-    @property
-    def output_filename(self) -> str:
-        """Output COG filename."""
-        return f"lst_{self.window_label}_{self.tile.name}.tif"
+    def asset_filename(self, product: str) -> str:
+        """Filename for one output asset of this job.
+
+        Args:
+            product: Asset name, ``"lst_p95"`` or ``"qa_count"``.
+
+        Returns:
+            ``{product}_{window_label}_{tile}.tif``
+        """
+        return f"{product}_{self.window_label}_{self.tile.name}.tif"
 
 
 class CompositeStats(BaseModel):

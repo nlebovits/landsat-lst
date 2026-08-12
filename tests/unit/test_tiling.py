@@ -191,10 +191,14 @@ class TestGlobalGeobox:
         """Integer pixels-per-degree gives whole-pixel global dimensions."""
         assert global_geobox().shape == (432_000, 1_296_000)
 
-    def test_divides_by_every_pyramid_factor(self):
-        """Overviews of the global array never trim, at any configured factor."""
+    def test_divides_by_every_overview_factor(self):
+        """Overviews of the global array never trim, down to the coarsest level.
+
+        64 is the deepest factor the pyramid reaches; the intermediate powers of
+        two below it divide whatever 64 does.
+        """
         height, width = global_geobox().shape
-        for factor in settings.pyramid_factors:
+        for factor in (4, 16, 64):
             assert height % factor == 0, f"{height} not divisible by {factor}"
             assert width % factor == 0, f"{width} not divisible by {factor}"
 

@@ -8,7 +8,7 @@
 
 This pipeline produces global annual Land Surface Temperature (LST) composites from Landsat Collection 2 Level-2 data. The output is intended for municipal decision-makers analyzing urban heat, not for research scientists who would composite raw data themselves.
 
-Output will be hosted on Source Cooperative as Zarr stores with STAC catalog. See [ADR-003](adr/003-direct-zarr-architecture.md) for the architecture pivot from COG+Icechunk to direct Zarr.
+Output is hosted on Source Cooperative as per-tile COGs in a STAC catalog. See [ADR-009](009-cog-output-and-stac-catalog.md) for the current output architecture, and [ADR-003](003-direct-zarr-architecture.md) for the Zarr interlude between the two.
 
 ---
 
@@ -193,24 +193,32 @@ lst_celsius = lst_kelvin - 273.15
 
 ### 11. Output Format
 
-> **⚠️ SUPERSEDED (2026-05-08):** This section's COG decision has been superseded by [ADR-003](003-direct-zarr-architecture.md), which pivots to direct Zarr writes. The historical context below is preserved for reference.
+> **RESTORED (2026-08-12):** COG is the output format again. [ADR-003](003-direct-zarr-architecture.md)
+> superseded this section in 2026-05-08 and has itself been superseded by
+> [ADR-009](009-cog-output-and-stac-catalog.md), which is the current authority on output format,
+> catalog shape, and overview strategy. The Zarr interlude is recorded below for history.
 
-**Decision:** ~~Cloud-Optimized GeoTIFF (COG)~~ → **Zarr v3** (see ADR-003)
+**Decision:** Cloud-Optimized GeoTIFF (COG). See [ADR-009](009-cog-output-and-stac-catalog.md) for
+the current specification, including the two assets per tile and the per-product overview rules.
 
-| Property | Original (COG) | Current (Zarr) |
-|----------|----------------|----------------|
-| Format | COG | Zarr v3 |
-| Compression | DEFLATE | Blosc (zstd) |
-| Chunk size | 512×512 | 500×500 |
-| Data type | uint16 | uint16 |
-| Nodata/Fill | 0 | 0 |
+| Property | Original (COG) | Zarr interlude | Current (COG, ADR-009) |
+|----------|----------------|----------------|------------------------|
+| Format | COG | Zarr v3 | COG |
+| Compression | DEFLATE | Blosc (zstd) | DEFLATE |
+| Block/chunk size | 512×512 | 500×500 | 512×512 |
+| Data type | uint16 | uint16 | uint16 (LST), uint8 (QA) |
+| Nodata/Fill | 0 | 0 | 0 (LST), none (QA) |
 
-**Why the pivot:** GDAL requires COG block sizes to be multiples of 16, but VirtualZarr concatenation requires array dimensions evenly divisible by chunk size. Our ~18,500 pixel tiles have no chunk size satisfying both constraints. Direct Zarr writes avoid this conflict entirely.
+**Why the pivot happened, and why it reversed:** GDAL requires COG block sizes to be multiples of
+16, and VirtualZarr concatenation requires array dimensions evenly divisible by the chunk size.
+No chunk size satisfied both against the tile shape of the day, so ADR-003 dropped the COG. It
+dropped VirtualZarr in the same document, which removed the second half of the conflict. With no
+virtual byte-range layer, 512 satisfies GDAL and nothing else has an opinion. ADR-009 records the
+full reasoning.
 
-**Chunk size rationale (500×500):**
-- 18,500 ÷ 500 = 37 exactly (no partial edge chunks)
-- No GDAL multiple-of-16 constraint for Zarr
-- Aligns with industry practice (Earthmover, Dynamical.org use non-power-of-2 chunks)
+**Chunk size history (500×500):** chosen for the Zarr interlude because 18,500 ÷ 500 = 37 exactly
+and Zarr has no multiple-of-16 constraint. Superseded twice over. The tile is now 18,000 px on the
+shared global grid of [ADR-008](008-global-mosaic-topology.md), and the COG block is 512.
 
 <details>
 <summary>Historical COG rationale (superseded)</summary>
@@ -229,7 +237,8 @@ Non-power-of-2 chunk sizes are standard in geospatial (when GDAL constraint is m
 </details>
 
 **References:**
-- [ADR-003: Direct Zarr Architecture](003-direct-zarr-architecture.md) — current architecture
+- [ADR-009: COG output and STAC catalog](009-cog-output-and-stac-catalog.md) — current architecture
+- [ADR-003: Direct Zarr Architecture](003-direct-zarr-architecture.md) — the superseded interlude
 - [findings-direct-zarr-spike.md](../findings-direct-zarr-spike.md) — validation findings
 
 ---
@@ -326,11 +335,12 @@ landsat-lst-annual/
 
 **Decision:** Source Cooperative
 
-> **Updated (2026-05-08):** Per [ADR-003](003-direct-zarr-architecture.md), output format changed from COG to Zarr.
+> **Updated (2026-08-12):** Per [ADR-009](009-cog-output-and-stac-catalog.md), the output format
+> is COG again after the Zarr interlude of [ADR-003](003-direct-zarr-architecture.md).
 
-- **Zarr stores** on Source Cooperative (one per tile)
-- STAC catalog published (pointing to Zarr stores)
-- Direct xarray access via `xr.open_zarr()`
+- **COGs** on Source Cooperative, two assets per tile
+- Portolan STAC catalog published, one collection per window
+- Direct access via `rioxarray.open_rasterio()`, GDAL, or any STAC client
 
 **Rationale:** Source Cooperative is the appropriate home for open geospatial data products.
 
@@ -338,9 +348,10 @@ landsat-lst-annual/
 
 ### 16. Retry/Resume with Idempotent Writes
 
-> **Updated (2026-05-08):** Per [ADR-003](003-direct-zarr-architecture.md), Icechunk commits replaced with direct Zarr writes. The core retry/resume pattern remains.
+> **Updated (2026-08-12):** Per [ADR-009](009-cog-output-and-stac-catalog.md), the unit of work is
+> a tile's two COGs and completion means both objects exist. The core retry/resume pattern remains.
 
-**Decision:** Idempotent per-tile Zarr writes with existence checks
+**Decision:** Idempotent per-tile writes with existence checks
 
 **Context:** Global processing = 10,000+ tile-year jobs. Failures are guaranteed (network errors, OOM, spot preemption). Without checkpointing, partial progress is lost and re-runs redo completed work.
 
