@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -66,7 +65,17 @@ def _build_jobs(year: int | None, end_year: int | None, tiles: tuple[str, ...]) 
     "--distributed",
     "-d",
     is_flag=True,
-    help="Run on Coiled workers instead of locally (writes a run manifest)",
+    help="Submit to Coiled Batch, one VM per tile, instead of running locally",
+)
+@click.option(
+    "--wait",
+    is_flag=True,
+    help="With --distributed, block until the run finishes and reconcile it",
+)
+@click.option(
+    "--run-id",
+    default=None,
+    help="Run token. Set by the batch task so each VM reports into the same run.",
 )
 @click.option("--limit", type=int, help="Process at most N tiles from the job list")
 def process(
@@ -77,14 +86,17 @@ def process(
     dry_run: bool,
     force: bool,
     distributed: bool,
+    wait: bool,
+    run_id: str | None,
     limit: int | None,
 ) -> None:
     """Process Landsat data to COG composites.
 
     With no --year, processes the production window (2021-2025). Passing --year
     alone builds a single-year composite; add --end-year for a custom window.
-    With --distributed, jobs run on Coiled in settings.coiled_region and a JSON
-    manifest is written under settings.manifest_dir.
+    With --distributed, tiles are submitted to Coiled Batch and this command
+    returns immediately; run `landsat-lst reconcile RUN_ID` afterwards to write
+    the manifest, or pass --wait to do both in one go.
     """
     jobs = _build_jobs(year, end_year, tiles)
     if limit is not None:
@@ -108,13 +120,18 @@ def process(
         return
 
     if distributed:
-        _process_distributed(jobs, force=force)
+        _process_distributed(jobs, force=force, run_id=run_id, wait=wait)
     else:
-        _process_local(jobs, force=force)
+        _process_local(jobs, force=force, run_id=run_id)
 
 
-def _process_local(jobs: list, *, force: bool) -> None:
-    """Process jobs sequentially in this process with a progress bar."""
+def _process_local(jobs: list, *, force: bool, run_id: str | None = None) -> None:
+    """Process jobs sequentially in this process with a progress bar.
+
+    This is also the code path a Coiled Batch VM runs, with one tile and a
+    ``run_id``. The progress bar renders to the task's log; the run record it
+    writes for that tile is what reconciliation reads.
+    """
     from landsat_lst.job import process_tile_job
 
     with Progress(
@@ -130,7 +147,7 @@ def _process_local(jobs: list, *, force: bool) -> None:
 
         for job in jobs:
             progress.update(task, description=f"Processing {job.tile.name}...")
-            result = process_tile_job(job, force=force)
+            result = process_tile_job(job, force=force, run_id=run_id)
 
             if result.status == "completed":
                 completed += 1
@@ -147,39 +164,83 @@ def _process_local(jobs: list, *, force: bool) -> None:
     console.print(f"  Skipped: [yellow]{skipped}[/yellow]")
     if failed:
         console.print(f"  Failed: [red]{failed}[/red]")
+        # A batch task must exit non-zero on failure, or Coiled's retries and
+        # the task state a manifest falls back on both report success.
+        raise SystemExit(1)
 
 
-def _process_distributed(jobs: list, *, force: bool) -> None:
-    """Dispatch jobs to Coiled and report the manifest.
-
-    No per-tile progress bar: the Coiled dashboard is the live progress UI;
-    the manifest is the durable record.
-    """
-    from datetime import datetime
-
-    from landsat_lst.config import settings
-    from landsat_lst.job import run_distributed
-
-    window = jobs[0].window_label if jobs else "empty"
-    run_id = f"{window}-{datetime.now(tz=UTC):%Y%m%dT%H%M%SZ}"
-    console.print(f"  Run id: {run_id}")
-    console.print(f"  Region: {settings.coiled_region}  Workers: {settings.coiled_n_workers}")
-    console.print("  Progress: https://cloud.coiled.io (cluster lst-" + run_id + ")")
-
-    results = run_distributed(jobs, force=force, run_id=run_id)
-
+def _print_results(results: list) -> None:
+    """Render reconciled per-tile outcomes."""
     completed = sum(1 for r in results if r.status == "completed")
     skipped = sum(1 for r in results if r.status == "skipped")
-    failed = sum(1 for r in results if r.status == "failed")
+    failed = [r for r in results if r.status == "failed"]
 
     console.print("\n[bold]Results:[/bold]")
     console.print(f"  Completed: [green]{completed}[/green]")
     console.print(f"  Skipped: [yellow]{skipped}[/yellow]")
     if failed:
-        console.print(f"  Failed: [red]{failed}[/red]")
-        for r in results:
-            if r.status == "failed":
-                console.print(f"    [red]{r.job.tile.name}: {r.error}[/red]")
+        console.print(f"  Failed: [red]{len(failed)}[/red]")
+        for r in failed:
+            console.print(f"    [red]{r.job.tile.name}: {r.error}[/red]")
+
+
+def _process_distributed(jobs: list, *, force: bool, run_id: str | None, wait: bool) -> None:
+    """Submit jobs to Coiled Batch and hand back the run token.
+
+    No per-tile progress bar and no held connection: the Coiled dashboard is
+    the live progress UI, and the manifest built by `reconcile` is the durable
+    record. Closing this shell does not touch the run.
+    """
+    from landsat_lst.batch import reconcile_run, submit_batch, wait_for_batch
+    from landsat_lst.config import settings
+
+    console.print(
+        f"  Region: {settings.coiled_region}  "
+        f"VMs: up to {settings.coiled_max_workers}  "
+        f"Types: {', '.join(settings.coiled_vm_types)}"
+    )
+
+    submission = submit_batch(jobs, force=force, run_id=run_id)
+    console.print(f"  Run id: [bold]{submission.run_id}[/bold]")
+
+    if submission.cluster_id is None:
+        console.print("  [yellow]Every tile is already complete; no cluster started.[/yellow]")
+        _print_results(reconcile_run(submission.run_id))
+        return
+
+    console.print(f"  Cluster: {submission.cluster_id}  Tasks: {len(submission.submitted_tiles)}")
+    console.print(f"  Progress: {submission.dashboard_url}")
+
+    if not wait:
+        console.print(
+            f"\n  Submitted. This shell is free to close.\n"
+            f"  When it finishes: [bold]landsat-lst reconcile {submission.run_id}[/bold]"
+        )
+        return
+
+    console.print("\n  Waiting for the run to finish (Ctrl-C is safe; the run continues)...")
+    state = wait_for_batch(submission.run_id)
+    console.print(f"  Final job state: {state or 'unknown'}")
+    _print_results(reconcile_run(submission.run_id))
+    console.print(f"  Manifest: {settings.manifest_dir / (submission.run_id + '.json')}")
+
+
+@main.command()
+@click.argument("run_id")
+def reconcile(run_id: str) -> None:
+    """Build the run manifest for a submitted batch run.
+
+    Reads the COG listing for what finished, the per-tile run records for
+    duration, scene count, and peak memory, and Coiled's task states for why a
+    tile without output has none. Safe to run more than once, and safe to run
+    while tasks are still going: tiles with no COGs yet report as failed.
+    """
+    from landsat_lst.batch import reconcile_run
+    from landsat_lst.config import settings
+
+    console.print(f"[bold]Reconciling run {run_id}[/bold]")
+    results = reconcile_run(run_id)
+    _print_results(results)
     console.print(f"  Manifest: {settings.manifest_dir / (run_id + '.json')}")
 
 

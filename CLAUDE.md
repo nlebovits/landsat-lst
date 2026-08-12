@@ -74,10 +74,20 @@ composite = process_tile(job)  # ✅ Includes land mask
 job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2021, end_year=2025)
 composite = process_tile(job)  # ✅ Includes land mask
 
-# Option 3: Distributed (Coiled)
-from landsat_lst.job import run_distributed, generate_jobs
-jobs = generate_jobs()              # 700 tiles x 2021-2025
-results = run_distributed(jobs)     # ✅ Includes land mask
+# Option 3: Distributed (Coiled Batch, one VM per tile)
+from landsat_lst.batch import submit_batch, reconcile_run
+from landsat_lst.job import generate_jobs
+
+jobs = generate_jobs()                    # 700 tiles x 2021-2025
+submission = submit_batch(jobs)           # returns immediately; run outlives this process
+results = reconcile_run(submission.run_id)  # after the run: builds the manifest
+```
+
+Or from the CLI:
+
+```bash
+landsat-lst process --distributed     # submits, prints a run id, returns
+landsat-lst reconcile <run-id>        # builds the manifest afterwards
 ```
 
 ### DO NOT use `compute_annual_composite()` directly
@@ -88,6 +98,36 @@ Calling it bare gives you an unmasked composite whose de-striping offsets were
 estimated over ocean as well as land. Only use it for benchmarking or when you
 explicitly don't want ocean masking. (Despite the name, it also handles
 multi-year windows — it pools whatever scenes it is given.)
+
+---
+
+## Distributed execution — Coiled Batch, never Coiled Functions
+
+Each tile runs as a plain process on its own VM. Do not put `process_tile_job` back inside a
+dask cluster's worker: a multi-hour tile graph inside another cluster killed three validation
+runs on 2026-08-12, first by escaping to the shared scheduler, then by crushing it with three
+tiles at once, then by starving the worker heartbeat until Coiled tore the VM down mid-tile.
+See [ADR-010](docs/adr/010-coiled-batch-for-distributed-runs.md).
+
+Two phases that never share a process:
+
+```bash
+landsat-lst process --distributed   # submits, prints a run id, returns
+landsat-lst reconcile <run-id>      # builds the manifest from S3 afterwards
+```
+
+Rules worth keeping:
+
+- **Completion is bytes in the bucket, not a task exit code.** A task can exit non-zero after its
+  COGs landed. `storage.list_completed()` decides status; exit codes only explain a tile that has
+  no output.
+- **The submitting shell is disposable.** Nothing may require it to stay open. `submit_batch`
+  writes `{run_id}.submission.json` before returning, and that file is all `reconcile_run` needs.
+- **Each VM reports for itself** to `_runs/{run_id}/{tile}.json` (duration, scene count, peak RSS,
+  error). A missing record is ordinary, not an error: preempted and timed-out VMs never write one.
+- **VMs carry 64 GiB.** A heavy tile OOMed at 28.77 GiB on a 32 GiB `r6i.xlarge`.
+- **Cost caps are `coiled_max_workers` (concurrent VMs) and `coiled_job_timeout`** (per-task
+  wall clock), not a fixed cluster size.
 
 ---
 

@@ -210,3 +210,91 @@ class TestCatalogLayoutContract:
         storage = LocalStorage(output_dir=tmp_path)
         key = storage.cog_key("2021-2025", "N40W075", "lst_p95")
         assert key.startswith(spec_for_window("2021-2025").collection_id + "/")
+
+
+class TestRunRecords:
+    """Per-tile run records: what a batch VM leaves behind for reconciliation."""
+
+    def test_key_layout(self, tmp_path):
+        storage = LocalStorage(output_dir=tmp_path)
+
+        assert storage.run_record_key("2021-2025-abc", "N40W075") == (
+            "_runs/2021-2025-abc/N40W075.json"
+        )
+
+    def test_backends_agree_on_layout(self, tmp_path):
+        local = LocalStorage(output_dir=tmp_path)
+        s3 = S3Storage(bucket="b", prefix="p", region="r")
+
+        assert local.run_record_key("r", "N40W075") == s3.run_record_key("r", "N40W075")
+
+    def test_records_sit_outside_the_published_collections(self, tmp_path):
+        """The catalog reads lst-p95-*; run records must not land in there."""
+        storage = LocalStorage(output_dir=tmp_path)
+
+        assert not storage.run_record_key("r", "N40W075").startswith(collection_prefix("2021-2025"))
+
+    def test_local_roundtrip(self, tmp_path):
+        storage = LocalStorage(output_dir=tmp_path)
+        key = storage.run_record_key("r", "N40W075")
+
+        storage.write_text(key, '{"status": "completed"}')
+
+        assert storage.read_text(key) == '{"status": "completed"}'
+
+    def test_local_read_missing_returns_none(self, tmp_path):
+        """A tile whose VM died before reporting is normal, not an error."""
+        storage = LocalStorage(output_dir=tmp_path)
+
+        assert storage.read_text("_runs/r/N40W075.json") is None
+
+    def test_local_write_replaces(self, tmp_path):
+        storage = LocalStorage(output_dir=tmp_path)
+        key = storage.run_record_key("r", "N40W075")
+
+        storage.write_text(key, "first")
+        storage.write_text(key, "second")
+
+        assert storage.read_text(key) == "second"
+
+    def test_s3_write_uses_the_full_key(self):
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        storage._client = MagicMock()
+
+        storage.write_text("_runs/r/N40W075.json", "{}")
+
+        kwargs = storage._client.put_object.call_args.kwargs
+        assert kwargs["Bucket"] == "b"
+        assert kwargs["Key"] == "p/_runs/r/N40W075.json"
+        assert kwargs["Body"] == b"{}"
+
+    def test_s3_read_returns_body(self):
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        storage._client = MagicMock()
+        storage._client.get_object.return_value = {"Body": MagicMock(read=lambda: b"{}")}
+
+        assert storage.read_text("_runs/r/N40W075.json") == "{}"
+
+    def test_s3_missing_key_returns_none(self):
+        from botocore.exceptions import ClientError
+
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        storage._client = MagicMock()
+        storage._client.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+        )
+
+        assert storage.read_text("_runs/r/N40W075.json") is None
+
+    def test_s3_other_errors_propagate(self):
+        """A denied read is a broken run, not an absent record."""
+        from botocore.exceptions import ClientError
+
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        storage._client = MagicMock()
+        storage._client.get_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "GetObject"
+        )
+
+        with pytest.raises(ClientError):
+            storage.read_text("_runs/r/N40W075.json")

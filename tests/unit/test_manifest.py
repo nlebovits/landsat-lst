@@ -51,6 +51,8 @@ def test_writes_manifest_with_counts_and_tiles(results, tmp_path):
     assert payload["counts"] == {"total": 3, "completed": 1, "skipped": 1, "failed": 1}
     assert payload["config"]["retries"] == 3
     assert payload["config"]["region"] == "us-west-2"
+    assert payload["config"]["max_workers"] == 4
+    assert payload["config"]["job_timeout"] == "6 hours"
 
     by_tile = {t["tile"]: t for t in payload["tiles"]}
     assert by_tile["N40W075"]["duration_s"] == 812.3
@@ -87,3 +89,35 @@ def test_roundtrips_valid_json(results, tmp_path):
     payload = json.loads(path.read_text())
     assert len(payload["tiles"]) == 3
     assert payload["started_at"] < payload["finished_at"]
+
+
+def test_records_the_cluster_that_ran_it(results, tmp_path):
+    """Task logs live in Coiled; the manifest has to say where to find them."""
+    path = write_run_manifest(
+        results,
+        run_id="r3",
+        window="2021-2025",
+        started_at=datetime.now(tz=UTC),
+        retries=3,
+        cluster_id=4242,
+        job_id=77,
+        out_dir=tmp_path,
+    )
+
+    payload = json.loads(path.read_text())
+    assert payload["cluster_id"] == 4242
+    assert payload["job_id"] == 77
+
+
+def test_cluster_is_null_when_nothing_was_submitted(results, tmp_path):
+    path = write_run_manifest(
+        results,
+        run_id="r4",
+        window="2021-2025",
+        started_at=datetime.now(tz=UTC),
+        retries=3,
+        out_dir=tmp_path,
+    )
+
+    payload = json.loads(path.read_text())
+    assert payload["cluster_id"] is None
