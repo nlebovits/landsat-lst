@@ -9,8 +9,8 @@ Derives QGIS-ready COGs from a native-resolution composite level:
   descriptions set accordingly. **No nodata** is set: a value of 0 is meaningful
   (no valid observations that month) and must stay visible for gap diagnosis.
 
-The input is the decoded native level (``uint16`` LST DN + ``uint8`` per-month
-counts), e.g. ``xr.open_zarr(store, group=f"{group}/0")``.
+The input is the encoded native-resolution dataset (``uint16`` LST DN + ``uint8``
+per-month counts), as produced by the pipeline before export.
 
 Three properties of the writer are load-bearing and easy to regress:
 
