@@ -162,10 +162,7 @@ line up pixel for pixel and any number of them can be treated as a single raster
 import rioxarray
 
 # Once published:
-url = (
-    "https://data.source.coop/nlebovits/landsat-lst/"
-    "lst-p95-2021-2025/N40W075/lst_p95.tif"
-)
+url = "https://data.source.coop/nlebovits/landsat-lst/lst-p95-2021-2025/N40W075/lst_p95.tif"
 
 # Range requests: only the bytes for the requested window are fetched.
 da = rioxarray.open_rasterio(url, masked=True)
