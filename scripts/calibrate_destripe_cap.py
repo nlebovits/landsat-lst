@@ -11,7 +11,9 @@ it before treating the default as settled.
 
     uv run python scripts/calibrate_destripe_cap.py
 
-Uses Planetary Computer per CLAUDE.md: Earth Search costs egress from a laptop.
+Defaults to Planetary Computer per CLAUDE.md: Earth Search costs egress from a
+laptop. Pass ``--stac earth-search`` when running on AWS (e.g. ``coiled run``
+in us-west-2), where Earth Search reads are same-region and free.
 """
 
 import argparse
@@ -26,12 +28,11 @@ CANDIDATE_CAPS = [5.0, 7.5, 10.0, 12.5, 15.0, 20.0, 25.0, 30.0]
 DEFAULT_BBOX = [-61.1, -34.4, -60.1, -33.4]
 
 
-def _load_lst(bbox: tuple, year: int, end_year: int):
+def _load_lst(bbox: tuple, year: int, end_year: int, *, sign_pc: bool = True):
     """Load a QA-masked Celsius LST stack for the window."""
     import pystac_client  # noqa: PLC0415
     import structlog  # noqa: PLC0415
 
-    from landsat_lst.azure_auth import enable_pc_azure_refresh  # noqa: PLC0415
     from landsat_lst.config import settings  # noqa: PLC0415
     from landsat_lst.pipeline import load_scenes  # noqa: PLC0415
     from landsat_lst.qa import apply_qa_mask, convert_to_celsius  # noqa: PLC0415
@@ -54,7 +55,13 @@ def _load_lst(bbox: tuple, year: int, end_year: int):
         msg = "no scenes"
         raise ValueError(msg)
 
-    patch_url = enable_pc_azure_refresh(items)
+    # Azure SAS signing is Planetary Computer-specific; Earth Search assets
+    # are plain requester-pays S3 reads.
+    patch_url = None
+    if sign_pc:
+        from landsat_lst.azure_auth import enable_pc_azure_refresh  # noqa: PLC0415
+
+        patch_url = enable_pc_azure_refresh(items)
     data = load_scenes(items, bbox, patch_url=patch_url, fail_on_error=False)
     return convert_to_celsius(apply_qa_mask(data)["lwir11"])
 
@@ -84,6 +91,13 @@ def main() -> int:
     parser.add_argument(
         "--out", type=Path, default=Path("results/decision/destripe_cap_calibration.json")
     )
+    parser.add_argument(
+        "--stac",
+        choices=("pc", "earth-search"),
+        default="pc",
+        help="STAC endpoint: pc (Planetary Computer, local default) or "
+        "earth-search (keep the config default; use on AWS/Coiled)",
+    )
     args = parser.parse_args()
 
     import structlog  # noqa: PLC0415
@@ -92,7 +106,8 @@ def main() -> int:
     from landsat_lst.config import STAC_PLANETARY_COMPUTER, settings  # noqa: PLC0415
     from landsat_lst.normalization import scene_offsets  # noqa: PLC0415
 
-    settings.stac_url = STAC_PLANETARY_COMPUTER
+    if args.stac == "pc":
+        settings.stac_url = STAC_PLANETARY_COMPUTER
     log = structlog.get_logger()
 
     window = f"{args.year}-{args.end_year}"
@@ -109,7 +124,7 @@ def main() -> int:
     log.info("dask_ready", window=window, chunk=settings.load_chunk_size)
 
     try:
-        lst = _load_lst(bbox, args.year, args.end_year)
+        lst = _load_lst(bbox, args.year, args.end_year, sign_pc=args.stac == "pc")
 
         log.info("computing_offsets")
         offset, n_valid = scene_offsets(lst)

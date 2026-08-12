@@ -7,8 +7,10 @@ import pytest
 from landsat_lst.job import (
     DEFAULT_WINDOW,
     JobResult,
+    _is_transient,
     generate_jobs,
     process_tile_job,
+    run_distributed,
 )
 from landsat_lst.models import ProcessingJob, TileId
 from landsat_lst.storage import LocalStorage
@@ -219,3 +221,230 @@ class TestProcessTileJobFailure:
 
         assert result.status == "failed"
         assert "No scenes found" in result.error
+
+    def test_transient_error_reraises(self, sample_job, mock_storage):
+        """Transient failures must escape so Coiled task retries engage."""
+        mock_storage.cog_exists.return_value = False
+
+        with patch("landsat_lst.job.process_tile") as mock_process:
+            mock_process.side_effect = TimeoutError("read timed out")
+
+            with pytest.raises(TimeoutError):
+                process_tile_job(sample_job, storage=mock_storage)
+
+    def test_failed_result_records_duration(self, sample_job, mock_storage):
+        mock_storage.cog_exists.return_value = False
+
+        with patch("landsat_lst.job.process_tile") as mock_process:
+            mock_process.side_effect = ValueError("boom")
+            result = process_tile_job(sample_job, storage=mock_storage)
+
+        assert result.status == "failed"
+        assert result.duration_s is not None
+
+
+class TestIsTransient:
+    """Tests for the transient/deterministic failure split."""
+
+    @staticmethod
+    def _client_error(status: int, code: str):
+        from botocore.exceptions import ClientError
+
+        return ClientError(
+            {
+                "Error": {"Code": code, "Message": "x"},
+                "ResponseMetadata": {"HTTPStatusCode": status},
+            },
+            "GetObject",
+        )
+
+    @pytest.mark.parametrize(
+        ("exc", "expected"),
+        [
+            (ConnectionError("reset"), True),
+            (TimeoutError("timeout"), True),
+            (ValueError("no scenes"), False),
+            (KeyError("band"), False),
+        ],
+    )
+    def test_builtin_exceptions(self, exc, expected):
+        assert _is_transient(exc) is expected
+
+    def test_rasterio_io_error(self):
+        from rasterio.errors import RasterioIOError
+
+        assert _is_transient(RasterioIOError("curl error")) is True
+
+    @pytest.mark.parametrize(
+        ("status", "code", "expected"),
+        [
+            (500, "InternalError", True),
+            (503, "SlowDown", True),
+            (400, "Throttling", True),
+            (404, "NoSuchKey", False),
+            (403, "AccessDenied", False),
+        ],
+    )
+    def test_client_errors(self, status, code, expected):
+        assert _is_transient(self._client_error(status, code)) is expected
+
+
+class _FakeCoiledFunction:
+    """Stand-in for the object coiled.function() wraps a callable into."""
+
+    def __init__(self, fn, drop_tiles=()):
+        self.fn = fn
+        self.drop_tiles = set(drop_tiles)
+
+    def map(self, jobs, forces, retries=None, errors="raise"):
+        return [
+            self.fn(job, force)
+            for job, force in zip(jobs, forces, strict=True)
+            if job.tile.name not in self.drop_tiles
+        ]
+
+
+@pytest.fixture
+def fake_coiled(monkeypatch):
+    """Install a coiled stub; returns dict capturing decorator kwargs."""
+    import sys
+    import types
+
+    captured: dict = {}
+
+    def function(**kwargs):
+        captured.update(kwargs)
+
+        def deco(fn):
+            return _FakeCoiledFunction(fn, drop_tiles=captured.pop("_drop_tiles", ()))
+
+        return deco
+
+    fake = types.ModuleType("coiled")
+    fake.function = function
+    monkeypatch.setitem(sys.modules, "coiled", fake)
+    # Static creds so _worker_environ never reaches for boto3/SSO in tests.
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+    return captured
+
+
+@pytest.fixture
+def manifest_dir(tmp_path, monkeypatch):
+    from landsat_lst.config import settings
+
+    monkeypatch.setattr(settings, "manifest_dir", tmp_path / "runs")
+    return tmp_path / "runs"
+
+
+def _jobs(*tiles: str) -> list[ProcessingJob]:
+    from landsat_lst.tiling import parse_tile_name
+
+    return [ProcessingJob(tile=parse_tile_name(t), year=2021, end_year=2025) for t in tiles]
+
+
+class TestRunDistributed:
+    """Tests for the hardened Coiled driver (all mocked, no cluster)."""
+
+    def _stub_worker(self, monkeypatch):
+        def fake_process(job, force=False):
+            return JobResult(job=job, status="completed", duration_s=1.0)
+
+        monkeypatch.setattr("landsat_lst.job.process_tile_job", fake_process)
+
+    def test_resume_filters_completed_tiles(self, fake_coiled, manifest_dir, monkeypatch):
+        self._stub_worker(monkeypatch)
+        storage = MagicMock()
+        storage.list_completed.return_value = {"N40W075"}
+
+        jobs = _jobs("N40W075", "S05W060", "N60W150")
+        results = run_distributed(jobs, storage=storage)
+
+        storage.list_completed.assert_called_once_with("2021-2025")
+        by_status = {r.job.tile.name: r.status for r in results}
+        assert by_status == {
+            "N40W075": "skipped",
+            "S05W060": "completed",
+            "N60W150": "completed",
+        }
+
+    def test_force_bypasses_resume(self, fake_coiled, manifest_dir, monkeypatch):
+        self._stub_worker(monkeypatch)
+        storage = MagicMock()
+
+        results = run_distributed(_jobs("N40W075"), force=True, storage=storage)
+
+        storage.list_completed.assert_not_called()
+        assert [r.status for r in results] == ["completed"]
+
+    def test_missing_results_marked_failed(self, fake_coiled, manifest_dir, monkeypatch):
+        """A task dropped by errors='skip' is reconciled as failed."""
+        self._stub_worker(monkeypatch)
+        storage = MagicMock()
+        storage.list_completed.return_value = set()
+        fake_coiled["_drop_tiles"] = {"S05W060"}
+
+        results = run_distributed(_jobs("N40W075", "S05W060"), storage=storage)
+
+        by_status = {r.job.tile.name: r.status for r in results}
+        assert by_status["N40W075"] == "completed"
+        assert by_status["S05W060"] == "failed"
+        failed = next(r for r in results if r.status == "failed")
+        assert "retries" in failed.error
+
+    def test_coiled_kwargs_pinned(self, fake_coiled, manifest_dir, monkeypatch):
+        """Region, scaling, spot policy, and environ must never be defaults."""
+        self._stub_worker(monkeypatch)
+        storage = MagicMock()
+        storage.list_completed.return_value = set()
+
+        run_distributed(_jobs("N40W075"), storage=storage, run_id="test-run")
+
+        assert fake_coiled["region"] == "us-west-2"
+        assert fake_coiled["n_workers"] == 4
+        assert fake_coiled["spot_policy"] == "spot_with_fallback"
+        assert fake_coiled["vm_type"] == ["r6i.xlarge", "m6i.2xlarge"]
+        assert fake_coiled["name"] == "lst-test-run"
+        assert fake_coiled["tags"] == {"project": "landsat-lst", "run_id": "test-run"}
+        environ = fake_coiled["environ"]
+        assert environ["LST_STORAGE_BACKEND"] == "s3"
+        assert environ["AWS_REQUEST_PAYER"] == "requester"
+        assert environ["AWS_ACCESS_KEY_ID"] == "test-key"
+
+    def test_stac_url_not_forwarded(self, fake_coiled, manifest_dir, monkeypatch):
+        """A local Planetary Computer override must not leak onto AWS workers."""
+        self._stub_worker(monkeypatch)
+        monkeypatch.setenv("LST_STAC_URL", "https://planetarycomputer.example")
+        monkeypatch.setenv("LST_S3_BUCKET", "custom-bucket")
+        storage = MagicMock()
+        storage.list_completed.return_value = set()
+
+        run_distributed(_jobs("N40W075"), storage=storage)
+
+        environ = fake_coiled["environ"]
+        assert "LST_STAC_URL" not in environ
+        assert environ["LST_S3_BUCKET"] == "custom-bucket"
+
+    def test_no_cluster_when_nothing_to_run(self, fake_coiled, manifest_dir, monkeypatch):
+        """A fully-completed window must not pay for a cluster at all."""
+        self._stub_worker(monkeypatch)
+        storage = MagicMock()
+        storage.list_completed.return_value = {"N40W075"}
+
+        results = run_distributed(_jobs("N40W075"), storage=storage)
+
+        assert [r.status for r in results] == ["skipped"]
+        assert "region" not in fake_coiled  # coiled.function never invoked
+
+    def test_writes_manifest(self, fake_coiled, manifest_dir, monkeypatch):
+        import json
+
+        self._stub_worker(monkeypatch)
+        storage = MagicMock()
+        storage.list_completed.return_value = set()
+
+        run_distributed(_jobs("N40W075"), storage=storage, run_id="manifest-run")
+
+        payload = json.loads((manifest_dir / "manifest-run.json").read_text())
+        assert payload["run_id"] == "manifest-run"
+        assert payload["counts"]["completed"] == 1
