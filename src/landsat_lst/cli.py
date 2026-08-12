@@ -245,6 +245,58 @@ def reconcile(run_id: str) -> None:
 
 
 @main.command()
+@click.option("-t", "--tile", "tiles", multiple=True, required=True, help="Tile to verify")
+@click.option(
+    "-y", "--year", type=int, default=None, help="Start year. Omit for the default window."
+)
+@click.option("--end-year", type=int, default=None, help="End year (inclusive)")
+@click.option("--urls", is_flag=True, help="Print the access URLs for each verified tile")
+def verify(*, tiles: tuple[str, ...], year: int | None, end_year: int | None, urls: bool) -> None:
+    """Check published COGs open over public HTTPS with the right encoding.
+
+    Answers the question a bucket listing cannot: does the person who pastes
+    this URL into QGIS get a raster that decodes to Celsius? Each asset is
+    opened unauthenticated over the public read host, so a tile that reads only
+    with credentials fails here.
+
+    Exits non-zero if any tile fails.
+    """
+    from landsat_lst.job import DEFAULT_WINDOW
+    from landsat_lst.verify import verify_tile
+
+    start = year or DEFAULT_WINDOW[0]
+    if year is None:
+        end_year = DEFAULT_WINDOW[1]
+    window = str(start) if end_year is None or end_year == start else f"{start}-{end_year}"
+
+    console.print(f"[bold]Verifying window {window}[/bold]")
+    failed = 0
+    for tile in tiles:
+        check = verify_tile(tile, window)
+        if check.ok:
+            lst = next(a for a in check.assets if a.product == "lst_p95")
+            shape = f"{lst.shape[0]}x{lst.shape[1]}" if lst.shape else "unknown shape"
+            console.print(
+                f"  [green]OK[/green] {tile}: {lst.dtype} {shape}, "
+                f"nodata {lst.nodata}, scale {lst.scale}, offset {lst.offset}, "
+                f"{len(lst.overviews)} overviews"
+            )
+        else:
+            failed += 1
+            for asset in check.assets:
+                if not asset.ok:
+                    console.print(f"  [red]FAIL[/red] {tile} {asset.product}: {asset.error}")
+        if urls:
+            for asset in check.assets:
+                console.print(f"       {asset.url}")
+
+    console.print(f"\n  Verified: [green]{len(tiles) - failed}[/green]")
+    if failed:
+        console.print(f"  Failed: [red]{failed}[/red]")
+        raise SystemExit(1)
+
+
+@main.command()
 def list_tiles() -> None:
     """List all tiles in the global grid."""
     from landsat_lst.tiling import generate_global_tiles

@@ -146,6 +146,18 @@ The manifest records per-tile status, duration, scene count, and peak memory und
 `settings.manifest_dir`. Completion comes from the S3 listing, so a resumed run reprocesses only
 the tiles missing an asset.
 
+### Verifying published tiles
+
+A bucket listing proves two objects exist. It does not prove someone can read them:
+
+```bash
+landsat-lst verify -t N40W075 --urls
+```
+
+Each COG is opened unauthenticated over the public read host, and its dtype, shape, nodata, scale,
+offset, and overview levels are printed. A tile that reads only with credentials fails here. The
+command exits non-zero if any tile fails.
+
 ## Data Access
 
 The output is one Portolan STAC collection per window, one item per tile, and two COG

@@ -74,8 +74,18 @@ landsat-lst catalog validate ./rehearsal-catalog
 ```
 
 Expect zero errors and exactly the accepted warning set, `PTL-AST-003` and `PTL-DAT-010`. Any
-other warning id fails the gate and the command exits non-zero. Open one COG in
-QGIS and confirm the composite reads in Celsius and lands in the range the tile deserves.
+other warning id fails the gate and the command exits non-zero.
+
+Then check the published objects the way a consumer meets them, unauthenticated over HTTPS:
+
+```bash
+landsat-lst verify -t N40W075 -t S05E035 -t N55E010 --urls
+```
+
+This opens each COG over the public read host and prints its dtype, shape, nodata, scale, offset,
+and overview levels. A tile that reads only with credentials fails here, which a bucket listing
+would have called complete. Paste one of the printed URLs into QGIS and confirm the composite
+reads in Celsius and lands in the range the tile deserves.
 
 Go back to the pipeline, not forward to S2, if the rehearsal turns up anything.
 
