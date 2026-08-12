@@ -165,6 +165,7 @@ def catalog() -> None:
 def catalog_build(
     source: str,
     out: str,
+    *,
     window: str | None,
     tiles: str | None,
     thumbnail: str | None,

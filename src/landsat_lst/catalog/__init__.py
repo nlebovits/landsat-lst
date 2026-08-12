@@ -101,6 +101,7 @@ def build_catalog(
     source: str | Path,
     out: str | Path,
     spec: CatalogSpec = DEFAULT_SPEC,
+    *,
     tiles: tuple[str, ...] | None = None,
     thumbnail: str | Path | None = None,
     place_assets: bool = True,
