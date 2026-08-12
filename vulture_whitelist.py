@@ -8,7 +8,6 @@ Format: module.attribute or just attribute
 _.name  # noqa: F821
 _.bbox  # noqa: F821
 _.datetime_range  # noqa: F821
-_.output_filename  # noqa: F821
 _.is_daytime  # noqa: F821
 
 # Click CLI commands are discovered dynamically

@@ -54,9 +54,10 @@ class TestProcessingJob:
         job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2023)
         assert job.datetime_range == "2023-01-01/2023-12-31"
 
-    def test_output_filename(self):
+    def test_asset_filename(self):
         job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2023)
-        assert job.output_filename == "lst_2023_N40W075.tif"
+        assert job.asset_filename("lst_p95") == "lst_p95_2023_N40W075.tif"
+        assert job.asset_filename("qa_count") == "qa_count_2023_N40W075.tif"
 
     def test_single_year_window_label(self):
         job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2024)
@@ -66,7 +67,7 @@ class TestProcessingJob:
         job = ProcessingJob(tile=TileId(lat=-30, lon=-65), year=2020, end_year=2024)
         assert job.datetime_range == "2020-01-01/2024-12-31"
         assert job.window_label == "2020-2024"
-        assert job.output_filename == "lst_2020-2024_S30W065.tif"
+        assert job.asset_filename("lst_p95") == "lst_p95_2020-2024_S30W065.tif"
 
     def test_end_year_equal_to_year_is_single(self):
         job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2022, end_year=2022)

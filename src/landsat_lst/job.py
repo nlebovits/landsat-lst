@@ -1,9 +1,8 @@
-"""Job orchestration with idempotent Zarr writes and retry support.
+"""Job orchestration with idempotent COG writes and retry support.
 
 This module implements the retry/resume strategy from ADR-001 Section 16:
-- Idempotent Zarr check: skip tiles where output already exists
+- Idempotent asset check: skip tiles whose COGs are already stored
 - Coiled worker retry: recover from transient failures
-- Icechunk conflict retry: handle concurrent distributed writes
 
 Usage:
     from landsat_lst.job import process_tile_job, run_batch
@@ -15,83 +14,83 @@ Usage:
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
 
+from landsat_lst.cog import cog_export
 from landsat_lst.config import settings
+from landsat_lst.encoding import encode_lst_uint16
 from landsat_lst.models import ProcessingJob
 from landsat_lst.pipeline import process_tile
-from landsat_lst.storage import IcechunkStorage, StorageBackend, get_storage
-from landsat_lst.zarr_writer import write_zarr
+from landsat_lst.storage import StorageBackend, get_storage
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    import xarray as xr
 
 log = structlog.get_logger()
 
 
 @dataclass
 class JobResult:
-    """Result of processing a single tile-year job."""
+    """Result of processing a single tile-window job."""
 
     job: ProcessingJob
     status: str  # "completed", "skipped", "failed"
-    zarr_path: str | None = None
-    commit_id: str | None = None
+    lst_key: str | None = None
+    qa_key: str | None = None
     error: str | None = None
 
 
-def _write_to_icechunk_with_retry(
-    composite,
-    storage: IcechunkStorage,
+def _encode_native(composite: xr.Dataset) -> xr.Dataset:
+    """Encode a float composite into the DN form :func:`cog_export` expects.
+
+    ``process_tile`` yields ``lst_p95`` as float32 Celsius (nodata ``-9999``);
+    the COG writer expects the uint16 DN whose scale/offset it stamps onto the
+    band. ``qa_count`` already leaves the pipeline as ``uint8`` per-month counts.
+    """
+    return composite.assign(lst_p95=encode_lst_uint16(composite["lst_p95"]))
+
+
+def _write_cogs(
+    composite: xr.Dataset,
+    storage: StorageBackend,
     job: ProcessingJob,
     logger,
 ) -> tuple[str, str]:
-    """Write to Icechunk with conflict retry for concurrent workers.
+    """Export both COGs to a scratch dir, upload them, and drop the scratch dir.
 
-    When multiple Coiled workers write tiles simultaneously, each opens
-    its own writable session. On commit, if another worker committed first,
-    Icechunk raises ConflictError. We retry with a fresh session.
-
-    Args:
-        composite: Dataset to write
-        storage: IcechunkStorage instance
-        job: Processing job for logging
-        logger: Structured logger
+    Assets are uploaded QA first and LST last, but that ordering carries no
+    meaning: a reader must not treat the presence of ``lst_p95`` as proof the
+    tile is complete. Completion is ``storage.cog_exists``, which checks both.
 
     Returns:
-        Tuple of (group_path, commit_id)
-
-    Raises:
-        icechunk.ConflictError: After max retries exceeded
+        ``(lst_key, qa_key)`` as stored.
     """
-    import icechunk as ic  # noqa: PLC0415
+    window, tile = job.window_label, job.tile.name
+    lst_key = storage.cog_key(window, tile, "lst_p95")
+    qa_key = storage.cog_key(window, tile, "qa_count")
 
-    group_path = storage.zarr_path(job.window_label, job.tile.name)
-    max_retries = settings.icechunk_max_retries
+    scratch = Path(tempfile.mkdtemp(prefix="lst_job_"))
+    try:
+        lst_local = scratch / job.asset_filename("lst_p95")
+        qa_local = scratch / job.asset_filename("qa_count")
+        logger.info("cog_exporting")
+        cog_export(_encode_native(composite), lst_local, qa_local)
 
-    for attempt in range(max_retries):
-        try:
-            session = storage.writable_session()
-            logger.info("icechunk_writing", group=group_path, attempt=attempt + 1)
+        logger.info("cog_uploading", lst_key=lst_key, qa_key=qa_key)
+        storage.upload(qa_local, qa_key)
+        storage.upload(lst_local, lst_key)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
-            write_zarr(composite, session, group=group_path)
-
-            commit_msg = f"Add {job.tile.name} for {job.window_label}"
-            commit_id = session.commit(commit_msg)
-            logger.info("icechunk_committed", commit_id=commit_id[:12])
-            return group_path, commit_id
-
-        except ic.ConflictError:
-            logger.warning("icechunk_conflict", attempt=attempt + 1)
-            if attempt == max_retries - 1:
-                raise
-            continue
-
-    msg = f"Failed to commit after {max_retries} retries"
-    raise RuntimeError(msg)
+    return lst_key, qa_key
 
 
 def process_tile_job(
@@ -100,32 +99,31 @@ def process_tile_job(
     force: bool = False,
     storage: StorageBackend | None = None,
 ) -> JobResult:
-    """Process a single tile-year job with retry/resume support.
+    """Process a single tile-window job with retry/resume support.
 
     This is the main entry point for tile processing. It implements:
-    1. Idempotent check: skip if Zarr exists (unless force=True)
+    1. Idempotent check: skip if both COGs exist (unless force=True)
     2. Pipeline: query STAC, load scenes, compute composite
-    3. Zarr write: uint16 encoding, proper metadata
-    4. Icechunk commit: with conflict retry (if using IcechunkStorage)
+    3. COG export: uint16 LST DN + 12-band monthly QA, uploaded to storage
 
     The @coiled.function decorator enables distributed execution.
     Use with retries parameter for transient failure recovery:
         results = process_tile_job.map(jobs, retries=3)
 
     Args:
-        job: Processing job specification (tile + year)
-        force: If True, reprocess even if Zarr exists
+        job: Processing job specification (tile + window)
+        force: If True, reprocess even if the COGs exist
         storage: Storage backend (defaults to configured backend)
 
     Returns:
-        JobResult with status and path info
+        JobResult with status and asset keys
     """
     storage = storage or get_storage()
     logger = log.bind(tile=job.tile.name, year=job.window_label)
 
     # Layer 1: Idempotent check
-    if not force and storage.zarr_exists(job.window_label, job.tile.name):
-        logger.info("tile_skipped", reason="zarr_exists")
+    if not force and storage.cog_exists(job.window_label, job.tile.name):
+        logger.info("tile_skipped", reason="cogs_exist")
         return JobResult(job=job, status="skipped")
 
     try:
@@ -133,29 +131,11 @@ def process_tile_job(
         logger.info("tile_processing_start")
         composite = process_tile(job)
 
-        # Layer 3: Write to storage
-        if isinstance(storage, IcechunkStorage):
-            # Icechunk path with conflict retry
-            zarr_path, commit_id = _write_to_icechunk_with_retry(composite, storage, job, logger)
-            logger.info("tile_completed", zarr_path=zarr_path, commit_id=commit_id[:12])
-            return JobResult(
-                job=job,
-                status="completed",
-                zarr_path=zarr_path,
-                commit_id=commit_id,
-            )
-        else:
-            # Plain Zarr path
-            zarr_path = storage.zarr_path(job.window_label, job.tile.name)
-            logger.info("zarr_writing", path=zarr_path)
-            write_zarr(composite, zarr_path)
+        # Layer 3: Export COGs and upload them
+        lst_key, qa_key = _write_cogs(composite, storage, job, logger)
 
-            logger.info("tile_completed", zarr_path=zarr_path)
-            return JobResult(
-                job=job,
-                status="completed",
-                zarr_path=zarr_path,
-            )
+        logger.info("tile_completed", lst_key=lst_key, qa_key=qa_key)
+        return JobResult(job=job, status="completed", lst_key=lst_key, qa_key=qa_key)
 
     except Exception as e:
         logger.exception("tile_failed", error=str(e))
@@ -174,7 +154,7 @@ def run_batch(
 
     Args:
         jobs: Iterable of processing jobs
-        force: If True, reprocess even if Zarr stores exist
+        force: If True, reprocess even if the COGs exist
         storage: Storage backend (defaults to configured backend)
 
     Returns:
@@ -206,7 +186,7 @@ def run_distributed(
 
     Args:
         jobs: List of processing jobs
-        force: If True, reprocess even if Zarr stores exist
+        force: If True, reprocess even if the COGs exist
         retries: Number of retries per job (default from settings)
 
     Returns:

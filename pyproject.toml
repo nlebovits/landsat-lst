@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Nissim Lebovits", email = "nlebovits@pm.me" }]
-keywords = ["landsat", "land-surface-temperature", "urban-heat", "stac", "zarr"]
+keywords = ["landsat", "land-surface-temperature", "urban-heat", "stac", "cog"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -29,6 +29,11 @@ dependencies = [
     "geopandas>=1.0.0",
     "shapely>=2.0.0",
     "pyproj>=3.6.0",
+    # STAC catalog output (GeoParquet item collections)
+    "pyarrow>=16.0.0",
+    "stac-geoparquet>=0.6.0",
+    # Figure generation for analysis writeups and QA plots
+    "matplotlib>=3.8.0",
     # Distributed computing
     "dask[distributed]>=2024.1.0",
     "coiled>=1.0.0",
@@ -43,17 +48,13 @@ dependencies = [
     "structlog>=24.1.0",
     "odc-geo>=0.5.1",
     "planetary-computer>=1.0.0",
-    "s3fs>=2026.4.0",
-    "zarr>=3.0.0",
-    "icechunk>=2.0.4,<3",
+    "boto3>=1.34.0",
     "bokeh>=3.9.1",
 ]
 
 [project.optional-dependencies]
 analysis = [
-    # Figure generation for analysis writeups (e.g. findings docs).
-    # geopandas/rasterio/pandas/dask are already core deps.
-    "matplotlib>=3.8.0",
+    # geopandas/rasterio/pandas/dask/matplotlib are already core deps.
     # ASTER GED coverage-gap analysis: HDF5 granule reads plus NASA Earthdata
     # search/download. See scripts/aster_gap_urban_analysis.py.
     "h5py>=3.10.0",
@@ -84,6 +85,7 @@ dev = [
     "vulture>=2.14",
     "xenon>=0.9.0",
     "pylint>=3.2.0",
+    "rashid>=0.1.3,<0.2",
     # Pre-commit
     "prek>=0.1.0",
     # Profiling

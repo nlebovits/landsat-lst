@@ -38,35 +38,21 @@ class Settings(BaseSettings):
     # Local storage (testing)
     output_dir: Path = Field(
         default=Path("output"),
-        description="Local output directory for Zarr stores (used when storage_backend='local')",
+        description="Local output directory for COGs (used when storage_backend='local')",
     )
 
     # S3 storage (production)
     s3_bucket: str = Field(
         default="source-coop-radiant-earth",
-        description="S3 bucket for Zarr/Icechunk storage",
+        description="S3 bucket for COG storage",
     )
     s3_prefix: str = Field(
         default="landsat-lst",
-        description="S3 key prefix for Zarr stores",
+        description="S3 key prefix for COGs",
     )
     s3_region: str = Field(
         default="us-west-2",
         description="AWS region for S3 bucket",
-    )
-
-    # Icechunk storage
-    use_icechunk: bool = Field(
-        default=False,
-        description="Use Icechunk for versioned Zarr storage (enables time-travel)",
-    )
-    icechunk_prefix: str = Field(
-        default="icechunk",
-        description="Subdirectory/prefix for Icechunk store (under output_dir or s3_prefix)",
-    )
-    icechunk_max_retries: int = Field(
-        default=5,
-        description="Maximum retry attempts for Icechunk ConflictError",
     )
 
     tile_size_degrees: float = Field(
@@ -170,26 +156,17 @@ class Settings(BaseSettings):
         "caps out near 2x regardless, since the P95 still needs a native pass.",
     )
 
-    # Multiscale overviews (GeoZarr multiscales convention)
-    pyramid_factors: list[int] = Field(
-        default=[4, 16, 64],
-        description="Downsample factors (relative to native) for overview levels. "
-        "Default is a sparse 4x pyramid (4x/16x/64x): ~6.7% storage overhead, "
-        "tuned for mostly zoomed-out global viewing. Use [2, 4, 8, 16, 32, 64] for "
-        "a full 2x pyramid (~33% overhead, smoother near-native zoom).",
+    # COG output. Literal rather than str so an unsupported codec fails at
+    # settings load instead of deep inside the GeoTIFF write.
+    cog_compression: Literal["deflate", "zstd", "lzw"] = Field(
+        default="deflate",
+        description="GeoTIFF compression for exported COGs. Deflate is the widest-"
+        "supported option; zstd is smaller and faster but needs a newer GDAL.",
     )
-
-    # Compression (Zarr v3 codec)
-    # Literal rather than str so an unsupported codec fails at settings load
-    # instead of deep inside the Zarr write, and so the value satisfies the
-    # codec name type BloscCodec expects.
-    compression_codec: Literal["lz4", "lz4hc", "blosclz", "snappy", "zlib", "zstd"] = Field(
-        default="zstd",
-        description="Blosc compression codec name (e.g. 'zstd', 'lz4', 'blosclz').",
-    )
-    compression_level: int = Field(
-        default=5,
-        description="Blosc compression level (0-9). 0 disables compression.",
+    cog_blocksize: int = Field(
+        default=512,
+        description="Internal tile size (px) for exported COGs. 512 keeps range "
+        "requests coarse enough to amortize HTTP overhead without over-fetching.",
     )
 
     load_chunk_size: int = Field(

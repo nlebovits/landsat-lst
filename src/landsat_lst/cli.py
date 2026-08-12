@@ -41,7 +41,7 @@ def _build_jobs(year: int | None, end_year: int | None, tile: str | None) -> lis
 @click.option("--end-year", type=int, help="End year (inclusive) for a multi-year window")
 @click.option("--tile", "-t", type=str, help="Specific tile to process (e.g., N40W075)")
 @click.option("--dry-run", is_flag=True, help="Show what would be processed without running")
-@click.option("--force", "-f", is_flag=True, help="Reprocess even if Zarr exists")
+@click.option("--force", "-f", is_flag=True, help="Reprocess even if the COGs exist")
 def process(
     year: int | None,
     end_year: int | None,
@@ -49,7 +49,7 @@ def process(
     dry_run: bool,
     force: bool,
 ) -> None:
-    """Process Landsat data to Zarr composites.
+    """Process Landsat data to COG composites.
 
     With no --year, processes the production window (2021-2025). Passing --year
     alone builds a single-year composite; add --end-year for a custom window.
@@ -64,7 +64,7 @@ def process(
         console.print(f"  Tiles: {len(jobs)} land tiles")
 
     if force:
-        console.print("  [yellow]Force mode: reprocessing existing Zarr stores[/yellow]")
+        console.print("  [yellow]Force mode: reprocessing existing COGs[/yellow]")
 
     if dry_run:
         console.print("[yellow]Dry run - no processing performed[/yellow]")

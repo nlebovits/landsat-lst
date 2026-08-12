@@ -1,12 +1,12 @@
-"""Full tile integration test with direct Zarr + Icechunk.
+"""Full tile integration test with COG output.
 
-End-to-end test: STAC query → composite → Zarr → Icechunk
+End-to-end test: STAC query → composite → COG → read back
 
 Uses optimized settings from parameter sweeps:
 - Cloud cover: ≤20%
 - Chunk size: 500x500
 - Resampling: bilinear (thermal), nearest (QA)
-- Storage: Icechunk for versioned writes
+- Storage: one lst_p95 COG plus one qa_count COG per tile
 
 Run with: pytest -m tile -v -s
 """
@@ -17,12 +17,14 @@ import numpy as np
 import planetary_computer
 import pystac_client
 import pytest
+import rasterio
 import xarray as xr
 from odc.stac import configure_rio, stac_load
+from rio_cogeo.cogeo import cog_validate
 
+from landsat_lst.cog import cog_export
 from landsat_lst.config import settings
-from landsat_lst.storage import IcechunkStorage
-from landsat_lst.zarr_writer import write_zarr
+from landsat_lst.encoding import encode_lst_uint16
 
 # 0.25° tile for integration test (~900x900px)
 # Located within Pergamino region for good data availability
@@ -80,7 +82,7 @@ def stac_items(stac_client):
 @pytest.mark.slow
 @pytest.mark.tile
 class TestFullTileIntegration:
-    """End-to-end test for direct Zarr + Icechunk pipeline."""
+    """End-to-end test for the COG output pipeline."""
 
     def test_01_load_all_scenes(self, stac_items):
         """Load all scenes for the tile."""
@@ -156,11 +158,11 @@ class TestFullTileIntegration:
         composite = xr.Dataset(
             {
                 "lst_p95": lst_p95.astype(np.float32),
-                "qa_count": qa_count.astype(np.uint16),
+                "qa_count": qa_count.astype(np.uint8),
             }
         )
 
-        # Rechunk to optimal size for Zarr write
+        # Rechunk to the size the COG writer streams in
         composite = composite.chunk({"latitude": 500, "longitude": 500})
 
         elapsed = time.perf_counter() - start
@@ -173,81 +175,79 @@ class TestFullTileIntegration:
 
         pytest.composite = composite
 
-    def test_05_write_to_icechunk(self, tmp_path):
-        """Write composite to Icechunk repository."""
-        print("\n--- Step 5: Write to Icechunk ---")
+    def test_05_export_cogs(self, tmp_path):
+        """Export the composite as the two output COGs."""
+        print("\n--- Step 5: Export COGs ---")
         composite = pytest.composite
 
         start = time.perf_counter()
 
-        # Create Icechunk storage
-        icechunk_path = tmp_path / "icechunk"
-        storage = IcechunkStorage.from_local(icechunk_path)
+        # cog_export takes the encoded native level: uint16 LST DN + count band.
+        encoded = composite.assign(lst_p95=encode_lst_uint16(composite["lst_p95"]))
 
-        # Write to Icechunk
-        session = storage.writable_session()
-        group_path = f"{TILE_YEAR}/{TILE_NAME}"
-
-        print(f"Writing to Icechunk group: {group_path}")
-        write_zarr(composite, session, group=group_path, chunks=(500, 500))
-
-        # Commit
-        commit_id = session.commit(f"Add {TILE_NAME} for {TILE_YEAR}")
+        lst_cog = tmp_path / f"lst_p95_{TILE_YEAR}_{TILE_NAME}.tif"
+        qa_cog = tmp_path / f"qa_count_{TILE_YEAR}_{TILE_NAME}.tif"
+        cog_export(encoded, lst_cog, qa_cog)
 
         elapsed = time.perf_counter() - start
-        print(f"Icechunk write + commit in {elapsed:.1f}s")
-        print(f"Commit ID: {commit_id[:16]}...")
+        print(f"COG export in {elapsed:.1f}s")
+        print(f"LST: {lst_cog.stat().st_size / 1e6:.1f} MB")
+        print(f"QA:  {qa_cog.stat().st_size / 1e6:.1f} MB")
 
-        pytest.icechunk_storage = storage
-        pytest.group_path = group_path
+        assert cog_validate(str(lst_cog))[0], "lst_p95 is not a valid COG"
+        assert cog_validate(str(qa_cog))[0], "qa_count is not a valid COG"
 
-    def test_06_read_back_from_icechunk(self):
-        """Read data back from Icechunk."""
-        print("\n--- Step 6: Read back from Icechunk ---")
-        storage = pytest.icechunk_storage
-        group_path = pytest.group_path
+        pytest.lst_cog = lst_cog
+        pytest.qa_cog = qa_cog
+
+    def test_06_read_back_with_rasterio(self):
+        """Read the COGs back off disk."""
+        print("\n--- Step 6: Read back COGs ---")
 
         start = time.perf_counter()
 
-        # Read from Icechunk (native data lives in multiscale level "0")
-        session = storage.readonly_session()
-        ds_read = xr.open_zarr(session.store, group=f"{group_path}/0", consolidated=False)
+        with rasterio.open(pytest.lst_cog) as src:
+            lst_profile = src.profile
+            lst_scale, lst_offset = src.scales[0], src.offsets[0]
+            lst_dn = src.read(1)
+        with rasterio.open(pytest.qa_cog) as src:
+            qa_dtype = src.dtypes[0]
 
         elapsed = time.perf_counter() - start
-        print(f"Opened from Icechunk in {elapsed:.3f}s")
-        print(f"Variables: {list(ds_read.data_vars)}")
+        print(f"Opened both COGs in {elapsed:.3f}s")
 
-        pytest.ds_read = ds_read
+        pytest.lst_profile = lst_profile
+        pytest.lst_scale_offset = (lst_scale, lst_offset)
+        pytest.lst_dn = lst_dn
+        pytest.qa_dtype = qa_dtype
 
     def test_07_validate_structure(self):
-        """Validate dataset structure."""
+        """Validate raster structure."""
         print("\n--- Step 7: Validate structure ---")
-        ds_read = pytest.ds_read
+        profile = pytest.lst_profile
 
-        # Check variables exist
-        assert "lst_p95" in ds_read.data_vars
-        assert "qa_count" in ds_read.data_vars
+        # LST is a single uint16 DN band with 0 reserved for nodata.
+        assert profile["count"] == 1
+        assert profile["dtype"] == "uint16"
+        assert profile["nodata"] == 0
+        assert profile["crs"].to_epsg() == 4326
 
-        # Check dtype after encoding: LST uint16 DN, QA count uint8.
-        assert ds_read["lst_p95"].dtype == np.uint16
-        assert ds_read["qa_count"].dtype == np.uint8
+        # Counts stay well under 255, so uint8.
+        assert pytest.qa_dtype == "uint8"
 
-        # Check encoding attributes preserved
-        assert ds_read["lst_p95"].attrs["lst_scale_factor"] == 0.01
-        assert ds_read["lst_p95"].attrs["lst_add_offset"] == -50.0
+        # Scale/offset are embedded so viewers auto-decode DN to Celsius.
+        scale, offset = pytest.lst_scale_offset
+        assert scale == 0.01
+        assert offset == -50.0
 
         print("✓ Structure validated")
 
     def test_08_validate_values(self):
         """Validate data values are reasonable."""
         print("\n--- Step 8: Validate values ---")
-        ds_read = pytest.ds_read
 
-        # Decode values
-        scale = ds_read["lst_p95"].attrs["lst_scale_factor"]
-        offset = ds_read["lst_p95"].attrs["lst_add_offset"]
-
-        p95_celsius = ds_read["lst_p95"].values * scale + offset
+        scale, offset = pytest.lst_scale_offset
+        p95_celsius = pytest.lst_dn * scale + offset
 
         # Check reasonable temperature range (Argentina in winter/summer)
         # Allow wide range for different seasons and nodata handling
@@ -266,5 +266,5 @@ class TestFullTileIntegration:
         print(f"Tile: {TILE_NAME}")
         print(f"Year: {TILE_YEAR}")
         print(f"Bbox: {TILE_BBOX}")
-        print("Pipeline: STAC → Load → QA → Composite → Zarr → Icechunk")
+        print("Pipeline: STAC → Load → QA → Composite → COG")
         print("All steps passed!")

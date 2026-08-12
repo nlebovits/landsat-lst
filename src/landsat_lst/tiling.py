@@ -747,10 +747,10 @@ def global_geobox() -> GeoBox:
     """The single grid every tile and every overview level is cut from.
 
     ``pixels_per_degree`` is an integer, so this comes out at exactly
-    1,296,000 x 432,000 px and divides cleanly by every pyramid factor in
-    ``settings.pyramid_factors`` (20,250 x 6,750 at 64x). A 5-degree tile is
-    18,000 px, which divides by 4 and 16 but not by 64 -- the reason overviews
-    belong to the global array rather than to a tile. See ADR-008.
+    1,296,000 x 432,000 px and divides cleanly by every overview factor down to
+    64x (20,250 x 6,750). A 5-degree tile is 18,000 px, which divides by 4 and
+    16 but not by 64 -- the reason overviews belong to the global array rather
+    than to a tile. See ADR-008.
     """
     return GeoBox.from_bbox(
         (-180.0, settings.min_latitude, 180.0, settings.max_latitude),
