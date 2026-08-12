@@ -219,7 +219,7 @@ def main() -> int:  # noqa: PLR0915
 
         if args.cogs:
             from landsat_lst.cog import export_lst_cog  # noqa: PLC0415
-            from landsat_lst.zarr_writer import encode_lst_uint16  # noqa: PLC0415
+            from landsat_lst.encoding import encode_lst_uint16  # noqa: PLC0415
 
             outdir = Path("results/decision/percentile_test")
             outdir.mkdir(parents=True, exist_ok=True)

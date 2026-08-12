@@ -31,6 +31,17 @@ from pyproj import CRS
 from zarr.codecs import BloscCodec
 
 from landsat_lst.config import settings
+from landsat_lst.encoding import (  # noqa: F401 - re-exported for compatibility
+    LST_FILL_VALUE,
+    LST_MAX_DN,
+    LST_MIN_DN,
+    LST_MIN_TRUSTED_C,
+    LST_MIN_TRUSTED_DN,
+    LST_NODATA_FLOAT,
+    LST_OFFSET,
+    LST_SCALE,
+    encode_lst_uint16,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -40,67 +51,12 @@ if TYPE_CHECKING:
 # Permanent UUID of the GeoZarr multiscales convention (zarr-conventions/multiscales)
 MULTISCALES_UUID = "d35379db-88df-4056-af3a-620245f8e347"
 
-# Encoding constants for LST bands (lst_p95)
-LST_SCALE: float = 0.01
-LST_OFFSET: float = -50.0
-LST_NODATA_FLOAT: float = -9999.0
-LST_FILL_VALUE: int = 0
-
-# DN 0 is reserved for fill, so the encodable range is 1..65535.
-LST_MIN_DN: int = 1
-LST_MAX_DN: int = 65535
-
-# Lowest DN carrying a physically meaningful LST. DN 0 is fill, and DN 1 is
-# reachable only from values sitting on the encoding floor (-49.99 C). A
-# hot-season P95 over land between 60S and 60N never gets that cold, so DN 1
-# marks a failed retrieval rather than a real temperature. See issue #24.
-LST_MIN_TRUSTED_DN: int = 2
-
-# Coldest Celsius value the pipeline will keep: the bottom of the DN 2 bucket.
-# Anything below encodes to DN 0 or DN 1 and is treated as missing.
-LST_MIN_TRUSTED_C: float = LST_OFFSET + LST_MIN_TRUSTED_DN * LST_SCALE
-
 # Zarr chunking. 500 divides an 18,000 px tile into 36 chunks with no partial
 # edge chunk, and divides the global grid (1,296,000 x 432,000) evenly too.
 DEFAULT_CHUNKS: tuple[int, int] = (500, 500)
 
 # Type alias for output target
 OutputTarget = Union[Path, str, "ic.Session"]
-
-
-def encode_lst_uint16(data: xr.DataArray) -> xr.DataArray:
-    """Encode LST float values to uint16 with scale/offset.
-
-    Formula: dn = (celsius - offset) / scale
-    Decode:  celsius = dn * scale + offset
-
-    Values outside the encodable range become fill (DN 0) rather than being
-    clipped to the nearest representable DN. Clipping would turn an
-    out-of-range value such as -124 C into a believable -49.99 C, which is
-    exactly how the isolated anomaly pixels in issue #24 were produced.
-    ``convert_to_celsius`` already drops implausible observations, so anything
-    arriving here out of range signals a defect and is better recorded as
-    missing than as a plausible temperature.
-
-    Args:
-        data: LST values in Celsius (float32), nodata=-9999.0
-
-    Returns:
-        Encoded uint16 values, fill_value=0
-    """
-    # Convert celsius to DN: dn = (celsius - offset) / scale
-    dn = (data - LST_OFFSET) / LST_SCALE
-
-    # Out-of-range values (including NaN, which fails both comparisons) become
-    # fill. DN 0 is reserved for fill, so the floor is 1.
-    in_range = (dn >= LST_MIN_DN) & (dn <= LST_MAX_DN)
-    dn = xr.where(in_range, dn, LST_FILL_VALUE)
-
-    # Set nodata pixels to fill value (0)
-    dn = xr.where(data == LST_NODATA_FLOAT, LST_FILL_VALUE, dn)
-    dn = xr.where(np.isnan(data), LST_FILL_VALUE, dn)
-
-    return dn.astype(np.uint16)
 
 
 def _add_zarr_metadata(ds: xr.Dataset) -> xr.Dataset:

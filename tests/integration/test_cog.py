@@ -9,7 +9,7 @@ import xarray as xr
 from rio_cogeo.cogeo import cog_validate
 
 from landsat_lst.cog import cog_export
-from landsat_lst.zarr_writer import LST_OFFSET, LST_SCALE
+from landsat_lst.encoding import LST_OFFSET, LST_SCALE
 
 
 def _native(n: int = 64) -> xr.Dataset:
