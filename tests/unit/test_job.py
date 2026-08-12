@@ -124,8 +124,8 @@ class TestCogWrite:
         result, _ = self._run(sample_job, mock_storage)
 
         assert result.status == "completed"
-        assert result.lst_key == "2023/N40W075/lst_p95_2023_N40W075.tif"
-        assert result.qa_key == "2023/N40W075/qa_count_2023_N40W075.tif"
+        assert result.lst_key == "lst-p95-2023/N40W075/lst_p95_2023_N40W075.tif"
+        assert result.qa_key == "lst-p95-2023/N40W075/qa_count_2023_N40W075.tif"
         uploaded_keys = {call.args[1] for call in mock_storage.upload.call_args_list}
         assert uploaded_keys == {result.lst_key, result.qa_key}
 

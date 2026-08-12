@@ -103,6 +103,7 @@ def build_catalog(
     spec: CatalogSpec = DEFAULT_SPEC,
     tiles: tuple[str, ...] | None = None,
     thumbnail: str | Path | None = None,
+    place_assets: bool = True,
 ) -> Path:
     """Build the catalog for one observation window.
 
@@ -113,6 +114,15 @@ def build_catalog(
         tiles: Restrict the catalog to these tile names.
         thumbnail: PNG to register as the collection thumbnail. When omitted,
             the global mosaic preview is rendered from the tiles themselves.
+        place_assets: When ``False``, write a metadata-only staging tree: every
+            number the items carry is still read from the source COG headers,
+            but the COGs themselves are not copied or downloaded beside their
+            items. This is the shape an S3-sourced build wants, where the COGs
+            already sit at their published paths and pulling ~700 tiles onto
+            the build machine is exactly the egress the design avoids. A
+            validator run over such a tree silently skips the COG byte checks
+            (a missing local asset is a skip, not an error), so it proves the
+            metadata, not the rasters.
 
     Returns:
         The catalog root directory.
@@ -133,7 +143,8 @@ def build_catalog(
     catalog.normalize_hrefs(str(root))
 
     collection_dir = root / spec.collection_id
-    _place_assets(collection_dir, pairs, items)
+    if place_assets:
+        _place_assets(collection_dir, pairs, items)
     _attach_thumbnail(
         collection, _thumbnail_asset(collection_dir, _as_path(thumbnail), pairs, spec)
     )

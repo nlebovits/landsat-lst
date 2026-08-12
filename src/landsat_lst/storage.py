@@ -6,9 +6,15 @@ Two backends:
 - :class:`S3Storage`: writes under ``s3://{bucket}/{prefix}`` (production).
 
 Each tile-window produces **two** assets, ``lst_p95`` and ``qa_count``, laid out
-as ``{window}/{tile}/{product}_{window}_{tile}.tif``. Both must be present for a
-tile to count as done: a tile with one uploaded asset is a half-written tile and
-has to be rebuilt, so :meth:`StorageBackend.cog_exists` always checks both.
+as ``lst-p95-{window}/{tile}/{product}_{window}_{tile}.tif``. The leading
+segment is the published collection id, so the pipeline writes every COG at the
+exact path the STAC catalog will declare and publication syncs metadata only.
+A test pins this prefix to ``catalog.spec.spec_for_window`` rather than an
+import, which would drag the whole catalog stack into every worker.
+
+Both assets must be present for a tile to count as done: a tile with one
+uploaded asset is a half-written tile and has to be rebuilt, so
+:meth:`StorageBackend.cog_exists` always checks both.
 """
 
 from __future__ import annotations
@@ -21,6 +27,16 @@ from landsat_lst.config import settings
 
 #: The two assets that together make one complete tile-window output.
 PRODUCTS: tuple[str, str] = ("lst_p95", "qa_count")
+
+
+def collection_prefix(window: str) -> str:
+    """The published collection id for one window, e.g. ``lst-p95-2021-2025``.
+
+    Must match ``catalog.spec.spec_for_window(window).collection_id``; the
+    contract is asserted by a unit test instead of an import so workers do not
+    pay for the catalog stack.
+    """
+    return f"lst-p95-{window}"
 
 
 class StorageBackend(ABC):
@@ -39,9 +55,9 @@ class StorageBackend(ABC):
             product: Asset name, one of :data:`PRODUCTS`.
 
         Returns:
-            ``{window}/{tile}/{product}_{window}_{tile}.tif``
+            ``lst-p95-{window}/{tile}/{product}_{window}_{tile}.tif``
         """
-        return f"{window}/{tile}/{product}_{window}_{tile}.tif"
+        return f"{collection_prefix(window)}/{tile}/{product}_{window}_{tile}.tif"
 
     @abstractmethod
     def cog_exists(self, window: str, tile: str) -> bool:
@@ -74,11 +90,13 @@ class LocalStorage(StorageBackend):
         dest.write_bytes(local.read_bytes())
 
     def list_completed(self, window: str) -> set[str]:
-        window_dir = self.output_dir / window
-        if not window_dir.is_dir():
+        collection_dir = self.output_dir / collection_prefix(window)
+        if not collection_dir.is_dir():
             return set()
         return {
-            d.name for d in window_dir.iterdir() if d.is_dir() and self.cog_exists(window, d.name)
+            d.name
+            for d in collection_dir.iterdir()
+            if d.is_dir() and self.cog_exists(window, d.name)
         }
 
 
@@ -128,7 +146,7 @@ class S3Storage(StorageBackend):
 
     def list_completed(self, window: str) -> set[str]:
         """One paginated listing of the window prefix, rather than 2N head requests."""
-        prefix = self._full_key(f"{window}/")
+        prefix = self._full_key(f"{collection_prefix(window)}/")
         seen: set[str] = set()
         paginator = self.client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
