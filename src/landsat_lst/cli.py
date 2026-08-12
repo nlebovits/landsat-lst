@@ -1,8 +1,16 @@
 """Command-line interface for Landsat LST pipeline."""
 
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 import click
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+
+if TYPE_CHECKING:
+    from rashid import Report
 
 console = Console()
 
@@ -128,6 +136,69 @@ def tile_info(tile_name: str) -> None:
     """Show information about a specific tile."""
     console.print(f"[bold]Tile: {tile_name}[/bold]")
     console.print("[red]Not yet implemented[/red]")
+
+
+@main.group()
+def catalog() -> None:
+    """Build and validate the published STAC catalog."""
+
+
+@catalog.command("build")
+@click.option("--source", required=True, help="Directory or s3:// prefix of finished COGs")
+@click.option("--out", default="./catalog", help="Directory to write the catalog into")
+@click.option("--window", default=None, help="Observation window label, e.g. 2021-2025")
+@click.option("--tiles", default=None, help="Comma-separated tile names to include")
+@click.option("--thumbnail", default=None, help="PNG to register as the collection thumbnail")
+def catalog_build(
+    source: str,
+    out: str,
+    window: str | None,
+    tiles: str | None,
+    thumbnail: str | None,
+) -> None:
+    """Build a Portolan-compliant STAC catalog from finished per-tile COGs."""
+    from landsat_lst.catalog import build_catalog
+    from landsat_lst.catalog.spec import DEFAULT_SPEC, spec_for_window
+
+    spec = DEFAULT_SPEC if window is None else spec_for_window(window)
+    wanted = tuple(name.strip() for name in tiles.split(",")) if tiles else None
+    console.print(f"[bold]Building catalog for {spec.window}[/bold] from {source}")
+    root = build_catalog(source, out, spec, tiles=wanted, thumbnail=thumbnail)
+    console.print(f"  Wrote [green]{root}[/green]")
+
+
+def _print_report(report: Report, unaccepted: set[str]) -> None:
+    """Render a validation report for a person reading a terminal."""
+    for finding in report.errors:
+        console.print(f"[red]{finding.rule_id}[/red] {finding.path}: {finding.message}")
+    for summary in report.by_rule():
+        colour = "red" if summary.severity.value == "error" else "yellow"
+        console.print(
+            f"  [{colour}]{summary.rule_id}[/{colour}] x{summary.count}  {summary.description}"
+        )
+    if unaccepted:
+        console.print(f"[red]Warnings outside the accepted baseline: {sorted(unaccepted)}[/red]")
+
+
+@catalog.command("validate")
+@click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--json", "as_json", is_flag=True, help="Emit the full report as JSON")
+def catalog_validate(path: Path, as_json: bool) -> None:
+    """Validate a built catalog against the Portolan profile."""
+    import json as json_module
+
+    from landsat_lst.catalog.validation import unaccepted_warnings, validate_catalog
+
+    report = validate_catalog(path)
+    unaccepted = unaccepted_warnings(report)
+    if as_json:
+        payload = report.to_dict()
+        payload["unaccepted_warnings"] = sorted(unaccepted)
+        click.echo(json_module.dumps(payload, indent=2))
+    else:
+        _print_report(report, unaccepted)
+    if report.errors or unaccepted:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
