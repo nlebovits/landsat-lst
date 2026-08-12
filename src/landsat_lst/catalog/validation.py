@@ -34,9 +34,6 @@ ACCEPTED_WARNING_RULE_IDS = frozenset(
         # month") is a real value that must stay visible. A band without nodata
         # only SHOULD declare STATISTICS_VALID_PERCENT, so its absence warns.
         "PTL-DAT-010",
-        # No items.parquet mirror yet: the stac-geoparquet mirror is a separate
-        # artifact of the publishing pipeline, not of catalog assembly.
-        "PTL-MIR-001",
     }
 )
 

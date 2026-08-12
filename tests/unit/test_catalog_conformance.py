@@ -43,9 +43,11 @@ TILES = ("N40W075", "N35W120", "S30W060")
 #                valid-percent statistic is only a SHOULD, so its absence warns
 #                rather than errors. lst_p95 does declare nodata and does carry
 #                the statistic, so it contributes no finding.
-#   PTL-MIR-001  no items.parquet mirror: the stac-geoparquet mirror is a
-#                separate publishing artifact, not part of catalog assembly.
-EXPECTED_WARNING_RULE_IDS = frozenset({"PTL-AST-003", "PTL-DAT-010", "PTL-MIR-001"})
+#
+# PTL-MIR-001 was in this set until the build began writing items.parquet; the
+# mirror is now part of catalog assembly, so its absence is no longer a warning
+# the catalog accepts.
+EXPECTED_WARNING_RULE_IDS = frozenset({"PTL-AST-003", "PTL-DAT-010"})
 
 
 @pytest.fixture(scope="module")

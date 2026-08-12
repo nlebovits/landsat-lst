@@ -25,6 +25,7 @@ from landsat_lst.catalog.docs import (
     root_readme_md,
 )
 from landsat_lst.catalog.items import build_item
+from landsat_lst.catalog.parquet import write_item_mirror
 from landsat_lst.catalog.scan import place_file, scan_source
 from landsat_lst.catalog.spec import (
     DEFAULT_SPEC,
@@ -129,6 +130,12 @@ def build_catalog(
     collection_dir = root / spec.collection_id
     _place_assets(collection_dir, pairs, items)
     _attach_thumbnail(collection, _thumbnail_asset(collection_dir, _as_path(thumbnail)))
+
+    # --- items.parquet mirror -------------------------------------------
+    # Written from the same in-memory items the JSON below is written from,
+    # and registered on the collection before it saves.
+    write_item_mirror(collection, collection_dir, items)
+    # --------------------------------------------------------------------
 
     catalog.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
     _write_docs(root, collection_dir, spec)
