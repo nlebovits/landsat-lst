@@ -334,7 +334,15 @@ def _submit_to_coiled(
         tags={"project": "landsat-lst", "run_id": run_id},
     )
     def _distributed_process(job: ProcessingJob, force: bool) -> JobResult:
-        return process_tile_job(job, force=force)
+        # Inside a Coiled task the cluster's own dask client is ambient, so an
+        # unqualified compute() would submit the tile's whole scene graph back
+        # to the shared scheduler -- three tiles at once crushed it
+        # (scheduler-connection-lost, run 2021-2025-20260812T150618Z). Pin the
+        # threaded scheduler so each tile computes on its own VM's cores.
+        import dask  # noqa: PLC0415
+
+        with dask.config.set(scheduler="threads"):
+            return process_tile_job(job, force=force)
 
     # errors="skip" drops tasks that still fail after Coiled's retries; the
     # caller reconciles those tiles as failed instead of aborting the whole
