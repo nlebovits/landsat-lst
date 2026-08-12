@@ -27,7 +27,7 @@ import rioxarray  # noqa: F401 - needed for .rio accessor
 from rio_cogeo.cogeo import cog_translate, cog_validate
 from rio_cogeo.profiles import cog_profiles
 
-from landsat_lst.zarr_writer import LST_OFFSET, LST_SCALE
+from landsat_lst.encoding import LST_OFFSET, LST_SCALE
 
 if TYPE_CHECKING:
     import xarray as xr

@@ -29,9 +29,9 @@ settings.stac_url = STAC_PLANETARY_COMPUTER  # local rule: PC (free, no egress)
 
 from landsat_lst.azure_auth import enable_pc_azure_refresh  # noqa: E402
 from landsat_lst.cog import export_lst_cog  # noqa: E402
+from landsat_lst.encoding import encode_lst_uint16  # noqa: E402
 from landsat_lst.pipeline import load_scenes  # noqa: E402
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius  # noqa: E402
-from landsat_lst.zarr_writer import encode_lst_uint16  # noqa: E402
 
 log = structlog.get_logger()
 

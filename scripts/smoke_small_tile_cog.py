@@ -38,8 +38,9 @@ from landsat_lst.config import STAC_PLANETARY_COMPUTER, settings
 settings.stac_url = STAC_PLANETARY_COMPUTER
 
 from landsat_lst.azure_auth import enable_pc_azure_refresh  # noqa: E402
+from landsat_lst.encoding import LST_OFFSET, LST_SCALE  # noqa: E402
 from landsat_lst.pipeline import compute_annual_composite, load_scenes  # noqa: E402
-from landsat_lst.zarr_writer import LST_OFFSET, LST_SCALE, write_zarr  # noqa: E402
+from landsat_lst.zarr_writer import write_zarr  # noqa: E402
 
 # A small (~0.2 deg, ~700px at 30m) slice of Pergamino, Argentina.
 BBOX = (-60.60, -33.95, -60.40, -33.75)
