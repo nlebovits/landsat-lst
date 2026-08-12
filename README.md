@@ -228,6 +228,28 @@ native = xr.Dataset(
 cog_export(native, "lst_p95.tif", "qa_count.tif")
 ```
 
+### Publishing the catalog
+
+```bash
+landsat-lst catalog build \
+  --source s3://bucket/prefix \
+  --out ./catalog
+landsat-lst catalog validate ./catalog
+landsat-lst catalog publish ./catalog \
+  --remote s3://us-west-2.opendata.source.coop/nlebovits/landsat-lst/ \
+  --dry-run
+```
+
+`publish` uploads each object with the media type its extension declares, re-sends JSON
+and markdown every time, and skips an asset whose remote size already matches. Add
+`--live --live-base-url https://data.source.coop/nlebovits/landsat-lst/` to `validate`
+to probe the hosting server for range support, CORS, and Content-Length once the tree is
+up.
+
+The dataset is not published yet. The operational sequence, including the two decisions
+still open, is written down in
+[`docs/runbook-publication.md`](docs/runbook-publication.md).
+
 ## Architecture
 
 See [docs/adr/001-architecture-decisions.md](docs/adr/001-architecture-decisions.md) for detailed design decisions.

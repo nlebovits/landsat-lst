@@ -187,13 +187,25 @@ def _print_report(report: Report, unaccepted: set[str]) -> None:
 @catalog.command("validate")
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--json", "as_json", is_flag=True, help="Emit the full report as JSON")
-def catalog_validate(path: Path, as_json: bool) -> None:
-    """Validate a built catalog against the Portolan profile."""
+@click.option("--live", is_flag=True, help="Also probe the hosting server (requires network)")
+@click.option("--live-base-url", default=None, help="https URL the catalog root is published under")
+def catalog_validate(path: Path, as_json: bool, live: bool, live_base_url: str | None) -> None:
+    """Validate a built catalog against the Portolan profile.
+
+    The default run is offline. --live adds the hosting pass, which probes the
+    published server for range support, CORS, and Content-Length. The catalog's
+    hrefs are relative, so that pass needs --live-base-url to know what to probe.
+    """
     import json as json_module
 
     from landsat_lst.catalog.validation import unaccepted_warnings, validate_catalog
 
-    report = validate_catalog(path)
+    if live and live_base_url is None:
+        msg = "--live needs --live-base-url: the catalog's asset hrefs are relative"
+        raise click.UsageError(msg)
+    # --live-base-url alone turns the pass on too, so naming a URL is never a
+    # no-op that quietly reports an offline verdict.
+    report = validate_catalog(path, live_base_url=live_base_url)
     unaccepted = unaccepted_warnings(report)
     if as_json:
         payload = report.to_dict()
@@ -203,6 +215,40 @@ def catalog_validate(path: Path, as_json: bool) -> None:
         _print_report(report, unaccepted)
     if report.errors or unaccepted:
         raise SystemExit(1)
+
+
+@catalog.command("publish")
+@click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--remote", required=True, help="s3://bucket/prefix/ to publish the tree under")
+@click.option("--dry-run", is_flag=True, help="Print the upload plan without uploading")
+@click.option("--profile", default=None, help="AWS named profile to authenticate with")
+def catalog_publish(path: Path, remote: str, dry_run: bool, profile: str | None) -> None:
+    """Sync a built catalog tree to the S3 prefix it is published under.
+
+    Each object is uploaded with the media type its extension declares. An
+    asset whose remote size already matches is skipped; JSON and markdown are
+    always re-sent, because an equal-sized metadata edit is realistic and they
+    cost kilobytes.
+    """
+    from landsat_lst.catalog.publish import publish_catalog
+
+    console.print(f"[bold]Publishing {path}[/bold] to {remote}")
+    summary = publish_catalog(path, remote, dry_run=dry_run, profile=profile)
+
+    if dry_run:
+        for upload in summary.planned:
+            console.print(f"    upload  {upload}")
+        console.print(
+            f"[yellow]Dry run - nothing uploaded.[/yellow] Would upload "
+            f"{len(summary.planned)} objects ({summary.planned_bytes} bytes), "
+            f"skipping {summary.skipped_count} unchanged."
+        )
+        return
+
+    console.print("\n[bold]Results:[/bold]")
+    console.print(f"  Uploaded: [green]{summary.uploaded_count}[/green]")
+    console.print(f"  Skipped:  [yellow]{summary.skipped_count}[/yellow]")
+    console.print(f"  Bytes:    {summary.uploaded_bytes}")
 
 
 if __name__ == "__main__":
