@@ -280,6 +280,124 @@ def _process_distributed(jobs: list, *, force: bool, run_id: str | None, wait: b
     console.print(f"  Manifest: {settings.manifest_dir / (submission.run_id + '.json')}")
 
 
+def _print_plan_phases(phases: tuple, vm_gib: float) -> None:
+    """Render one configuration: what each phase builds and what it needs."""
+    for phase in phases:
+        peak = phase.peak
+        verdict = "[green]fits[/green]" if peak.fits_in(vm_gib) else "[red]over[/red]"
+        console.print(f"\n  [bold]{phase.name}[/bold]  {phase.height}x{phase.width} px")
+        console.print(
+            f"    tasks     {phase.graph.tasks:,} in {phase.graph.layers} layers, "
+            f"{phase.graph.blocks:,} output blocks"
+        )
+        top = "  ".join(f"{s.prefix} {s.tasks:,}" for s in phase.graph.top(5))
+        console.print(f"    heaviest  {top}")
+        console.print(
+            f"    memory    floor {peak.total_gib:.1f} GiB {verdict} in {vm_gib:.0f} GiB "
+            f"(stack {peak.stack_bytes / (1024**3):.1f}, "
+            f"climatology {peak.climatology_bytes / (1024**3):.1f}, "
+            f"baseline {peak.baseline_bytes / (1024**3):.1f})"
+        )
+
+
+def _print_sweep(rows: tuple) -> None:
+    """Render the sweep table: one line per configuration, cheapest first."""
+    console.print(
+        f"\n  {'chunk':>6}{'threads':>9}{'offset tasks':>15}"
+        f"{'composite tasks':>18}{'floor GiB':>12}{'':>7}"
+    )
+    console.print("  " + "-" * 67)
+    for row in rows:
+        verdict = "[green]fits[/green]" if row.fits else "[red]over[/red]"
+        console.print(
+            f"  {row.chunk_size:>6}{row.threads:>9}{row.offsets_tasks:>15,}"
+            f"{row.composite_tasks:>18,}{row.floor_gib:>12.1f}   {verdict}"
+        )
+
+
+@main.command()
+@click.option("-t", "--tile", "tile_name", required=True, help="Tile to plan, e.g. N40W075")
+@click.option(
+    "--scenes",
+    type=int,
+    default=None,
+    help="Scenes in the window (default: the 2,930 a five-year land tile pulls)",
+)
+@click.option("--chunk", type=int, default=None, help="Spatial chunk edge in px")
+@click.option("--threads", type=int, default=None, help="Concurrent dask threads")
+@click.option("--vm-gib", type=float, default=None, help="VM memory to judge against")
+@click.option("--sweep", is_flag=True, help="Cross chunk size with thread count instead")
+@click.option("--json", "as_json", is_flag=True, help="Emit the plan as JSON")
+def plan(
+    *,
+    tile_name: str,
+    scenes: int | None,
+    chunk: int | None,
+    threads: int | None,
+    vm_gib: float | None,
+    sweep: bool,
+    as_json: bool,
+) -> None:
+    """Price a tile's dask graphs without loading a pixel or starting a VM.
+
+    Task count follows from array shape and chunking, never from pixel values,
+    so both of a tile's graphs can be built against synthetic data on a laptop.
+    That is the difference between reading 598,604 tasks here and learning it
+    sixty seconds into a cloud run. See issue #76.
+
+    Reported memory is a **floor**, not a forecast: the concurrent block stacks,
+    the resident monthly climatology, and a process baseline. A configuration
+    that cannot fit the floor is disqualified for free. One that fits may still
+    OOM, which is what `scripts/synthetic_scaling.py` measures.
+
+    Building a full production graph is arithmetic, but a lot of it: expect
+    roughly half a minute and several GB of RSS at the default 2,930 scenes.
+    Pass a smaller --scenes to sketch faster.
+    """
+    import json as json_module
+
+    from landsat_lst.profiling import (
+        DEFAULT_VM_GIB,
+        PRODUCTION_SCENES,
+        plan_tile,
+        sweep_plan,
+    )
+    from landsat_lst.tiling import LAND_TILES, parse_tile_name
+
+    if tile_name not in LAND_TILES:
+        # On stderr, so `--json` output stays pipeable into jq either way.
+        click.echo(f"Note: {tile_name} is not in the land tiles set", err=True)
+    tile = parse_tile_name(tile_name)
+    n_scenes = PRODUCTION_SCENES if scenes is None else scenes
+    vm = DEFAULT_VM_GIB if vm_gib is None else vm_gib
+
+    if sweep:
+        rows = sweep_plan(tile=tile, scenes=n_scenes, vm_gib=vm)
+        if as_json:
+            # Nothing but JSON on stdout, so the output pipes straight into jq.
+            click.echo(json_module.dumps([r.as_dict() for r in rows], indent=2))
+            return
+        console.print(f"[bold]Sweep {tile_name}[/bold]  {n_scenes:,} scenes  {vm:.0f} GiB VM")
+        _print_sweep(rows)
+        return
+
+    phases = plan_tile(tile=tile, scenes=n_scenes, chunk_size=chunk, threads=threads)
+    if as_json:
+        click.echo(json_module.dumps([p.as_dict() for p in phases], indent=2))
+        return
+
+    first = phases[0].peak
+    console.print(
+        f"[bold]Plan {tile_name}[/bold]  {n_scenes:,} scenes  "
+        f"chunk {first.chunk_size}  threads {first.threads}"
+    )
+    _print_plan_phases(phases, vm)
+    console.print(
+        "\n  [dim]Floor only: concurrent block stacks, the resident monthly "
+        "climatology, and process baseline.[/dim]"
+    )
+
+
 @main.command()
 @click.argument("run_id")
 def reconcile(run_id: str) -> None:

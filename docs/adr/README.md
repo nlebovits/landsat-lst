@@ -16,6 +16,7 @@ ADRs are kept for history and link to their replacement.
 | [008](008-global-mosaic-topology.md) | Global sparse mosaic for the pyramid, and one shared tile grid | Shared-grid decision accepted; mosaic decision ⚠️ superseded by [009](009-cog-output-and-stac-catalog.md) |
 | [009](009-cog-output-and-stac-catalog.md) | Per-tile COGs in a Portolan STAC catalog, retiring the Zarr output | Accepted |
 | [010](010-coiled-batch-for-distributed-runs.md) | Coiled Batch for distributed runs, replacing Coiled Functions | Accepted |
+| [011](011-static-planning-and-synthetic-benchmarks.md) | Static graph planning, synthetic-geometry benchmarks, and per-key profiling | Accepted |
 
 ## Adding an ADR
 

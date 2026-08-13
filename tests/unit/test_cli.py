@@ -287,3 +287,58 @@ class TestWatchCommand:
 
         assert result.exit_code == 0
         assert "run is untouched" in result.output
+
+
+class TestPlan:
+    """`plan` prices a tile's graphs statically: no network, no cluster, no pixels.
+
+    Scene counts stay tiny. The command builds real 18,000-squared graphs, and
+    the production default of 2,930 scenes would take half a minute per case.
+    """
+
+    def test_reports_both_phases_and_their_task_counts(self, runner):
+        result = runner.invoke(main, ["plan", "-t", "N40W075", "--scenes", "8"])
+
+        assert result.exit_code == 0, result.output
+        assert "destripe_offsets" in result.output
+        assert "composite" in result.output
+        assert "18000x18000" in result.output
+        assert "floor" in result.output
+
+    def test_json_output_round_trips(self, runner):
+        import json as json_module
+
+        result = runner.invoke(
+            main, ["plan", "-t", "N40W075", "--scenes", "8", "--threads", "4", "--json"]
+        )
+
+        assert result.exit_code == 0, result.output
+        phases = json_module.loads(result.output)
+        assert [p["phase"] for p in phases] == ["destripe_offsets", "composite"]
+        assert phases[1]["shape"] == [18000, 18000]
+        assert phases[0]["memory"]["threads"] == 4
+
+    def test_sweep_emits_one_row_per_configuration(self, runner):
+        import json as json_module
+
+        result = runner.invoke(
+            main, ["plan", "-t", "N40W075", "--scenes", "8", "--sweep", "--json"]
+        )
+
+        assert result.exit_code == 0, result.output
+        rows = json_module.loads(result.output)
+        # Three chunk sizes crossed with four thread counts.
+        assert len(rows) == 12
+        assert [r["floor_gib"] for r in rows] == sorted(r["floor_gib"] for r in rows)
+
+    def test_flags_a_tile_that_is_not_land(self, runner):
+        """Ocean tiles are never processed, so planning one is likely a typo."""
+        result = runner.invoke(main, ["plan", "-t", "S55W180", "--scenes", "4"])
+
+        assert result.exit_code == 0, result.output
+        assert "not in the land tiles set" in result.output
+
+    def test_rejects_an_unparseable_tile(self, runner):
+        result = runner.invoke(main, ["plan", "-t", "not-a-tile", "--scenes", "4"])
+
+        assert result.exit_code != 0

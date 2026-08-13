@@ -112,6 +112,23 @@ class StorageBackend(ABC):
         """
         return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.progress.json"
 
+    def profile_key(self, run_id: str, tile: str, label: str) -> str:
+        """Backend-relative key for one dask profile dump.
+
+        Written at most once per labelled compute, and only when
+        ``settings.profile_dask`` is on, so it sits beside the heartbeat and
+        the log rather than replacing either.
+
+        Args:
+            run_id: Run token the profile belongs to.
+            tile: Tile name (``"N40W075"``).
+            label: Which compute was profiled (``"destripe_offsets"``).
+
+        Returns:
+            ``_runs/{run_id}/{tile}.{label}.profile.json``
+        """
+        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.{label}.profile.json"
+
     def log_key(self, run_id: str, tile: str) -> str:
         """Backend-relative key for one tile's captured task log.
 

@@ -120,6 +120,22 @@ Production runs go through [Coiled Batch](https://docs.coiled.io/user_guide/batc
 per task, one plain process per VM, no shared scheduler (see
 [ADR-010](docs/adr/010-coiled-batch-for-distributed-runs.md)).
 
+Before submitting, price the configuration. Task count and the memory floor follow from array
+shape and chunking, so both are readable on a laptop in seconds instead of sixty seconds into a
+cloud run (see [ADR-011](docs/adr/011-static-planning-and-synthetic-benchmarks.md)).
+
+```bash
+# Both of a tile's dask graphs, built against synthetic data
+landsat-lst plan -t N40W075
+
+# Chunk size crossed with thread count, cheapest floor first
+landsat-lst plan -t N40W075 --sweep
+```
+
+Reported memory is a floor, not a forecast: a configuration that cannot fit it is ruled out for
+free, and one that fits may still run out. To measure the gap, sweep scene count against
+production chunking with `scripts/synthetic_scaling.py`.
+
 ```bash
 # Ensure AWS SSO session is active
 aws sso login --profile radiant-earth

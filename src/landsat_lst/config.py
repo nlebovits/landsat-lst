@@ -278,6 +278,32 @@ class Settings(BaseSettings):
         description="Directory for per-run JSON manifests of distributed runs.",
     )
 
+    # Per-key dask profiling. A heartbeat says a phase has run for an hour and
+    # GraphProgress says how many tasks are left; neither says which tasks. See
+    # issue #76 and landsat_lst.profiling.
+    profile_dask: bool = Field(
+        default=False,
+        description="Wrap the de-striping compute in dask.diagnostics and dump "
+        "a per-task-prefix summary beside the tile's heartbeat. Answers which "
+        "operation owns the wall clock, and records the RSS curve we otherwise "
+        "reconstruct by hand from heartbeat samples. Off by default: it is "
+        "worth turning on for a sampled run, not for a 700-tile build.",
+    )
+    profile_dask_cache: bool = Field(
+        default=False,
+        description="Also run CacheProfiler, which reports the bytes dask held "
+        "in memory and so answers why RSS is climbing. Gated separately from "
+        "profile_dask because it retains one record per task: the de-striping "
+        "graph reached 598,604 tasks on a 300-scene N40W075 sample, on a run "
+        "already near its memory ceiling.",
+    )
+    profile_dask_interval_s: float = Field(
+        default=1.0,
+        description="Sampling interval for ResourceProfiler's RSS and CPU "
+        "curve. One second over a two-hour phase is 7,200 samples, which the "
+        "dump strides down before writing.",
+    )
+
     @model_validator(mode="after")
     def _grid_must_be_integral(self) -> "Settings":
         """Reject any grid where the globe or a tile lands on a fractional pixel.

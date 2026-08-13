@@ -140,6 +140,42 @@ Rules worth keeping:
 
 ---
 
+## Price a configuration before you run it
+
+Never submit a run to learn a number that follows from array shape and chunking. Task count
+and the memory floor are both knowable on a laptop in seconds. Ten validation attempts on
+2026-08-13 produced zero completed tiles, at twenty minutes a turn, because every lever was
+tested serially in the cloud. See [ADR-011](docs/adr/011-static-planning-and-synthetic-benchmarks.md)
+and issue #76.
+
+```bash
+landsat-lst plan -t N40W075                      # both graphs, 2021-2025 defaults
+landsat-lst plan -t N40W075 --scenes 300 --threads 4
+landsat-lst plan -t N40W075 --sweep              # chunk x threads, cheapest first
+landsat-lst plan -t N40W075 --json | jq          # stdout is pure JSON
+```
+
+Rules worth keeping:
+
+- **Reported memory is a floor, not a forecast.** Three terms: concurrent per-block time
+  stacks (`threads * chunk**2 * scenes * 4`), the resident monthly climatology
+  (`12 * height * width * 4`), and a process baseline. A configuration that cannot fit the
+  floor is disqualified for free. One that fits may still OOM — the 300-scene N40W075 sample
+  peaked at 78.6 GB against a floor of a few GB.
+- **Benchmark memory with `scripts/synthetic_scaling.py`, never against a small AOI.**
+  Below roughly one degree the whole stack fits in RAM and dask never streams; a five degree
+  tile streams from its first block. `scripts/measure_memory_scaling.py` is deprecated for
+  exactly this reason, and the new script refuses to extrapolate when peak RSS did not move.
+- **Keep `pipeline.TIME_CHUNK` and `profiling.synthetic_dataset` in step.** A synthetic stack
+  chunked differently from a real load builds a different graph, which would make planning
+  against it worthless.
+- **`settings.profile_dask` answers *which* tasks.** A heartbeat fraction of `4182/18600` reads
+  the same whether the hour is in `median-aggregate` or a rechunk shuffle. Turn it on for a
+  sampled run, not a 700-tile build. `settings.profile_dask_cache` is gated separately: it
+  retains one record per task, and these graphs hold hundreds of thousands.
+
+---
+
 ## Output grid — one shared grid, always
 
 `settings.pixels_per_degree` (3600) is the grid definition; `settings.resolution` is a
