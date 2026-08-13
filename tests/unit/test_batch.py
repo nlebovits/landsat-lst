@@ -110,8 +110,9 @@ class TestTaskCommand:
         command = _task_command(run_id="r1", year=2021, end_year=2025, force=False)
 
         assert command == (
+            "#!/bin/bash\n"
             "python -m landsat_lst.cli process --run-id r1 --year 2021 "
-            '--end-year 2025 --tile "$COILED_BATCH_TASK_INPUT"'
+            '--end-year 2025 --tile "$COILED_BATCH_TASK_INPUT"\n'
         )
 
     def test_single_year_omits_end_year(self):
@@ -130,6 +131,18 @@ class TestTaskCommand:
         command = _task_command(run_id="r1", year=2021, end_year=2025, force=False)
 
         assert '"$COILED_BATCH_TASK_INPUT"' in command
+
+    def test_is_a_script_so_coiled_ships_it_verbatim(self):
+        """A list or a plain string is split and rejoined by Coiled, and the
+        quotes around the tile placeholder did not survive that round trip: the
+        CLI received --tile with literal quote characters, parse_tile_name
+        rejected it, and the task died in 0.6s having written nothing. A "#!"
+        command is passed through untouched.
+        """
+        command = _task_command(run_id="r1", year=2024, end_year=None, force=False)
+
+        assert command.startswith("#!/bin/bash\n")
+        assert command.endswith("\n")
 
     def test_run_id_is_quoted(self):
         """A run id is generated, but the command must not be shell-injectable."""
@@ -156,7 +169,7 @@ class TestSubmit:
         submit_batch(_jobs("N40W075", "S05W060"), storage=storage, run_id="r")
 
         assert fake_coiled["map_over_values"] == ["N40W075", "S05W060"]
-        assert fake_coiled["command"][:2] == ["bash", "-c"]
+        assert fake_coiled["command"].startswith("#!/bin/bash\n")
 
     def test_forwards_worker_environment(self, fake_coiled, runs_dir, storage, monkeypatch):
         monkeypatch.setenv("LST_S3_BUCKET", "custom-bucket")
@@ -187,7 +200,7 @@ class TestSubmit:
         submission = submit_batch(_jobs("N40W075"), force=True, storage=storage, run_id="r")
 
         assert submission.submitted_tiles == ["N40W075"]
-        assert "--force" in fake_coiled["command"][2]
+        assert "--force" in fake_coiled["command"]
 
     def test_no_cluster_when_everything_is_done(self, fake_coiled, runs_dir, storage):
         """A finished window must not pay for a cluster at all."""

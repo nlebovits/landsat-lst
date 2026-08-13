@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -98,51 +99,61 @@ def process(
     returns immediately; run `landsat-lst reconcile RUN_ID` afterwards to write
     the manifest, or pass --wait to do both in one go.
     """
-    jobs = _build_jobs(year, end_year, tiles)
-    if limit is not None:
-        jobs = jobs[:limit]
-    console.print(f"[bold]Processing window {jobs[0].window_label}[/bold]")
-    if tiles:
-        console.print(f"  Tiles: {', '.join(tiles)}")
-    else:
-        console.print(f"  Tiles: {len(jobs)} land tiles")
+    # The capture opens before the jobs are built, so an unusable --tile is
+    # explained by an uploaded log rather than by silence on a dead VM.
+    with _task_log(tiles, run_id):
+        jobs = _build_jobs(year, end_year, tiles)
+        if limit is not None:
+            jobs = jobs[:limit]
+        console.print(f"[bold]Processing window {jobs[0].window_label}[/bold]")
+        if tiles:
+            console.print(f"  Tiles: {', '.join(tiles)}")
+        else:
+            console.print(f"  Tiles: {len(jobs)} land tiles")
 
-    if force:
-        console.print("  [yellow]Force mode: reprocessing existing COGs[/yellow]")
+        if force:
+            console.print("  [yellow]Force mode: reprocessing existing COGs[/yellow]")
 
-    if dry_run:
-        console.print("[yellow]Dry run - no processing performed[/yellow]")
-        mode = "on Coiled" if distributed else "locally"
-        for job in jobs[:5]:
-            console.print(f"    Would process {mode}: {job.tile.name} {job.window_label}")
-        if len(jobs) > 5:
-            console.print(f"    ... and {len(jobs) - 5} more")
-        return
+        if dry_run:
+            console.print("[yellow]Dry run - no processing performed[/yellow]")
+            mode = "on Coiled" if distributed else "locally"
+            for job in jobs[:5]:
+                console.print(f"    Would process {mode}: {job.tile.name} {job.window_label}")
+            if len(jobs) > 5:
+                console.print(f"    ... and {len(jobs) - 5} more")
+            return
 
-    if distributed:
-        _process_distributed(jobs, force=force, run_id=run_id, wait=wait)
-    else:
-        with _task_log(jobs, run_id):
+        if distributed:
+            _process_distributed(jobs, force=force, run_id=run_id, wait=wait)
+        else:
             _process_local(jobs, force=force, run_id=run_id)
 
 
-def _task_log(jobs: list, run_id: str | None):
+def _task_log(tiles: tuple[str, ...], run_id: str | None):
     """Capture this process's output when it is a batch task running one tile.
 
     Coiled keeps a task's stdout on the VM and reports the tee wrapper's exit
     code rather than the pipeline's, so a tile that dies explains itself only if
     it uploads its own log. Anything else -- a local run, a multi-tile sweep --
     already has its output in front of somebody, and is left alone.
+
+    Keyed off the raw ``--tile`` argument rather than a built job, so that a
+    task which dies *building* its jobs still uploads a log. That was the one
+    failure mode with no evidence at all: a malformed tile argument raised in
+    :func:`_build_jobs`, before any capture existed, and the task died in 0.6s
+    having written nothing. The name is sanitized because the argument reaching
+    this point has not been validated.
     """
     from contextlib import nullcontext
 
-    if run_id is None or len(jobs) != 1:
+    if run_id is None or len(tiles) != 1:
         return nullcontext()
 
     from landsat_lst.progress import capture_task_log
     from landsat_lst.storage import get_storage
 
-    return capture_task_log(run_id=run_id, tile=jobs[0].tile.name, storage=get_storage())
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tiles[0]) or "unnamed-tile"
+    return capture_task_log(run_id=run_id, tile=safe, storage=get_storage())
 
 
 def _process_local(jobs: list, *, force: bool, run_id: str | None = None) -> None:

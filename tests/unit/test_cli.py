@@ -199,6 +199,31 @@ class TestProcessLocal:
         assert result.exit_code == 1
         assert storage.read_text(storage.log_key("run-1", "N40W075")) is not None
 
+    def test_an_unusable_tile_argument_still_leaves_its_log(self, tmp_path):
+        """The one failure mode that used to leave no evidence at all.
+
+        A tile name the CLI cannot parse raises while the jobs are being built.
+        That happened before any capture existed, so the task died in 0.6s on a
+        VM whose stdout stays on the VM, having written nothing anywhere.
+        """
+        from landsat_lst.storage import LocalStorage
+        from tests.unit.test_progress import stdio_on_descriptors
+
+        # The capture tees descriptors, so the test needs the arrangement a
+        # real run has: sys.stderr over fd 2. CliRunner installs its own
+        # redirection inside invoke and would swallow the traceback again, so
+        # the command is invoked directly.
+        with stdio_on_descriptors(), pytest.raises(ValueError):
+            main.main(
+                ["process", "-t", '"N40W075"', "--run-id", "run-1"],
+                standalone_mode=False,
+            )
+
+        storage = LocalStorage(output_dir=tmp_path / "cogs")
+        log = storage.read_text(storage.log_key("run-1", "_N40W075_"))
+        assert log is not None
+        assert "Invalid tile name format" in log
+
     def test_a_local_run_uploads_nothing(self, runner, tmp_path):
         """Output is already in front of somebody; do not pay S3 to repeat it."""
         with patch("landsat_lst.job.process_tile_job") as mock_job:
