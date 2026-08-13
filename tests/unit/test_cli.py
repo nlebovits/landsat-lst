@@ -321,8 +321,11 @@ class TestPlan:
     def test_sweep_emits_one_row_per_configuration(self, runner):
         import json as json_module
 
+        # --fast skips graph fusion. A sweep ranks configurations by memory
+        # floor, which is exact either way, and fusing three chunk sizes takes
+        # longer than the pre-push per-test timeout allows.
         result = runner.invoke(
-            main, ["plan", "-t", "N40W075", "--scenes", "8", "--sweep", "--json"]
+            main, ["plan", "-t", "N40W075", "--scenes", "8", "--sweep", "--fast", "--json"]
         )
 
         assert result.exit_code == 0, result.output
@@ -330,6 +333,25 @@ class TestPlan:
         # Three chunk sizes crossed with four thread counts.
         assert len(rows) == 12
         assert [r["floor_gib"] for r in rows] == sorted(r["floor_gib"] for r in rows)
+        assert all(r["optimized"] is False for r in rows)
+
+    def test_fast_labels_its_counts_as_unfused(self, runner):
+        """A raw count must never read as one a heartbeat would report."""
+        result = runner.invoke(main, ["plan", "-t", "N40W075", "--scenes", "8", "--fast"])
+
+        assert result.exit_code == 0, result.output
+        assert "unfused" in result.output
+        assert "after fusion" not in result.output
+
+    def test_default_reports_fused_counts(self, runner):
+        """The headline count is the one the scheduler runs."""
+        result = runner.invoke(main, ["plan", "-t", "N40W075", "--scenes", "8", "--json"])
+
+        import json as json_module
+
+        phases = json_module.loads(result.output)
+        assert all(p["graph"]["optimized"] for p in phases)
+        assert all(p["graph"]["tasks"] <= p["graph"]["raw_tasks"] for p in phases)
 
     def test_flags_a_tile_that_is_not_land(self, runner):
         """Ocean tiles are never processed, so planning one is likely a typo."""

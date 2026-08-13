@@ -151,11 +151,18 @@ and issue #76.
 ```bash
 landsat-lst plan -t N40W075                      # both graphs, 2021-2025 defaults
 landsat-lst plan -t N40W075 --scenes 300 --threads 4
-landsat-lst plan -t N40W075 --sweep              # chunk x threads, cheapest first
+landsat-lst plan -t N40W075 --sweep --fast       # chunk x threads, cheapest first
 landsat-lst plan -t N40W075 --json | jq          # stdout is pure JSON
 ```
 
 Rules worth keeping:
+
+- **Task counts come from the fused graph, never the raw one.** `dask.optimize` runs before
+  counting, because that is the graph the scheduler runs and the one `GraphProgress` counts
+  against. Raw held 905,923 tasks for the 300-scene N40W075 offset pass where the run
+  reported 598,604; fused gives 613,240. Fusion is not a constant (1.48x offsets at 300,
+  1.59x at 1,000, 2.71x composite), so a raw count cannot be scaled into a real one. `--fast`
+  skips fusion and says so in the output. Never quote an unfused count as a task count.
 
 - **Reported memory is a floor, not a forecast.** Three terms: concurrent per-block time
   stacks (`threads * chunk**2 * scenes * 4`), the resident monthly climatology

@@ -91,6 +91,49 @@ def test_graph_stats_handles_a_dataset_whose_variables_disagree_on_chunks():
     assert stats.blocks > 0
 
 
+def _offsets(scenes=8, shape=(64, 64), chunk_size=32):
+    """The offset pair for a small synthetic stack, as a single Dataset."""
+    data = synthetic_dataset(shape=shape, scenes=scenes, chunk_size=chunk_size)
+    offset, n_valid = offset_graph(convert_to_celsius(apply_qa_mask(data)["lwir11"]))
+    return xr.Dataset({"offset": offset, "n_valid": n_valid})
+
+
+def test_graph_stats_counts_the_fused_graph_by_default():
+    """Fusion removes tasks, so the headline count sits below the raw one.
+
+    This is the whole reason the default is not the raw graph: on a 300-scene
+    N40W075 offset pass the raw graph holds 905,923 tasks where the run itself
+    reported 598,604, and fusing brings the plan to 613,240.
+    """
+    stats = graph_stats(_offsets())
+    assert stats.optimized is True
+    assert stats.tasks < stats.raw_tasks
+    assert stats.fusion > 1.0
+
+
+def test_graph_stats_can_skip_fusion_and_says_so():
+    """--fast trades comparability for speed, and marks the result."""
+    raw = graph_stats(_offsets(), optimize=False)
+    fused = graph_stats(_offsets())
+    assert raw.optimized is False
+    # With fusion skipped, the headline is the raw count itself.
+    assert raw.tasks == raw.raw_tasks
+    assert raw.fusion == 1.0
+    assert raw.raw_tasks == fused.raw_tasks
+
+
+def test_graph_stats_fusion_is_not_a_constant_factor():
+    """Why a raw count cannot be corrected after the fact.
+
+    Measured on real geometry: 1.48x on the offset graph at 300 scenes, 1.59x
+    at 1,000, and 2.71x on the composite. A single divisor would be wrong
+    somewhere, so the graph has to be fused rather than scaled.
+    """
+    shallow = graph_stats(_offsets(scenes=8)).fusion
+    deep = graph_stats(_offsets(scenes=40)).fusion
+    assert shallow != pytest.approx(deep, rel=0.01)
+
+
 # --------------------------------------------------------------- predict_peak
 
 
@@ -212,7 +255,7 @@ def test_destripe_disabled_restores_after_an_exception():
 @pytest.fixture(scope="module")
 def planned():
     """Both phases of a real tile, at a scene count that keeps the suite fast."""
-    return plan_tile(tile=parse_tile_name(TILE), scenes=12, threads=4)
+    return plan_tile(tile=parse_tile_name(TILE), scenes=12, threads=4, optimize=False)
 
 
 def test_plan_tile_reports_both_phases_in_order(planned):
@@ -239,8 +282,8 @@ def test_plan_tile_composite_blocks_follow_the_chunking(planned):
 def test_plan_tile_honours_an_explicit_chunk_size():
     """A smaller chunk means more blocks, and so a larger graph."""
     tile = parse_tile_name(TILE)
-    coarse = plan_tile(tile=tile, scenes=10, chunk_size=1024, threads=2)
-    fine = plan_tile(tile=tile, scenes=10, chunk_size=512, threads=2)
+    coarse = plan_tile(tile=tile, scenes=10, chunk_size=1024, threads=2, optimize=False)
+    fine = plan_tile(tile=tile, scenes=10, chunk_size=512, threads=2, optimize=False)
     assert fine[1].graph.tasks > coarse[1].graph.tasks
     assert fine[1].peak.stack_bytes < coarse[1].peak.stack_bytes
 
@@ -258,12 +301,14 @@ def test_plan_phase_serializes_for_the_json_flag(planned):
 
 @pytest.fixture(scope="module")
 def swept():
+    """Ranking configurations needs only the floor, so fusion is skipped here."""
     return sweep_plan(
         tile=parse_tile_name(TILE),
         scenes=10,
         chunk_sizes=(1024, 512),
         thread_counts=(2, 8),
         vm_gib=64.0,
+        optimize=False,
     )
 
 

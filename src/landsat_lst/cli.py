@@ -284,12 +284,22 @@ def _print_plan_phases(phases: tuple, vm_gib: float) -> None:
     """Render one configuration: what each phase builds and what it needs."""
     for phase in phases:
         peak = phase.peak
+        graph = phase.graph
         verdict = "[green]fits[/green]" if peak.fits_in(vm_gib) else "[red]over[/red]"
         console.print(f"\n  [bold]{phase.name}[/bold]  {phase.height}x{phase.width} px")
-        console.print(
-            f"    tasks     {phase.graph.tasks:,} in {phase.graph.layers} layers, "
-            f"{phase.graph.blocks:,} output blocks"
-        )
+        if graph.optimized:
+            # Fused count: what the scheduler runs, so it lines up with the
+            # fraction `landsat-lst watch` shows for a live tile.
+            console.print(
+                f"    tasks     {graph.tasks:,} after fusion "
+                f"({graph.raw_tasks:,} raw, {graph.fusion:.2f}x), "
+                f"{graph.blocks:,} output blocks"
+            )
+        else:
+            console.print(
+                f"    tasks     {graph.raw_tasks:,} raw, unfused -- not comparable "
+                f"to a heartbeat; {graph.blocks:,} output blocks"
+            )
         top = "  ".join(f"{s.prefix} {s.tasks:,}" for s in phase.graph.top(5))
         console.print(f"    heaviest  {top}")
         console.print(
@@ -302,9 +312,10 @@ def _print_plan_phases(phases: tuple, vm_gib: float) -> None:
 
 def _print_sweep(rows: tuple) -> None:
     """Render the sweep table: one line per configuration, cheapest first."""
+    label = "tasks" if rows and rows[0].optimized else "raw tasks"
     console.print(
-        f"\n  {'chunk':>6}{'threads':>9}{'offset tasks':>15}"
-        f"{'composite tasks':>18}{'floor GiB':>12}{'':>7}"
+        f"\n  {'chunk':>6}{'threads':>9}{'offset ' + label:>15}"
+        f"{'composite ' + label:>18}{'floor GiB':>12}{'':>7}"
     )
     console.print("  " + "-" * 67)
     for row in rows:
@@ -327,6 +338,11 @@ def _print_sweep(rows: tuple) -> None:
 @click.option("--threads", type=int, default=None, help="Concurrent dask threads")
 @click.option("--vm-gib", type=float, default=None, help="VM memory to judge against")
 @click.option("--sweep", is_flag=True, help="Cross chunk size with thread count instead")
+@click.option(
+    "--fast",
+    is_flag=True,
+    help="Skip graph fusion. Much quicker, but the counts stop matching a heartbeat.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit the plan as JSON")
 def plan(
     *,
@@ -336,6 +352,7 @@ def plan(
     threads: int | None,
     vm_gib: float | None,
     sweep: bool,
+    fast: bool,
     as_json: bool,
 ) -> None:
     """Price a tile's dask graphs without loading a pixel or starting a VM.
@@ -345,14 +362,21 @@ def plan(
     That is the difference between reading 598,604 tasks here and learning it
     sixty seconds into a cloud run. See issue #76.
 
+    Task counts are taken after fusion, so they match the fraction
+    `landsat-lst watch` shows for a live tile. The unfused graph is a poor
+    stand-in: for a 300-scene N40W075 offset pass it holds 905,923 tasks where
+    the run reported 598,604, and fusion is not a constant factor to divide out.
+
     Reported memory is a **floor**, not a forecast: the concurrent block stacks,
     the resident monthly climatology, and a process baseline. A configuration
     that cannot fit the floor is disqualified for free. One that fits may still
     OOM, which is what `scripts/synthetic_scaling.py` measures.
 
-    Building a full production graph is arithmetic, but a lot of it: expect
-    roughly half a minute and several GB of RSS at the default 2,930 scenes.
-    Pass a smaller --scenes to sketch faster.
+    Fusing a full production graph takes minutes and several GB of RSS at the
+    default 2,930 scenes, and a --sweep pays that once per chunk size. Pass a
+    smaller --scenes, or --fast to skip fusion. A swept comparison survives
+    --fast intact, since ranking configurations turns on the memory floor,
+    which is exact either way.
     """
     import json as json_module
 
@@ -372,7 +396,7 @@ def plan(
     vm = DEFAULT_VM_GIB if vm_gib is None else vm_gib
 
     if sweep:
-        rows = sweep_plan(tile=tile, scenes=n_scenes, vm_gib=vm)
+        rows = sweep_plan(tile=tile, scenes=n_scenes, vm_gib=vm, optimize=not fast)
         if as_json:
             # Nothing but JSON on stdout, so the output pipes straight into jq.
             click.echo(json_module.dumps([r.as_dict() for r in rows], indent=2))
@@ -381,7 +405,9 @@ def plan(
         _print_sweep(rows)
         return
 
-    phases = plan_tile(tile=tile, scenes=n_scenes, chunk_size=chunk, threads=threads)
+    phases = plan_tile(
+        tile=tile, scenes=n_scenes, chunk_size=chunk, threads=threads, optimize=not fast
+    )
     if as_json:
         click.echo(json_module.dumps([p.as_dict() for p in phases], indent=2))
         return

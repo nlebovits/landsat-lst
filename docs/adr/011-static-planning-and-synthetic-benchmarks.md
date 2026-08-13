@@ -52,6 +52,28 @@ per-pixel monthly climatology (`12 * height * width * itemsize`), and a process 
 since task count follows from chunking and thread count changes only how many blocks are
 in flight. A config sweep becomes a table instead of a day.
 
+**Counts are taken after `dask.optimize`.** This was not the first implementation, and the
+correction matters more than it sounds. The unoptimized graph for the 300-scene offset pass
+holds 905,923 tasks, against the 598,604 the run itself reported; fusing brings the plan to
+613,240, within 2.4% of the real number. A plan that disagreed by 50% with the heartbeat it
+exists to predict would be worse than no plan.
+
+Fusion cannot be divided out afterwards, because the ratio is not one number: 1.48x on the
+offset graph at 300 scenes, 1.59x at 1,000, and 2.71x on the composite. Reading raw counts
+reverses a real conclusion. Raw makes the composite graph look twice the offset graph
+(1,822,754 against 905,923), when after fusion the two are within 10% of each other
+(672,381 against 613,240).
+
+It also changes where the work appears to be. Raw, the offset graph reads as a rechunk
+shuffle (`rechunk-merge`, 390,072 tasks). Fused, the rechunk tasks disappear into the
+reduction and the graph is 93% `nanmedian` (570,850 of 613,240) — the per-pixel monthly
+median, which is a different optimization target. The fused names are also the ones
+`Profiler` reports at runtime, so layers 1 and 3 describe the same thing.
+
+The cost is real: about 11 seconds to fuse that 300-scene graph, 31 for a 1,000-scene one,
+minutes at production scale. `--fast` skips fusion and labels the result unfused, which is
+a fair trade for a `--sweep` whose decision variable is the memory floor.
+
 The floor is not a forecast, and the report says so. On the 300-scene N40W075 sample it
 lands far below the 78.6 GB observed. A floor still earns its keep: a configuration that
 cannot fit even the floor is disqualified for free.
@@ -100,10 +122,12 @@ profile cannot outgrow what it profiles.
 
 ## Consequences
 
-- Task count is knowable in seconds. A full production graph is still a lot of arithmetic:
-  expect roughly half a minute and several GB of RSS at 2,930 scenes. That is the cost of
-  an exact count rather than an estimate, and it beats twenty minutes by two orders of
-  magnitude.
+- Task count is knowable without a cloud run. Fusing a full production graph takes minutes
+  and several GB of RSS at 2,930 scenes, and `--fast` trades comparability for seconds.
+  Either way it beats a twenty-minute submission by a wide margin.
+- A task count is only meaningful next to the graph it was taken from. Anything reporting
+  one states whether it was fused, because raw and fused differ by 1.5x to 2.7x and the gap
+  moves with both phase and scene count.
 - `normalization.scene_offsets` is split. `offset_graph` builds the lazy pair and
   `scene_offsets` computes it, so a planner can inspect the graph without running it.
 - `pipeline.TIME_CHUNK` is named rather than inlined. A synthetic stack chunked differently

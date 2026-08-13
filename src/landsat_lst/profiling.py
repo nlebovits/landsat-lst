@@ -109,12 +109,33 @@ class PrefixStats:
 
 @dataclass(frozen=True)
 class GraphStats:
-    """What a dask graph holds, read without computing any of it."""
+    """What a dask graph holds, read without computing any of it.
+
+    ``tasks`` counts the graph **after** ``dask.optimize``, because that is the
+    graph the scheduler runs and therefore the one
+    :class:`~landsat_lst.progress.GraphProgress` counts against on a live tile.
+    A plan that disagreed with the heartbeat it is meant to predict would be
+    worse than no plan.
+
+    ``raw_tasks`` is the count before fusion. The two are kept apart rather than
+    reconciled by a constant because the ratio is not one: measured at 1.48x on
+    the offset graph at 300 scenes, 1.59x at 1,000, and 2.71x on the composite.
+    Reading the raw count as a task count reverses a real conclusion -- raw
+    makes the composite graph look twice the offset graph, when after fusion
+    the two are within 10% of each other.
+    """
 
     tasks: int
+    raw_tasks: int
     layers: int
     blocks: int
     by_prefix: tuple[PrefixStats, ...]
+    optimized: bool
+
+    @property
+    def fusion(self) -> float:
+        """How much fusion removed, as ``raw_tasks / tasks``."""
+        return self.raw_tasks / self.tasks if self.tasks else 1.0
 
     def top(self, n: int = 5) -> tuple[PrefixStats, ...]:
         """The ``n`` prefixes holding the most tasks, largest first."""
@@ -124,6 +145,9 @@ class GraphStats:
         """A JSON-safe view, for a manifest or a sweep table."""
         return {
             "tasks": self.tasks,
+            "raw_tasks": self.raw_tasks,
+            "optimized": self.optimized,
+            "fusion": round(self.fusion, 2),
             "layers": self.layers,
             "blocks": self.blocks,
             "by_prefix": [{"prefix": p.prefix, "tasks": p.tasks} for p in self.by_prefix],
@@ -153,14 +177,56 @@ def _block_count(obj: Any) -> int:
     return int(np.prod(counts)) if counts else 0
 
 
-def graph_stats(obj: Any) -> GraphStats:
+def _graph_of(obj: Any) -> Any:
+    """The dask graph behind a collection, or a TypeError explaining its absence."""
+    graph = getattr(obj, "__dask_graph__", None)
+    if graph is None or (dsk := graph()) is None:
+        msg = (
+            f"{type(obj).__name__} has no dask graph. Load it lazily "
+            "(chunks=...) before asking what it would cost."
+        )
+        raise TypeError(msg)
+    return dsk
+
+
+def _count_by_prefix(dsk: Any) -> tuple[Counter[str], int]:
+    """Task counts per key prefix, and the number of layers they came from."""
+    from dask.utils import key_split  # noqa: PLC0415
+
+    layers = getattr(dsk, "layers", None)
+    counts: Counter[str] = Counter()
+    if layers:
+        for name, layer in layers.items():
+            counts[key_split(name)] += len(layer)
+        return counts, len(layers)
+
+    # An optimized graph is a flat mapping, so prefixes come from the keys.
+    for key in dsk:
+        counts[key_split(key)] += 1
+    return counts, 1
+
+
+def graph_stats(obj: Any, *, optimize: bool = True) -> GraphStats:
     """Count the tasks in a lazy collection's graph, grouped by key prefix.
 
     Costs no data and no network. The whole point is that this is knowable
     before a run rather than sixty seconds into one.
 
+    By default the count is taken after ``dask.optimize``, which is the graph
+    the scheduler actually runs. That makes it directly comparable to the live
+    fraction :class:`~landsat_lst.progress.GraphProgress` publishes: the
+    unoptimized graph for a 300-scene N40W075 offset pass holds 905,923 tasks
+    where the run reported 598,604, and optimizing brings the plan to 613,240.
+    Fusion is not a constant factor, so the raw count cannot be corrected after
+    the fact -- it has to be optimized.
+
+    Optimizing costs real time: about 11 seconds for that 300-scene graph and
+    31 for a 1,000-scene one. ``optimize=False`` skips it for a quick sketch,
+    and marks the result so nothing downstream mistakes it for a task count.
+
     Args:
         obj: A dask collection, or an xarray object backed by one.
+        optimize: Whether to fuse the graph before counting.
 
     Returns:
         Task, layer, and block counts, with a per-prefix breakdown sorted by
@@ -170,25 +236,22 @@ def graph_stats(obj: Any) -> GraphStats:
         TypeError: If ``obj`` has no dask graph, which usually means it was
             loaded eagerly and there is nothing to plan.
     """
-    graph = getattr(obj, "__dask_graph__", None)
-    if graph is None or (dsk := graph()) is None:
-        msg = (
-            f"{type(obj).__name__} has no dask graph. Load it lazily "
-            "(chunks=...) before asking what it would cost."
-        )
-        raise TypeError(msg)
+    raw_dsk = _graph_of(obj)
+    raw_counts, layers = _count_by_prefix(raw_dsk)
+    raw_tasks = sum(raw_counts.values())
 
-    from dask.utils import key_split  # noqa: PLC0415
+    counts = raw_counts
+    if optimize:
+        import dask  # noqa: PLC0415
 
-    layers = getattr(dsk, "layers", None) or {"": dsk}
-    counts: Counter[str] = Counter()
-    for name, layer in layers.items():
-        counts[key_split(name)] += len(layer)
+        counts, _ = _count_by_prefix(_graph_of(dask.optimize(obj)[0]))
 
     return GraphStats(
         tasks=sum(counts.values()),
-        layers=len(layers),
+        raw_tasks=raw_tasks,
+        layers=layers,
         blocks=_block_count(obj),
+        optimized=optimize,
         by_prefix=tuple(
             PrefixStats(prefix=prefix, tasks=tasks) for prefix, tasks in counts.most_common()
         ),
@@ -433,6 +496,7 @@ def _phase(
     chunk_size: int,
     threads: int,
     baseline_gib: float,
+    optimize: bool,
 ) -> PlanPhase:
     """Pair a built graph with the memory floor for the configuration behind it."""
     return PlanPhase(
@@ -440,7 +504,7 @@ def _phase(
         height=height,
         width=width,
         scenes=scenes,
-        graph=graph_stats(collection),
+        graph=graph_stats(collection, optimize=optimize),
         peak=predict_peak(
             scenes=scenes,
             chunk_size=chunk_size,
@@ -460,6 +524,7 @@ def plan_tile(
     threads: int | None = None,
     offset_factor: int | None = None,
     baseline_gib: float = DEFAULT_BASELINE_GIB,
+    optimize: bool = True,
 ) -> tuple[PlanPhase, ...]:
     """Build both of a tile's graphs against synthetic data and read their size.
 
@@ -484,6 +549,9 @@ def plan_tile(
         offset_factor: Resolution factor for the offset pass. Defaults to
             ``settings.destripe_offset_resolution_factor``.
         baseline_gib: Process memory before any data is loaded.
+        optimize: Fuse each graph before counting, so the totals match what a
+            live heartbeat reports. Costs tens of seconds per phase at
+            production scene counts.
 
     Returns:
         One :class:`PlanPhase` per phase, offsets first.
@@ -498,7 +566,12 @@ def plan_tile(
     csize = settings.load_chunk_size if chunk_size is None else chunk_size
     nthreads = threads or settings.dask_max_threads or os.cpu_count() or 1
     factor = settings.destripe_offset_resolution_factor if offset_factor is None else offset_factor
-    common = {"chunk_size": csize, "threads": nthreads, "baseline_gib": baseline_gib}
+    common = {
+        "chunk_size": csize,
+        "threads": nthreads,
+        "baseline_gib": baseline_gib,
+        "optimize": optimize,
+    }
 
     coarse_h, coarse_w = tile_geobox(tile, factor).shape
     coarse = synthetic_dataset(shape=(coarse_h, coarse_w), scenes=scenes, chunk_size=csize)
@@ -551,6 +624,7 @@ class SweepRow:
     composite_tasks: int
     floor_gib: float
     vm_gib: float
+    optimized: bool
 
     @property
     def fits(self) -> bool:
@@ -563,6 +637,7 @@ class SweepRow:
             "threads": self.threads,
             "offsets_tasks": self.offsets_tasks,
             "composite_tasks": self.composite_tasks,
+            "optimized": self.optimized,
             "floor_gib": round(self.floor_gib, 2),
             "fits": self.fits,
         }
@@ -576,6 +651,7 @@ def sweep_plan(
     thread_counts: tuple[int, ...] = SWEEP_THREAD_COUNTS,
     vm_gib: float = DEFAULT_VM_GIB,
     baseline_gib: float = DEFAULT_BASELINE_GIB,
+    optimize: bool = True,
 ) -> tuple[SweepRow, ...]:
     """Price every combination of chunk size and thread count, statically.
 
@@ -583,6 +659,13 @@ def sweep_plan(
     follows from array shape and chunking, and the thread count changes only
     how many blocks are in flight. A four-by-three sweep therefore costs three
     graph builds, not twelve.
+
+    Fusion dominates the cost of a sweep, since it runs once per chunk size.
+    ``optimize=False`` trades comparable totals for speed, which is a fair trade
+    here: a sweep's decision variable is the memory floor, which is exact and
+    free either way, and its task counts only have to rank configurations
+    against one another. Every row carries ``optimized`` so a raw count is never
+    mistaken for one a heartbeat would report.
 
     Each row's floor is the larger of the two phases, since they run one after
     the other and the binding constraint is whichever peaks higher.
@@ -594,6 +677,7 @@ def sweep_plan(
         thread_counts: Concurrent dask threads to try.
         vm_gib: Memory of the VM each row is judged against.
         baseline_gib: Process memory before any data is loaded.
+        optimize: Fuse each graph before counting its tasks.
 
     Returns:
         One row per combination, cheapest floor first.
@@ -601,7 +685,12 @@ def sweep_plan(
     rows: list[SweepRow] = []
     for chunk_size in chunk_sizes:
         phases = plan_tile(
-            tile=tile, scenes=scenes, chunk_size=chunk_size, threads=1, baseline_gib=baseline_gib
+            tile=tile,
+            scenes=scenes,
+            chunk_size=chunk_size,
+            threads=1,
+            baseline_gib=baseline_gib,
+            optimize=optimize,
         )
         tasks = {phase.name: phase.graph.tasks for phase in phases}
         for threads in thread_counts:
@@ -624,6 +713,7 @@ def sweep_plan(
                     composite_tasks=tasks.get(PHASE_COMPOSITE, 0),
                     floor_gib=floor,
                     vm_gib=vm_gib,
+                    optimized=optimize,
                 )
             )
     return tuple(sorted(rows, key=lambda r: r.floor_gib))
