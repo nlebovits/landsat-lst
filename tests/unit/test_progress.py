@@ -17,6 +17,7 @@ import pytest
 
 from landsat_lst.progress import (
     TERMINAL_PHASES,
+    GraphProgress,
     TileHeartbeat,
     active_heartbeat,
     capture_task_log,
@@ -355,3 +356,81 @@ def test_utc_is_used_for_published_timestamps(storage):
         stamped = datetime.fromisoformat(_published(storage)["updated_at"])
 
     assert abs((datetime.now(tz=UTC) - stamped).total_seconds()) < 60
+
+
+class TestPhaseTimings:
+    """A tile that took three hours should say which phase took them."""
+
+    def test_time_accrues_per_phase(self, storage):
+        with TileHeartbeat(
+            run_id=RUN, tile=TILE, window=WINDOW, storage=storage, interval_s=3600
+        ) as hb:
+            hb.set_phase("loading")
+            hb.set_phase("destriping")
+            payload = hb.payload()
+
+        assert set(payload["phase_seconds"]) >= {"starting", "loading", "destriping"}
+        assert all(v >= 0 for v in payload["phase_seconds"].values())
+
+    def test_current_phase_is_counted_before_it_ends(self, storage):
+        """A tile killed mid-phase still reports where its hours went."""
+        with TileHeartbeat(
+            run_id=RUN, tile=TILE, window=WINDOW, storage=storage, interval_s=3600
+        ) as hb:
+            hb.set_phase("destriping")
+            time.sleep(0.05)
+            payload = hb.payload()
+
+        assert payload["phase_seconds"]["destriping"] > 0
+
+
+class TestGraphProgress:
+    """Sub-phase progress: a one-hour dask graph published only its name."""
+
+    def test_reports_task_counts_into_the_heartbeat(self, storage):
+        import dask
+        import dask.array as da
+
+        with TileHeartbeat(
+            run_id=RUN, tile=TILE, window=WINDOW, storage=storage, interval_s=3600
+        ) as hb:
+            seen = []
+            original = hb.set_task_progress
+
+            def record(done, total):
+                seen.append((done, total))
+                original(done, total)
+
+            hb.set_task_progress = record
+            with GraphProgress():
+                dask.compute(da.ones((40, 40), chunks=(10, 10)).sum())
+
+        counted = [pair for pair in seen if pair[0] is not None]
+        assert counted, "no task progress was reported"
+        assert all(done <= total for done, total in counted)
+        assert counted[-1][1] >= counted[0][1] > 0
+
+    def test_progress_is_cleared_when_the_graph_ends(self, storage):
+        """A stale fraction on a later phase would be worse than none."""
+        import dask
+        import dask.array as da
+
+        with TileHeartbeat(
+            run_id=RUN, tile=TILE, window=WINDOW, storage=storage, interval_s=3600
+        ) as hb:
+            with GraphProgress():
+                dask.compute(da.ones((20, 20), chunks=(10, 10)).sum())
+            payload = hb.payload()
+
+        assert payload["tasks_done"] is None
+        assert payload["tasks_total"] is None
+
+    def test_is_inert_without_a_heartbeat(self):
+        """Local runs and benchmarks wrap their computes unconditionally."""
+        import dask
+        import dask.array as da
+
+        with GraphProgress():
+            result = dask.compute(da.ones((10, 10), chunks=(5, 5)).sum())
+
+        assert result[0] == 100

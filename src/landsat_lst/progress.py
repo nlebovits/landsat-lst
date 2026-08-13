@@ -129,17 +129,37 @@ class TileHeartbeat:
         self._error: str | None = None
         self._counts: dict[str, int] = {}
         self._token: Any = None
+        # Seconds spent in each phase so far. Without this a manifest says a
+        # tile took three hours and nothing about which phase to optimize.
+        self._phase_seconds: dict[str, float] = {}
+        self._phase_started = self._started
+        # Completed and total dask tasks for the graph currently running, set
+        # by :class:`GraphProgress`. Cleared when a graph finishes, so a phase
+        # between graphs reports no fraction rather than a stale one.
+        self._tasks_done: int | None = None
+        self._tasks_total: int | None = None
 
     def payload(self) -> dict:
         """The heartbeat object as it is stored."""
+        now = time.monotonic()
         with self._lock:
             phase, error, counts = self._phase, self._error, dict(self._counts)
+            # The current phase's time is added live rather than only on exit,
+            # so a tile killed mid-phase still reports where its hours went.
+            phase_seconds = dict(self._phase_seconds)
+            phase_seconds[phase] = round(
+                phase_seconds.get(phase, 0.0) + (now - self._phase_started), 1
+            )
+            done, total = self._tasks_done, self._tasks_total
         return {
             "run_id": self.run_id,
             "tile": self.tile,
             "window": self.window,
             "phase": phase,
-            "elapsed_s": round(time.monotonic() - self._started, 1),
+            "elapsed_s": round(now - self._started, 1),
+            "phase_seconds": phase_seconds,
+            "tasks_done": done,
+            "tasks_total": total,
             "peak_rss_mb": peak_rss_mb(),
             "host": self._host,
             "pid": os.getpid(),
@@ -147,6 +167,12 @@ class TileHeartbeat:
             "error": error,
             **counts,
         }
+
+    def set_task_progress(self, done: int | None, total: int | None) -> None:
+        """Record progress through the dask graph now running. Never raises."""
+        with self._lock:
+            self._tasks_done = done
+            self._tasks_total = total
 
     def write(self) -> None:
         """Publish the current state. Never raises."""
@@ -166,9 +192,17 @@ class TileHeartbeat:
         ignored rather than stored, so a caller with nothing to add can pass the
         keyword unconditionally.
         """
+        now = time.monotonic()
         with self._lock:
+            self._phase_seconds[self._phase] = round(
+                self._phase_seconds.get(self._phase, 0.0) + (now - self._phase_started), 1
+            )
+            self._phase_started = now
             self._phase = phase
             self._counts.update({k: v for k, v in counts.items() if v is not None})
+            # A fraction belongs to the graph that reported it, never to the
+            # next phase, which may run no graph at all.
+            self._tasks_done = self._tasks_total = None
         self.write()
 
     def set_failed(self, error: str) -> None:
@@ -219,6 +253,62 @@ class TileHeartbeat:
             if self._token is not None:
                 _active.reset(self._token)
                 self._token = None
+        return False
+
+
+class GraphProgress:
+    """Report how far a dask computation has got, into the active heartbeat.
+
+    A phase like ``destriping`` can run for an hour as one ``dask.compute``
+    call, and until now the only thing published about it was that it had
+    started. Dask's callback hooks carry the same state its own ``ProgressBar``
+    renders from, so a tile can report ``4182/18600 tasks`` and let an operator
+    tell a slow phase from a wedged one, and estimate a finish time.
+
+    Used as a context manager around a compute. Outside a batch task there is
+    no heartbeat and this is inert, so the pipeline can wrap its computes
+    unconditionally.
+
+    Counting tasks is not counting work: dask tasks are wildly uneven, so the
+    fraction is a progress indication, not a schedule. It is still the
+    difference between "something is happening" and nothing at all.
+    """
+
+    def __init__(self) -> None:
+        self._heartbeat = _active.get()
+        self._callback: Any = None
+
+    def __enter__(self) -> GraphProgress:
+        if self._heartbeat is None:
+            return self
+        from dask.callbacks import Callback  # noqa: PLC0415
+
+        heartbeat = self._heartbeat
+
+        class _Reporter(Callback):
+            # Same state dask's own ProgressBar reads: the scheduler keeps
+            # every task in exactly one of these sets.
+            # Dask invokes these positionally, so the arity is the contract and
+            # the arguments it does not need are named with a leading
+            # underscore rather than dropped.
+            def _pretask(self, _key, _dsk, state):
+                done = len(state["finished"])
+                total = done + sum(len(state[k]) for k in ("ready", "waiting", "running"))
+                heartbeat.set_task_progress(done, total)
+
+            def _finish(self, _dsk, _state, _errored):
+                heartbeat.set_task_progress(None, None)
+
+        self._callback = _Reporter()
+        self._callback.register()
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        if self._callback is not None:
+            self._callback.unregister()
+            self._callback = None
+        if self._heartbeat is not None:
+            self._heartbeat.set_task_progress(None, None)
         return False
 
 

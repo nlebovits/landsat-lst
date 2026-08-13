@@ -26,6 +26,8 @@ import dask
 import numpy as np
 import xarray as xr
 
+from landsat_lst.progress import GraphProgress
+
 _TIME_DIM = "time"
 
 
@@ -66,10 +68,11 @@ def scene_offsets(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
     # nothing on its own. dask.compute shares the loaded chunks between the two
     # graphs, which is the same trick scripts/validate_offset_subsampling.py
     # already uses to sweep factors in one pass.
-    offset, n_valid = dask.compute(
-        anomaly.median(dim=spatial, skipna=True),
-        lst.notnull().sum(dim=spatial),
-    )
+    with GraphProgress():
+        offset, n_valid = dask.compute(
+            anomaly.median(dim=spatial, skipna=True),
+            lst.notnull().sum(dim=spatial),
+        )
     return offset, n_valid
 
 
