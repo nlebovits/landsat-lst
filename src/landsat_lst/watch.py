@@ -68,6 +68,20 @@ class TileStatus:
     host: str | None = None
     error: str | None = None
     log_key: str | None = None
+    tasks_done: int | None = None
+    tasks_total: int | None = None
+
+    @property
+    def graph_fraction(self) -> str:
+        """How far through the running dask graph, as a percentage.
+
+        Empty between graphs, and empty for a phase that runs none. Dask tasks
+        are wildly uneven, so this indicates progress; it does not predict a
+        finish time.
+        """
+        if not self.tasks_total or self.tasks_done is None:
+            return ""
+        return f"{100 * self.tasks_done / self.tasks_total:.0f}%"
 
     @property
     def is_live(self) -> bool:
@@ -116,6 +130,20 @@ def _sort_key(tile: TileStatus) -> tuple[int, str]:
     return (CATEGORIES.index(tile.category), tile.tile)
 
 
+def _storage_for_run(run_id: str) -> StorageBackend:
+    """The backend a run wrote to, from its submission record if there is one.
+
+    Watching from a machine that never submitted the run leaves nothing to read
+    it from, so the configured backend stands in.
+    """
+    try:
+        from landsat_lst.batch import load_submission  # noqa: PLC0415
+
+        return load_submission(run_id).storage()
+    except Exception:
+        return get_storage()
+
+
 class RunWatcher:
     """Polls one run's heartbeat objects, caching the bodies that did not change."""
 
@@ -127,7 +155,10 @@ class RunWatcher:
         stale_after_s: float | None = None,
     ) -> None:
         self.run_id = run_id
-        self.storage = storage or get_storage()
+        # A run's own submission record knows where its tiles wrote. Falling
+        # back to the configured backend would search the local output dir for
+        # a distributed run and report every live tile as pending.
+        self.storage = storage or _storage_for_run(run_id)
         self.stale_after_s = (
             settings.watch_stale_after_s if stale_after_s is None else stale_after_s
         )
@@ -250,6 +281,8 @@ class RunWatcher:
             scenes_found=body.get("scenes_found"),
             scenes_kept=body.get("scenes_kept"),
             peak_rss_mb=body.get("peak_rss_mb"),
+            tasks_done=body.get("tasks_done"),
+            tasks_total=body.get("tasks_total"),
             host=body.get("host"),
             error=body.get("error"),
             log_key=logs.get(tile),
@@ -322,6 +355,7 @@ def render_snapshot(snapshot: RunSnapshot, *, show_all: bool = False):
     table.add_column("Tile", no_wrap=True)
     table.add_column("Phase", no_wrap=True)
     table.add_column("Elapsed", justify="right", no_wrap=True)
+    table.add_column("Graph", justify="right", no_wrap=True)
     table.add_column("Beat", justify="right", no_wrap=True)
     table.add_column("Scenes", justify="right", no_wrap=True)
     table.add_column("RSS", justify="right", no_wrap=True)
@@ -333,6 +367,7 @@ def render_snapshot(snapshot: RunSnapshot, *, show_all: bool = False):
             tile.tile,
             f"[{phase_style}]{tile.phase}[/]" if phase_style else tile.phase,
             format_duration(tile.elapsed_s),
+            tile.graph_fraction or "-",
             format_duration(tile.heartbeat_age_s),
             _scenes(tile),
             "-" if tile.peak_rss_mb is None else f"{tile.peak_rss_mb / 1024:.1f}G",

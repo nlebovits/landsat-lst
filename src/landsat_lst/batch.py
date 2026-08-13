@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -42,7 +42,7 @@ import structlog
 
 from landsat_lst.config import settings
 from landsat_lst.job import JobResult, _split_completed, _worker_environ
-from landsat_lst.storage import get_storage
+from landsat_lst.storage import S3Storage, get_storage
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -78,6 +78,13 @@ class BatchSubmission:
     end_year: int | None = None
     skipped_tiles: list[str] = field(default_factory=list)
     command: str = ""
+    #: Where the run's tiles wrote. A distributed run always writes to S3,
+    #: whatever the submitting shell had configured, so watch and reconcile
+    #: read this rather than the local default -- otherwise they search an
+    #: empty output directory and report a live run as pending.
+    storage_backend: str = "s3"
+    s3_bucket: str = ""
+    s3_prefix: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -91,11 +98,23 @@ class BatchSubmission:
             "year": self.year,
             "end_year": self.end_year,
             "command": self.command,
+            "storage_backend": self.storage_backend,
+            "s3_bucket": self.s3_bucket,
+            "s3_prefix": self.s3_prefix,
         }
 
     @classmethod
     def from_dict(cls, payload: dict) -> BatchSubmission:
-        return cls(**payload)
+        # Tolerant of records written before the storage fields existed; those
+        # runs predate this and fall back to the configured backend.
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in payload.items() if k in known})
+
+    def storage(self) -> StorageBackend:
+        """The backend this run's tiles actually wrote to."""
+        if self.storage_backend != "s3":
+            return get_storage()
+        return S3Storage(bucket=self.s3_bucket or None, prefix=self.s3_prefix or None)
 
     @property
     def dashboard_url(self) -> str:
@@ -274,6 +293,10 @@ def submit_batch(
         year=jobs[0].year,
         end_year=jobs[0].end_year,
         command=command,
+        # Recorded from config rather than from the live backend: the tasks
+        # always run with LST_STORAGE_BACKEND=s3, whatever this shell is set to.
+        s3_bucket=settings.s3_bucket,
+        s3_prefix=settings.s3_prefix,
     )
 
     if tiles:
@@ -467,7 +490,8 @@ def reconcile_run(
     from landsat_lst.tiling import parse_tile_name  # noqa: PLC0415
 
     submission = load_submission(run_id, out_dir)
-    storage = storage or get_storage()
+    # The run's own record of where it wrote, not this shell's configuration.
+    storage = storage or submission.storage()
 
     completed = storage.list_completed(submission.window)
     # One listing of the run prefix answers two questions at once: which tiles

@@ -19,6 +19,7 @@ from landsat_lst.storage import LocalStorage
 from landsat_lst.watch import (
     _TERMINAL_CATEGORY,
     RunWatcher,
+    TileStatus,
     format_duration,
     render_snapshot,
     watch_run,
@@ -332,3 +333,24 @@ def test_format_duration():
     assert format_duration(14.6) == "14s"
     assert format_duration(501) == "8m21s"
     assert format_duration(3720) == "1h02m"
+
+
+class TestGraphFraction:
+    """Sub-phase progress is the difference between slow and wedged."""
+
+    def test_renders_a_percentage_while_a_graph_runs(self):
+        tile = TileStatus(
+            tile="N40W075",
+            category="running",
+            phase="destriping",
+            tasks_done=4182,
+            tasks_total=18600,
+        )
+
+        assert tile.graph_fraction == "22%"
+
+    def test_is_empty_between_graphs(self):
+        """A phase that runs no graph must not inherit the last one's number."""
+        tile = TileStatus(tile="N40W075", category="running", phase="uploading")
+
+        assert tile.graph_fraction == ""

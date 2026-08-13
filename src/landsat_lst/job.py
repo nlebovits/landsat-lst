@@ -35,7 +35,13 @@ from landsat_lst.config import settings
 from landsat_lst.encoding import encode_lst_uint16
 from landsat_lst.models import ProcessingJob
 from landsat_lst.pipeline import process_tile
-from landsat_lst.progress import TileHeartbeat, peak_rss_mb, report_failed, report_phase
+from landsat_lst.progress import (
+    GraphProgress,
+    TileHeartbeat,
+    peak_rss_mb,
+    report_failed,
+    report_phase,
+)
 from landsat_lst.storage import StorageBackend, get_storage
 
 if TYPE_CHECKING:
@@ -224,7 +230,12 @@ def _write_cogs(
         qa_local = scratch / job.asset_filename("qa_count")
         logger.info("cog_exporting")
         report_phase("exporting")
-        cog_export(_encode_native(composite), lst_local, qa_local)
+        # The composite is lazy until it is written, so this call is where the
+        # native P95 over every surviving scene actually runs -- the second of
+        # the two hour-scale graphs in a tile, and the one a bare phase label
+        # said nothing about.
+        with GraphProgress():
+            cog_export(_encode_native(composite), lst_local, qa_local)
 
         logger.info("cog_uploading", lst_key=lst_key, qa_key=qa_key)
         report_phase("uploading")
