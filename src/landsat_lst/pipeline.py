@@ -40,6 +40,34 @@ def _configure_requester_pays() -> None:
     os.environ.setdefault("GDAL_HTTP_UNSAFESSL", "NO")
 
 
+def _sample_scenes(items: list, max_scenes: int) -> list:
+    """Keep at most ``max_scenes``, spread evenly over the window by date.
+
+    Evenly rather than the first N, because de-striping estimates each scene's
+    offset against a per-pixel *monthly* climatology: a sample drawn from one
+    end of the window would leave most months with no reference at all, and the
+    run would exercise a rejection path rather than the pipeline.
+
+    Sampled output is not the product. It exists so the machinery can be
+    exercised at real tile geometry in minutes -- the same chunking, the same
+    reprojection, the same COG write -- instead of hours.
+    """
+    if len(items) <= max_scenes:
+        return items
+
+    ordered = sorted(items, key=lambda item: item.datetime)
+    step = len(ordered) / max_scenes
+    sampled = [ordered[int(i * step)] for i in range(max_scenes)]
+
+    log.warning(
+        "scene_sample_applied",
+        kept=len(sampled),
+        available=len(items),
+        note="composite is a sample, not the product",
+    )
+    return sampled
+
+
 def query_stac(job: ProcessingJob) -> list:
     """Query STAC catalog for Landsat scenes.
 
@@ -297,6 +325,9 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
     if not items:
         msg = f"No scenes found for {job.tile.name} in {job.year}"
         raise ValueError(msg)
+
+    if job.max_scenes is not None:
+        items = _sample_scenes(items, job.max_scenes)
 
     report_phase("loading", scenes_found=len(items))
 

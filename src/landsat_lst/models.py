@@ -62,6 +62,15 @@ class ProcessingJob(BaseModel):
         le=2030,
         description="Last inclusive year for a multi-year window; None = single year",
     )
+    max_scenes: int | None = Field(
+        default=None,
+        gt=0,
+        description="Keep at most this many scenes, sampled evenly across the "
+        "window. For exercising the machinery at tile geometry in minutes "
+        "instead of hours; the composite it produces is not the product. The "
+        "sample is stamped into window_label so it can never be written over a "
+        "real tile.",
+    )
 
     @model_validator(mode="after")
     def _check_year_window(self) -> "ProcessingJob":
@@ -80,10 +89,18 @@ class ProcessingJob(BaseModel):
     @computed_field
     @property
     def window_label(self) -> str:
-        """Storage/label token: ``2024`` for single year, ``2020-2024`` for a range."""
-        if self.end_year is None or self.end_year == self.year:
-            return str(self.year)
-        return f"{self.year}-{self.end_year}"
+        """Storage/label token: ``2024`` for single year, ``2020-2024`` for a range.
+
+        A sampled job carries ``-sample{n}``. Every storage key is built from
+        this token, so a throwaway run cannot land on the keys a real tile owns,
+        and ``list_completed`` for the real window never counts one as done.
+        """
+        window = (
+            str(self.year)
+            if self.end_year is None or self.end_year == self.year
+            else f"{self.year}-{self.end_year}"
+        )
+        return window if self.max_scenes is None else f"{window}-sample{self.max_scenes}"
 
     def asset_filename(self, product: str) -> str:
         """Filename for one output asset of this job.

@@ -22,7 +22,12 @@ def main() -> None:
     """Landsat Land Surface Temperature annual composites."""
 
 
-def _build_jobs(year: int | None, end_year: int | None, tiles: tuple[str, ...]) -> list:
+def _build_jobs(
+    year: int | None,
+    end_year: int | None,
+    tiles: tuple[str, ...],
+    max_scenes: int | None = None,
+) -> list:
     """Resolve CLI options into the job list to run.
 
     Omitting ``--year`` selects the production window. Passing ``--year`` alone
@@ -40,9 +45,18 @@ def _build_jobs(year: int | None, end_year: int | None, tiles: tuple[str, ...]) 
             if tile not in LAND_TILES:
                 console.print(f"[red]Warning: {tile} is not in the land tiles set[/red]")
         return [
-            ProcessingJob(tile=parse_tile_name(tile), year=year, end_year=end_year)
+            ProcessingJob(
+                tile=parse_tile_name(tile),
+                year=year,
+                end_year=end_year,
+                max_scenes=max_scenes,
+            )
             for tile in tiles
         ]
+
+    if max_scenes is not None:
+        msg = "--max-scenes is for exercising the machinery on named tiles; pass --tile."
+        raise click.UsageError(msg)
 
     if end_year:
         return generate_jobs(window=(year, end_year))
@@ -79,6 +93,13 @@ def _build_jobs(year: int | None, end_year: int | None, tiles: tuple[str, ...]) 
     help="Run token. Set by the batch task so each VM reports into the same run.",
 )
 @click.option("--limit", type=int, help="Process at most N tiles from the job list")
+@click.option(
+    "--max-scenes",
+    type=int,
+    help="Keep at most N scenes, sampled evenly across the window. Exercises the "
+    "machinery at tile geometry in minutes; output is a sample, not the product, "
+    "and is written under a -sampleN window so it cannot overwrite a real tile.",
+)
 def process(
     *,
     year: int | None,
@@ -90,6 +111,7 @@ def process(
     wait: bool,
     run_id: str | None,
     limit: int | None,
+    max_scenes: int | None,
 ) -> None:
     """Process Landsat data to COG composites.
 
@@ -102,7 +124,7 @@ def process(
     # The capture opens before the jobs are built, so an unusable --tile is
     # explained by an uploaded log rather than by silence on a dead VM.
     with _task_log(tiles, run_id):
-        jobs = _build_jobs(year, end_year, tiles)
+        jobs = _build_jobs(year, end_year, tiles, max_scenes)
         if limit is not None:
             jobs = jobs[:limit]
         console.print(f"[bold]Processing window {jobs[0].window_label}[/bold]")

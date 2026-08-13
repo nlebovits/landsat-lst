@@ -77,3 +77,23 @@ class TestProcessingJob:
     def test_end_year_before_year_rejected(self):
         with pytest.raises(ValueError, match="end_year"):
             ProcessingJob(tile=TileId(lat=40, lon=-75), year=2024, end_year=2020)
+
+
+class TestSampledJobs:
+    """--max-scenes exists to exercise the machinery, not to make a product."""
+
+    def test_sample_is_stamped_into_the_window(self):
+        """Storage keys derive from window_label, so a sample cannot collide."""
+        job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2021, end_year=2025, max_scenes=50)
+
+        assert job.window_label == "2021-2025-sample50"
+        assert job.asset_filename("lst_p95") == "lst_p95_2021-2025-sample50_N40W075.tif"
+
+    def test_unsampled_window_is_unchanged(self):
+        job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2021, end_year=2025)
+
+        assert job.window_label == "2021-2025"
+
+    def test_sample_must_be_positive(self):
+        with pytest.raises(ValueError, match="max_scenes"):
+            ProcessingJob(tile=TileId(lat=40, lon=-75), year=2021, max_scenes=0)

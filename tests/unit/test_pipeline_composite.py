@@ -270,3 +270,43 @@ class TestDaskComposite:
         assert qa.dtype == np.uint8
         assert qa.sizes["month"] == 12
         assert "lst_p50" not in result.data_vars
+
+
+class TestSceneSampling:
+    """Sampling exists so a run exercises the pipeline in minutes, not hours."""
+
+    @staticmethod
+    def _items(n: int):
+        from datetime import UTC, datetime, timedelta
+        from unittest.mock import MagicMock
+
+        start = datetime(2021, 1, 1, tzinfo=UTC)
+        items = []
+        for i in range(n):
+            item = MagicMock()
+            item.datetime = start + timedelta(days=i)
+            items.append(item)
+        return items
+
+    def test_keeps_the_requested_count(self):
+        from landsat_lst.pipeline import _sample_scenes
+
+        assert len(_sample_scenes(self._items(2930), 50)) == 50
+
+    def test_spreads_the_sample_across_the_window(self):
+        """De-striping references a monthly climatology, so a sample drawn from
+        one end of the window would leave most months without a reference and
+        exercise the rejection path instead of the pipeline."""
+        from landsat_lst.pipeline import _sample_scenes
+
+        sampled = _sample_scenes(self._items(1000), 10)
+        span = (sampled[-1].datetime - sampled[0].datetime).days
+
+        assert span > 800
+
+    def test_a_short_stack_is_returned_untouched(self):
+        from landsat_lst.pipeline import _sample_scenes
+
+        items = self._items(7)
+
+        assert _sample_scenes(items, 50) is items
