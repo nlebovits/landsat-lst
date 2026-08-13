@@ -109,10 +109,11 @@ runs on 2026-08-12, first by escaping to the shared scheduler, then by crushing 
 tiles at once, then by starving the worker heartbeat until Coiled tore the VM down mid-tile.
 See [ADR-010](docs/adr/010-coiled-batch-for-distributed-runs.md).
 
-Two phases that never share a process:
+Two phases that never share a process, plus a live view that needs neither:
 
 ```bash
 landsat-lst process --distributed   # submits, prints a run id, returns
+landsat-lst watch <run-id>          # live: phase and heartbeat age per tile
 landsat-lst reconcile <run-id>      # builds the manifest from S3 afterwards
 ```
 
@@ -125,6 +126,14 @@ Rules worth keeping:
   writes `{run_id}.submission.json` before returning, and that file is all `reconcile_run` needs.
 - **Each VM reports for itself** to `_runs/{run_id}/{tile}.json` (duration, scene count, peak RSS,
   error). A missing record is ordinary, not an error: preempted and timed-out VMs never write one.
+- **A running tile is only visible through what it publishes.** The cluster dashboard describes a
+  dask scheduler that a batch task never registers with, task stdout never reaches `coiled logs`,
+  and the exit code Coiled records is the tee wrapper's. So each tile beats to
+  `{tile}.progress.json` every 60s (`progress.TileHeartbeat`, rendered by `landsat-lst watch`) and
+  uploads its own stdout and stderr to `{tile}.log` on exit either way. Do not reason about a live
+  run from the dashboard, and do not trust an exit code. See issue #68.
+- **Instrumentation never fails a tile.** Every heartbeat and log write is best-effort: a failure
+  is logged and swallowed. Losing observability costs less than losing a two-hour composite.
 - **VMs carry 64 GiB.** A heavy tile OOMed at 28.77 GiB on a 32 GiB `r6i.xlarge`.
 - **Cost caps are `coiled_max_workers` (concurrent VMs) and `coiled_job_timeout`** (per-task
   wall clock), not a fixed cluster size.

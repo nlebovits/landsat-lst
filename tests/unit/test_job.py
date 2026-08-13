@@ -339,8 +339,12 @@ class TestRunRecord:
         record = json.loads(mock_storage.write_text.call_args.args[1])
         assert record["status"] == "skipped"
 
-    def test_transient_failure_writes_nothing(self, sample_job, mock_storage):
-        """The retry on a fresh VM writes the record; a doomed attempt must not."""
+    def test_transient_failure_writes_no_record(self, sample_job, mock_storage):
+        """The retry on a fresh VM writes the record; a doomed attempt must not.
+
+        It does still beat, and its last beat says why it died: that is what a
+        watcher sees while the retry is being scheduled.
+        """
         with (
             patch("landsat_lst.job.process_tile") as mock_process,
             pytest.raises(TimeoutError),
@@ -348,7 +352,9 @@ class TestRunRecord:
             mock_process.side_effect = TimeoutError("read timed out")
             process_tile_job(sample_job, storage=mock_storage, run_id="run-1")
 
-        mock_storage.write_text.assert_not_called()
+        written = [call.args[0] for call in mock_storage.write_text.call_args_list]
+        assert mock_storage.run_record_key("run-1", "N40W075") not in written
+        assert mock_storage.progress_key("run-1", "N40W075") in written
 
     def test_unwritable_record_does_not_fail_an_uploaded_tile(self, sample_job, mock_storage):
         mock_storage.write_text.side_effect = OSError("bucket on fire")
@@ -366,3 +372,113 @@ class TestRunRecord:
         assert restored.status == result.status
         assert restored.scene_count == result.scene_count
         assert restored.lst_key == result.lst_key
+
+
+class _NoUploadStorage(LocalStorage):
+    """Real storage for the small objects, no-op for the assets.
+
+    These tests read heartbeats back out of storage, which a mock cannot give
+    them, but ``cog_export`` is patched out so there is no asset on disk to
+    upload.
+    """
+
+    def upload(self, local, key) -> None:
+        pass
+
+
+class TestHeartbeat:
+    """The tile is the only thing that knows it is alive, so it has to say so."""
+
+    def _storage(self, tmp_path) -> LocalStorage:
+        return _NoUploadStorage(output_dir=tmp_path / "cogs")
+
+    def _phases(self, storage: LocalStorage, tile: str = "N40W075") -> list[str]:
+        raw = storage.read_text(storage.progress_key("run-1", tile))
+        return [] if raw is None else [json.loads(raw)["phase"]]
+
+    def _run(self, job, storage, *, run_id="run-1", pipeline=None):
+        with (
+            patch("landsat_lst.job.process_tile") as mock_process,
+            patch("landsat_lst.job._encode_native") as mock_encode,
+            patch("landsat_lst.job.cog_export") as mock_export,
+        ):
+            mock_process.side_effect = pipeline or (lambda _job: MagicMock())
+            mock_encode.return_value = MagicMock()
+            mock_export.return_value = (MagicMock(), MagicMock())
+            return process_tile_job(job, storage=storage, run_id=run_id)
+
+    def test_phases_reported_from_the_pipeline_reach_storage(self, sample_job, tmp_path):
+        """The pipeline reports through a context variable, not an argument."""
+        from landsat_lst.pipeline import report_phase
+
+        storage = self._storage(tmp_path)
+        seen = []
+
+        def pipeline(job):
+            report_phase("stac_query")
+            seen.append(json.loads(storage.read_text(storage.progress_key("run-1", "N40W075"))))
+            return MagicMock()
+
+        self._run(sample_job, storage, pipeline=pipeline)
+
+        assert seen[0]["phase"] == "stac_query"
+        assert seen[0]["tile"] == "N40W075"
+
+    def test_a_completed_tile_ends_on_done(self, sample_job, tmp_path):
+        storage = self._storage(tmp_path)
+
+        self._run(sample_job, storage)
+
+        assert self._phases(storage) == ["done"]
+
+    def test_export_and_upload_are_visible(self, sample_job, tmp_path):
+        """Two of the longest phases; a flat dashboard here is what started #68."""
+        storage = self._storage(tmp_path)
+        phases = []
+
+        original = storage.write_text
+
+        def spy(key, text, **kwargs):
+            if key.endswith(".progress.json"):
+                phases.append(json.loads(text)["phase"])
+            original(key, text, **kwargs)
+
+        storage.write_text = spy
+        self._run(sample_job, storage)
+
+        assert "exporting" in phases
+        assert "uploading" in phases
+
+    def test_a_failed_tile_ends_on_failed_with_its_error(self, sample_job, tmp_path):
+        storage = self._storage(tmp_path)
+
+        def pipeline(job):
+            msg = "No scenes found for the window"
+            raise ValueError(msg)
+
+        result = self._run(sample_job, storage, pipeline=pipeline)
+
+        published = json.loads(storage.read_text(storage.progress_key("run-1", "N40W075")))
+        assert result.status == "failed"
+        assert published["phase"] == "failed"
+        assert published["error"] == "No scenes found for the window"
+
+    def test_a_tile_with_no_run_id_beats_to_nobody(self, sample_job, tmp_path):
+        storage = self._storage(tmp_path)
+
+        self._run(sample_job, storage, run_id=None)
+
+        assert not (storage.output_dir / "_runs").exists()
+
+    def test_a_skipped_tile_writes_only_its_record(self, sample_job, tmp_path):
+        storage = self._storage(tmp_path)
+        for product in ("lst_p95", "qa_count"):
+            path = storage.output_dir / storage.cog_key("2023", "N40W075", product)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"tif")
+
+        result = process_tile_job(sample_job, storage=storage, run_id="run-1")
+
+        assert result.status == "skipped"
+        assert storage.read_text(storage.run_record_key("run-1", "N40W075")) is not None
+        assert storage.read_text(storage.progress_key("run-1", "N40W075")) is None

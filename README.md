@@ -135,12 +135,23 @@ landsat-lst process --distributed --dry-run
 ```
 
 Submission prints a run id and hands the run to Coiled. Closing the shell does not affect it.
-Watch progress on the Coiled dashboard or with `coiled batch status <cluster-id>`, then build the
-run manifest:
 
 ```bash
+# Live view: phase, elapsed time, and heartbeat age for every tile
+landsat-lst watch <run-id>
+
+# Afterwards: the durable record of what the run produced
 landsat-lst reconcile <run-id>
 ```
+
+Each tile publishes a heartbeat to `_runs/{run_id}/{tile}.progress.json` every minute and at every
+phase change, and uploads its own stdout and stderr to `_runs/{run_id}/{tile}.log` when it exits.
+`watch` renders the heartbeats as one table, so a wedged tile shows a stale heartbeat within two
+minutes and a failed one leaves its traceback in the bucket. Neither command needs the submitting
+shell, or even the machine that submitted the run.
+
+The cluster dashboard cannot report this: a batch task is a plain process that never registers
+with the dask scheduler its panels describe (issue #68).
 
 The manifest records per-tile status, duration, scene count, and peak memory under
 `settings.manifest_dir`. Completion comes from the S3 listing, so a resumed run reprocesses only

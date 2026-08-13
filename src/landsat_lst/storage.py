@@ -16,17 +16,28 @@ Both assets must be present for a tile to count as done: a tile with one
 uploaded asset is a half-written tile and has to be rebuilt, so
 :meth:`StorageBackend.cog_exists` always checks both.
 
-Each backend also stores small per-tile **run records** under ``_runs/``, one
-JSON object per tile per run. A distributed run has no live driver to collect
-results, so the VM that processes a tile writes its own duration, scene count,
-peak memory, and error there; :func:`landsat_lst.batch.reconcile_run` reads them
-back. The prefix is a sibling of the collection directories and is invisible to
-the catalog, which only ever reads ``lst-p95-*``.
+Each backend also stores small per-tile objects under ``_runs/{run_id}/``, the
+only channel a batch VM has back to whoever is watching:
+
+- ``{tile}.json`` -- the **run record**, written once when the tile finishes.
+  A distributed run has no live driver to collect results, so the VM reports its
+  own duration, scene count, peak memory, and error;
+  :func:`landsat_lst.batch.reconcile_run` reads them back.
+- ``{tile}.progress.json`` -- the **heartbeat**, rewritten every
+  ``settings.heartbeat_interval_s`` while the tile runs, so a wedged tile is
+  distinguishable from a busy one (:mod:`landsat_lst.progress`).
+- ``{tile}.log`` -- the task's captured stdout and stderr, uploaded when it
+  exits either way. Coiled's own logs never carry it and its exit code is the
+  tee wrapper's, so a failed tile explains itself here or nowhere.
+
+The prefix is a sibling of the collection directories and is invisible to the
+catalog, which only ever reads ``lst-p95-*``.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
 from pathlib import Path  # noqa: TC003 - used at runtime in type hints
 from typing import Any
 
@@ -69,6 +80,14 @@ class StorageBackend(ABC):
         """
         return f"{collection_prefix(window)}/{tile}/{product}_{window}_{tile}.tif"
 
+    def run_prefix(self, run_id: str) -> str:
+        """Backend-relative prefix holding everything one run reported.
+
+        Returns:
+            ``_runs/{run_id}/``
+        """
+        return f"{RUN_RECORD_PREFIX}/{run_id}/"
+
     def run_record_key(self, run_id: str, tile: str) -> str:
         """Backend-relative key for one tile's run record.
 
@@ -80,6 +99,26 @@ class StorageBackend(ABC):
             ``_runs/{run_id}/{tile}.json``
         """
         return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.json"
+
+    def progress_key(self, run_id: str, tile: str) -> str:
+        """Backend-relative key for one tile's heartbeat.
+
+        Distinct from :meth:`run_record_key` because the two have opposite
+        lifetimes: the heartbeat is overwritten every minute while the tile
+        runs, the record is written once at the end and never touched again.
+
+        Returns:
+            ``_runs/{run_id}/{tile}.progress.json``
+        """
+        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.progress.json"
+
+    def log_key(self, run_id: str, tile: str) -> str:
+        """Backend-relative key for one tile's captured task log.
+
+        Returns:
+            ``_runs/{run_id}/{tile}.log``
+        """
+        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.log"
 
     @abstractmethod
     def cog_exists(self, window: str, tile: str) -> bool:
@@ -94,8 +133,15 @@ class StorageBackend(ABC):
         """Tile names in ``window`` that have both assets stored."""
 
     @abstractmethod
-    def write_text(self, key: str, text: str) -> None:
-        """Store ``text`` at ``key``, replacing whatever was there."""
+    def write_text(self, key: str, text: str, *, content_type: str = "application/json") -> None:
+        """Store ``text`` at ``key``, replacing whatever was there.
+
+        Args:
+            key: Backend-relative key.
+            text: Content to store.
+            content_type: Media type recorded with the object. Backends that
+                have nowhere to put it ignore it.
+        """
 
     @abstractmethod
     def read_text(self, key: str) -> str | None:
@@ -104,6 +150,15 @@ class StorageBackend(ABC):
         A missing key is an ordinary outcome, not an error: a tile whose VM was
         killed before it could report leaves no record, and reconciliation has
         to distinguish that from a read failure.
+        """
+
+    @abstractmethod
+    def list_prefix(self, prefix: str) -> dict[str, datetime]:
+        """Every key under ``prefix``, mapped to when it was last written.
+
+        The timestamp comes from the store rather than from the object's own
+        contents, so a watcher measures heartbeat age against one clock instead
+        of trusting a VM's. An absent prefix maps to an empty dict.
         """
 
 
@@ -134,7 +189,8 @@ class LocalStorage(StorageBackend):
             if d.is_dir() and self.cog_exists(window, d.name)
         }
 
-    def write_text(self, key: str, text: str) -> None:
+    def write_text(self, key: str, text: str, *, content_type: str = "application/json") -> None:
+        del content_type  # a filesystem records the media type in the suffix
         dest = self.output_dir / key
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text)
@@ -142,6 +198,18 @@ class LocalStorage(StorageBackend):
     def read_text(self, key: str) -> str | None:
         path = self.output_dir / key
         return path.read_text() if path.is_file() else None
+
+    def list_prefix(self, prefix: str) -> dict[str, datetime]:
+        root = self.output_dir / prefix
+        if not root.is_dir():
+            return {}
+        return {
+            str(path.relative_to(self.output_dir)): datetime.fromtimestamp(
+                path.stat().st_mtime, tz=UTC
+            )
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
 
 
 class S3Storage(StorageBackend):
@@ -202,12 +270,12 @@ class S3Storage(StorageBackend):
             if all(self._full_key(self.cog_key(window, tile, p)) in seen for p in PRODUCTS)
         }
 
-    def write_text(self, key: str, text: str) -> None:
+    def write_text(self, key: str, text: str, *, content_type: str = "application/json") -> None:
         self.client.put_object(
             Bucket=self.bucket,
             Key=self._full_key(key),
             Body=text.encode(),
-            ContentType="application/json",
+            ContentType=content_type,
         )
 
     def read_text(self, key: str) -> str | None:
@@ -220,6 +288,15 @@ class S3Storage(StorageBackend):
                 return None
             raise
         return response["Body"].read().decode()
+
+    def list_prefix(self, prefix: str) -> dict[str, datetime]:
+        full = self._full_key(prefix)
+        paginator = self.client.get_paginator("list_objects_v2")
+        listed: dict[str, datetime] = {}
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=full):
+            for obj in page.get("Contents", []):
+                listed[obj["Key"][len(self.prefix) + 1 :]] = obj["LastModified"]
+        return listed
 
 
 def get_storage() -> StorageBackend:

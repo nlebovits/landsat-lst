@@ -122,7 +122,27 @@ def process(
     if distributed:
         _process_distributed(jobs, force=force, run_id=run_id, wait=wait)
     else:
-        _process_local(jobs, force=force, run_id=run_id)
+        with _task_log(jobs, run_id):
+            _process_local(jobs, force=force, run_id=run_id)
+
+
+def _task_log(jobs: list, run_id: str | None):
+    """Capture this process's output when it is a batch task running one tile.
+
+    Coiled keeps a task's stdout on the VM and reports the tee wrapper's exit
+    code rather than the pipeline's, so a tile that dies explains itself only if
+    it uploads its own log. Anything else -- a local run, a multi-tile sweep --
+    already has its output in front of somebody, and is left alone.
+    """
+    from contextlib import nullcontext
+
+    if run_id is None or len(jobs) != 1:
+        return nullcontext()
+
+    from landsat_lst.progress import capture_task_log
+    from landsat_lst.storage import get_storage
+
+    return capture_task_log(run_id=run_id, tile=jobs[0].tile.name, storage=get_storage())
 
 
 def _process_local(jobs: list, *, force: bool, run_id: str | None = None) -> None:
@@ -187,9 +207,10 @@ def _print_results(results: list) -> None:
 def _process_distributed(jobs: list, *, force: bool, run_id: str | None, wait: bool) -> None:
     """Submit jobs to Coiled Batch and hand back the run token.
 
-    No per-tile progress bar and no held connection: the Coiled dashboard is
-    the live progress UI, and the manifest built by `reconcile` is the durable
-    record. Closing this shell does not touch the run.
+    No per-tile progress bar and no held connection: `watch` is the live view,
+    reading the heartbeats the tiles publish, and the manifest built by
+    `reconcile` is the durable record. Closing this shell does not touch the
+    run, and neither command needs it to have stayed open.
     """
     from landsat_lst.batch import reconcile_run, submit_batch, wait_for_batch
     from landsat_lst.config import settings
@@ -214,6 +235,7 @@ def _process_distributed(jobs: list, *, force: bool, run_id: str | None, wait: b
     if not wait:
         console.print(
             f"\n  Submitted. This shell is free to close.\n"
+            f"  Live progress: [bold]landsat-lst watch {submission.run_id}[/bold]\n"
             f"  When it finishes: [bold]landsat-lst reconcile {submission.run_id}[/bold]"
         )
         return
@@ -242,6 +264,49 @@ def reconcile(run_id: str) -> None:
     results = reconcile_run(run_id)
     _print_results(results)
     console.print(f"  Manifest: {settings.manifest_dir / (run_id + '.json')}")
+
+
+@main.command()
+@click.argument("run_id")
+@click.option(
+    "--interval",
+    type=float,
+    default=None,
+    help="Seconds between polls (default from settings.watch_poll_interval_s)",
+)
+@click.option("--once", is_flag=True, help="Poll a single time and exit")
+@click.option("--all", "show_all", is_flag=True, help="Show every tile, not only the live ones")
+def watch(run_id: str, interval: float | None, once: bool, show_all: bool) -> None:
+    """Follow a running batch run's tiles from their heartbeats.
+
+    Each tile republishes its phase, elapsed time, and memory every minute
+    while it works, so a wedged or preempted tile shows a stale heartbeat
+    within two minutes instead of looking identical to a busy one. Reads only
+    the run's storage prefix, so it works from any machine, including one that
+    did not submit the run.
+
+    This reports liveness, not outcome: run `landsat-lst reconcile` afterwards
+    for the verdict, which comes from the COGs in the bucket.
+
+    It returns on its own once every submitted tile has stopped. From a machine
+    without the run's submission record there is no tile list to check that
+    against, so it keeps watching until you stop it; Ctrl-C is safe and leaves
+    the run alone.
+    """
+    from landsat_lst.watch import watch_run
+
+    try:
+        snapshot = watch_run(
+            run_id, interval_s=interval, once=once, show_all=show_all, console=console
+        )
+    except KeyboardInterrupt:
+        console.print("\n  Stopped watching. The run is untouched.")
+        return
+
+    if snapshot.finished:
+        console.print(
+            f"\n  Every tile has stopped. Next: [bold]landsat-lst reconcile {run_id}[/bold]"
+        )
 
 
 @main.command()

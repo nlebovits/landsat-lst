@@ -318,6 +318,42 @@ class TestReconcile:
 
         assert "exited 137" in result.error
 
+    def test_failure_names_the_uploaded_task_log(self, fake_coiled, runs_dir, storage):
+        """Coiled reports the tee wrapper's exit code, so the log is the evidence."""
+        self._submit(fake_coiled, storage, "N40W075")
+        storage.write_text(
+            storage.log_key("r", "N40W075"), "Traceback...", content_type="text/plain"
+        )
+        _set_tasks(fake_coiled, _task(0, state="error", exit_code=1))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert "_runs/r/N40W075.log" in result.error
+
+    def test_failure_without_a_log_does_not_promise_one(self, fake_coiled, runs_dir, storage):
+        self._submit(fake_coiled, storage, "N40W075")
+        _set_tasks(fake_coiled, _task(0, state="error", exit_code=137))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert "task log" not in result.error
+
+    def test_records_are_read_only_where_they_exist(self, fake_coiled, runs_dir, storage):
+        """A 700-tile run must not spend a request discovering each absence."""
+        self._submit(fake_coiled, storage, "N40W075", "S05W060")
+        storage.write_text(
+            storage.run_record_key("r", "N40W075"),
+            json.dumps({"tile": "N40W075", "year": 2021, "end_year": 2025, "status": "failed"}),
+        )
+        reads: list[str] = []
+        original = storage.read_text
+        storage.read_text = lambda key: (reads.append(key), original(key))[1]
+        _set_tasks(fake_coiled, _task(0), _task(1))
+
+        reconcile_run("r", storage=storage)
+
+        assert reads == [storage.run_record_key("r", "N40W075")]
+
     def test_tile_never_scheduled_is_explained(self, fake_coiled, runs_dir, storage):
         self._submit(fake_coiled, storage, "N40W075")
         _set_tasks(fake_coiled)

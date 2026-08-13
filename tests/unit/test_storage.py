@@ -222,11 +222,21 @@ class TestRunRecords:
             "_runs/2021-2025-abc/N40W075.json"
         )
 
+    def test_a_run_keeps_its_record_heartbeat_and_log_apart(self, tmp_path):
+        """Three objects per tile, three lifetimes, one prefix a watcher lists."""
+        storage = LocalStorage(output_dir=tmp_path)
+
+        assert storage.progress_key("r", "N40W075") == "_runs/r/N40W075.progress.json"
+        assert storage.log_key("r", "N40W075") == "_runs/r/N40W075.log"
+        assert storage.run_prefix("r") == "_runs/r/"
+
     def test_backends_agree_on_layout(self, tmp_path):
         local = LocalStorage(output_dir=tmp_path)
         s3 = S3Storage(bucket="b", prefix="p", region="r")
 
         assert local.run_record_key("r", "N40W075") == s3.run_record_key("r", "N40W075")
+        assert local.progress_key("r", "N40W075") == s3.progress_key("r", "N40W075")
+        assert local.log_key("r", "N40W075") == s3.log_key("r", "N40W075")
 
     def test_records_sit_outside_the_published_collections(self, tmp_path):
         """The catalog reads lst-p95-*; run records must not land in there."""
@@ -286,6 +296,15 @@ class TestRunRecords:
 
         assert storage.read_text("_runs/r/N40W075.json") is None
 
+    def test_s3_write_declares_the_media_type(self):
+        """A log stored as JSON downloads as a file no browser will show."""
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        storage._client = MagicMock()
+
+        storage.write_text("_runs/r/N40W075.log", "Traceback", content_type="text/plain")
+
+        assert storage._client.put_object.call_args.kwargs["ContentType"] == "text/plain"
+
     def test_s3_other_errors_propagate(self):
         """A denied read is a broken run, not an absent record."""
         from botocore.exceptions import ClientError
@@ -298,3 +317,69 @@ class TestRunRecords:
 
         with pytest.raises(ClientError):
             storage.read_text("_runs/r/N40W075.json")
+
+
+class TestListPrefix:
+    """The listing a watcher polls: every key, and when it last changed."""
+
+    def test_local_lists_keys_with_their_modification_times(self, tmp_path):
+        storage = LocalStorage(output_dir=tmp_path)
+        storage.write_text("_runs/r/N40W075.progress.json", "{}")
+        storage.write_text("_runs/r/N40W075.json", "{}")
+        storage.write_text("_runs/other/S05W060.json", "{}")
+
+        listed = storage.list_prefix("_runs/r/")
+
+        assert set(listed) == {"_runs/r/N40W075.progress.json", "_runs/r/N40W075.json"}
+        assert all(stamp.tzinfo is not None for stamp in listed.values())
+
+    def test_local_reports_the_stored_mtime(self, tmp_path):
+        """Heartbeat age is measured from this, so it has to be the file's own."""
+        import os
+        from datetime import UTC, datetime
+
+        storage = LocalStorage(output_dir=tmp_path)
+        storage.write_text("_runs/r/N40W075.progress.json", "{}")
+        backdated = datetime(2026, 8, 13, 9, 0, tzinfo=UTC)
+        os.utime(
+            tmp_path / "_runs/r/N40W075.progress.json",
+            (backdated.timestamp(), backdated.timestamp()),
+        )
+
+        assert storage.list_prefix("_runs/r/")["_runs/r/N40W075.progress.json"] == backdated
+
+    def test_local_absent_prefix_is_empty(self, tmp_path):
+        """A run whose first VM has not written anything yet is not an error."""
+        storage = LocalStorage(output_dir=tmp_path)
+
+        assert storage.list_prefix("_runs/never/") == {}
+
+    def test_s3_strips_the_bucket_prefix(self):
+        from datetime import UTC, datetime
+
+        stamp = datetime(2026, 8, 13, 9, 0, tzinfo=UTC)
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        storage._client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"Contents": [{"Key": "p/_runs/r/N40W075.progress.json", "LastModified": stamp}]},
+            {"Contents": [{"Key": "p/_runs/r/N40W075.log", "LastModified": stamp}]},
+        ]
+        storage._client.get_paginator.return_value = paginator
+
+        listed = storage.list_prefix("_runs/r/")
+
+        assert listed == {
+            "_runs/r/N40W075.progress.json": stamp,
+            "_runs/r/N40W075.log": stamp,
+        }
+        paginator.paginate.assert_called_once_with(Bucket="b", Prefix="p/_runs/r/")
+
+    def test_s3_empty_prefix_is_empty(self):
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        storage._client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{}]  # no Contents key at all
+        storage._client.get_paginator.return_value = paginator
+
+        assert storage.list_prefix("_runs/r/") == {}
