@@ -26,6 +26,7 @@ import dask
 import numpy as np
 import xarray as xr
 
+from landsat_lst.profiling import PROFILE_DESTRIPE_OFFSETS, profile_compute
 from landsat_lst.progress import GraphProgress
 
 _TIME_DIM = "time"
@@ -41,15 +42,21 @@ def _pixel_count(lst: xr.DataArray) -> int:
     return int(np.prod([lst.sizes[d] for d in _spatial_dims(lst)]))
 
 
-def scene_offsets(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
-    """Estimate one scalar offset per scene, plus each scene's valid-pixel count.
+def offset_graph(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
+    """Build the lazy ``(offset, n_valid)`` pair without computing either.
 
-    Split out from ``seasonal_debias`` so the cap can be calibrated: computing
-    the offsets is the expensive part, and a sweep over candidate caps should
-    pay it once.
+    Separate from :func:`scene_offsets` so the graph can be inspected before it
+    is paid for. This is the graph that turned out to hold 598,604 tasks on a
+    300-scene N40W075 sample, and its size follows from array shape and
+    chunking alone. ``landsat-lst plan`` reads it through
+    :func:`landsat_lst.profiling.graph_stats` in seconds, on a laptop, against
+    a stack with no data behind it. See issue #76.
+
+    Args:
+        lst: Celsius LST on ``(time, latitude, longitude)``, chunked.
 
     Returns:
-        ``(offset, n_valid)``, both indexed on time and eagerly evaluated.
+        ``(offset, n_valid)`` as unevaluated DataArrays indexed on time.
     """
     spatial = _spatial_dims(lst)
 
@@ -61,18 +68,30 @@ def scene_offsets(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
 
     # One scalar per scene. Spatial median again for robustness: a handful of
     # contaminated pixels cannot move it.
-    #
+    return anomaly.median(dim=spatial, skipna=True), lst.notnull().sum(dim=spatial)
+
+
+def scene_offsets(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
+    """Estimate one scalar offset per scene, plus each scene's valid-pixel count.
+
+    Split out from ``seasonal_debias`` so the cap can be calibrated: computing
+    the offsets is the expensive part, and a sweep over candidate caps should
+    pay it once.
+
+    Returns:
+        ``(offset, n_valid)``, both indexed on time and eagerly evaluated.
+    """
     # Both reductions read the same stack, so they are computed together: two
     # `.compute()` calls would walk it twice, and on a 5-year tile that second
     # walk is a full re-read of every scene for a reduction that costs almost
     # nothing on its own. dask.compute shares the loaded chunks between the two
     # graphs, which is the same trick scripts/validate_offset_subsampling.py
     # already uses to sweep factors in one pass.
-    with GraphProgress():
-        offset, n_valid = dask.compute(
-            anomaly.median(dim=spatial, skipna=True),
-            lst.notnull().sum(dim=spatial),
-        )
+    #
+    # GraphProgress publishes the task fraction to the heartbeat; profile_compute
+    # records which task prefixes the hours went to, and is off by default.
+    with GraphProgress(), profile_compute(PROFILE_DESTRIPE_OFFSETS):
+        offset, n_valid = dask.compute(*offset_graph(lst))
     return offset, n_valid
 
 

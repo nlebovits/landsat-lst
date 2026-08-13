@@ -1,4 +1,13 @@
-"""Measure how peak memory scales with window length and the levers against it.
+"""DEPRECATED. Measure peak memory against window length, on a sub-degree AOI.
+
+Use ``scripts/synthetic_scaling.py`` instead. This script rests on the claim in
+its own body that "the **ratios** are what transfer" from a 0.25 degree AOI, and
+that claim is false. Below roughly one degree the whole time stack fits in RAM
+and dask never streams; a five degree tile streams from its first block. The
+numbers below therefore describe a regime production never runs in, and two
+tools that disagree about which regime matters are worse than one tool that is
+right. Kept only so the runs already recorded against it stay reproducible. See
+ADR-011 and issue #76.
 
 A single-year N40W075 tile reached 44 GB of RSS while de-striping on a 64 GiB
 VM (run ``2024-20260813T084842Z``). The production window is five years. Whether
@@ -240,6 +249,12 @@ def main() -> None:
     parser.add_argument("--threads", type=int, nargs="+", default=DEFAULT_THREADS)
     parser.add_argument("--out", type=Path, default=OUT_JSON)
     args = parser.parse_args()
+
+    print(
+        "DEPRECATED: this measures a sub-degree AOI, where the stack fits in RAM\n"
+        "and dask never streams. A production tile streams from its first block,\n"
+        "so these ratios do not transfer. Use scripts/synthetic_scaling.py.\n"
+    )
 
     bbox = list(args.bbox)
     results: list[Measurement] = []

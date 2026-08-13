@@ -23,6 +23,12 @@ log = structlog.get_logger()
 # Planetary Computer URL prefix for conditional signing
 _PC_URL_PREFIX = "https://planetarycomputer.microsoft.com"
 
+#: Scenes per time chunk when loading. Named rather than inlined because
+#: :func:`landsat_lst.profiling.synthetic_dataset` has to reproduce it exactly:
+#: a synthetic stack chunked differently from the real one builds a different
+#: graph, and the whole value of planning against it is that it does not.
+TIME_CHUNK = 10
+
 
 def _is_planetary_computer() -> bool:
     """Check if using Planetary Computer endpoint."""
@@ -154,7 +160,7 @@ def load_scenes(
         items,
         bands=["lwir11", "qa_pixel"],
         geobox=geobox_for_bbox(bbox, resolution_factor),
-        chunks={"time": 10, "latitude": csize, "longitude": csize},
+        chunks={"time": TIME_CHUNK, "latitude": csize, "longitude": csize},
         groupby="solar_day",
         patch_url=patch_url,
         fail_on_error=fail_on_error,
