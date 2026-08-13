@@ -480,3 +480,87 @@ class TestCoarseOffsetEstimation:
         )
 
         np.testing.assert_array_equal(base[2].values, with_arg[2].values)
+
+
+class TestOffsetCacheIntegration:
+    """The cache short-circuits the estimator without changing its answer."""
+
+    def _cache(self, tmp_path, **overrides):
+        from landsat_lst.offsets import OffsetCache, OffsetKey
+        from landsat_lst.storage import LocalStorage
+
+        key = OffsetKey.build(tile="N40W075", window="2021-2025", factor=2, scene_ids=("a", "b"))
+        return OffsetCache(storage=LocalStorage(output_dir=tmp_path), key=key, **overrides)
+
+    def test_a_hit_returns_without_computing(self, tmp_path):
+        """The whole point: 27 minutes becomes a kilobyte read."""
+        stack = _seasonal_stack()
+        cache = self._cache(tmp_path)
+
+        first = scene_offsets(stack, cache=cache)
+        assert cache.last_read_hit is False
+
+        with patch("landsat_lst.normalization.offset_graph") as never:
+            second = scene_offsets(stack, cache=cache)
+        never.assert_not_called()
+        assert cache.last_read_hit is True
+        np.testing.assert_allclose(second[0].values, first[0].values)
+        np.testing.assert_array_equal(second[1].values, first[1].values)
+
+    def test_a_cached_estimate_still_gets_the_live_rejection_rule(self, tmp_path):
+        """Only the estimate is cached, never the decision.
+
+        This is what makes a cap sweep cheap: the same stored offsets are
+        re-judged against each candidate cap, so a sweep pays the estimator once
+        rather than once per candidate.
+        """
+        bias = np.zeros(len(_times()))
+        bias[0] = 40.0
+        stack = _seasonal_stack(bias=bias)
+        cache = self._cache(tmp_path)
+
+        scene_offsets(stack, cache=cache)  # warm
+
+        generous = seasonal_debias(stack, max_offset_c=100.0, min_scene_pixels=0, cache=cache)
+        strict = seasonal_debias(stack, max_offset_c=5.0, min_scene_pixels=0, cache=cache)
+
+        assert cache.last_read_hit is True
+        assert int(generous[2].sum()) > int(strict[2].sum())
+
+    def test_a_broken_cache_falls_back_to_computing(self, tmp_path):
+        """A cache failure costs 27 minutes; raising would cost the run."""
+        stack = _seasonal_stack()
+        cache = self._cache(tmp_path)
+        cache.storage.read_text = lambda _key: (_ for _ in ()).throw(OSError("gone"))
+        cache.storage.write_text = lambda *_a, **_k: (_ for _ in ()).throw(OSError("gone"))
+
+        offset, n_valid = scene_offsets(stack, cache=cache)
+        assert offset.sizes["time"] == len(_times())
+        assert int(n_valid.sum()) > 0
+
+
+class TestRejectionRuleIsShared:
+    """`landsat-lst offsets` must apply the identical rule a tile applies."""
+
+    def test_keep_mask_matches_seasonal_debias(self):
+        from landsat_lst.normalization import scene_keep_mask
+
+        bias = np.zeros(len(_times()))
+        bias[0] = 40.0
+        stack = _seasonal_stack(bias=bias)
+
+        offset, n_valid = scene_offsets(stack)
+        direct = scene_keep_mask(offset, n_valid, max_offset_c=15.0, floor=0)
+        _, _, via_debias = seasonal_debias(stack, max_offset_c=15.0, min_scene_pixels=0)
+
+        np.testing.assert_array_equal(direct.values, via_debias.values)
+
+    def test_floor_follows_the_grid_the_offset_rests_on(self, monkeypatch):
+        """A coarse count cannot be scaled into a native one, so the floors swap."""
+        from landsat_lst.normalization import rejection_floor
+
+        monkeypatch.setattr(settings, "destripe_min_scene_pixels", 500)
+        monkeypatch.setattr(settings, "destripe_min_offset_samples", 200)
+
+        assert rejection_floor(offset_source_given=False) == 500
+        assert rejection_floor(offset_source_given=True) == 200

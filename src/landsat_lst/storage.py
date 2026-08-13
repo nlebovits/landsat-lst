@@ -36,9 +36,10 @@ catalog, which only ever reads ``lst-p95-*``.
 
 from __future__ import annotations
 
+import tempfile
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
-from pathlib import Path  # noqa: TC003 - used at runtime in type hints
+from pathlib import Path
 from typing import Any
 
 from landsat_lst.config import settings
@@ -48,6 +49,33 @@ PRODUCTS: tuple[str, str] = ("lst_p95", "qa_count")
 
 #: Prefix for per-tile run records, a sibling of the collection directories.
 RUN_RECORD_PREFIX = "_runs"
+
+#: Prefix for cached per-scene de-striping offsets. Another sibling of the
+#: collection directories, invisible to the catalog. See :mod:`landsat_lst.offsets`.
+OFFSET_PREFIX = "_offsets"
+
+
+def offset_cache_key(
+    *, tile: str, window: str, factor: int, algorithm_version: int, digest: str
+) -> str:
+    """Backend-relative key for one tile-window's cached scene offsets.
+
+    Every term that changes the offsets is in the path rather than only in the
+    digest, so a bucket listing is readable: a human can see which factor and
+    which algorithm version a record belongs to without opening it. The digest
+    is what actually makes a stale record unreachable from a changed input.
+
+    Args:
+        tile: Tile name (``"N40W075"``).
+        window: Window label (``"2021-2025"``, or ``"2021-2025-sample300"``).
+        factor: ``destripe_offset_resolution_factor`` the offsets were estimated at.
+        algorithm_version: :data:`landsat_lst.offsets.ALGORITHM_VERSION`.
+        digest: Hash over the scene ids and the settings that shape the estimate.
+
+    Returns:
+        ``_offsets/{tile}/{window}/f{factor}/v{version}-{digest}.json``
+    """
+    return f"{OFFSET_PREFIX}/{tile}/{window}/f{factor}/v{algorithm_version}-{digest}.json"
 
 
 def collection_prefix(window: str) -> str:
@@ -207,10 +235,30 @@ class LocalStorage(StorageBackend):
         }
 
     def write_text(self, key: str, text: str, *, content_type: str = "application/json") -> None:
+        """Write ``text`` at ``key`` atomically, via a temporary file and a rename.
+
+        A reader must never see half an object. S3 gives that for free, since a
+        PUT is atomic and a failed one leaves no key; a plain ``write_text``
+        does not, and a process killed mid-write would leave a truncated
+        heartbeat or a truncated offset record that parses as far as it goes.
+        ``Path.replace`` on the same filesystem is the local equivalent. See
+        issue #77 item 1.
+        """
         del content_type  # a filesystem records the media type in the suffix
         dest = self.output_dir / key
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text)
+        # Same directory as the destination, so the rename never crosses a
+        # filesystem boundary and so stays atomic.
+        handle = tempfile.NamedTemporaryFile(  # noqa: SIM115 - renamed, not closed-and-read
+            "w", dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp", delete=False
+        )
+        try:
+            with handle:
+                handle.write(text)
+            Path(handle.name).replace(dest)
+        except BaseException:
+            Path(handle.name).unlink(missing_ok=True)
+            raise
 
     def read_text(self, key: str) -> str | None:
         path = self.output_dir / key

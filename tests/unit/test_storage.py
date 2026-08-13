@@ -383,3 +383,39 @@ class TestListPrefix:
         storage._client.get_paginator.return_value = paginator
 
         assert storage.list_prefix("_runs/r/") == {}
+
+
+class TestAtomicTextWrite:
+    """A reader must never see half an object (issue #77 item 1).
+
+    S3 gives this for free: a PUT is atomic and a failed one leaves no key. A
+    plain ``Path.write_text`` does not, so a process killed mid-write would
+    leave a truncated heartbeat or a truncated offset record that parses as far
+    as it goes and then lies about the rest.
+    """
+
+    def test_write_then_read_round_trips(self, tmp_path):
+        storage = LocalStorage(output_dir=tmp_path)
+        storage.write_text("_offsets/a/b.json", '{"x": 1}')
+        assert storage.read_text("_offsets/a/b.json") == '{"x": 1}'
+
+    def test_overwrite_replaces_the_whole_object(self, tmp_path):
+        storage = LocalStorage(output_dir=tmp_path)
+        storage.write_text("k.json", "a-much-longer-first-value")
+        storage.write_text("k.json", "short")
+        assert storage.read_text("k.json") == "short"
+
+    def test_a_failed_write_leaves_no_partial_file(self, tmp_path, monkeypatch):
+        """The destination keeps its old content, and no temp file survives."""
+        storage = LocalStorage(output_dir=tmp_path)
+        storage.write_text("k.json", "original")
+
+        def explode(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("os.replace", explode)
+        with pytest.raises(OSError, match="disk full"):
+            storage.write_text("k.json", "replacement")
+
+        assert storage.read_text("k.json") == "original"
+        assert [p.name for p in tmp_path.iterdir()] == ["k.json"]

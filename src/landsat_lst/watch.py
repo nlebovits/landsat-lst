@@ -70,18 +70,29 @@ class TileStatus:
     log_key: str | None = None
     tasks_done: int | None = None
     tasks_total: int | None = None
+    graph_state: str | None = None
 
     @property
     def graph_fraction(self) -> str:
-        """How far through the running dask graph, as a percentage.
+        """How far through the running dask graph, or why there is no number.
 
-        Empty between graphs, and empty for a phase that runs none. Dask tasks
-        are wildly uneven, so this indicates progress; it does not predict a
-        finish time.
+        Three distinct answers, where there used to be one. A percentage means a
+        graph is running and has reported. ``"idle"`` means the tile is in a
+        phase that runs no graph at all -- graph construction, the land-mask
+        rasterization -- which is work, not silence. ``"starting"`` means a
+        graph is running but has not retired a task yet.
+
+        Dask tasks are wildly uneven, so the percentage indicates progress; it
+        does not predict a finish time.
         """
-        if not self.tasks_total or self.tasks_done is None:
-            return ""
-        return f"{100 * self.tasks_done / self.tasks_total:.0f}%"
+        if self.tasks_total and self.tasks_done is not None:
+            return f"{100 * self.tasks_done / self.tasks_total:.0f}%"
+        if self.graph_state == "idle":
+            return "idle"
+        if self.graph_state == "running":
+            return "starting"
+        # An older heartbeat, written before this field existed.
+        return ""
 
     @property
     def is_live(self) -> bool:
@@ -283,6 +294,7 @@ class RunWatcher:
             peak_rss_mb=body.get("peak_rss_mb"),
             tasks_done=body.get("tasks_done"),
             tasks_total=body.get("tasks_total"),
+            graph_state=body.get("graph_state"),
             host=body.get("host"),
             error=body.get("error"),
             log_key=logs.get(tile),

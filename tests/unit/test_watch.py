@@ -354,3 +354,48 @@ class TestGraphFraction:
         tile = TileStatus(tile="N40W075", category="running", phase="uploading")
 
         assert tile.graph_fraction == ""
+
+
+class TestGraphStateRendering:
+    """A watcher has to read three different silences differently."""
+
+    def _status(self, **fields):
+        from landsat_lst.watch import TileStatus
+
+        base = {"tile": "N40W075", "category": "running", "phase": "destriping"}
+        return TileStatus(**{**base, **fields})
+
+    def test_a_reporting_graph_shows_a_percentage(self):
+        assert self._status(tasks_done=50, tasks_total=200).graph_fraction == "25%"
+
+    def test_a_phase_with_no_graph_shows_idle(self):
+        """Graph construction and the land mask are work, not silence."""
+        assert self._status(phase="composite_graph", graph_state="idle").graph_fraction == "idle"
+
+    def test_a_graph_that_has_not_reported_shows_starting(self):
+        assert self._status(graph_state="running").graph_fraction == "starting"
+
+    def test_an_older_heartbeat_without_the_field_shows_nothing(self):
+        """Forward compatibility: a run in flight during a deploy still renders."""
+        assert self._status().graph_fraction == ""
+
+    def test_the_field_is_read_off_the_heartbeat_body(self, tmp_path):
+        from landsat_lst.storage import LocalStorage
+        from landsat_lst.watch import watch_run
+
+        storage = LocalStorage(output_dir=tmp_path)
+        storage.write_text(
+            "_runs/r/N40W075.progress.json",
+            json.dumps(
+                {
+                    "run_id": "r",
+                    "tile": "N40W075",
+                    "window": "2021-2025",
+                    "phase": "composite_graph",
+                    "elapsed_s": 12.0,
+                    "graph_state": "idle",
+                }
+            ),
+        )
+        snapshot = watch_run("r", once=True, storage=storage, console=Console(quiet=True))
+        assert snapshot.tiles[0].graph_fraction == "idle"

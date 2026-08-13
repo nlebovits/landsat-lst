@@ -364,3 +364,147 @@ class TestPlan:
         result = runner.invoke(main, ["plan", "-t", "not-a-tile", "--scenes", "4"])
 
         assert result.exit_code != 0
+
+
+class TestOffsetsCommand:
+    """`landsat-lst offsets`: the expensive phase, run and persisted on its own."""
+
+    def _estimate(self, *, cached=False):
+        from landsat_lst.offsets import OffsetKey
+        from landsat_lst.pipeline import OffsetEstimate
+
+        return OffsetEstimate(
+            key=OffsetKey.build(tile="N40W075", window="2021-2025", factor=2, scene_ids=("a", "b")),
+            scenes=300,
+            diagnostics={
+                "n_scenes": 300.0,
+                "n_kept": 234.0,
+                "rejected_frac": 0.22,
+                "std": 5.71,
+                "p1": -14.2,
+                "p50": 0.3,
+                "p99": 11.8,
+            },
+            cached=cached,
+            duration_s=1612.0,
+        )
+
+    def test_reports_the_rejection_fraction_and_the_key(self, runner):
+        """The rejection fraction is the number the cap was calibrated against."""
+        with patch("landsat_lst.pipeline.compute_tile_offsets") as mock:
+            mock.return_value = self._estimate()
+            result = runner.invoke(main, ["offsets", "-t", "N40W075"])
+
+        assert result.exit_code == 0, result.output
+        assert "234/300" in result.output
+        assert "22.0%" in result.output
+        assert "_offsets/N40W075/2021-2025/f2/" in result.output
+
+    def test_says_when_the_answer_came_from_cache(self, runner):
+        with patch("landsat_lst.pipeline.compute_tile_offsets") as mock:
+            mock.return_value = self._estimate(cached=True)
+            result = runner.invoke(main, ["offsets", "-t", "N40W075"])
+
+        assert "cached" in result.output
+
+    def test_defaults_to_the_production_window(self, runner):
+        with patch("landsat_lst.pipeline.compute_tile_offsets") as mock:
+            mock.return_value = self._estimate()
+            runner.invoke(main, ["offsets", "-t", "N40W075"])
+
+        assert mock.call_args.args[0].window_label == "2021-2025"
+
+    def test_no_offset_cache_disables_both_halves(self, runner):
+        with patch("landsat_lst.pipeline.compute_tile_offsets") as mock:
+            mock.return_value = self._estimate()
+            runner.invoke(main, ["offsets", "-t", "N40W075", "--no-offset-cache"])
+
+        assert mock.call_args.kwargs["use_offset_cache"] is False
+        assert mock.call_args.kwargs["refresh"] is False
+
+    def test_force_refreshes_rather_than_disabling(self, runner):
+        """--force rebuilds the estimate and replaces what was stored."""
+        with patch("landsat_lst.pipeline.compute_tile_offsets") as mock:
+            mock.return_value = self._estimate()
+            runner.invoke(main, ["offsets", "-t", "N40W075", "--force"])
+
+        assert mock.call_args.kwargs["use_offset_cache"] is True
+        assert mock.call_args.kwargs["refresh"] is True
+
+    def test_requires_a_tile(self, runner):
+        """No fleet-wide offset pass: this is a per-tile iteration command."""
+        assert runner.invoke(main, ["offsets"]).exit_code != 0
+
+
+class TestCompositeCommand:
+    """`landsat-lst composite`: one tile to COGs, reading whatever is cached."""
+
+    def _result(self, status="completed", **fields):
+        job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2021, end_year=2025)
+        base = {
+            "lst_key": "lst-p95-2021-2025/N40W075/lst_p95_2021-2025_N40W075.tif",
+            "qa_key": "lst-p95-2021-2025/N40W075/qa_count_2021-2025_N40W075.tif",
+            "duration_s": 900.0,
+            "scene_count": 2930,
+            "peak_rss_mb": 41000.0,
+        }
+        return JobResult(job=job, status=status, **{**base, **fields})
+
+    def test_reports_both_asset_keys(self, runner):
+        with patch("landsat_lst.job.process_tile_job") as mock:
+            mock.return_value = self._result()
+            result = runner.invoke(main, ["composite", "-t", "N40W075"])
+
+        assert result.exit_code == 0, result.output
+        assert "lst_p95_2021-2025_N40W075.tif" in result.output
+        assert "qa_count_2021-2025_N40W075.tif" in result.output
+
+    def test_skips_a_tile_whose_cogs_exist(self, runner):
+        """Completion is bytes in the bucket, and this command honours that."""
+        with patch("landsat_lst.job.process_tile_job") as mock:
+            mock.return_value = JobResult(job=self._result().job, status="skipped")
+            result = runner.invoke(main, ["composite", "-t", "N40W075"])
+
+        assert "skipped" in result.output
+        assert "--force" in result.output
+
+    def test_forwards_force_and_the_cache_flag(self, runner):
+        with patch("landsat_lst.job.process_tile_job") as mock:
+            mock.return_value = self._result()
+            runner.invoke(main, ["composite", "-t", "N40W075", "--force", "--no-offset-cache"])
+
+        assert mock.call_args.kwargs["force"] is True
+        assert mock.call_args.kwargs["use_offset_cache"] is False
+
+    def test_exits_non_zero_on_failure(self, runner):
+        with patch("landsat_lst.job.process_tile_job") as mock:
+            mock.return_value = self._result(status="failed", error="no scenes")
+            result = runner.invoke(main, ["composite", "-t", "N40W075"])
+
+        assert result.exit_code == 1
+        assert "no scenes" in result.output
+
+
+class TestProcessOffsetCacheFlag:
+    """The fleet driver forwards the flag both locally and to Coiled."""
+
+    def test_local_run_forwards_it(self, runner):
+        with patch("landsat_lst.job.process_tile_job") as mock:
+            mock.return_value = JobResult(
+                job=ProcessingJob(tile=parse_tile_name("N40W075"), year=2024),
+                status="completed",
+            )
+            runner.invoke(main, ["process", "-t", "N40W075", "-y", "2024", "--no-offset-cache"])
+
+        assert mock.call_args.kwargs["use_offset_cache"] is False
+
+    def test_the_batch_task_command_carries_it(self):
+        """A VM rebuilds its own job arguments, so an omitted flag reverts."""
+        from landsat_lst.batch import _task_command
+
+        assert "--no-offset-cache" in _task_command(
+            run_id="r", year=2021, end_year=2025, force=False, use_offset_cache=False
+        )
+        assert "--no-offset-cache" not in _task_command(
+            run_id="r", year=2021, end_year=2025, force=False
+        )

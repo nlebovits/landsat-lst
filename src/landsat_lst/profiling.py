@@ -53,7 +53,7 @@ import structlog
 import xarray as xr
 
 from landsat_lst.config import settings
-from landsat_lst.progress import active_heartbeat
+from landsat_lst.progress import active_heartbeat, silence_sections
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -463,7 +463,11 @@ def destripe_disabled() -> Iterator[None]:
     original = settings.destripe
     settings.destripe = False
     try:
-        yield
+        # The composite half runs the same instrumented code a tile does, and
+        # nothing here is a tile: `plan --json` promises nothing but JSON on
+        # stdout, and one phase_complete line makes it unparsable.
+        with silence_sections():
+            yield
     finally:
         settings.destripe = original
 

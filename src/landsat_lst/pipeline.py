@@ -1,7 +1,11 @@
 """Main ETL pipeline for Landsat LST composites."""
 
+from __future__ import annotations
+
 import os
-from collections.abc import Callable
+import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pystac_client
@@ -12,11 +16,23 @@ from odc.stac import stac_load
 from landsat_lst.config import settings
 from landsat_lst.encoding import LST_MIN_TRUSTED_C
 from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
-from landsat_lst.models import ProcessingJob
-from landsat_lst.normalization import offset_diagnostics, seasonal_debias
-from landsat_lst.progress import report_phase
+from landsat_lst.normalization import (
+    offset_diagnostics,
+    rejection_floor,
+    scene_keep_mask,
+    scene_offsets,
+    seasonal_debias,
+)
+from landsat_lst.offsets import OffsetCache, OffsetKey, cache_for_items
+from landsat_lst.progress import GraphProgress, report_phase, timed_section
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 from landsat_lst.tiling import geobox_for_bbox
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from landsat_lst.models import ProcessingJob
+    from landsat_lst.storage import StorageBackend
 
 log = structlog.get_logger()
 
@@ -202,6 +218,7 @@ def compute_annual_composite(
     land_mask: xr.DataArray | None = None,
     offset_source: xr.Dataset | None = None,
     offset_land_mask: xr.DataArray | None = None,
+    offset_cache: OffsetCache | None = None,
 ) -> xr.Dataset:
     """Compute an LST P95 composite with a per-month observation count.
 
@@ -231,6 +248,12 @@ def compute_annual_composite(
             Applied before de-biasing so per-scene offsets are estimated over
             land only; ocean is thermally stable and would otherwise damp the
             estimate on coastal tiles.
+        offset_source: Optional coarse stack to estimate the offsets from.
+        offset_land_mask: Land mask on ``offset_source``'s grid.
+        offset_cache: Optional :class:`~landsat_lst.offsets.OffsetCache`. A hit
+            replaces the tile's longest compute with a kilobyte read. Only the
+            estimate is cached, never the rejection, so a cap sweep re-reads one
+            record per candidate. See issue #77 item 2.
 
     Returns:
         Dataset with ``lst_p95`` ``(latitude, longitude)`` and ``qa_count``
@@ -261,21 +284,32 @@ def compute_annual_composite(
 
         # Estimating the offsets is the first real compute of the tile, and on a
         # five-year window it runs for many minutes, so the watcher hears about
-        # it before it starts rather than after.
-        report_phase("destriping")
-        lst, offset, keep = seasonal_debias(
-            lst,
-            max_offset_c=settings.destripe_max_offset_c,
-            min_scene_pixels=settings.destripe_min_scene_pixels,
-            min_offset_samples=settings.destripe_min_offset_samples,
-            offset_source=source,
-        )
+        # it before it starts rather than after. With a warm cache it is a
+        # kilobyte read instead, and the phase passes in under a second.
+        with timed_section("destriping"):
+            lst, offset, keep = seasonal_debias(
+                lst,
+                max_offset_c=settings.destripe_max_offset_c,
+                min_scene_pixels=settings.destripe_min_scene_pixels,
+                min_offset_samples=settings.destripe_min_offset_samples,
+                offset_source=source,
+                cache=offset_cache,
+            )
         diagnostics = offset_diagnostics(offset, keep)
         log.info("destripe_offsets_degC", **diagnostics)
         scenes_kept = int(diagnostics["n_kept"])
 
-    report_phase("compositing", scenes_kept=scenes_kept)
+    # Everything below is graph construction: single-threaded Python that
+    # allocates a task object per block per scene and computes nothing. At
+    # production geometry it is minutes, it runs no dask graph so it publishes
+    # no task fraction, and under the old single ``compositing`` label it was
+    # indistinguishable from a wedged compute. See issue #77 item 4.
+    with timed_section("composite_graph", scenes_kept=scenes_kept):
+        return _composite_graph(lst)
 
+
+def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
+    """Build the lazy P95 and monthly-count expressions. Computes nothing."""
     # notnull() (not ~np.isnan) so the result stays a typed xarray DataArray.
     valid_mask = lst.notnull()
 
@@ -311,7 +345,132 @@ def compute_annual_composite(
     )
 
 
-def process_tile(job: ProcessingJob) -> xr.Dataset:
+def _patch_url_for(items: list) -> Callable[[str], str] | None:
+    """Rewrite asset hrefs for Planetary Computer, or leave them alone on AWS.
+
+    Sets up refreshable Azure SAS auth (local plus dask workers) and points the
+    hrefs at token-free ``/vsiaz/`` paths, so a compute that outlives the
+    45-minute token never reads with an expired one. No-op against Earth Search.
+    """
+    if not _is_planetary_computer():
+        return None
+
+    from landsat_lst.azure_auth import enable_pc_azure_refresh  # noqa: PLC0415
+
+    return enable_pc_azure_refresh(items)
+
+
+@dataclass(frozen=True)
+class OffsetEstimate:
+    """What one tile-window's offset pass produced, and what it cost."""
+
+    key: OffsetKey
+    scenes: int
+    diagnostics: dict[str, float]
+    cached: bool
+    duration_s: float
+
+    @property
+    def rejected_frac(self) -> float:
+        """Share of scenes de-striping would discard, as a fraction."""
+        return float(self.diagnostics.get("rejected_frac", 0.0))
+
+
+def compute_tile_offsets(
+    job: ProcessingJob,
+    *,
+    use_offset_cache: bool = True,
+    refresh: bool = False,
+    storage: StorageBackend | None = None,
+) -> OffsetEstimate:
+    """Estimate and persist one tile-window's per-scene offsets, and stop there.
+
+    The offset pass is the longest compute in a tile and the one whose result is
+    a few kilobytes. Running it on its own warms the cache that
+    :func:`process_tile` reads, so the composite that follows starts halfway;
+    it is also the cheapest way to see a tile's rejection fraction, which is the
+    number ``destripe_max_offset_c`` was calibrated against and the one worth
+    checking on a climate unlike the mid-latitude cropland it was fitted on.
+
+    Only the native stack is skipped. Everything the estimate depends on -- the
+    scene set, the coarse load, the land mask, the QA mask, the clamp -- runs
+    exactly as it does in a full tile, so the offsets this writes are the
+    offsets a full tile would have computed.
+
+    Args:
+        job: Tile and window to estimate for.
+        use_offset_cache: ``False`` neither reads nor writes the cache, which
+            makes this a pure measurement with no side effect.
+        refresh: Skip the lookup but still write, replacing whatever was stored.
+        storage: Backend the cache lives in. Defaults to the configured one.
+
+    Returns:
+        :class:`OffsetEstimate` with the rejection diagnostics and whether the
+        answer came from cache.
+    """
+    started = time.monotonic()
+
+    with timed_section("stac_query"):
+        items = query_stac(job)
+    if not items:
+        msg = f"No scenes found for {job.tile.name} in {job.window_label}"
+        raise ValueError(msg)
+    if job.max_scenes is not None:
+        items = _sample_scenes(items, job.max_scenes)
+
+    factor = settings.destripe_offset_resolution_factor
+    cache = cache_for_items(
+        tile=job.tile.name,
+        window=job.window_label,
+        items=items,
+        factor=factor,
+        storage=storage,
+        enabled=use_offset_cache,
+        read=not refresh,
+    )
+
+    report_phase("loading", scenes_found=len(items))
+    patch_url = _patch_url_for(items)
+    source = load_scenes(
+        items,
+        job.tile.bbox,
+        patch_url=patch_url,
+        fail_on_error=False,
+        resolution_factor=factor,
+    )
+
+    with timed_section("land_mask"):
+        land = _build_land_mask(job.tile.bbox, source.latitude, source.longitude)
+
+    lst = convert_to_celsius(apply_qa_mask(source)["lwir11"]).where(land)
+
+    with timed_section("destriping", scenes_found=len(items)):
+        offset, n_valid = scene_offsets(lst, cache=cache)
+
+    keep = scene_keep_mask(
+        offset,
+        n_valid,
+        max_offset_c=settings.destripe_max_offset_c,
+        floor=rejection_floor(offset_source_given=factor > 1),
+    )
+    diagnostics = offset_diagnostics(offset, keep)
+    log.info("destripe_offsets_degC", tile=job.tile.name, **diagnostics)
+
+    return OffsetEstimate(
+        key=cache.key,
+        scenes=len(items),
+        diagnostics=diagnostics,
+        cached=bool(cache.last_read_hit),
+        duration_s=time.monotonic() - started,
+    )
+
+
+def process_tile(
+    job: ProcessingJob,
+    *,
+    use_offset_cache: bool = True,
+    storage: StorageBackend | None = None,
+) -> xr.Dataset:
     """Process a single tile for the job's window (single- or multi-year).
 
     Runs the full production pipeline: STAC query over ``job.datetime_range``,
@@ -320,13 +479,19 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
 
     Args:
         job: Processing job specification (``year`` plus optional ``end_year``).
+        use_offset_cache: Read and write the per-scene offset cache. Turn it off
+            (``--no-offset-cache``) to force a recompute, which is what you want
+            when validating a change to the estimator itself rather than to
+            anything downstream of it.
+        storage: Backend the offset cache lives in. Defaults to the configured
+            one. The composite itself is returned in memory either way.
 
     Returns:
         Dataset with the LST P95 composite (``lst_p95``) and per-month
         ``qa_count`` for the job's window.
     """
-    report_phase("stac_query")
-    items = query_stac(job)
+    with timed_section("stac_query"):
+        items = query_stac(job)
 
     if not items:
         msg = f"No scenes found for {job.tile.name} in {job.year}"
@@ -337,14 +502,7 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
 
     report_phase("loading", scenes_found=len(items))
 
-    # Planetary Computer: set up refreshable Azure SAS auth (local + Dask
-    # workers) and rewrite asset hrefs to token-free /vsiaz/ paths so a
-    # long-running compute never reads with an expired token. No-op for AWS.
-    patch_url = None
-    if _is_planetary_computer():
-        from landsat_lst.azure_auth import enable_pc_azure_refresh  # noqa: PLC0415
-
-        patch_url = enable_pc_azure_refresh(items)
+    patch_url = _patch_url_for(items)
 
     # A 5-year window pulls ~1900 scenes, so at least one transient read failure
     # is near-certain. Fill that scene with nodata rather than aborting the load;
@@ -354,8 +512,11 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
 
     # Built before the composite so de-striping estimates each scene's offset
     # over land only. Ocean is thermally stable and would damp the estimate on
-    # coastal tiles.
-    land_mask_da = _build_land_mask(job.tile.bbox, data.latitude, data.longitude)
+    # coastal tiles. Rasterizing Natural Earth over an 18,000 px grid runs no
+    # dask graph and is not free, so it gets its own phase rather than hiding
+    # inside `loading`.
+    with timed_section("land_mask"):
+        land_mask_da = _build_land_mask(job.tile.bbox, data.latitude, data.longitude)
 
     # A coarse second load for the de-striping offsets. Reading from the source
     # overviews costs ~factor**2 fewer bytes than a second native-resolution
@@ -371,20 +532,38 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
             fail_on_error=False,
             resolution_factor=factor,
         )
-        offset_land_mask = _build_land_mask(
-            job.tile.bbox, offset_source.latitude, offset_source.longitude
-        )
+        with timed_section("land_mask"):
+            offset_land_mask = _build_land_mask(
+                job.tile.bbox, offset_source.latitude, offset_source.longitude
+            )
 
     composite = compute_annual_composite(
         data,
         land_mask=land_mask_da,
         offset_source=offset_source,
         offset_land_mask=offset_land_mask,
+        offset_cache=cache_for_items(
+            tile=job.tile.name,
+            window=job.window_label,
+            items=items,
+            factor=factor,
+            storage=storage,
+            enabled=use_offset_cache,
+        ),
     )
 
     # Silent nodata fill is otherwise undetectable: a low median or a high zero
     # fraction means reads failed en masse rather than occasionally.
-    obs = composite["qa_count"].sum(dim="month").values
+    #
+    # This `.values` is a full eager pass over the native stack, and it is the
+    # second-longest compute in a tile. It ran for nine unattributed minutes
+    # under the old `compositing` label because nothing here reported a task
+    # count. It now has its own phase and a GraphProgress, so a watcher can see
+    # it move. NOTE: the export then walks the same stack again to write the
+    # COGs -- two native passes per tile, which instrumenting made visible and
+    # does not fix. See issue #77 item 4.
+    with timed_section("coverage_check"), GraphProgress():
+        obs = composite["qa_count"].sum(dim="month").values
     log.info(
         "valid_coverage_obs_per_pixel",
         tile=job.tile.name,

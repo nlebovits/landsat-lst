@@ -434,3 +434,107 @@ class TestGraphProgress:
             result = dask.compute(da.ones((10, 10), chunks=(5, 5)).sum())
 
         assert result[0] == 100
+
+
+class TestGraphState:
+    """Telling "no graph here" apart from "a graph that has not reported".
+
+    Before this, both published ``tasks_total=None``, so a heartbeat could not
+    say whether a silent phase was working or wedged. See issue #77 item 4.
+    """
+
+    def _beat(self, tmp_path):
+        from landsat_lst.progress import TileHeartbeat
+        from landsat_lst.storage import LocalStorage
+
+        return TileHeartbeat(
+            run_id="r",
+            tile="N40W075",
+            window="2021-2025",
+            storage=LocalStorage(output_dir=tmp_path),
+        )
+
+    def test_defaults_to_idle(self, tmp_path):
+        assert self._beat(tmp_path).payload()["graph_state"] == "idle"
+
+    def test_graph_progress_marks_running_then_idle(self, tmp_path):
+        import dask.array as da
+
+        from landsat_lst.progress import GraphProgress
+
+        heartbeat = self._beat(tmp_path)
+        with heartbeat:
+            with GraphProgress():
+                assert heartbeat.payload()["graph_state"] == "running"
+            assert heartbeat.payload()["graph_state"] == "idle"
+            # And a real compute inside one still leaves it idle afterwards.
+            with GraphProgress():
+                da.ones((4, 4), chunks=2).sum().compute()
+            assert heartbeat.payload()["graph_state"] == "idle"
+
+
+class TestTimedSection:
+    """The wrapper that lights up stretches running no dask graph."""
+
+    def test_reports_the_phase(self, tmp_path):
+        from landsat_lst.progress import TileHeartbeat, timed_section
+        from landsat_lst.storage import LocalStorage
+
+        heartbeat = TileHeartbeat(
+            run_id="r",
+            tile="N40W075",
+            window="2021-2025",
+            storage=LocalStorage(output_dir=tmp_path),
+        )
+        with heartbeat, timed_section("composite_graph"):
+            assert heartbeat.payload()["phase"] == "composite_graph"
+
+    def test_records_phase_seconds(self, tmp_path):
+        from landsat_lst.progress import TileHeartbeat, timed_section
+        from landsat_lst.storage import LocalStorage
+
+        heartbeat = TileHeartbeat(
+            run_id="r",
+            tile="N40W075",
+            window="2021-2025",
+            storage=LocalStorage(output_dir=tmp_path),
+        )
+        with heartbeat:
+            with timed_section("land_mask"):
+                pass
+            with timed_section("composite_graph"):
+                pass
+            assert "land_mask" in heartbeat.payload()["phase_seconds"]
+
+    def test_silenced_sections_do_not_report(self, tmp_path):
+        """`landsat-lst plan` builds the same graphs and is not a tile.
+
+        Its `--json` output must stay parseable, so nothing inside a silenced
+        block narrates itself.
+        """
+        from landsat_lst.progress import TileHeartbeat, silence_sections, timed_section
+        from landsat_lst.storage import LocalStorage
+
+        heartbeat = TileHeartbeat(
+            run_id="r",
+            tile="N40W075",
+            window="2021-2025",
+            storage=LocalStorage(output_dir=tmp_path),
+        )
+        with heartbeat, silence_sections(), timed_section("composite_graph"):
+            assert heartbeat.payload()["phase"] != "composite_graph"
+
+    def test_the_phase_is_reported_even_when_the_body_raises(self, tmp_path):
+        from landsat_lst.progress import TileHeartbeat, timed_section
+        from landsat_lst.storage import LocalStorage
+
+        heartbeat = TileHeartbeat(
+            run_id="r",
+            tile="N40W075",
+            window="2021-2025",
+            storage=LocalStorage(output_dir=tmp_path),
+        )
+        with heartbeat:
+            with pytest.raises(RuntimeError), timed_section("destriping"):
+                raise RuntimeError("boom")
+            assert heartbeat.payload()["phase"] == "destriping"

@@ -17,6 +17,7 @@ ADRs are kept for history and link to their replacement.
 | [009](009-cog-output-and-stac-catalog.md) | Per-tile COGs in a Portolan STAC catalog, retiring the Zarr output | Accepted |
 | [010](010-coiled-batch-for-distributed-runs.md) | Coiled Batch for distributed runs, replacing Coiled Functions | Accepted |
 | [011](011-static-planning-and-synthetic-benchmarks.md) | Static graph planning, synthetic-geometry benchmarks, and per-key profiling | Accepted |
+| [012](012-cached-scene-offsets.md) | Input-keyed scene-offset cache and a standalone offset phase | Accepted |
 
 ## Adding an ADR
 
