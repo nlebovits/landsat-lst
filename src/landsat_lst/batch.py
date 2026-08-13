@@ -121,13 +121,17 @@ def load_submission(run_id: str, out_dir: Path | None = None) -> BatchSubmission
 
 
 def _task_command(*, run_id: str, year: int, end_year: int | None, force: bool) -> str:
-    """The shell command one VM runs for one tile.
+    """The shell script one VM runs for one tile.
 
     The window is baked in as a literal and only the tile varies, which is why
     jobs are grouped by window before submission. ``python -m`` rather than the
     ``landsat-lst`` console script: both need the package importable on the VM,
     but the module path does not additionally depend on the entry point being
     installed on ``PATH`` by package sync.
+
+    A ``#!`` script rather than a command string. Coiled splits a plain string
+    on whitespace and rejoins a list, and either round trip mangles the quotes
+    around the task-input variable; a script is shipped to the VM verbatim.
     """
     parts = [
         "python",
@@ -145,7 +149,7 @@ def _task_command(*, run_id: str, year: int, end_year: int | None, force: bool) 
         parts.append("--force")
     quoted = shlex.join(parts)
     # Expanded by bash on the VM, not by the submitting shell.
-    return f'{quoted} --tile "${TASK_INPUT_VAR}"'
+    return f'#!/bin/bash\n{quoted} --tile "${TASK_INPUT_VAR}"\n'
 
 
 def _batch_run_kwargs(
@@ -158,7 +162,13 @@ def _batch_run_kwargs(
     would let a 700-tile submission start 700 machines.
     """
     return {
-        "command": ["bash", "-c", command],
+        # A script, not ["bash", "-c", command]. Coiled joins a list back into
+        # one shell string, and the inner quotes around the task-input variable
+        # came out of that round trip as literal characters: the CLI received
+        # --tile "N40W075" with the quote marks, parse_tile_name rejected it,
+        # and the task died in 0.6s having written nothing. A command that
+        # starts with "#!" is passed through verbatim instead. See issue #66.
+        "command": command,
         "name": f"lst-{run_id}",
         "region": settings.coiled_region,
         "vm_type": settings.coiled_vm_types,
