@@ -77,8 +77,15 @@ ITEMSIZE = 4
 DEFAULT_BASELINE_GIB = 2.0
 
 #: Scenes a five-year land tile pulls, from run ``2021-2025-20260812T142408Z``.
-#: The default subject of a ``landsat-lst plan`` question.
 PRODUCTION_SCENES = 2930
+
+#: Scenes ``landsat-lst plan`` uses unless told otherwise, matching the sample
+#: in run ``2021-2025-sample300-20260813T123249Z``. Not :data:`PRODUCTION_SCENES`,
+#: because planning the full window is not a laptop operation: the composite's
+#: quantile rechunks 293 time chunks into one across 1,296 spatial blocks, and
+#: one attempt at it ran past fifteen minutes before being killed. A 300-scene
+#: plan answers the same shape of question in about half a minute.
+DEFAULT_PLAN_SCENES = 300
 
 #: Labels under which :func:`profile_compute` dumps its summaries.
 PROFILE_DESTRIPE_OFFSETS = "destripe_offsets"
@@ -289,6 +296,7 @@ class PeakEstimate:
     threads: int
     height: int
     width: int
+    months: int
     stack_bytes: int
     climatology_bytes: int
     baseline_bytes: int
@@ -354,6 +362,7 @@ def predict_peak(
         threads=threads,
         height=height,
         width=width,
+        months=months,
         stack_bytes=threads * block_pixels * scenes * itemsize,
         climatology_bytes=months * height * width * itemsize,
         baseline_bytes=int(baseline_gib * GIB),
@@ -463,6 +472,79 @@ def destripe_disabled() -> Iterator[None]:
 PHASE_OFFSETS = "destripe_offsets"
 PHASE_COMPOSITE = "composite"
 
+#: Raw tasks one graph may hold before :func:`plan_tile` refuses to build it.
+#: Building a graph is Python object allocation and has nothing to do with
+#: computing it, so a plan can exhaust a machine that would have run the tile
+#: fine. Calibrated against measurements on this repo: an 18,000 squared
+#: composite at chunk 512 and 300 scenes holds 1.8M raw tasks in about 2.8 GB,
+#: and the same tile at chunk 128 and 2,930 scenes comes to roughly 274M, which
+#: took a 64 GB desktop down. 50M sits above every configuration worth planning
+#: and below the ones that cannot finish.
+MAX_PLAN_TASKS = 50_000_000
+
+#: Raw tasks per block-step (one spatial block at one time chunk), measured on
+#: real geometry: ~93 for the offset graph, ~47 for the composite. The larger is
+#: used for both, so the estimate errs toward refusing.
+_TASKS_PER_BLOCK_STEP = 95
+
+
+class PlanTooLarge(RuntimeError):
+    """Raised when building a graph would cost more memory than it is worth.
+
+    Carries the numbers, so the message can tell the caller which lever to pull
+    rather than only that it declined.
+    """
+
+    def __init__(self, *, phase: str, estimated: int, limit: int, chunk_size: int, scenes: int):
+        self.phase = phase
+        self.estimated = estimated
+        self.limit = limit
+        super().__init__(
+            f"Building the {phase} graph would allocate roughly {estimated:,} tasks, "
+            f"over the {limit:,} ceiling. Graph construction is Python objects, so "
+            f"this can exhaust the machine even though the tile itself would run. "
+            f"Raise --chunk above {chunk_size}, drop --scenes below {scenes}, or "
+            f"pass --max-tasks to override deliberately."
+        )
+
+
+def estimate_raw_tasks(*, height: int, width: int, chunk_size: int, scenes: int) -> int:
+    """Roughly how many raw tasks a graph over this geometry will hold.
+
+    Cheap enough to run before allocating anything, which is the whole point:
+    the expensive thing to discover late is that a graph does not fit.
+
+    Args:
+        height: Rows in the stack.
+        width: Columns in the stack.
+        chunk_size: Spatial chunk edge in pixels.
+        scenes: Time steps.
+
+    Returns:
+        An estimate that errs high, so the guard refuses before it should.
+    """
+    from landsat_lst.pipeline import TIME_CHUNK  # noqa: PLC0415
+
+    blocks_per_side_h = -(-height // chunk_size)
+    blocks_per_side_w = -(-width // chunk_size)
+    time_chunks = -(-scenes // TIME_CHUNK)
+    return blocks_per_side_h * blocks_per_side_w * time_chunks * _TASKS_PER_BLOCK_STEP
+
+
+def _guard(
+    *, phase: str, height: int, width: int, chunk_size: int, scenes: int, limit: int
+) -> None:
+    """Refuse to build a graph whose construction would not fit. Never allocates."""
+    estimated = estimate_raw_tasks(height=height, width=width, chunk_size=chunk_size, scenes=scenes)
+    if estimated > limit:
+        raise PlanTooLarge(
+            phase=phase,
+            estimated=estimated,
+            limit=limit,
+            chunk_size=chunk_size,
+            scenes=scenes,
+        )
+
 
 @dataclass(frozen=True)
 class PlanPhase:
@@ -497,6 +579,7 @@ def _phase(
     threads: int,
     baseline_gib: float,
     optimize: bool,
+    months: int,
 ) -> PlanPhase:
     """Pair a built graph with the memory floor for the configuration behind it."""
     return PlanPhase(
@@ -511,6 +594,7 @@ def _phase(
             threads=threads,
             height=height,
             width=width,
+            months=months,
             baseline_gib=baseline_gib,
         ),
     )
@@ -525,6 +609,7 @@ def plan_tile(
     offset_factor: int | None = None,
     baseline_gib: float = DEFAULT_BASELINE_GIB,
     optimize: bool = True,
+    max_tasks: int = MAX_PLAN_TASKS,
 ) -> tuple[PlanPhase, ...]:
     """Build both of a tile's graphs against synthetic data and read their size.
 
@@ -552,9 +637,14 @@ def plan_tile(
         optimize: Fuse each graph before counting, so the totals match what a
             live heartbeat reports. Costs tens of seconds per phase at
             production scene counts.
+        max_tasks: Refuse to build a graph estimated above this many raw tasks.
 
     Returns:
         One :class:`PlanPhase` per phase, offsets first.
+
+    Raises:
+        PlanTooLarge: If either graph would allocate past ``max_tasks``. Checked
+            before anything is built, so the refusal costs nothing.
     """
     import os  # noqa: PLC0415
 
@@ -573,30 +663,55 @@ def plan_tile(
         "optimize": optimize,
     }
 
+    # Both shapes are checked before either graph is built. A refusal has to
+    # arrive before the allocation it is refusing, or it is worth nothing.
     coarse_h, coarse_w = tile_geobox(tile, factor).shape
+    native_h, native_w = tile_geobox(tile).shape
+    for phase_name, (h, w) in (
+        (PHASE_OFFSETS, (coarse_h, coarse_w)),
+        (PHASE_COMPOSITE, (native_h, native_w)),
+    ):
+        _guard(
+            phase=phase_name,
+            height=h,
+            width=w,
+            chunk_size=csize,
+            scenes=scenes,
+            limit=max_tasks,
+        )
+
     coarse = synthetic_dataset(shape=(coarse_h, coarse_w), scenes=scenes, chunk_size=csize)
     offsets = offset_graph(convert_to_celsius(apply_qa_mask(coarse)["lwir11"]))
 
-    native_h, native_w = tile_geobox(tile).shape
     native = synthetic_dataset(shape=(native_h, native_w), scenes=scenes, chunk_size=csize)
     with destripe_disabled():
         composite = compute_annual_composite(native)
 
     return (
+        # Only de-striping builds the float32 monthly climatology. Its blocks
+        # are read by every scene's anomaly, so they stay resident and the whole
+        # (12, h, w) array is charged.
         _phase(
             PHASE_OFFSETS,
             xr.Dataset({"offset": offsets[0], "n_valid": offsets[1]}),
             height=coarse_h,
             width=coarse_w,
             scenes=scenes,
+            months=MONTHS,
             **common,
         ),
+        # The composite builds no such array. Its twelve-month band is
+        # ``qa_count``, a uint8 result streamed to the COG writer block by
+        # block, never a resident float32 cube. Charging it one put 14.5 GiB
+        # into every row of a --sweep, swamping the levers the sweep exists to
+        # rank: chunk 128 at 8 threads scored better than chunk 512 at 1.
         _phase(
             PHASE_COMPOSITE,
             composite,
             height=native_h,
             width=native_w,
             scenes=scenes,
+            months=0,
             **common,
         ),
     )
@@ -652,6 +767,7 @@ def sweep_plan(
     vm_gib: float = DEFAULT_VM_GIB,
     baseline_gib: float = DEFAULT_BASELINE_GIB,
     optimize: bool = True,
+    max_tasks: int = MAX_PLAN_TASKS,
 ) -> tuple[SweepRow, ...]:
     """Price every combination of chunk size and thread count, statically.
 
@@ -684,16 +800,34 @@ def sweep_plan(
     """
     rows: list[SweepRow] = []
     for chunk_size in chunk_sizes:
-        phases = plan_tile(
-            tile=tile,
-            scenes=scenes,
-            chunk_size=chunk_size,
-            threads=1,
-            baseline_gib=baseline_gib,
-            optimize=optimize,
-        )
+        # A sweep exists to find viable configurations, so one that cannot even
+        # be planned is dropped rather than allowed to fail the whole command.
+        # It is logged, never silently: a table that quietly lost its smallest
+        # chunk would read as though that chunk had been considered and lost.
+        try:
+            phases = plan_tile(
+                tile=tile,
+                scenes=scenes,
+                chunk_size=chunk_size,
+                threads=1,
+                baseline_gib=baseline_gib,
+                optimize=optimize,
+                max_tasks=max_tasks,
+            )
+        except PlanTooLarge as e:
+            log.warning(
+                "sweep_chunk_skipped",
+                chunk_size=chunk_size,
+                scenes=scenes,
+                estimated_tasks=e.estimated,
+                limit=e.limit,
+            )
+            continue
         tasks = {phase.name: phase.graph.tasks for phase in phases}
         for threads in thread_counts:
+            # months comes from the phase, not the default: only de-striping
+            # holds a monthly climatology, and charging the composite one too
+            # added a constant 14.5 GiB to every row and flattened the table.
             floor = max(
                 predict_peak(
                     scenes=scenes,
@@ -701,6 +835,7 @@ def sweep_plan(
                     threads=threads,
                     height=phase.height,
                     width=phase.width,
+                    months=phase.peak.months,
                     baseline_gib=baseline_gib,
                 ).total_gib
                 for phase in phases

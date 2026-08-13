@@ -1,0 +1,61 @@
+{
+  "_README": [
+    "Measured residuals between what landsat_lst.profiling predicts and what a real",
+    "run did. Required by issue #77 item 3: every prediction the model emits gets",
+    "checked against at least one real run, and the residual is recorded in the",
+    "repository alongside the VM type it was measured on.",
+    "",
+    "This file is data, not prose, so a tile run updates it instead of restarting",
+    "the argument. Append a record; do not rewrite history. Records are matched on",
+    "vm_type and threads, because neither constant transfers across them.",
+    "",
+    "peak_residuals[].ratio is measured_peak_gib / predicted_floor_gib. The floor is",
+    "a lower bound by construction, so the ratio is >= 1 and is what turns a floor",
+    "into a size estimate.",
+    "",
+    "throughput[].tasks_per_second converts a static fused task count into wall",
+    "time. Count tasks with `landsat-lst plan`, divide, and the answer is minutes",
+    "rather than an experiment."
+  ],
+  "peak_residuals": [
+    {
+      "run_id": "2021-2025-sample300-20260813T123249Z",
+      "tile": "N40W075",
+      "vm_type": "r6i.4xlarge",
+      "threads": 4,
+      "chunk_size": 512,
+      "scenes": 300,
+      "offset_factor": 2,
+      "phase": "destripe_offsets",
+      "measured_peak_gib": 78.6,
+      "measured_on": "2026-08-13",
+      "source": "heartbeat peak_rss_mb, run still in flight at 49.8 percent",
+      "note": "Peak had plateaued and held. Issue #77 records 87 GiB for the same run; 78.6 is the value read from the heartbeat at the time and is the conservative one of the two."
+    },
+    {
+      "run_id": "synthetic-20260813",
+      "tile": null,
+      "vm_type": "laptop",
+      "threads": 4,
+      "chunk_size": 512,
+      "scenes": 200,
+      "offset_factor": 2,
+      "phase": "destripe_offsets",
+      "measured_peak_gib": 4.9,
+      "measured_on": "2026-08-13",
+      "source": "scripts/synthetic_scaling.py, 8x8 blocks of 512",
+      "note": "Synthetic geometry at 4096x4096. Peak runs 1.3x the floor here against a far wider gap on the real tile, which is the open discrepancy."
+    }
+  ],
+  "throughput": [
+    {
+      "vm_type": "r6i.4xlarge",
+      "threads": 4,
+      "phase": "destripe_offsets",
+      "tasks_per_second": 350,
+      "measured_on": "2026-08-13",
+      "source": "run 2021-2025-sample300-20260813T123249Z, observed 237 to 763 per second, averaging roughly 350",
+      "note": "Fused tasks per second. Recorded per phase as well as per VM and thread count: the composite retires a different mix of work, so this rate says nothing about it. Does not transfer to another instance type or thread count unexamined."
+    }
+  ]
+}

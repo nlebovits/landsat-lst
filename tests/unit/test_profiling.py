@@ -22,10 +22,13 @@ from landsat_lst.normalization import offset_graph
 from landsat_lst.pipeline import TIME_CHUNK, compute_annual_composite
 from landsat_lst.profiling import (
     GIB,
+    MAX_PLAN_TASKS,
     MONTHS,
     PHASE_COMPOSITE,
     PHASE_OFFSETS,
+    PlanTooLarge,
     destripe_disabled,
+    estimate_raw_tasks,
     graph_stats,
     plan_tile,
     predict_peak,
@@ -294,6 +297,78 @@ def test_plan_phase_serializes_for_the_json_flag(planned):
     assert payload["graph"]["tasks"] > 0
     assert payload["memory"]["floor_gib"] > 0
     json.dumps(payload)  # must round-trip for `landsat-lst plan --json`
+
+
+# ---------------------------------------------------------------- build guard
+
+
+def test_estimate_raw_tasks_tracks_blocks_and_time_chunks():
+    """Blocks squared times time chunks: the shape of the allocation."""
+    small = estimate_raw_tasks(height=1024, width=1024, chunk_size=512, scenes=10)
+    # 2x2 blocks, 1 time chunk.
+    assert small == 2 * 2 * 1 * 95
+
+    # Halving the chunk quadruples the blocks.
+    finer = estimate_raw_tasks(height=1024, width=1024, chunk_size=256, scenes=10)
+    assert finer == small * 4
+
+    # Ten times the scenes is ten times the time chunks.
+    longer = estimate_raw_tasks(height=1024, width=1024, chunk_size=512, scenes=100)
+    assert longer == small * 10
+
+
+def test_guard_refuses_the_configuration_that_crashed_a_desktop():
+    """`plan --sweep` at 2,930 scenes reached chunk 128 and took the machine down.
+
+    The estimate has to catch it before a single task object is allocated, which
+    is the whole point of checking geometry rather than measuring memory.
+    """
+    estimated = estimate_raw_tasks(height=18000, width=18000, chunk_size=128, scenes=2930)
+    assert estimated > MAX_PLAN_TASKS
+
+    with pytest.raises(PlanTooLarge, match="over the"):
+        plan_tile(tile=parse_tile_name(TILE), scenes=2930, chunk_size=128, optimize=False)
+
+
+def test_guard_allows_the_production_default():
+    """The configuration people actually plan must not be blocked by the guard."""
+    for height, width in ((9000, 9000), (18000, 18000)):
+        estimated = estimate_raw_tasks(height=height, width=width, chunk_size=512, scenes=2930)
+        assert estimated < MAX_PLAN_TASKS
+
+
+def test_plan_too_large_names_the_levers():
+    """A refusal that does not say what to change is only half an answer."""
+    with pytest.raises(PlanTooLarge) as excinfo:
+        plan_tile(tile=parse_tile_name(TILE), scenes=2930, chunk_size=128, optimize=False)
+    message = str(excinfo.value)
+    assert "--chunk" in message
+    assert "--scenes" in message
+    assert "--max-tasks" in message
+
+
+def test_guard_checks_before_building_anything(monkeypatch):
+    """The refusal must beat the allocation, or it buys nothing."""
+    import landsat_lst.profiling as profiling_module
+
+    def explode(**_kwargs):
+        raise AssertionError("synthetic_dataset was called despite the guard")
+
+    monkeypatch.setattr(profiling_module, "synthetic_dataset", explode)
+    with pytest.raises(PlanTooLarge):
+        plan_tile(tile=parse_tile_name(TILE), scenes=2930, chunk_size=128, optimize=False)
+
+
+def test_sweep_drops_an_unplannable_chunk_rather_than_failing():
+    """A sweep finds viable configurations; an unviable one is not a crash."""
+    rows = sweep_plan(
+        tile=parse_tile_name(TILE),
+        scenes=10,
+        chunk_sizes=(512, 8),
+        thread_counts=(2,),
+        optimize=False,
+    )
+    assert {r.chunk_size for r in rows} == {512}
 
 
 # ----------------------------------------------------------------- sweep_plan

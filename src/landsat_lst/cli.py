@@ -302,27 +302,73 @@ def _print_plan_phases(phases: tuple, vm_gib: float) -> None:
             )
         top = "  ".join(f"{s.prefix} {s.tasks:,}" for s in phase.graph.top(5))
         console.print(f"    heaviest  {top}")
+        # Square brackets are rich's markup delimiters, so a literal label has
+        # to be escaped or the console silently swallows it.
+        terms = [f"stack {peak.stack_bytes / (1024**3):.1f}"]
+        if peak.climatology_bytes:
+            terms.append(f"climatology {peak.climatology_bytes / (1024**3):.1f}")
+        terms.append(rf"baseline {peak.baseline_bytes / (1024**3):.1f} \[assumed]")
         console.print(
-            f"    memory    floor {peak.total_gib:.1f} GiB {verdict} in {vm_gib:.0f} GiB "
-            f"(stack {peak.stack_bytes / (1024**3):.1f}, "
-            f"climatology {peak.climatology_bytes / (1024**3):.1f}, "
-            f"baseline {peak.baseline_bytes / (1024**3):.1f})"
+            rf"    memory    floor {peak.total_gib:.1f} GiB {verdict} in {vm_gib:.0f} GiB "
+            rf"\[derived]  ({', '.join(terms)})"
         )
+        _print_calibration(phase, vm_gib)
+
+
+def _print_calibration(phase, vm_gib: float) -> None:
+    """State what a real run measured against this phase, or that none has.
+
+    Issue #77 item 3: an unvalidated term says so where it is printed, not only
+    in a docstring. A floor with no measurement behind it is useful for ruling a
+    configuration out and useless for sizing one, and the output has to say
+    which of those it is offering.
+    """
+    from landsat_lst.calibration import peak_residuals, throughput_for, wall_time_minutes
+
+    # Rates are recorded per phase: the composite retires a different mix of
+    # work, so the offset pass's rate says nothing about it. No record for this
+    # phase means no wall-time line at all, rather than a transferred guess.
+    rate = throughput_for(vm_type="r6i.4xlarge", threads=phase.peak.threads, phase=phase.name)
+    if rate is not None and phase.graph.optimized:
+        minutes = wall_time_minutes(phase.graph.tasks, rate)
+        console.print(
+            rf"    wall      ~{minutes:.0f} min at {rate.tasks_per_second:.0f} tasks/s "
+            rf"\[measured: {rate.vm_type}, {rate.threads} threads, {rate.measured_on}]"
+        )
+
+    # Laptop numbers are kept in the file but excluded here: the gap between
+    # synthetic and production hardware is the open discrepancy, not evidence.
+    observed = peak_residuals(phase=phase.name, exclude_vm="laptop")
+    if not observed:
+        console.print(
+            r"    residual  [red]no real run measured against this phase[/red]; "
+            r"the floor rules a configuration out, it does not size one \[unvalidated]"
+        )
+        return
+    worst = max(observed, key=lambda r: r.measured_peak_gib)
+    ratio = worst.measured_peak_gib / phase.peak.total_gib if phase.peak.total_gib else 0.0
+    fits = "[green]fits[/green]" if worst.measured_peak_gib < vm_gib else "[red]over[/red]"
+    console.print(
+        rf"    residual  a real run peaked at {worst.measured_peak_gib:.1f} GiB, "
+        rf"{ratio:.1f}x this floor {fits} in {vm_gib:.0f} GiB "
+        rf"\[measured: {worst.vm_type}, {worst.threads} threads, "
+        rf"{worst.scenes} scenes, {worst.measured_on}]"
+    )
 
 
 def _print_sweep(rows: tuple) -> None:
     """Render the sweep table: one line per configuration, cheapest first."""
     label = "tasks" if rows and rows[0].optimized else "raw tasks"
     console.print(
-        f"\n  {'chunk':>6}{'threads':>9}{'offset ' + label:>15}"
-        f"{'composite ' + label:>18}{'floor GiB':>12}{'':>7}"
+        f"\n  {'chunk':>6}{'threads':>9}{'offset ' + label:>20}"
+        f"{'composite ' + label:>23}{'floor GiB':>12}{'':>7}"
     )
-    console.print("  " + "-" * 67)
+    console.print("  " + "-" * 77)
     for row in rows:
         verdict = "[green]fits[/green]" if row.fits else "[red]over[/red]"
         console.print(
-            f"  {row.chunk_size:>6}{row.threads:>9}{row.offsets_tasks:>15,}"
-            f"{row.composite_tasks:>18,}{row.floor_gib:>12.1f}   {verdict}"
+            f"  {row.chunk_size:>6}{row.threads:>9}{row.offsets_tasks:>20,}"
+            f"{row.composite_tasks:>23,}{row.floor_gib:>12.1f}   {verdict}"
         )
 
 
@@ -332,7 +378,8 @@ def _print_sweep(rows: tuple) -> None:
     "--scenes",
     type=int,
     default=None,
-    help="Scenes in the window (default: the 2,930 a five-year land tile pulls)",
+    help="Scenes to plan against (default: 300, the validation sample). "
+    "A five-year tile pulls 2,930; planning that many takes over 15 minutes.",
 )
 @click.option("--chunk", type=int, default=None, help="Spatial chunk edge in px")
 @click.option("--threads", type=int, default=None, help="Concurrent dask threads")
@@ -342,6 +389,12 @@ def _print_sweep(rows: tuple) -> None:
     "--fast",
     is_flag=True,
     help="Skip graph fusion. Much quicker, but the counts stop matching a heartbeat.",
+)
+@click.option(
+    "--max-tasks",
+    type=int,
+    default=None,
+    help="Refuse to build a graph estimated above this many raw tasks.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit the plan as JSON")
 def plan(
@@ -353,6 +406,7 @@ def plan(
     vm_gib: float | None,
     sweep: bool,
     fast: bool,
+    max_tasks: int | None,
     as_json: bool,
 ) -> None:
     """Price a tile's dask graphs without loading a pixel or starting a VM.
@@ -372,17 +426,24 @@ def plan(
     that cannot fit the floor is disqualified for free. One that fits may still
     OOM, which is what `scripts/synthetic_scaling.py` measures.
 
-    Fusing a full production graph takes minutes and several GB of RSS at the
-    default 2,930 scenes, and a --sweep pays that once per chunk size. Pass a
-    smaller --scenes, or --fast to skip fusion. A swept comparison survives
-    --fast intact, since ranking configurations turns on the memory floor,
-    which is exact either way.
+    Planning defaults to 300 scenes, the validation sample, and takes about half
+    a minute. A five-year tile pulls 2,930, and planning that many is not a
+    laptop operation: the composite's quantile rechunks 293 time chunks into one
+    across 1,296 spatial blocks, and one attempt ran past fifteen minutes before
+    being killed. Building a graph allocates Python objects whether or not you
+    ever compute it, so --max-tasks refuses a configuration that would exhaust
+    the machine. A --sweep pays that cost once per chunk size, and --fast skips
+    fusion; a swept comparison survives --fast intact, since ranking turns on
+    the memory floor, which is exact either way.
     """
     import json as json_module
 
     from landsat_lst.profiling import (
+        DEFAULT_PLAN_SCENES,
         DEFAULT_VM_GIB,
-        PRODUCTION_SCENES,
+        MAX_PLAN_TASKS,
+        SWEEP_CHUNK_SIZES,
+        PlanTooLarge,
         plan_tile,
         sweep_plan,
     )
@@ -392,22 +453,43 @@ def plan(
         # On stderr, so `--json` output stays pipeable into jq either way.
         click.echo(f"Note: {tile_name} is not in the land tiles set", err=True)
     tile = parse_tile_name(tile_name)
-    n_scenes = PRODUCTION_SCENES if scenes is None else scenes
+    n_scenes = DEFAULT_PLAN_SCENES if scenes is None else scenes
     vm = DEFAULT_VM_GIB if vm_gib is None else vm_gib
+    ceiling = MAX_PLAN_TASKS if max_tasks is None else max_tasks
 
     if sweep:
-        rows = sweep_plan(tile=tile, scenes=n_scenes, vm_gib=vm, optimize=not fast)
+        rows = sweep_plan(
+            tile=tile, scenes=n_scenes, vm_gib=vm, optimize=not fast, max_tasks=ceiling
+        )
         if as_json:
             # Nothing but JSON on stdout, so the output pipes straight into jq.
             click.echo(json_module.dumps([r.as_dict() for r in rows], indent=2))
             return
         console.print(f"[bold]Sweep {tile_name}[/bold]  {n_scenes:,} scenes  {vm:.0f} GiB VM")
         _print_sweep(rows)
+        # Never let a dropped chunk size pass unmentioned: a table missing its
+        # smallest chunk reads as though that chunk was considered and lost.
+        planned = {r.chunk_size for r in rows}
+        skipped = [c for c in SWEEP_CHUNK_SIZES if c not in planned]
+        if skipped:
+            console.print(
+                f"\n  [yellow]Skipped chunk {', '.join(str(c) for c in skipped)}[/yellow]: "
+                f"building the graph would allocate past the {ceiling:,}-task ceiling "
+                f"at {n_scenes:,} scenes. Lower --scenes or raise --max-tasks."
+            )
         return
 
-    phases = plan_tile(
-        tile=tile, scenes=n_scenes, chunk_size=chunk, threads=threads, optimize=not fast
-    )
+    try:
+        phases = plan_tile(
+            tile=tile,
+            scenes=n_scenes,
+            chunk_size=chunk,
+            threads=threads,
+            optimize=not fast,
+            max_tasks=ceiling,
+        )
+    except PlanTooLarge as e:
+        raise click.ClickException(str(e)) from e
     if as_json:
         click.echo(json_module.dumps([p.as_dict() for p in phases], indent=2))
         return
@@ -419,8 +501,9 @@ def plan(
     )
     _print_plan_phases(phases, vm)
     console.print(
-        "\n  [dim]Floor only: concurrent block stacks, the resident monthly "
-        "climatology, and process baseline.[/dim]"
+        "\n  [dim]The floor counts concurrent block stacks, the monthly climatology "
+        "de-striping holds resident, and a process baseline. It is a lower bound: "
+        "read the residual line for what a real run did.[/dim]"
     )
 
 
