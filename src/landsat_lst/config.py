@@ -178,6 +178,18 @@ class Settings(BaseSettings):
         "the P95 quantile on multi-year/large-tile runs (e.g. 256 for a 4x drop).",
     )
 
+    dask_max_threads: int | None = Field(
+        default=None,
+        description="Cap on dask's threaded scheduler for one tile. None leaves "
+        "dask's default of one thread per core. The threaded scheduler holds one "
+        "chunk per thread, so peak memory during de-striping is roughly "
+        "threads * chunk_size**2 * scenes * 4 bytes: on a 16-vCPU VM at chunk 512 "
+        "over 2,930 scenes that is ~49 GB of concurrent chunks alone. Capping "
+        "threads cuts that term linearly and, unlike halving load_chunk_size, "
+        "does not multiply per-chunk overhead (more graph nodes, more range "
+        "requests) -- the phase is I/O bound, so fewer threads mostly removes "
+        "concurrent waiting rather than useful work.",
+    )
     dask_workers: int = Field(
         default=8,
         description="Number of Dask workers for local processing",
