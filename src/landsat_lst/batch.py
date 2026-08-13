@@ -139,7 +139,14 @@ def load_submission(run_id: str, out_dir: Path | None = None) -> BatchSubmission
     return BatchSubmission.from_dict(json.loads(path.read_text()))
 
 
-def _task_command(*, run_id: str, year: int, end_year: int | None, force: bool) -> str:
+def _task_command(
+    *,
+    run_id: str,
+    year: int,
+    end_year: int | None,
+    force: bool,
+    max_scenes: int | None = None,
+) -> str:
     """The shell script one VM runs for one tile.
 
     The window is baked in as a literal and only the tile varies, which is why
@@ -166,6 +173,12 @@ def _task_command(*, run_id: str, year: int, end_year: int | None, force: bool) 
         parts += ["--end-year", str(end_year)]
     if force:
         parts.append("--force")
+    # Every field the job carries has to be restated here: the VM builds its
+    # own job from these arguments, so anything omitted silently reverts to a
+    # default. A missing --max-scenes turned a 300-scene sample into a full
+    # 2,930-scene run that looked like a sample from the submitting side.
+    if max_scenes is not None:
+        parts += ["--max-scenes", str(max_scenes)]
     quoted = shlex.join(parts)
     # Expanded by bash on the VM, not by the submitting shell.
     return f'#!/bin/bash\n{quoted} --tile "${TASK_INPUT_VAR}"\n'
@@ -267,6 +280,7 @@ def submit_batch(
         year=jobs[0].year,
         end_year=jobs[0].end_year,
         force=force,
+        max_scenes=jobs[0].max_scenes,
     )
 
     log.info(

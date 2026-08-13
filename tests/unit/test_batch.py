@@ -144,6 +144,44 @@ class TestTaskCommand:
         assert command.startswith("#!/bin/bash\n")
         assert command.endswith("\n")
 
+    def test_max_scenes_is_forwarded(self):
+        command = _task_command(run_id="r1", year=2021, end_year=2025, force=False, max_scenes=300)
+
+        assert "--max-scenes 300" in command
+
+    def test_every_job_field_reaches_the_vm(self):
+        """The VM rebuilds its job from these arguments alone.
+
+        A field the command omits does not travel: it silently takes its
+        default on the worker. That turned a 300-scene sample into a full
+        2,930-scene run which, from the submitting side, still looked like a
+        sample. This fails when a field is added to ProcessingJob and not
+        forwarded here.
+        """
+        from landsat_lst.models import ProcessingJob
+        from landsat_lst.tiling import parse_tile_name
+
+        job = ProcessingJob(
+            tile=parse_tile_name("N40W075"), year=2021, end_year=2025, max_scenes=300
+        )
+        command = _task_command(
+            run_id="r1",
+            year=job.year,
+            end_year=job.end_year,
+            force=True,
+            max_scenes=job.max_scenes,
+        )
+
+        for name in ProcessingJob.model_fields:
+            # The tile is the one field supplied per task, through the input
+            # variable rather than baked into the shared command.
+            if name == "tile":
+                continue
+            value = getattr(job, name)
+            if value is None:
+                continue
+            assert str(value) in command, f"{name} never reaches the VM"
+
     def test_run_id_is_quoted(self):
         """A run id is generated, but the command must not be shell-injectable."""
         command = _task_command(run_id="r1; rm -rf /", year=2021, end_year=None, force=False)
