@@ -482,3 +482,70 @@ class TestHeartbeat:
         assert result.status == "skipped"
         assert storage.read_text(storage.run_record_key("run-1", "N40W075")) is not None
         assert storage.read_text(storage.progress_key("run-1", "N40W075")) is None
+
+
+class TestThreadCap:
+    """Peak memory during de-striping is threads * chunk**2 * scenes * 4 bytes.
+
+    Capping threads cuts that term linearly without multiplying per-chunk
+    overhead the way halving the chunk size does.
+    """
+
+    def test_no_cap_leaves_dask_alone(self, sample_job, mock_storage, monkeypatch):
+        import dask
+
+        from landsat_lst.config import settings
+
+        monkeypatch.setattr(settings, "dask_max_threads", None)
+        seen = {}
+
+        def fake_process(job):
+            seen["num_workers"] = dask.config.get("num_workers", None)
+            return MagicMock()
+
+        with (
+            patch("landsat_lst.job.process_tile", side_effect=fake_process),
+            patch("landsat_lst.job._write_cogs", return_value=("a", "b")),
+        ):
+            process_tile_job(sample_job, storage=mock_storage)
+
+        assert seen["num_workers"] is None
+
+    def test_cap_applies_for_the_whole_tile(self, sample_job, mock_storage, monkeypatch):
+        import dask
+
+        from landsat_lst.config import settings
+
+        monkeypatch.setattr(settings, "dask_max_threads", 3)
+        seen = {}
+
+        def fake_process(job):
+            seen["num_workers"] = dask.config.get("num_workers", None)
+            seen["scheduler"] = dask.config.get("scheduler", None)
+            return MagicMock()
+
+        with (
+            patch("landsat_lst.job.process_tile", side_effect=fake_process),
+            patch("landsat_lst.job._write_cogs", return_value=("a", "b")),
+        ):
+            process_tile_job(sample_job, storage=mock_storage)
+
+        assert seen["num_workers"] == 3
+        assert seen["scheduler"] == "threads"
+
+    def test_cap_is_scoped_to_the_tile(self, sample_job, mock_storage, monkeypatch):
+        """A cap must not leak into whatever the process does next."""
+        import dask
+
+        from landsat_lst.config import settings
+
+        monkeypatch.setattr(settings, "dask_max_threads", 2)
+        before = dask.config.get("num_workers", None)
+
+        with (
+            patch("landsat_lst.job.process_tile", return_value=MagicMock()),
+            patch("landsat_lst.job._write_cogs", return_value=("a", "b")),
+        ):
+            process_tile_job(sample_job, storage=mock_storage)
+
+        assert dask.config.get("num_workers", None) == before

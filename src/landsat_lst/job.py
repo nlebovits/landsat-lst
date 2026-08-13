@@ -289,6 +289,35 @@ def process_tile_job(
     storage = storage or get_storage()
     logger = log.bind(tile=job.tile.name, year=job.window_label)
 
+    with _thread_cap():
+        return _process_tile_job(job, force=force, storage=storage, run_id=run_id, logger=logger)
+
+
+def _thread_cap():
+    """Bound dask's thread count for this tile, if configured.
+
+    Applied around the whole tile rather than at each compute, because both
+    hour-scale graphs -- the offset estimation and the COG write -- are subject
+    to it and neither is reached from here directly.
+    """
+    if settings.dask_max_threads is None:
+        return nullcontext()
+
+    import dask  # noqa: PLC0415
+
+    return dask.config.set(scheduler="threads", num_workers=settings.dask_max_threads)
+
+
+def _process_tile_job(
+    job: ProcessingJob,
+    *,
+    force: bool,
+    storage: StorageBackend,
+    run_id: str | None,
+    logger,
+) -> JobResult:
+    """The body of :func:`process_tile_job`, under whatever dask config it set."""
+
     # Layer 1: Idempotent check
     if not force and storage.cog_exists(job.window_label, job.tile.name):
         logger.info("tile_skipped", reason="cogs_exist")
