@@ -233,6 +233,34 @@ class Settings(BaseSettings):
         description="AWS profile whose (SSO) credentials are frozen and "
         "forwarded to Coiled workers for S3 writes.",
     )
+
+    # Live observability for batch tiles. A batch task is a plain process that
+    # never registers with dask, so the cluster dashboard reports nothing about
+    # it and its stdout stays on the VM until it exits. These knobs drive the
+    # heartbeat objects and uploaded logs that replace both. See issue #68.
+    heartbeat_interval_s: int = Field(
+        default=60,
+        description="Seconds between heartbeat writes from a running tile. "
+        "One small PUT each, ~84k across a 700-tile run (about $0.42).",
+    )
+    watch_stale_after_s: int = Field(
+        default=120,
+        description="A tile whose last heartbeat is older than this is stale: "
+        "killed, wedged, or preempted. Two heartbeat intervals, so a single "
+        "missed write does not raise a false alarm.",
+    )
+    watch_poll_interval_s: int = Field(
+        default=30,
+        description="Seconds between storage polls in `landsat-lst watch`. "
+        "Unchanged heartbeat objects are served from cache, so a poll costs "
+        "one listing plus a read per tile that actually beat.",
+    )
+    task_log_max_bytes: int = Field(
+        default=1_048_576,
+        description="Ceiling on the uploaded task log. A longer log is "
+        "uploaded as its tail, where the traceback is, under a truncation "
+        "notice; the full log stays on the VM until it is torn down.",
+    )
     manifest_dir: Path = Field(
         default=Path("results/runs"),
         description="Directory for per-run JSON manifests of distributed runs.",

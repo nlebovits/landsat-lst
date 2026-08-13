@@ -105,11 +105,27 @@ billing on its own.
 `run_distributed` is gone, along with the Coiled Functions path. The public surface is
 `submit_batch`, `reconcile_run`, and `wait_for_batch` in `landsat_lst.batch`.
 
-Live progress moves entirely to the Coiled dashboard and `coiled batch status`. There is no
-per-tile progress bar on the submitting machine, because there is no longer a process there to
-draw one.
+There is no per-tile progress bar on the submitting machine, because there is no longer a process
+there to draw one.
 
-Per-task logs live in Coiled rather than in the driver's output, so the manifest records
-`cluster_id` and `job_id` to make `coiled batch logs <cluster-id>` reachable after the fact.
+**Amended 2026-08-13.** This ADR first said live progress moves to the Coiled dashboard, and that
+per-task logs live in Coiled and are reachable through `coiled batch logs <cluster-id>`. Neither
+held. The dashboard's panels describe the cluster's dask scheduler, and a batch task is a plain
+process that never registers with it, so they stay flat for hours whether a tile is computing or
+wedged. Task stdout never reaches the logs API either: it goes to
+`COILED_BATCH_TASK_OUTPUT_DIR` on the VM, and `get_logs` returns lines whose content is already
+empty. The exit code Coiled records belongs to the `tee` wrapper it runs the task under, which is
+why a task that produced nothing could report exit 0.
+
+Diagnosing the first live batch failure therefore took a hand-built shell wrapper and most of a
+day. The instrumentation now lives in the CLI: each tile publishes a heartbeat to
+`_runs/{run_id}/{tile}.progress.json` every minute and at every phase change, uploads its own
+stdout and stderr to `_runs/{run_id}/{tile}.log` when it exits either way, and
+`landsat-lst watch <run-id>` renders the heartbeats from storage alone. `coiled batch status`
+remains useful for the scheduling view: which tasks started, on what, and when. See
+[#68](https://github.com/nlebovits/landsat-lst/issues/68).
+
+The manifest still records `cluster_id` and `job_id`, which is what makes that scheduling view
+reachable after the fact, and it names a failed tile's uploaded log.
 
 Refs [#66](https://github.com/nlebovits/landsat-lst/issues/66), [#31](https://github.com/nlebovits/landsat-lst/issues/31).

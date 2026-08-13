@@ -17,6 +17,12 @@ The run is split into two phases that never share a process:
    the COG listing, enriches it with the per-tile run records the VMs wrote,
    and produces the run manifest.
 
+While the run is going, the tiles themselves are the only source of progress:
+each publishes a heartbeat every minute under the same ``_runs/{run_id}/``
+prefix, and :mod:`landsat_lst.watch` renders them. The cluster dashboard cannot
+help, because a batch task never registers with the dask scheduler its panels
+describe.
+
 Completion is decided by the COG listing, not by a task exit code. A task can
 exit non-zero after its assets landed (a failed record write, a preempted VM
 during teardown), and a task can exit zero having produced nothing if the
@@ -327,20 +333,22 @@ def _task_duration_s(task: dict) -> float | None:
     return (datetime.fromisoformat(stop) - datetime.fromisoformat(start)).total_seconds()
 
 
-def _failure_reason(task: dict | None) -> str:
+def _failure_reason(task: dict | None, log_key: str | None = None) -> str:
     """Why a tile without both COGs has no output.
 
     Coiled's task state is all that is left when a VM died before its own
     record could be written, which is exactly the case a manifest most needs to
-    explain.
+    explain. Coiled reports the tee wrapper's exit code rather than the CLI's,
+    so the uploaded task log is named whenever the tile got far enough to leave
+    one: that is where the traceback is.
     """
     if task is None:
-        return "no task state and no run record; tile may never have been scheduled"
-    exit_code = task.get("exit_code")
-    state = task.get("state", "unknown")
-    if exit_code:
-        return f"task exited {exit_code} (state {state})"
-    return f"task state {state} with no COGs written"
+        reason = "no task state and no run record; tile may never have been scheduled"
+    elif task.get("exit_code"):
+        reason = f"task exited {task['exit_code']} (state {task.get('state', 'unknown')})"
+    else:
+        reason = f"task state {task.get('state', 'unknown')} with no COGs written"
+    return f"{reason}; task log at {log_key}" if log_key else reason
 
 
 def _resolve_tile(
@@ -350,6 +358,7 @@ def _resolve_tile(
     completed: set[str],
     records: dict[str, JobResult],
     tasks: dict[str, dict],
+    logs: dict[str, str],
     storage: StorageBackend,
 ) -> JobResult:
     """One tile's outcome, from the COG listing first and the record second."""
@@ -386,22 +395,29 @@ def _resolve_tile(
     return JobResult(
         job=job,
         status="failed",
-        error=(record.error if record else None) or _failure_reason(task),
+        error=(record.error if record else None) or _failure_reason(task, logs.get(tile)),
         duration_s=(record.duration_s if record else None) or _task_duration_s(task or {}),
         scene_count=record.scene_count if record else None,
         peak_rss_mb=record.peak_rss_mb if record else None,
     )
 
 
-def _read_records(submission: BatchSubmission, storage: StorageBackend) -> dict[str, JobResult]:
+def _read_records(
+    submission: BatchSubmission, storage: StorageBackend, listed: set[str]
+) -> dict[str, JobResult]:
     """Per-tile run records the VMs wrote, keyed by tile name.
 
     A tile with no record is normal, not an error: its VM was preempted, timed
-    out, or was killed before it could report.
+    out, or was killed before it could report. ``listed`` already says which
+    tiles left one, so a 700-tile run reads only the records that exist rather
+    than issuing a request per tile to discover the same thing.
     """
     records: dict[str, JobResult] = {}
     for tile in submission.submitted_tiles:
-        raw = storage.read_text(storage.run_record_key(submission.run_id, tile))
+        key = storage.run_record_key(submission.run_id, tile)
+        if key not in listed:
+            continue
+        raw = storage.read_text(key)
         if raw is None:
             continue
         try:
@@ -444,7 +460,15 @@ def reconcile_run(
     storage = storage or get_storage()
 
     completed = storage.list_completed(submission.window)
-    records = _read_records(submission, storage)
+    # One listing of the run prefix answers two questions at once: which tiles
+    # left a record worth reading, and which left a log worth pointing at.
+    listed = set(storage.list_prefix(storage.run_prefix(run_id)))
+    records = _read_records(submission, storage, listed)
+    logs = {
+        tile: key
+        for tile in submission.submitted_tiles
+        if (key := storage.log_key(run_id, tile)) in listed
+    }
     tasks = _task_states(submission)
 
     results = [
@@ -454,6 +478,7 @@ def reconcile_run(
             completed=completed,
             records=records,
             tasks=tasks,
+            logs=logs,
             storage=storage,
         )
         for tile in submission.submitted_tiles

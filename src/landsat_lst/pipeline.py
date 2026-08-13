@@ -14,6 +14,7 @@ from landsat_lst.encoding import LST_MIN_TRUSTED_C
 from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
 from landsat_lst.models import ProcessingJob
 from landsat_lst.normalization import offset_diagnostics, seasonal_debias
+from landsat_lst.progress import report_phase
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 from landsat_lst.tiling import geobox_for_bbox
 
@@ -212,6 +213,7 @@ def compute_annual_composite(
     if land_mask is not None:
         lst = lst.where(land_mask)
 
+    scenes_kept = None
     if settings.destripe:
         # The offset is one scalar per scene, so it can be estimated from a
         # coarse stack read off the source COGs' overviews. That cuts bytes
@@ -223,6 +225,10 @@ def compute_annual_composite(
             if offset_land_mask is not None:
                 source = source.where(offset_land_mask)
 
+        # Estimating the offsets is the first real compute of the tile, and on a
+        # five-year window it runs for many minutes, so the watcher hears about
+        # it before it starts rather than after.
+        report_phase("destriping")
         lst, offset, keep = seasonal_debias(
             lst,
             max_offset_c=settings.destripe_max_offset_c,
@@ -230,7 +236,11 @@ def compute_annual_composite(
             min_offset_samples=settings.destripe_min_offset_samples,
             offset_source=source,
         )
-        log.info("destripe_offsets_degC", **offset_diagnostics(offset, keep))
+        diagnostics = offset_diagnostics(offset, keep)
+        log.info("destripe_offsets_degC", **diagnostics)
+        scenes_kept = int(diagnostics["n_kept"])
+
+    report_phase("compositing", scenes_kept=scenes_kept)
 
     # notnull() (not ~np.isnan) so the result stays a typed xarray DataArray.
     valid_mask = lst.notnull()
@@ -281,11 +291,14 @@ def process_tile(job: ProcessingJob) -> xr.Dataset:
         Dataset with the LST P95 composite (``lst_p95``) and per-month
         ``qa_count`` for the job's window.
     """
+    report_phase("stac_query")
     items = query_stac(job)
 
     if not items:
         msg = f"No scenes found for {job.tile.name} in {job.year}"
         raise ValueError(msg)
+
+    report_phase("loading", scenes_found=len(items))
 
     # Planetary Computer: set up refreshable Azure SAS auth (local + Dask
     # workers) and rewrite asset hrefs to token-free /vsiaz/ paths so a

@@ -51,6 +51,30 @@ checks, which is the intended S4 behavior. Sample real tiles into the tree for b
 
 ## S1. Rehearsal on two or three tiles
 
+### First, one cheap distributed tile
+
+Before any five-year tile runs, prove the distributed path itself on a single-year window over a
+small tile. It finishes in minutes for pennies, and it exercises the parts a local run never
+touches: the task command, the heartbeats, the run record, and the uploaded log.
+
+```bash
+LST_COILED_JOB_TIMEOUT="30 minutes" \
+  landsat-lst process --distributed --year 2024 --tile N40W075
+landsat-lst watch <run-id>
+landsat-lst reconcile <run-id>
+```
+
+Lower the timeout for the validation run, as above. The 6-hour default is sized for a five-year
+tile, and a wedged task that cannot finish in 30 minutes would otherwise bill for all six hours
+before anyone found out.
+
+Expect the tile to move through `stac_query`, `loading`, `destriping`, `compositing`, `exporting`,
+and `uploading`, and to leave three objects under `_runs/{run-id}/`: a heartbeat, a run record,
+and a log. If the log is empty, the task died before the CLI produced a line, which is a task
+command problem rather than a pipeline problem.
+
+### Then the tiles that disagree
+
 Prove the whole path on a handful of tiles before spending a global run on it. Pick tiles that
 disagree with each other, for example one dense urban tile, one humid tropical tile, and one
 sparse high-latitude tile.
@@ -110,11 +134,23 @@ only the tiles that carry both assets, so a tile that died between its two uploa
 rather than published half-finished. Re-running the same command after any interruption is the
 resume mechanism, and it is cheap enough to be the normal way to start.
 
-Watch progress on the Coiled dashboard, or:
+Watch it:
 
 ```bash
-coiled batch status <cluster-id>
+landsat-lst watch <run-id>
 ```
+
+Each tile republishes its phase, elapsed time, scene counts, and peak memory every minute, and
+`watch` renders one table over all of them, refreshing every 30 seconds. Live tiles get a row;
+finished and pending ones are counted in the caption, and `--all` gives every tile a row. A tile
+whose heartbeat stops advancing for two minutes is wedged, preempted, or killed, and shows as
+stale. The command reads only the run's storage prefix, so it works from any machine, including
+one that never submitted the run.
+
+The Coiled dashboard cannot answer this question. Its panels describe the cluster's dask
+scheduler, and a batch task is a plain process that never registers with it, so they stay flat
+whether the tile is computing or dead (issue #68). `coiled batch status <cluster-id>` still gives
+the scheduling view: which tasks started, on what, and when.
 
 When the run finishes, build the manifest:
 
@@ -126,8 +162,19 @@ Reconciliation takes completion from the S3 listing, per-tile duration, scene co
 memory from the run records each VM wrote under `_runs/{run_id}/`, and the reason for any tile
 with no output from Coiled's task state. It is safe to run early and safe to run twice.
 
-Expect failures at the tail. A tile that fails twice is a data problem, not a scheduling problem,
-and it belongs in an issue rather than in a third retry.
+Expect failures at the tail. Read the failed tile's own log before deciding what it is:
+
+```bash
+aws s3 cp s3://<bucket>/<prefix>/_runs/<run-id>/<tile>.log -
+```
+
+Every task uploads its stdout and stderr there when it exits, either way. That is the only place
+the traceback survives: task output never reaches `coiled logs`, and the exit code Coiled records
+belongs to the tee wrapper rather than to the pipeline. The manifest names the log for any tile
+that left one.
+
+A tile that fails twice is a data problem, not a scheduling problem, and it belongs in an issue
+rather than in a third retry.
 
 ## S3. Build the catalog
 

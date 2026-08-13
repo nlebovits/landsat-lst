@@ -23,6 +23,7 @@ import os
 import shutil
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,6 +35,7 @@ from landsat_lst.config import settings
 from landsat_lst.encoding import encode_lst_uint16
 from landsat_lst.models import ProcessingJob
 from landsat_lst.pipeline import process_tile
+from landsat_lst.progress import TileHeartbeat, peak_rss_mb, report_failed, report_phase
 from landsat_lst.storage import StorageBackend, get_storage
 
 if TYPE_CHECKING:
@@ -101,16 +103,6 @@ class JobResult:
             scene_count=record.get("scene_count"),
             peak_rss_mb=record.get("peak_rss_mb"),
         )
-
-
-def _peak_rss_mb() -> float | None:
-    """Peak resident set size of this process in MiB, if measurable."""
-    try:
-        import resource  # noqa: PLC0415
-
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    except (ImportError, ValueError):  # pragma: no cover - non-POSIX
-        return None
 
 
 _HTTP_SERVER_ERROR = 500
@@ -231,9 +223,11 @@ def _write_cogs(
         lst_local = scratch / job.asset_filename("lst_p95")
         qa_local = scratch / job.asset_filename("qa_count")
         logger.info("cog_exporting")
+        report_phase("exporting")
         cog_export(_encode_native(composite), lst_local, qa_local)
 
         logger.info("cog_uploading", lst_key=lst_key, qa_key=qa_key)
+        report_phase("uploading")
         storage.upload(qa_local, qa_key)
         storage.upload(lst_local, lst_key)
     finally:
@@ -285,7 +279,9 @@ def process_tile_job(
         storage: Storage backend (defaults to configured backend)
         run_id: Distributed run this tile belongs to. When set, the outcome is
             written to ``_runs/{run_id}/{tile}.json`` for
-            :func:`landsat_lst.batch.reconcile_run` to collect.
+            :func:`landsat_lst.batch.reconcile_run` to collect, and a heartbeat
+            at ``_runs/{run_id}/{tile}.progress.json`` reports the tile's phase
+            while it runs, for `landsat-lst watch` to render.
 
     Returns:
         JobResult with status and asset keys
@@ -302,41 +298,53 @@ def process_tile_job(
         return result
 
     start = time.monotonic()
-    try:
-        # Layer 2: Process tile through pipeline
-        logger.info("tile_processing_start")
-        composite = process_tile(job)
+    # A tile with no run id has someone watching it directly, so it beats to
+    # nobody. Nothing else about the tile changes.
+    heartbeat = (
+        TileHeartbeat(run_id=run_id, tile=job.tile.name, window=job.window_label, storage=storage)
+        if run_id
+        else nullcontext()
+    )
+    with heartbeat:
+        try:
+            # Layer 2: Process tile through pipeline
+            logger.info("tile_processing_start")
+            composite = process_tile(job)
 
-        # Layer 3: Export COGs and upload them
-        lst_key, qa_key = _write_cogs(composite, storage, job, logger)
+            # Layer 3: Export COGs and upload them
+            lst_key, qa_key = _write_cogs(composite, storage, job, logger)
 
-        duration = time.monotonic() - start
-        logger.info("tile_completed", lst_key=lst_key, qa_key=qa_key, duration_s=duration)
-        result = JobResult(
-            job=job,
-            status="completed",
-            lst_key=lst_key,
-            qa_key=qa_key,
-            duration_s=duration,
-            scene_count=composite.attrs.get("scene_count"),
-            peak_rss_mb=_peak_rss_mb(),
-        )
+            duration = time.monotonic() - start
+            logger.info("tile_completed", lst_key=lst_key, qa_key=qa_key, duration_s=duration)
+            result = JobResult(
+                job=job,
+                status="completed",
+                lst_key=lst_key,
+                qa_key=qa_key,
+                duration_s=duration,
+                scene_count=composite.attrs.get("scene_count"),
+                peak_rss_mb=peak_rss_mb(),
+            )
 
-    except Exception as e:
-        if _is_transient(e):
-            # Re-raise so the batch task's retries reschedule the tile on a
-            # fresh VM; the idempotency check above makes a retry after a
-            # partial upload safe.
-            logger.warning("tile_transient_failure", error=str(e))
-            raise
-        logger.exception("tile_failed", error=str(e))
-        result = JobResult(
-            job=job,
-            status="failed",
-            error=str(e),
-            duration_s=time.monotonic() - start,
-            peak_rss_mb=_peak_rss_mb(),
-        )
+        except Exception as e:
+            if _is_transient(e):
+                # Re-raise so the batch task's retries reschedule the tile on a
+                # fresh VM; the idempotency check above makes a retry after a
+                # partial upload safe. The heartbeat's exit reports it.
+                logger.warning("tile_transient_failure", error=str(e))
+                raise
+            logger.exception("tile_failed", error=str(e))
+            # A deterministic failure is returned rather than raised, so the
+            # heartbeat has to be told; otherwise the tile's last published
+            # phase is whatever it died in and it reads as merely stale.
+            report_failed(str(e))
+            result = JobResult(
+                job=job,
+                status="failed",
+                error=str(e),
+                duration_s=time.monotonic() - start,
+                peak_rss_mb=peak_rss_mb(),
+            )
 
     if run_id:
         _write_run_record(result, storage, run_id, logger)
