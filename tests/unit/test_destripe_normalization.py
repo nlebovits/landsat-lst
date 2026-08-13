@@ -11,6 +11,8 @@ cap must be absent from the output stack and absent from qa_count, not present
 with a bounded correction.
 """
 
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -74,6 +76,36 @@ def _seasonal_stack(
 
 def _debias(lst, *, max_offset_c=15.0, min_scene_pixels=500):
     return seasonal_debias(lst, max_offset_c=max_offset_c, min_scene_pixels=min_scene_pixels)
+
+
+class TestSceneOffsets:
+    """The offset pass is the expensive half of de-striping on a real tile."""
+
+    def test_reads_the_stack_once(self):
+        """Both reductions share one traversal.
+
+        They read the same stack, and the valid-pixel count is trivial next to
+        the monthly median. Computing them separately would walk every scene a
+        second time to collect it -- on a 5-year tile that is a full re-read of
+        ~2,900 scenes for almost nothing.
+        """
+        import dask
+
+        from landsat_lst import normalization
+
+        calls = []
+        real_compute = dask.compute
+
+        def counting_compute(*args, **kwargs):
+            calls.append(args)
+            return real_compute(*args, **kwargs)
+
+        with patch.object(normalization.dask, "compute", counting_compute):
+            offset, n_valid = scene_offsets(_seasonal_stack())
+
+        assert len(calls) == 1, "the stack must be traversed once, not per reduction"
+        assert len(calls[0]) == 2, "both reductions belong to the same graph"
+        assert offset.sizes["time"] == n_valid.sizes["time"]
 
 
 class TestSeasonalDebias:
