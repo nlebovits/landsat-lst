@@ -1,6 +1,7 @@
 # How far a real peak lands above the predicted floor
 
-**Status:** Measured. Verdict `growing_ratio`; `predict_peak` is not correctable by a factor.
+**Status:** Measured, twice. `predict_peak` is not correctable by a factor, but chunk 256 with
+one thread takes a production tile from >123 GB to ~57 GB and is the recommended configuration.
 **Date:** 2026-08-14
 **Tracking:** [#94](https://github.com/nlebovits/landsat-lst/issues/94), [ADR-011](adr/011-static-planning-and-synthetic-benchmarks.md)
 
@@ -149,8 +150,9 @@ the multiple grows with the window. Something scales that the three-term model t
 which points at the `groupby` rechunk shuffle or the anomaly broadcast materializing a second
 stack — direct evidence for [#93](https://github.com/nlebovits/landsat-lst/issues/93).
 
-It also means **#93 alone may not be sufficient**. Halving the offset pass takes a 123 GB tile to
-roughly 62 GB, which is at the ceiling rather than under it.
+That read alone would have made **#93 look load-bearing**: halving the offset pass takes a 123 GB
+tile to roughly 62 GB, at the ceiling rather than under it. The second sweep below changes that
+conclusion, which is why it was worth a dime to run before starting the work.
 
 ### The configuration levers were already pulled, and did not hold
 
@@ -168,15 +170,59 @@ That is not a wrong formula. `stack_bytes` is precisely what concurrent block st
 the wrong *dominant term* — at 400 scenes the pipeline holds 6.37x its floor, so the part the
 levers control is a shrinking minority of the total.
 
-**So the next measurement is a fork, not a confirmation.** Re-run this sweep at `--threads 1
---chunk 256`, twelve minutes and a dime:
+## The levers do work: `scaling-20260814T142614Z`
 
-- Ratio falls toward 1 → the excess is concurrent block stacks after all, the levers work, and
-  #93 is an optimization.
-- Ratio holds near 6.4x → the excess is the shuffle or the broadcast, both levers are dead ends,
-  and #93 is structural work no setting can avoid.
+Same sweep at `--threads 1 --chunk 256`. Twelve minutes, another dime.
 
-Do this before starting #93. It costs a dime and it decides how much #93 has to accomplish.
+| scenes | A: chunk 512, 4 threads | B: chunk 256, 1 thread | cut | A tasks | B tasks |
+|---:|---:|---:|---:|---:|---:|
+| 50 | 6.4 GB | 1.7 GB | 3.7x | 19,943 | 19,907 |
+| 100 | 10.0 GB | 2.4 GB | 4.1x | 35,782 | 35,708 |
+| 200 | 16.3 GB | 5.2 GB | 3.1x | 83,069 | 80,231 |
+| 400 | 27.5 GB | 8.1 GB | 3.4x | 132,435 | 162,601 |
+| 800 | **OOM** | **16.2 GB** | — | — | 322,624 |
+
+**The point that killed a VM now finishes in 16.2 GB.** That is the result. A configuration change
+takes a production tile from impossible to feasible.
+
+**The floor did not predict the size of the win.** Cutting threads 4x and chunk 4x should divide
+`stack_bytes` by sixteen, but at 400 scenes the floor only moved 4.3 GB to 2.3 GB, because the
+2 GiB process baseline and the resident climatology dominate it at these scene counts. The floor
+predicted saving 2.0 GB. The measured saving was 19.4 GB, roughly ten times that. So the
+unmodelled memory scales with `threads * chunk**2` as well — the model has the right shape and a
+badly wrong coefficient, which is a different failure from the one it looked like.
+
+**Growth is now linear rather than accelerating.** B's top pair doubles peak for double the
+scenes, an exponent of exactly 1.00, and the linear fit and a power law agree to within 5%: **56.9
+GB** and **59.3 GB** at 2,930 scenes. Predictable extrapolation is itself worth something. A's
+exponent was still climbing when it hit the wall.
+
+### What this does not settle
+
+**The margin is thin.** 57 to 59 GB against a 64 GiB VM is 68.7 GB of RAM, so roughly 85%
+utilization with nothing held back for a bad tile.
+
+**The synthetic stack understates a real one.** These measurements carry no odc-stac read layers,
+no land mask, no GDAL block cache. The production tile that OOMed at 46.5 GB was doing all three.
+Read 57 GB as a floor on the real figure, not an estimate of it.
+
+**The wall-clock cost is unmeasured here and is known to be real.** `7fda25c` measured chunk 256
+at **2.9x slower** on real data, through four times the graph nodes and four times the range
+requests against the source COGs. Synthetic data does no I/O, so this sweep cannot see any of
+that: it shows 3.2 minutes for both configurations at 400 scenes, which is true and irrelevant.
+Task count does show the shape of it — 162,601 against 132,435 at 400 scenes, 23% more work for
+the scheduler.
+
+### What to do
+
+1. **Move production to chunk 256 and one thread.** The current default provably cannot finish a
+   tile; this one provably can, at 27% of a tile's scene count.
+2. **Validate on real pixels before the 700-tile build.** `landsat-lst process --tile N40W075
+   --max-scenes 800` at the new configuration measures both the things this sweep cannot: real
+   peak with the I/O layers present, and the wall-clock price of 4x the range requests.
+3. **#93 is now about margin, not viability.** Cutting the structural excess buys headroom against
+   an 85% utilization figure that will only get worse when the real layers are added back. Worth
+   doing, no longer blocking.
 
 The laptop pre-flight projected ~85 GB and `growing_ratio`. It called the verdict correctly and
 understated the magnitude by a third to a half. That is the substitution this document warns
