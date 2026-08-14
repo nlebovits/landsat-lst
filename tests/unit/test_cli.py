@@ -353,6 +353,40 @@ class TestPlan:
         assert all(p["graph"]["optimized"] for p in phases)
         assert all(p["graph"]["tasks"] <= p["graph"]["raw_tasks"] for p in phases)
 
+    def test_offset_factor_shrinks_the_offset_grid_and_leaves_the_composite(self, runner):
+        """Pricing a factor change is the point of the flag.
+
+        The offset pass reads a grid coarsened by the factor, so its task count
+        falls as ``factor**2``. The composite always runs at native resolution,
+        so it must not move at all -- that invariance is the reason the offset
+        saving caps out where it does.
+        """
+        import json as json_module
+
+        def phases(factor):
+            result = runner.invoke(
+                main,
+                [
+                    "plan",
+                    "-t",
+                    "N40W075",
+                    "--scenes",
+                    "8",
+                    "--offset-factor",
+                    str(factor),
+                    "--json",
+                ],
+            )
+            assert result.exit_code == 0, result.output
+            return json_module.loads(result.output)
+
+        two, four = phases(2), phases(4)
+
+        assert two[0]["shape"] == [9000, 9000]
+        assert four[0]["shape"] == [4500, 4500]
+        assert four[0]["graph"]["tasks"] < two[0]["graph"]["tasks"]
+        assert four[1] == two[1]
+
     def test_flags_a_tile_that_is_not_land(self, runner):
         """Ocean tiles are never processed, so planning one is likely a typo."""
         result = runner.invoke(main, ["plan", "-t", "S55W180", "--scenes", "4"])
