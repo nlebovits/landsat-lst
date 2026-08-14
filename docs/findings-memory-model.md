@@ -76,20 +76,29 @@ until a VM produces it.
 
 ### Watching it
 
-`landsat-lst watch` will not work here. It lists `_runs/{run_id}/` and classifies every object as
-a tile attempt, and a sweep is not a tile. Neither does the Coiled dashboard, which describes a
-dask scheduler a batch task never registers with, nor `coiled logs`, which does not carry task
-stdout. Poll `--fetch` instead:
+`--distributed` follows by default, so submitting and watching are one command. Output appends as
+things happen, so scrollback keeps the whole run:
 
-```bash
-watch -n 60 'landsat-lst benchmark --fetch <run-id>'
+```
+     50 scenes: running...
+     50 scenes: 6.2 GB peak, 2.1x floor, 19,943 tasks, 0.7 min
+    100 scenes: running...
+    100 scenes: 9.6 GB peak, 3.1x floor, 35,782 tasks, 1.6 min
+    200 scenes: running...
 ```
 
-The VM republishes the whole object after every scene count, carrying `status` and `completed`, so
-a partial read shows the points that have landed and names the ones still to run. It uploads its
-own stdout and stderr to `_benchmarks/{run_id}/sweep.log` on the way out either way. Both together
-are the only channel a batch task has, which is the same conclusion the tile path reached in issue
-\#68 and ADR-014.
+Ctrl-C detaches and leaves the VM running. Re-attach with
+`landsat-lst benchmark --follow <run-id>`, or pass `--no-follow` at submit to get the run id back
+and nothing else.
+
+Nothing here is a true tail, and it cannot be. `landsat-lst watch` lists `_runs/{run_id}/` and
+classifies every object there as a tile attempt, so it cannot see a sweep. The Coiled dashboard
+describes a dask scheduler a batch task never registers with, and `coiled logs` does not carry
+task stdout. The only channel is what the VM publishes, so it republishes the whole result object
+when it starts each scene count and again when that point lands, and uploads its own stdout to
+`_benchmarks/{run_id}/sweep.log` on exit either way. One line per transition is the real
+resolution of the work: the top point runs for twelve minutes. Same conclusion the tile path
+reached in issue \#68 and ADR-014.
 
 The sweep runs `landsat_lst.benchmarks.measure` once per scene count, each in a fresh subprocess:
 `getrusage` reports a high-water mark for the life of a process, so a second configuration measured

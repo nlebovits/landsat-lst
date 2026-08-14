@@ -832,6 +832,96 @@ _VERDICTS = {
 }
 
 
+def _follow_sweep(run_id: str, poll_s: float) -> None:
+    """Stream a running sweep to this terminal until it settles.
+
+    Appends as things happen rather than repainting, so scrollback keeps the
+    whole run. Nothing here can be a true tail: Coiled keeps a task's stdout on
+    the VM, and the only channel back is the object the sweep republishes after
+    it starts each scene count and again after that point lands. So this polls
+    that object and prints what is new, which at one line per transition is the
+    real resolution of the underlying work.
+
+    Ctrl-C detaches the terminal and leaves the VM running, because the sweep
+    outlives this process by design.
+    """
+    import time
+
+    from landsat_lst.benchmarks import benchmark_log_key, fetch_sweep
+
+    seen: set = set()
+    started_at = time.monotonic()
+    waiting_printed = False
+
+    while True:
+        try:
+            payload = fetch_sweep(run_id)
+        except Exception as e:
+            console.print(f"[yellow]  poll failed ({e}); retrying[/yellow]")
+            payload = None
+
+        if payload is None:
+            if not waiting_printed:
+                console.print("[dim]  waiting for the VM to start its first point...[/dim]")
+                waiting_printed = True
+        else:
+            for line in _sweep_transitions(payload, seen):
+                console.print(line)
+            if payload.get("status") == "finished":
+                console.print()
+                _print_fetched_sweep(payload, run_id)
+                return
+
+        elapsed = time.monotonic() - started_at
+        if elapsed > _FOLLOW_GIVE_UP_S:
+            console.print(
+                f"\n[yellow]Nothing new for {elapsed / 60:.0f} minutes. Detaching.[/yellow]\n"
+                f"  The VM may still be working. Check {benchmark_log_key(run_id)}, "
+                f"or re-attach with: landsat-lst benchmark --follow {run_id}"
+            )
+            return
+        time.sleep(poll_s)
+
+
+#: Stop following after this long with the sweep still unsettled. Comfortably
+#: past SWEEP_JOB_TIMEOUT, so a live sweep is never abandoned early and a dead
+#: one does not hold a terminal forever.
+_FOLLOW_GIVE_UP_S = 75 * 60
+
+
+def _sweep_transitions(payload: dict, seen: set) -> list[str]:
+    """Lines for whatever changed since the last poll, in order."""
+    lines = []
+
+    # Completed points first, then whatever is now in flight. When two
+    # transitions land in the same poll -- which they do whenever a point runs
+    # faster than the poll interval -- the other order announces the next point
+    # as starting before reporting the one it followed.
+    for row in payload.get("measurements", []):
+        scenes = row["geometry"]["scenes"]
+        if ("done", scenes) in seen:
+            continue
+        seen.add(("done", scenes))
+        seen.add(("start", scenes))
+        if row.get("error"):
+            first = str(row["error"]).splitlines()[-1][:80]
+            lines.append(f"  [red]{scenes:>5} scenes: FAILED - {first}[/red]")
+        else:
+            lines.append(
+                f"  [green]{scenes:>5} scenes:[/green] "
+                f"{row['peak_rss_mb'] / 1024:.1f} GB peak, "
+                f"{row['peak_over_floor']:.1f}x floor, "
+                f"{row['offset_tasks']:,} tasks, {row['wall_s'] / 60:.1f} min"
+            )
+
+    in_flight = payload.get("in_flight")
+    if in_flight is not None and ("start", in_flight) not in seen:
+        seen.add(("start", in_flight))
+        lines.append(f"  [dim]{in_flight:>5} scenes: running...[/dim]")
+
+    return lines
+
+
 def _print_fetched_sweep(payload: dict, run_id: str) -> None:
     """Render a published sweep, whether it has finished or is still working."""
     from landsat_lst.benchmarks import Geometry, Measurement, benchmark_log_key
@@ -888,6 +978,18 @@ def _print_fetched_sweep(payload: dict, run_id: str) -> None:
 )
 @click.option("--fetch", "fetch_id", default=None, help="Read a published sweep back by run id")
 @click.option(
+    "--follow",
+    "follow_id",
+    default=None,
+    help="Stream a running sweep to this terminal until it settles",
+)
+@click.option(
+    "--no-follow",
+    is_flag=True,
+    help="With --distributed, print the run id and return instead of streaming",
+)
+@click.option("--poll", "poll_s", type=float, default=20.0, help="Seconds between polls")
+@click.option(
     "--run-id",
     default=None,
     help="Publish the result under this run id. Set by the VM; rarely useful locally.",
@@ -908,6 +1010,9 @@ def benchmark(
     threads: int,
     distributed: bool,
     fetch_id: str | None,
+    follow_id: str | None,
+    no_follow: bool,
+    poll_s: float,
     run_id: str | None,
     force_local: bool,
     out: Path | None,
@@ -945,6 +1050,10 @@ def benchmark(
 
     counts = list(scenes) if scenes else list(DEFAULT_SWEEP_SCENES)
 
+    if follow_id:
+        _follow_sweep(follow_id, poll_s)
+        return
+
     if fetch_id:
         payload = fetch_sweep(fetch_id)
         if payload is None:
@@ -959,12 +1068,17 @@ def benchmark(
 
     if distributed:
         submission = submit_sweep(counts, blocks=blocks, chunk=chunk, threads=threads)
-        console.print(f"[bold]Submitted[/bold] {submission['run_id']}")
+        run = submission["run_id"]
+        console.print(f"[bold]Submitted[/bold] {run}")
         console.print(f"  Cluster: {submission['cluster_id']}")
         console.print(f"  Result:  {submission['key']}")
-        console.print(
-            f"\n  Read it back with: landsat-lst benchmark --fetch {submission['run_id']}"
-        )
+        console.print(f"  Log:     {benchmark_log_key(run)}")
+        if no_follow:
+            console.print(f"\n  Follow it:  landsat-lst benchmark --follow {run}")
+            console.print(f"  Read once:  landsat-lst benchmark --fetch  {run}")
+            return
+        console.print("\n[dim]Following. Ctrl-C detaches; the VM keeps going.[/dim]\n")
+        _follow_sweep(run, poll_s)
         return
 
     over = [n for n in counts if n > LOCAL_SCENE_CEILING]
@@ -995,6 +1109,10 @@ def benchmark(
             blocks=blocks,
             chunk=chunk,
             threads=threads,
+            on_start=lambda g: (
+                console.print(f"  [dim]{g.scenes:>5} scenes: running...[/dim]"),
+                publish(None, starting=g.scenes),
+            ),
             on_result=lambda m: (
                 console.print(
                     f"  [dim]{m.geometry.scenes:>5} scenes: "
@@ -1055,6 +1173,8 @@ def _sweep_publisher(run_id, counts, blocks, chunk, threads):
 
     done: list = []
 
+    in_flight: list = [None]
+
     def _payload(results, report) -> dict:
         return {
             "blocks": blocks,
@@ -1062,6 +1182,10 @@ def _sweep_publisher(run_id, counts, blocks, chunk, threads):
             "threads": threads,
             "requested_scenes": list(counts),
             "completed": len(results),
+            # The scene count currently being measured. The top point of a
+            # production sweep runs for twelve minutes, so without this a
+            # follower cannot tell working from wedged.
+            "in_flight": in_flight[0] if report is None else None,
             "status": "running" if report is None else "finished",
             "report": report if report is not None else sweep_report(results),
             "measurements": [m.as_dict() for m in results],
@@ -1069,7 +1193,10 @@ def _sweep_publisher(run_id, counts, blocks, chunk, threads):
 
     if run_id is None:
 
-        def publish(measurement, *, results=None, report=None) -> str:
+        def publish(measurement, *, results=None, report=None, starting=None) -> str:
+            if starting is not None:
+                in_flight[0] = starting
+                return ""
             if measurement is not None:
                 done.append(measurement)
                 return ""
@@ -1085,7 +1212,9 @@ def _sweep_publisher(run_id, counts, blocks, chunk, threads):
     storage = get_storage()
     key = benchmark_key(run_id)
 
-    def publish(measurement, *, results=None, report=None) -> str:
+    def publish(measurement, *, results=None, report=None, starting=None) -> str:
+        if starting is not None:
+            in_flight[0] = starting
         if measurement is not None:
             done.append(measurement)
         settled = results if results is not None else done

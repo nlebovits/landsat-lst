@@ -254,12 +254,13 @@ Rules worth keeping:
   drifting toward a cliff over five PRs. Nightly uploads `results/benchmark/trend.jsonl`.
 - **A sweep publishes under `_benchmarks/`, never `_runs/`.** `runs.py` classifies everything
   under the run prefix as a tile attempt, and a sweep is not a tile. The corollary is that
-  `landsat-lst watch` and `explain` cannot see it, so the sweep republishes its whole result
-  object after **every** scene count with `status` and `completed`, and uploads its own stdout
-  to `_benchmarks/{run_id}/sweep.log`. Poll it with
-  `watch -n 60 'landsat-lst benchmark --fetch <run-id>'`. Publishing only at the end would be
-  25 minutes of silence and nothing at all on a crash, which is the mistake ADR-014 already
-  paid for once.
+  `landsat-lst watch` and `explain` cannot see it, so the sweep publishes its own progress:
+  the whole result object is republished when a scene count **starts** (`in_flight`) and again
+  when it **lands** (`completed`, `status`), and stdout goes to `_benchmarks/{run_id}/sweep.log`
+  on exit either way. `--distributed` follows by default; `--follow <run-id>` re-attaches and
+  `--no-follow` opts out. Publishing only at the end would be 25 minutes of silence and nothing
+  at all on a crash, which is the mistake ADR-014 already paid for once. Announcing only on
+  completion is the same mistake at smaller scale, because the top point runs twelve minutes.
 
 ---
 

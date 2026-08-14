@@ -265,6 +265,23 @@ class TestSweepIsVisibleWhileItRuns:
 
         assert '"completed": 1' in text
 
+    def test_the_in_flight_point_is_published_before_it_finishes(self, published, monkeypatch):
+        """The top point runs twelve minutes; without this, working looks wedged."""
+        import json
+
+        from landsat_lst.benchmarks import benchmark_key
+        from landsat_lst.storage import LocalStorage
+
+        storage = LocalStorage(output_dir=published)
+        monkeypatch.setattr("landsat_lst.storage.get_storage", lambda: storage)
+
+        _, publish = self._publisher("r4", [12, 24])
+        publish(None, starting=12)
+
+        payload = json.loads(storage.read_text(benchmark_key("r4")))
+        assert payload["in_flight"] == 12
+        assert payload["completed"] == 0
+
     def test_without_a_run_id_nothing_is_published(self, monkeypatch):
         """A local sweep has nowhere to publish and stays a plain command."""
 
@@ -276,3 +293,63 @@ class TestSweepIsVisibleWhileItRuns:
         capture, publish = self._publisher(None, [12])
         with capture:
             publish(_point(12, 400.0))
+
+
+class TestFollowTransitions:
+    """What the follower prints between polls."""
+
+    def _row(self, scenes: int, **over) -> dict:
+        row = {
+            "geometry": {"scenes": scenes},
+            "peak_rss_mb": 1024.0,
+            "peak_over_floor": 2.0,
+            "offset_tasks": 1000,
+            "wall_s": 60.0,
+            "error": None,
+        }
+        return {**row, **over}
+
+    def test_a_finished_point_prints_before_the_next_one_starts(self):
+        """Both land in one poll whenever a point runs faster than the interval."""
+        from landsat_lst.cli import _sweep_transitions
+
+        lines = _sweep_transitions({"measurements": [self._row(12)], "in_flight": 24}, set())
+
+        assert len(lines) == 2
+        assert "12 scenes" in lines[0]
+        assert "running" in lines[1]
+
+    def test_nothing_repeats_across_polls(self):
+        from landsat_lst.cli import _sweep_transitions
+
+        payload = {"measurements": [self._row(12)], "in_flight": 24}
+        seen: set = set()
+
+        _sweep_transitions(payload, seen)
+
+        assert _sweep_transitions(payload, seen) == []
+
+    def test_a_point_that_already_reported_running_does_not_report_twice(self):
+        from landsat_lst.cli import _sweep_transitions
+
+        seen: set = set()
+        _sweep_transitions({"measurements": [], "in_flight": 12}, seen)
+
+        lines = _sweep_transitions({"measurements": [self._row(12)], "in_flight": 24}, seen)
+
+        assert sum("12 scenes" in line for line in lines) == 1
+
+    def test_a_failed_point_shows_its_error(self):
+        from landsat_lst.cli import _sweep_transitions
+
+        lines = _sweep_transitions(
+            {"measurements": [self._row(12, error="MemoryError: out of memory")]}, set()
+        )
+
+        assert "FAILED" in lines[0]
+        assert "MemoryError" in lines[0]
+
+    def test_an_empty_payload_prints_nothing(self):
+        from landsat_lst.cli import _sweep_transitions
+
+        assert _sweep_transitions({}, set()) == []

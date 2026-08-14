@@ -429,6 +429,7 @@ def sweep(
     threads: int = 4,
     graph: str = GRAPH_BOTH,
     timeout_s: int = DEFAULT_TIMEOUT_S,
+    on_start=None,
     on_result=None,
 ) -> list[Measurement]:
     """Measure one configuration per scene count, each in its own interpreter.
@@ -441,6 +442,10 @@ def sweep(
         threads: Concurrent dask threads.
         graph: Which graphs to build. See the ``GRAPH_*`` constants.
         timeout_s: Per-configuration ceiling.
+        on_start: Optional callback taking each :class:`Geometry` as its
+            measurement begins. The top point of a production sweep runs for
+            twelve minutes, so announcing it on the way in is the difference
+            between a live view and a stalled one.
         on_result: Optional callback taking each :class:`Measurement` as it
             lands, so a long sweep can report progress rather than going quiet.
 
@@ -450,10 +455,10 @@ def sweep(
     """
     results = []
     for n in scene_counts:
-        m = measure(
-            Geometry(scenes=n, blocks=blocks, chunk=chunk, threads=threads, graph=graph),
-            timeout_s=timeout_s,
-        )
+        geometry = Geometry(scenes=n, blocks=blocks, chunk=chunk, threads=threads, graph=graph)
+        if on_start is not None:
+            on_start(geometry)
+        m = measure(geometry, timeout_s=timeout_s)
         results.append(m)
         if on_result is not None:
             on_result(m)
