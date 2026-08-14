@@ -24,7 +24,7 @@ from landsat_lst.normalization import (
     seasonal_debias,
 )
 from landsat_lst.offsets import OffsetCache, OffsetKey, cache_for_items
-from landsat_lst.progress import GraphProgress, report_phase, timed_section
+from landsat_lst.progress import report_phase, timed_section
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 from landsat_lst.tiling import geobox_for_bbox
 
@@ -309,7 +309,24 @@ def compute_annual_composite(
 
 
 def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
-    """Build the lazy P95 and monthly-count expressions. Computes nothing."""
+    """Build the lazy P95 and monthly-count expressions. Computes nothing.
+
+    Both outputs are deliberately built on one time-contiguous view of the
+    stack. ``quantile`` needs the whole time series per pixel and inserts that
+    rechunk itself; ``groupby("time.month").sum()`` does not and would otherwise
+    consume the 10-scene chunks straight from the load. Two differently chunked
+    consumers means every source block is materialized twice, and when
+    :func:`~landsat_lst.cog.cog_export` then asks for both in one compute the
+    scheduler has no block-by-block order that satisfies them together -- it
+    fans out and holds the whole stack. Measured on a 4096 x 4096 x 120 synthetic
+    tile: three sequential passes cost 1.30 GB peak, fusing the two export
+    writes without this line cost 1.0 pass but **10.88 GB**, and fusing them
+    with it costs 1.0 pass at 1.60 GB. The rechunk itself adds nothing to the
+    memory floor, since the P95 already forced it.
+    """
+    if lst.chunks is not None:
+        lst = lst.chunk({"time": -1})
+
     # notnull() (not ~np.isnan) so the result stays a typed xarray DataArray.
     valid_mask = lst.notnull()
 
@@ -507,7 +524,9 @@ def process_tile(
     # A 5-year window pulls ~1900 scenes, so at least one transient read failure
     # is near-certain. Fill that scene with nodata rather than aborting the load;
     # a handful of dropped observations costs almost nothing against a P95 over
-    # the full stack. The coverage check below is what makes this safe.
+    # the full stack. The coverage line the exporter logs is what makes this
+    # safe: it is where a run that filled wholesale rather than occasionally
+    # shows up. See `cog._log_coverage`.
     data = load_scenes(items, job.tile.bbox, patch_url=patch_url, fail_on_error=False)
 
     # Built before the composite so de-striping estimates each scene's offset
@@ -552,28 +571,14 @@ def process_tile(
         ),
     )
 
-    # Silent nodata fill is otherwise undetectable: a low median or a high zero
-    # fraction means reads failed en masse rather than occasionally.
-    #
-    # This `.values` is a full eager pass over the native stack, and it is the
-    # second-longest compute in a tile. It ran for nine unattributed minutes
-    # under the old `compositing` label because nothing here reported a task
-    # count. It now has its own phase and a GraphProgress, so a watcher can see
-    # it move. NOTE: the export then walks the same stack again to write the
-    # COGs -- two native passes per tile, which instrumenting made visible and
-    # does not fix. See issue #77 item 4.
-    with timed_section("coverage_check"), GraphProgress():
-        obs = composite["qa_count"].sum(dim="month").values
-    log.info(
-        "valid_coverage_obs_per_pixel",
-        tile=job.tile.name,
-        window=job.window_label,
-        min=int(obs.min()),
-        median=int(np.median(obs)),
-        max=int(obs.max()),
-        zero_frac=round(float((obs == 0).mean()), 3),
-    )
-
+    # No coverage reduction here. Silent nodata fill still has to be caught --
+    # `fail_on_error=False` above makes a low median or a high zero fraction the
+    # only sign that reads failed en masse -- but this used to be an eager
+    # `.values` on `qa_count`, a full pass over the native stack for four
+    # numbers that were logged and thrown away. Measured at 1.0x a full pass on
+    # a synthetic tile, one of three. The same four numbers now come off the
+    # written QA raster during the statistics walk the exporter already runs
+    # (`cog._log_coverage`, same `valid_coverage_obs_per_pixel` key). See #80.
     composite["lst_p95"] = composite["lst_p95"].where(land_mask_da)
     # Zero out ocean in the per-month counts too (broadcasts over the month dim);
     # keeps qa_count uint8 and makes ocean compress away.

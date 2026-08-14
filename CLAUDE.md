@@ -218,15 +218,44 @@ Rules worth keeping:
   `landsat-lst offsets` on purpose. A second copy of the rule would drift.
 
 Phases are split finer than the work is, so a silence is attributable
-(`stac_query`, `loading`, `land_mask`, `destriping`, `composite_graph`, `coverage_check`,
-`exporting`, `uploading`). `graph_state` in the heartbeat says whether a dask graph is
+(`stac_query`, `loading`, `land_mask`, `destriping`, `composite_graph`, `exporting`,
+`uploading`). `graph_state` in the heartbeat says whether a dask graph is
 running at all, which a `None` task count could not. Wrap anything that can exceed ~10s in
 `progress.timed_section`. A caller that builds pipeline graphs without being a tile — only
 `landsat-lst plan` — wraps them in `progress.silence_sections`, or `plan --json` stops
 being parseable.
 
-**Known, not fixed:** `process_tile` computes `qa_count` eagerly for the coverage log and
-`cog_export` then walks the same native stack again. Two full passes per tile.
+---
+
+## One native pass per tile — keep it that way
+
+A tile used to read the full native stack three times: an eager coverage reduction, the
+LST write, and the QA write. Measured on a synthetic tile, that was exactly 3.0x one pass.
+It is 1.0x now. See [ADR-013](docs/adr/013-single-native-pass.md) and issue #80.
+
+Two things hold it there, and either one alone gives back a pass:
+
+- **`_composite_graph` rechunks time to a single chunk before building either output.**
+  `quantile` needs the whole time series per pixel and would insert that rechunk anyway;
+  `groupby("time.month").sum()` would not, and two differently chunked consumers means
+  every source block is materialized twice. Worse, the fused write then has no
+  block-by-block order that satisfies both, so the scheduler fans out and holds the stack:
+  **10.88 GB** peak against 1.30 GB, on a 4096² x 120 synthetic tile. With the shared
+  rechunk it is 1.60 GB. The rechunk adds nothing to the memory floor, because the P95
+  already forced it.
+- **`cog_export` writes both intermediates in one `dask.compute`.** `rio.to_raster(compute=False)`
+  returns a deferred store per product; handing both to one compute retires the shared
+  source blocks once. Calling `export_lst_cog` and `export_qa_cog` in sequence costs two
+  passes, which is what `tests/integration/test_cog.py` pins from both sides.
+
+The coverage diagnostic survived the deletion. `valid_coverage_obs_per_pixel` reports the
+same four numbers, now accumulated as a histogram of per-pixel month sums during the
+windowed statistics walk the exporter already runs over the written QA raster. That walk
+also went from one pass per band to one pass total. Do not restore an eager `.values` on
+`qa_count` to get a number the COG tags already carry — but note that QA
+`STATISTICS_VALID_PERCENT` is **always 100** by construction (`nodata=None`, because 0
+observations is data), so it is the LST band's `VALID_PERCENT` and the coverage line, not
+the QA one, that catch a run that filled wholesale.
 
 ---
 

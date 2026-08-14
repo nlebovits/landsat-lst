@@ -12,8 +12,9 @@ import numpy as np
 import pytest
 import rasterio
 import xarray as xr
+from structlog.testing import capture_logs
 
-from landsat_lst.cog import export_lst_cog, export_qa_cog
+from landsat_lst.cog import _coverage_summary, export_lst_cog, export_qa_cog
 from landsat_lst.encoding import LST_OFFSET, LST_SCALE
 
 pytestmark = pytest.mark.unit
@@ -287,3 +288,67 @@ def test_dask_backed_qa_input_streams_all_twelve_bands(tmp_path):
         assert src.count == 12
         for bidx in range(1, 13):
             np.testing.assert_array_equal(src.read(bidx), values[bidx - 1])
+
+
+# ---------------------------------------------------------------------------
+# Coverage diagnostic (issue #80)
+# ---------------------------------------------------------------------------
+
+
+def _coverage_reference(values: np.ndarray) -> dict[str, float]:
+    """What the retired eager reduction in ``process_tile`` used to report."""
+    obs = values.sum(axis=0, dtype=np.int64)
+    return {
+        "min": int(obs.min()),
+        "median": float(np.median(obs)),
+        "max": int(obs.max()),
+        "zero_frac": round(float((obs == 0).mean()), 3),
+    }
+
+
+@pytest.mark.parametrize("n", [64, 65])  # even and odd pixel counts per band
+def test_coverage_summary_matches_the_reduction_it_replaced(n):
+    """The histogram must reproduce numpy exactly, median included.
+
+    An odd pixel count exercises the single middle order statistic; an even one
+    exercises the mean of the two straddling it, which is where a cumulative
+    lookup is easiest to get wrong.
+    """
+    rng = np.random.default_rng(7)
+    values = rng.integers(0, 9, size=(12, n, n), dtype=np.uint8)
+    values[:, 0, :] = 0  # a row of pixels with no observations at all
+
+    histogram = np.bincount(
+        values.sum(axis=0, dtype=np.int64).ravel(), minlength=255 * 12 + 1
+    ).astype(np.int64)
+
+    assert _coverage_summary(histogram) == _coverage_reference(values)
+
+
+def test_coverage_summary_of_an_empty_raster_is_all_zero():
+    assert _coverage_summary(np.zeros(3061, dtype=np.int64)) == {
+        "min": 0,
+        "median": 0.0,
+        "max": 0,
+        "zero_frac": 0.0,
+    }
+
+
+def test_qa_export_logs_coverage_without_a_second_pass(tmp_path):
+    """Exporting the QA COG is where the coverage line comes from now."""
+    values = _striped_qa(n=256, high=5)
+    with capture_logs() as logs:
+        export_qa_cog(_qa_dataset(values), tmp_path / "qa.tif")
+
+    coverage = [entry for entry in logs if entry["event"] == "valid_coverage_obs_per_pixel"]
+    assert len(coverage) == 1
+    reported = {key: coverage[0][key] for key in ("min", "median", "max", "zero_frac")}
+    assert reported == _coverage_reference(values)
+
+
+def test_lst_export_logs_no_coverage(tmp_path):
+    """Only the observation counts carry coverage; DN sums would be meaningless."""
+    with capture_logs() as logs:
+        export_lst_cog(_lst_dataset(_striped_lst(n=256)), tmp_path / "lst.tif")
+
+    assert not [e for e in logs if e["event"] == "valid_coverage_obs_per_pixel"]

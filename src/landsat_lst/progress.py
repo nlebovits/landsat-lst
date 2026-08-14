@@ -55,8 +55,13 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 #: Phases one tile passes through, in order. Wall clock concentrates in
-#: ``destriping`` (the coarse offset pass), ``coverage_check`` and ``exporting``
-#: (two separate full passes over the native stack; see issue #77 item 4).
+#: ``destriping`` (the coarse offset pass) and ``exporting``, which is now the
+#: tile's only pass over the native stack.
+#:
+#: ``coverage_check`` used to sit between them and was retired in issue #80: it
+#: was a full native pass whose entire output was one log line, and the same
+#: numbers now come off the written raster inside ``exporting``. Naming it is
+#: what made it measurable, and then deletable.
 #:
 #: Split finer than the work is, on purpose. A label covering three unrelated
 #: things cannot point at any of them: ``compositing`` used to span lazy graph
@@ -72,7 +77,6 @@ PHASES = (
     "land_mask",
     "destriping",
     "composite_graph",
-    "coverage_check",
     "exporting",
     "uploading",
 )
@@ -202,9 +206,9 @@ class TileHeartbeat:
         """Record whether a dask graph is running. Never raises.
 
         Owned by :class:`GraphProgress` rather than by :meth:`set_phase`,
-        because a phase boundary and a graph boundary are different events: the
-        composite's graph construction and its coverage reduction are two phases
-        inside one stretch of work, and only one of them runs a graph.
+        because a phase boundary and a graph boundary are different events:
+        ``composite_graph`` and ``exporting`` are two phases inside one stretch
+        of work, and only the second one runs a graph.
         """
         with self._lock:
             self._graph_state = state
