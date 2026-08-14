@@ -28,7 +28,12 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
+
+# A fresh interpreter per measurement is the whole point: getrusage reports a
+# high-water mark for the life of a process, so measuring twice in one of them
+# draws a flat curve whatever the truth is. The argv is fixed and no shell is
+# involved; see the call site.
+import subprocess  # nosec B404
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -56,6 +61,13 @@ GRAPH_BOTH = "both"
 GRAPH_EXPORT = "export"
 GRAPH_EXPORT_SEPARATE = "export_separate"
 
+#: Every graph name the child knows. An unrecognized one would fall through
+#: every branch, compute nothing, and report zeros as though it had measured
+#: something, so it is rejected here instead.
+GRAPH_CHOICES = frozenset(
+    {GRAPH_OFFSETS, GRAPH_COMPOSITE, GRAPH_BOTH, GRAPH_EXPORT, GRAPH_EXPORT_SEPARATE}
+)
+
 #: Seconds a child may run before the parent gives up on it. A CI-scale point
 #: takes single-digit seconds; a production-scale one on a VM takes minutes.
 DEFAULT_TIMEOUT_S = 1800
@@ -76,6 +88,14 @@ class Geometry:
     chunk: int = 512
     threads: int = 4
     graph: str = GRAPH_BOTH
+
+    def __post_init__(self) -> None:
+        if self.graph not in GRAPH_CHOICES:
+            msg = f"unknown graph {self.graph!r}; expected one of {sorted(GRAPH_CHOICES)}"
+            raise ValueError(msg)
+        if min(self.scenes, self.blocks, self.chunk, self.threads) < 1:
+            msg = f"every lever must be positive, got {self}"
+            raise ValueError(msg)
 
     @property
     def side(self) -> int:
@@ -326,8 +346,11 @@ def measure(geometry: Geometry, *, timeout_s: int = DEFAULT_TIMEOUT_S) -> Measur
     }
     started = time.monotonic()
     try:
-        # Fixed argv and no shell: the only variable part is the environment.
-        proc = subprocess.run(
+        # Fixed argv and no shell. The program is a module constant and the
+        # interpreter is this one; the only variable part is the environment,
+        # which carries four integers and one graph name validated against
+        # GRAPH_CHOICES. Nothing here reaches a shell.
+        proc = subprocess.run(  # nosec B603
             [sys.executable, "-c", _child_source()],
             env={**os.environ, **env},
             capture_output=True,

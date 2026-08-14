@@ -40,6 +40,16 @@ class TestGeometry:
         """More blocks than threads, or dask never streams and peak is a baseline."""
         assert CI_GEOMETRY.blocks**2 > CI_GEOMETRY.threads
 
+    def test_an_unknown_graph_is_rejected(self):
+        """It would fall through every branch and report zeros as a measurement."""
+        with pytest.raises(ValueError, match="unknown graph"):
+            Geometry(scenes=10, graph="offsets_v2")
+
+    @pytest.mark.parametrize("lever", ["scenes", "blocks", "chunk", "threads"])
+    def test_a_non_positive_lever_is_rejected(self, lever):
+        with pytest.raises(ValueError, match="must be positive"):
+            Geometry(**{"scenes": 10, lever: 0})
+
     def test_label_names_every_lever(self):
         label = Geometry(scenes=24, blocks=4, chunk=256, threads=2).label
         assert "24sc" in label
