@@ -1081,29 +1081,36 @@ def benchmark(
         _follow_sweep(run, poll_s)
         return
 
-    over = [n for n in counts if n > LOCAL_SCENE_CEILING]
-    if over and not force_local:
-        raise click.UsageError(
-            f"{', '.join(str(n) for n in over)} scenes is past the "
-            f"{LOCAL_SCENE_CEILING}-scene local ceiling. Building a graph "
-            "allocates Python objects whether or not you compute it, and an "
-            "unbounded local build has taken a 64 GB desktop down. Use "
-            "--distributed for the real sweep, or --force-local to override."
-        )
-
-    side = blocks * chunk
-    console.print(
-        f"[bold]Sweep[/bold] {side}x{side} px ({blocks**2} blocks of {chunk}), {threads} threads"
-    )
-
-    # A batch task is only visible through what it publishes. Coiled keeps the
-    # task's stdout on the VM and the cluster dashboard describes a dask
-    # scheduler a batch task never registers with, so a sweep that reported only
-    # at the end would be 25 minutes of silence and nothing at all if it died.
-    # Same lesson as the tile path: issue #68 and ADR-014.
+    # The capture opens before anything can reject the arguments, so a task that
+    # dies *validating* them still uploads a log. The first version wrapped only
+    # the sweep loop, and the scene-ceiling rejection below then killed two VMs
+    # in under a minute each having written nothing at all -- no result, no log,
+    # nothing under _benchmarks/ to read. Same lesson, same fix, as the tile path
+    # in _task_log.
     capture, publish = _sweep_publisher(run_id, counts, blocks, chunk, threads)
 
     with capture:
+        # The ceiling protects an interactive machine from a graph build that has
+        # taken a 64 GB desktop down. A batch task is not that machine: it passes
+        # --run-id, it exists to run the points a laptop cannot, and the default
+        # sweep's top two exceed the ceiling by design. Applying it there killed
+        # the run this guard was written to make possible.
+        over = [n for n in counts if n > LOCAL_SCENE_CEILING]
+        if over and not force_local and run_id is None:
+            raise click.UsageError(
+                f"{', '.join(str(n) for n in over)} scenes is past the "
+                f"{LOCAL_SCENE_CEILING}-scene local ceiling. Building a graph "
+                "allocates Python objects whether or not you compute it, and an "
+                "unbounded local build has taken a 64 GB desktop down. Use "
+                "--distributed for the real sweep, or --force-local to override."
+            )
+
+        side = blocks * chunk
+        console.print(
+            f"[bold]Sweep[/bold] {side}x{side} px ({blocks**2} blocks of {chunk}), "
+            f"{threads} threads"
+        )
+
         results = sweep(
             counts,
             blocks=blocks,
@@ -1206,10 +1213,13 @@ def _sweep_publisher(run_id, counts, blocks, chunk, threads):
 
         return nullcontext(), publish
 
+    from landsat_lst.benchmarks import published_storage
     from landsat_lst.progress import capture_task_log
-    from landsat_lst.storage import get_storage
 
-    storage = get_storage()
+    # The same backend --follow reads. A VM always runs with
+    # LST_STORAGE_BACKEND=s3 so this is S3 there either way; going through the
+    # one helper keeps writer and reader from ever disagreeing.
+    storage = published_storage()
     key = benchmark_key(run_id)
 
     def publish(measurement, *, results=None, report=None, starting=None) -> str:

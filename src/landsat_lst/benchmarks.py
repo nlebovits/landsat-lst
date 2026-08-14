@@ -649,9 +649,31 @@ def submit_sweep(
     }
 
 
-def fetch_sweep(run_id: str) -> dict | None:
-    """Read a published sweep back, or ``None`` if it has not landed yet."""
+def published_storage():
+    """The backend a distributed sweep publishes to, which is always S3.
+
+    Not ``get_storage()``. ``job._worker_environ`` pins ``LST_STORAGE_BACKEND=s3``
+    on every VM whatever the submitting shell is set to, so a laptop left on the
+    local default would poll its own disk and never see the run. That is the
+    same reason ``BatchSubmission`` records its backend rather than reading the
+    live one.
+
+    An explicit ``LST_STORAGE_BACKEND`` still wins, so a test or a local
+    rehearsal can point this somewhere else on purpose.
+    """
+    import os  # noqa: PLC0415
+
     from landsat_lst.storage import get_storage  # noqa: PLC0415
 
-    text = get_storage().read_text(benchmark_key(run_id))
+    if any(key.upper() == "LST_STORAGE_BACKEND" for key in os.environ):
+        return get_storage()
+
+    from landsat_lst.storage import S3Storage  # noqa: PLC0415
+
+    return S3Storage()
+
+
+def fetch_sweep(run_id: str) -> dict | None:
+    """Read a published sweep back, or ``None`` if it has not landed yet."""
+    text = published_storage().read_text(benchmark_key(run_id))
     return json.loads(text) if text else None

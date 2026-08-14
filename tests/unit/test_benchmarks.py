@@ -221,7 +221,7 @@ class TestSweepIsVisibleWhileItRuns:
         from landsat_lst.storage import LocalStorage
 
         storage = LocalStorage(output_dir=published)
-        monkeypatch.setattr("landsat_lst.storage.get_storage", lambda: storage)
+        monkeypatch.setattr("landsat_lst.benchmarks.published_storage", lambda: storage)
 
         _, publish = self._publisher("r1", [12, 24, 48])
         publish(_point(12, 400.0))
@@ -238,7 +238,7 @@ class TestSweepIsVisibleWhileItRuns:
         from landsat_lst.storage import LocalStorage
 
         storage = LocalStorage(output_dir=published)
-        monkeypatch.setattr("landsat_lst.storage.get_storage", lambda: storage)
+        monkeypatch.setattr("landsat_lst.benchmarks.published_storage", lambda: storage)
 
         _, publish = self._publisher("r2", [12, 24, 48])
         publish(_point(12, 400.0))
@@ -258,7 +258,7 @@ class TestSweepIsVisibleWhileItRuns:
                 raise OSError("bucket on fire")
 
         broken = _Broken()
-        monkeypatch.setattr("landsat_lst.storage.get_storage", lambda: broken)
+        monkeypatch.setattr("landsat_lst.benchmarks.published_storage", lambda: broken)
 
         _, publish = self._publisher("r3", [12])
         text = publish(_point(12, 400.0))  # must not raise
@@ -273,7 +273,7 @@ class TestSweepIsVisibleWhileItRuns:
         from landsat_lst.storage import LocalStorage
 
         storage = LocalStorage(output_dir=published)
-        monkeypatch.setattr("landsat_lst.storage.get_storage", lambda: storage)
+        monkeypatch.setattr("landsat_lst.benchmarks.published_storage", lambda: storage)
 
         _, publish = self._publisher("r4", [12, 24])
         publish(None, starting=12)
@@ -286,13 +286,119 @@ class TestSweepIsVisibleWhileItRuns:
         """A local sweep has nowhere to publish and stays a plain command."""
 
         def _boom():  # pragma: no cover - must never run
-            raise AssertionError("get_storage was called for a local sweep")
+            raise AssertionError("published_storage was called for a local sweep")
 
-        monkeypatch.setattr("landsat_lst.storage.get_storage", _boom)
+        monkeypatch.setattr("landsat_lst.benchmarks.published_storage", _boom)
 
         capture, publish = self._publisher(None, [12])
         with capture:
             publish(_point(12, 400.0))
+
+
+class TestTheSubmittedCommandActuallyRuns:
+    """The command ``submit_sweep`` builds must survive this CLI's own validation.
+
+    Two VMs died in under a minute each on 2026-08-14 because it did not. The
+    default sweep's top two points, 400 and 800, exceed the 200-scene ceiling
+    that exists to stop an interactive machine building a graph it cannot hold.
+    The guard fired on the VM, click exited 2 during option handling, and
+    nothing reached ``_benchmarks/`` -- no result and no log, because the log
+    capture opened after validation.
+
+    Testing the pieces missed it. Only running the assembled command through the
+    parser catches it.
+    """
+
+    def _submitted_argv(self, monkeypatch, counts=None) -> list[str]:
+        """The argv a VM would run, taken from submit_sweep itself."""
+        import shlex
+
+        from landsat_lst import benchmarks
+
+        captured = {}
+
+        def _fake_batch_run(**kwargs):
+            captured.update(kwargs)
+            return {"cluster_id": 1, "job_id": 2}
+
+        fake_coiled = type("C", (), {"batch_run": staticmethod(_fake_batch_run)})
+        monkeypatch.setitem(__import__("sys").modules, "coiled", fake_coiled)
+        monkeypatch.setattr(benchmarks, "_worker_environ", lambda: {}, raising=False)
+        monkeypatch.setattr("landsat_lst.job._worker_environ", lambda: {})
+
+        benchmarks.submit_sweep(counts or list(benchmarks.DEFAULT_SWEEP_SCENES))
+
+        script = captured["command"]
+        assert script.startswith("#!"), "a plain string gets its quoting mangled; see issue #66"
+        command_line = script.splitlines()[1]
+        # Drop the `python -m landsat_lst.cli` prefix; click gets the rest.
+        return shlex.split(command_line)[3:]
+
+    def test_the_default_sweep_command_passes_validation(self, monkeypatch):
+        from click.testing import CliRunner
+
+        from landsat_lst.cli import main
+
+        argv = self._submitted_argv(monkeypatch)
+        # --help short-circuits before any measurement runs, so this exercises
+        # option parsing and nothing expensive.
+        result = CliRunner().invoke(main, [*argv, "--help"])
+
+        assert result.exit_code == 0, result.output
+
+    def test_the_ceiling_does_not_reject_the_submitted_scene_counts(self, monkeypatch):
+        """The exact failure: 400 and 800 are past the interactive ceiling."""
+        from landsat_lst.benchmarks import DEFAULT_SWEEP_SCENES
+        from landsat_lst.cli import LOCAL_SCENE_CEILING
+
+        argv = self._submitted_argv(monkeypatch)
+
+        assert "--run-id" in argv, "the VM must identify itself, or the ceiling applies"
+        assert max(DEFAULT_SWEEP_SCENES) > LOCAL_SCENE_CEILING, (
+            "if this ever stops being true the regression cannot recur, and this "
+            "test is no longer guarding anything"
+        )
+
+    def test_a_batch_task_is_exempt_from_the_interactive_ceiling(self, monkeypatch, tmp_path):
+        """--run-id means a VM, and a VM exists to run what a laptop cannot."""
+        from click.testing import CliRunner
+
+        from landsat_lst.cli import main
+
+        monkeypatch.setenv("LST_STORAGE_BACKEND", "local")
+        monkeypatch.setenv("LST_OUTPUT_DIR", str(tmp_path))
+        # One tiny point, so this measures the guard and not the pipeline.
+        result = CliRunner().invoke(
+            main,
+            [
+                "benchmark",
+                "--run-id",
+                "guard-test",
+                "--scenes",
+                "4",
+                "--blocks",
+                "1",
+                "--chunk",
+                "64",
+                "--threads",
+                "1",
+                "--out",
+                str(tmp_path / "out.json"),
+            ],
+        )
+
+        assert "past the" not in result.output, result.output
+
+    def test_an_interactive_run_still_hits_the_ceiling(self, monkeypatch):
+        """The guard has to keep working for the machine it protects."""
+        from click.testing import CliRunner
+
+        from landsat_lst.cli import main
+
+        result = CliRunner().invoke(main, ["benchmark", "--scenes", "800"])
+
+        assert result.exit_code != 0
+        assert "past the" in result.output
 
 
 class TestFollowTransitions:
