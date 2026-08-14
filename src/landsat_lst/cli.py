@@ -148,6 +148,7 @@ def process(
     capture, attempt = _task_log(tiles, run_id)
     with capture:
         jobs = _build_jobs(year, end_year, tiles, max_scenes)
+        _profile_sampled_run(max_scenes)
         if limit is not None:
             jobs = jobs[:limit]
         console.print(f"[bold]Processing window {jobs[0].window_label}[/bold]")
@@ -184,6 +185,39 @@ def process(
                 use_offset_cache=not no_offset_cache,
                 attempt=attempt,
             )
+
+
+def _profile_sampled_run(max_scenes: int | None) -> None:
+    """Turn per-task profiling on for a sampled run, unless the operator spoke.
+
+    ``--max-scenes`` means a sample, and a sample exists to be measured: it
+    writes no product, it runs in minutes, and the question it was started to
+    answer is nearly always which operation owns the wall clock. Leaving the
+    dump behind a second flag is how the run that mattered on 2026-08-14
+    produced one only because ``LST_PROFILE_DASK`` happened to be set by hand.
+
+    ``settings.profile_dask``'s own docstring reasoning still holds for a
+    700-tile build, and that path passes no ``--max-scenes``, so it is untouched.
+    ``profile_dask_cache`` stays gated on its own: it retains a record per task,
+    and a sampled de-striping graph still reaches hundreds of thousands.
+
+    An explicit ``LST_PROFILE_DASK`` wins either way. The environment is read
+    directly rather than through ``settings.model_fields_set``: pydantic adds a
+    field to that set on plain attribute assignment, so anything that toggled
+    ``settings.profile_dask`` at runtime would read as an operator decision.
+    """
+    import os
+
+    from landsat_lst.config import settings
+
+    spoken = any(key.upper() == "LST_PROFILE_DASK" for key in os.environ)
+    if max_scenes is None or spoken:
+        return
+    settings.profile_dask = True
+    console.print(
+        f"  [dim]Sampled run ({max_scenes} scenes): dask profiling on. "
+        f"Set LST_PROFILE_DASK=0 to opt out.[/dim]"
+    )
 
 
 def _task_log(tiles: tuple[str, ...], run_id: str | None):
@@ -738,6 +772,576 @@ def plan(
         "de-striping holds resident, and a process baseline. It is a lower bound: "
         "read the residual line for what a real run did.[/dim]"
     )
+
+
+#: Scenes this command will build locally without being told twice. The dev box
+#: carries less memory than a production VM, and an unbounded local graph build
+#: has taken a 64 GB desktop down before. Execution belongs on the VM; the
+#: laptop gets the graph-inspection tier and a small smoke sweep.
+LOCAL_SCENE_CEILING = 200
+
+
+def _print_sweep_measurements(results: list) -> None:
+    """One row per configuration, with the ratio the sweep exists to produce."""
+    from rich.table import Table
+
+    table = Table(box=None, pad_edge=False)
+    for column, justify in (
+        ("scenes", "right"),
+        ("peak GB", "right"),
+        ("floor GB", "right"),
+        ("ratio", "right"),
+        ("offset tasks", "right"),
+        ("min", "right"),
+    ):
+        table.add_column(column, justify=justify)
+
+    for m in results:
+        if not m.ok:
+            table.add_row(f"{m.geometry.scenes:,}", "[red]FAILED[/red]", "", "", "", "")
+            continue
+        table.add_row(
+            f"{m.geometry.scenes:,}",
+            f"{m.peak_rss_mb / 1024:.1f}",
+            f"{m.floor_mb / 1024:.1f}",
+            f"{m.peak_over_floor:.1f}",
+            f"{m.offset_tasks:,}",
+            f"{m.wall_s / 60:.1f}",
+        )
+    console.print(table)
+
+
+#: What each verdict means for `plan`, stated once so a reader does not have to
+#: re-derive it from the fit. These are the three outcomes issue #94 enumerates.
+_VERDICTS = {
+    "constant_ratio": (
+        "The ratio holds across the sweep. Give predict_peak this correction "
+        "factor and `landsat-lst plan` becomes predictive rather than one-sided."
+    ),
+    "growing_ratio": (
+        "The ratio grows with scene count. Something scales that the model "
+        "treats as fixed, which localizes the leak to the groupby shuffle or "
+        "the anomaly broadcast. Direct evidence for issue #93."
+    ),
+    "not_streaming": (
+        "Peak RSS barely moved: the stack still fits in RAM at this geometry, "
+        "so dask never streams and there is no memory scaling to fit. Per "
+        "ADR-011 no projection is printed. Raise --blocks or --scenes."
+    ),
+    "insufficient": "Too few configurations survived to fit a curve.",
+}
+
+
+def _follow_sweep(run_id: str, poll_s: float) -> None:
+    """Stream a running sweep to this terminal until it settles.
+
+    Appends as things happen rather than repainting, so scrollback keeps the
+    whole run. Nothing here can be a true tail: Coiled keeps a task's stdout on
+    the VM, and the only channel back is the object the sweep republishes after
+    it starts each scene count and again after that point lands. So this polls
+    that object and prints what is new, which at one line per transition is the
+    real resolution of the underlying work.
+
+    Ctrl-C detaches the terminal and leaves the VM running, because the sweep
+    outlives this process by design.
+    """
+    import time
+
+    from landsat_lst.benchmarks import benchmark_log_key, fetch_sweep
+
+    seen: set = set()
+    started_at = time.monotonic()
+    waiting_printed = False
+
+    while True:
+        try:
+            payload = fetch_sweep(run_id)
+        except Exception as e:
+            console.print(f"[yellow]  poll failed ({e}); retrying[/yellow]")
+            payload = None
+
+        if payload is None:
+            if not waiting_printed:
+                console.print("[dim]  waiting for the VM to start its first point...[/dim]")
+                waiting_printed = True
+        else:
+            for line in _sweep_transitions(payload, seen):
+                console.print(line)
+            if payload.get("status") == "finished":
+                console.print()
+                _print_fetched_sweep(payload, run_id)
+                return
+
+        elapsed = time.monotonic() - started_at
+        if elapsed > _FOLLOW_GIVE_UP_S:
+            console.print(
+                f"\n[yellow]Nothing new for {elapsed / 60:.0f} minutes. Detaching.[/yellow]\n"
+                f"  The VM may still be working. Check {benchmark_log_key(run_id)}, "
+                f"or re-attach with: landsat-lst benchmark --follow {run_id}"
+            )
+            return
+        time.sleep(poll_s)
+
+
+#: Stop following after this long with the sweep still unsettled. Comfortably
+#: past SWEEP_JOB_TIMEOUT, so a live sweep is never abandoned early and a dead
+#: one does not hold a terminal forever.
+_FOLLOW_GIVE_UP_S = 75 * 60
+
+
+def _sweep_transitions(payload: dict, seen: set) -> list[str]:
+    """Lines for whatever changed since the last poll, in order."""
+    lines = []
+
+    # Completed points first, then whatever is now in flight. When two
+    # transitions land in the same poll -- which they do whenever a point runs
+    # faster than the poll interval -- the other order announces the next point
+    # as starting before reporting the one it followed.
+    for row in payload.get("measurements", []):
+        scenes = row["geometry"]["scenes"]
+        if ("done", scenes) in seen:
+            continue
+        seen.add(("done", scenes))
+        seen.add(("start", scenes))
+        if row.get("error"):
+            first = str(row["error"]).splitlines()[-1][:80]
+            lines.append(f"  [red]{scenes:>5} scenes: FAILED - {first}[/red]")
+        else:
+            lines.append(
+                f"  [green]{scenes:>5} scenes:[/green] "
+                f"{row['peak_rss_mb'] / 1024:.1f} GB peak, "
+                f"{row['peak_over_floor']:.1f}x floor, "
+                f"{row['offset_tasks']:,} tasks, {row['wall_s'] / 60:.1f} min"
+            )
+
+    in_flight = payload.get("in_flight")
+    if in_flight is not None and ("start", in_flight) not in seen:
+        seen.add(("start", in_flight))
+        lines.append(f"  [dim]{in_flight:>5} scenes: running...[/dim]")
+
+    return lines
+
+
+def _print_fetched_sweep(payload: dict, run_id: str) -> None:
+    """Render a published sweep, whether it has finished or is still working."""
+    from landsat_lst.benchmarks import Geometry, Measurement, benchmark_log_key
+
+    requested = payload.get("requested_scenes") or []
+    completed = payload.get("completed", 0)
+    status = payload.get("status", "unknown")
+
+    colour = "green" if status == "finished" else "yellow"
+    console.print(
+        f"[bold]{run_id}[/bold]  [{colour}]{status}[/{colour}]  {completed}/{len(requested)} points"
+    )
+
+    results = []
+    for row in payload.get("measurements", []):
+        geometry = Geometry(**row.pop("geometry"))
+        row.pop("peak_over_floor", None)
+        row.pop("native_passes", None)
+        results.append(Measurement(geometry=geometry, **row))
+    if results:
+        console.print()
+        _print_sweep_measurements(results)
+
+    report = payload.get("report") or {}
+    verdict = str(report.get("verdict") or "unknown")
+    if status != "finished":
+        remaining = [n for n in requested if n not in [m.geometry.scenes for m in results]]
+        console.print(
+            f"\n  [dim]Still to run: {', '.join(str(n) for n in remaining)}. "
+            f"Live output at {benchmark_log_key(run_id)}.[/dim]"
+        )
+        return
+
+    console.print(f"\n[bold]Verdict: {verdict}[/bold]")
+    console.print(f"  {_VERDICTS.get(verdict, '')}")
+    if report.get("streaming_regime"):
+        console.print(
+            f"\n  At {report['target_scenes']:,} scenes this geometry projects to "
+            f"{report['projected_peak_mb'] / 1024:.1f} GB, against a 64 GiB VM."
+        )
+    console.print("\n  [dim]Write the outcome into docs/findings-memory-model.md.[/dim]")
+
+
+@main.command()
+@click.option("--scenes", multiple=True, type=int, help="Scene count to measure; repeatable")
+@click.option("--blocks", type=int, default=8, help="Blocks per side, in chunks")
+@click.option("--chunk", type=int, default=512, help="Spatial chunk edge in px")
+@click.option("--threads", type=int, default=4, help="Concurrent dask threads")
+@click.option(
+    "--distributed",
+    "-d",
+    is_flag=True,
+    help="Run the sweep on one Coiled VM of the production instance type",
+)
+@click.option("--fetch", "fetch_id", default=None, help="Read a published sweep back by run id")
+@click.option(
+    "--follow",
+    "follow_id",
+    default=None,
+    help="Stream a running sweep to this terminal until it settles",
+)
+@click.option(
+    "--no-follow",
+    is_flag=True,
+    help="With --distributed, print the run id and return instead of streaming",
+)
+@click.option("--poll", "poll_s", type=float, default=20.0, help="Seconds between polls")
+@click.option(
+    "--run-id",
+    default=None,
+    help="Publish the result under this run id. Set by the VM; rarely useful locally.",
+)
+@click.option(
+    "--force-local",
+    is_flag=True,
+    help=f"Build more than {LOCAL_SCENE_CEILING} scenes on this machine anyway",
+)
+@click.option(
+    "--out", type=click.Path(path_type=Path), default=None, help="Where to write the JSON"
+)
+def benchmark(
+    *,
+    scenes: tuple[int, ...],
+    blocks: int,
+    chunk: int,
+    threads: int,
+    distributed: bool,
+    fetch_id: str | None,
+    follow_id: str | None,
+    no_follow: bool,
+    poll_s: float,
+    run_id: str | None,
+    force_local: bool,
+    out: Path | None,
+) -> None:
+    """Measure peak RSS against scene count on synthetic data at real geometry.
+
+    `landsat-lst plan` reports a memory **floor**: the concurrent block stacks,
+    the resident climatology, and a process baseline. A configuration that
+    cannot fit the floor is disqualified for free, but one that fits may still
+    OOM, and the size of that gap is what this measures. On the 300-scene
+    N40W075 sample the floor landed far under the 78.6 GB actually observed.
+
+    Run it on a VM, not here. The dev box carries less memory than the VM, so
+    the ceiling under test is unreachable; the answer is about production
+    hardware, which is the only hardware whose peak RSS matters; and synthetic
+    data means the VM does no I/O, so the sweep is about 20 minutes and well
+    under a dollar.
+
+        landsat-lst benchmark --distributed     # submits, prints a run id
+        landsat-lst benchmark --fetch <run-id>  # reads the result back
+
+    The verdict is the deliverable, not the numbers. Write it up in
+    docs/findings-memory-model.md whichever way it lands.
+    """
+
+    from landsat_lst.benchmarks import (
+        DEFAULT_SWEEP_SCENES,
+        benchmark_key,
+        benchmark_log_key,
+        fetch_sweep,
+        submit_sweep,
+        sweep,
+        sweep_report,
+    )
+
+    counts = list(scenes) if scenes else list(DEFAULT_SWEEP_SCENES)
+
+    if follow_id:
+        _follow_sweep(follow_id, poll_s)
+        return
+
+    if fetch_id:
+        payload = fetch_sweep(fetch_id)
+        if payload is None:
+            raise click.ClickException(
+                f"Nothing published at {benchmark_key(fetch_id)} yet. The VM "
+                "publishes after its first scene count, so this means the sweep "
+                "has not finished one yet, or it died before it could. Its own "
+                f"stdout is at {benchmark_log_key(fetch_id)}."
+            )
+        _print_fetched_sweep(payload, fetch_id)
+        return
+
+    if distributed:
+        submission = submit_sweep(counts, blocks=blocks, chunk=chunk, threads=threads)
+        run = submission["run_id"]
+        console.print(f"[bold]Submitted[/bold] {run}")
+        console.print(f"  Cluster: {submission['cluster_id']}")
+        console.print(f"  Result:  {submission['key']}")
+        console.print(f"  Log:     {benchmark_log_key(run)}")
+        if no_follow:
+            console.print(f"\n  Follow it:  landsat-lst benchmark --follow {run}")
+            console.print(f"  Read once:  landsat-lst benchmark --fetch  {run}")
+            return
+        console.print("\n[dim]Following. Ctrl-C detaches; the VM keeps going.[/dim]\n")
+        _follow_sweep(run, poll_s)
+        return
+
+    # The capture opens before anything can reject the arguments, so a task that
+    # dies *validating* them still uploads a log. The first version wrapped only
+    # the sweep loop, and the scene-ceiling rejection below then killed two VMs
+    # in under a minute each having written nothing at all -- no result, no log,
+    # nothing under _benchmarks/ to read. Same lesson, same fix, as the tile path
+    # in _task_log.
+    capture, publish = _sweep_publisher(run_id, counts, blocks, chunk, threads)
+
+    with capture:
+        # The ceiling protects an interactive machine from a graph build that has
+        # taken a 64 GB desktop down. A batch task is not that machine: it passes
+        # --run-id, it exists to run the points a laptop cannot, and the default
+        # sweep's top two exceed the ceiling by design. Applying it there killed
+        # the run this guard was written to make possible.
+        over = [n for n in counts if n > LOCAL_SCENE_CEILING]
+        if over and not force_local and run_id is None:
+            raise click.UsageError(
+                f"{', '.join(str(n) for n in over)} scenes is past the "
+                f"{LOCAL_SCENE_CEILING}-scene local ceiling. Building a graph "
+                "allocates Python objects whether or not you compute it, and an "
+                "unbounded local build has taken a 64 GB desktop down. Use "
+                "--distributed for the real sweep, or --force-local to override."
+            )
+
+        side = blocks * chunk
+        console.print(
+            f"[bold]Sweep[/bold] {side}x{side} px ({blocks**2} blocks of {chunk}), "
+            f"{threads} threads"
+        )
+
+        results = sweep(
+            counts,
+            blocks=blocks,
+            chunk=chunk,
+            threads=threads,
+            on_start=lambda g: (
+                console.print(f"  [dim]{g.scenes:>5} scenes: running...[/dim]"),
+                publish(None, starting=g.scenes),
+            ),
+            on_result=lambda m: (
+                console.print(
+                    f"  [dim]{m.geometry.scenes:>5} scenes: "
+                    + (
+                        f"FAILED - {m.error.splitlines()[-1][:80]}"
+                        if not m.ok
+                        else f"{m.peak_rss_mb / 1024:.1f} GB, {m.wall_s / 60:.1f} min"
+                    )
+                    + "[/dim]"
+                ),
+                publish(m),
+            ),
+        )
+
+        console.print()
+        _print_sweep_measurements(results)
+
+        report = sweep_report(results)
+        console.print(f"\n[bold]Verdict: {report['verdict']}[/bold]")
+        console.print(f"  {_VERDICTS.get(report['verdict'], '')}")
+        if report.get("streaming_regime"):
+            projected = report["projected_peak_mb"] / 1024
+            console.print(
+                f"\n  At {report['target_scenes']:,} scenes this geometry projects to "
+                f"{projected:.1f} GB, against a 64 GiB VM."
+            )
+            if not report["projected_fits_vm"]:
+                console.print(
+                    "  [yellow]That does not fit. Cut threads or chunk size and re-run, "
+                    "or plan on a larger instance.[/yellow]"
+                )
+
+        text = publish(None, results=results, report=report)
+
+    destination = out or Path("results/decision/synthetic_scaling.json")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text)
+    console.print(f"Wrote {destination}")
+
+
+def _sweep_publisher(run_id, counts, blocks, chunk, threads):
+    """A log capture and an incremental publisher for one sweep.
+
+    Returns ``(capture, publish)``. Without a ``run_id`` there is nowhere to
+    publish, so both are inert and the sweep behaves as a local command. With
+    one, every measurement rewrites the same object, carrying ``status`` and
+    ``completed`` so a reader can tell a sweep still working from one that
+    settled, and so a crash at the fourth point leaves the first three.
+
+    Publishing is best-effort, like every other instrument in this project: a
+    failed write is reported and swallowed, because losing a progress update
+    costs less than losing the sweep.
+    """
+    import json as json_module
+    from contextlib import nullcontext
+
+    from landsat_lst.benchmarks import benchmark_key, benchmark_log_key, sweep_report
+
+    done: list = []
+
+    in_flight: list = [None]
+
+    def _payload(results, report) -> dict:
+        return {
+            "blocks": blocks,
+            "chunk": chunk,
+            "threads": threads,
+            "requested_scenes": list(counts),
+            "completed": len(results),
+            # The scene count currently being measured. The top point of a
+            # production sweep runs for twelve minutes, so without this a
+            # follower cannot tell working from wedged.
+            "in_flight": in_flight[0] if report is None else None,
+            "status": "running" if report is None else "finished",
+            "report": report if report is not None else sweep_report(results),
+            "measurements": [m.as_dict() for m in results],
+        }
+
+    if run_id is None:
+
+        def publish(measurement, *, results=None, report=None, starting=None) -> str:
+            if starting is not None:
+                in_flight[0] = starting
+                return ""
+            if measurement is not None:
+                done.append(measurement)
+                return ""
+            return json_module.dumps(
+                _payload(results if results is not None else done, report), indent=2
+            )
+
+        return nullcontext(), publish
+
+    from landsat_lst.benchmarks import published_storage
+    from landsat_lst.progress import capture_task_log
+
+    # The same backend --follow reads. A VM always runs with
+    # LST_STORAGE_BACKEND=s3 so this is S3 there either way; going through the
+    # one helper keeps writer and reader from ever disagreeing.
+    storage = published_storage()
+    key = benchmark_key(run_id)
+
+    def publish(measurement, *, results=None, report=None, starting=None) -> str:
+        if starting is not None:
+            in_flight[0] = starting
+        if measurement is not None:
+            done.append(measurement)
+        settled = results if results is not None else done
+        text = json_module.dumps(_payload(settled, report), indent=2)
+        try:
+            storage.write_text(key, text)
+        except Exception as e:
+            console.print(f"  [yellow]progress not published: {e}[/yellow]")
+        return text
+
+    capture = capture_task_log(
+        run_id=run_id,
+        tile="sweep",
+        storage=storage,
+        key=benchmark_log_key(run_id),
+    )
+    return capture, publish
+
+
+@main.command()
+@click.option("--tile", "-t", default="N40W075", help="Tile to cache")
+@click.option("--year", "-y", type=int, default=2021, help="First year of the window")
+@click.option("--end-year", type=int, default=2025, help="Last year, inclusive")
+@click.option("--max-scenes", type=int, default=300, help="Scenes to keep, sampled evenly")
+@click.option(
+    "--factor",
+    type=int,
+    default=8,
+    help="Resolution factor. Each doubling divides the stack by four. "
+    "Production estimates offsets at 2, which for a five-degree tile is 97 GB.",
+)
+@click.option("--max-gb", type=float, default=None, help="Refuse a fetch larger than this")
+@click.option("--force", "-f", is_flag=True, help="Refetch even if the fixture exists")
+@click.option("--list", "show_list", is_flag=True, help="Show what is already cached")
+@click.option("--dry-run", is_flag=True, help="Print the size arithmetic and stop")
+def fixture(
+    *,
+    tile: str,
+    year: int,
+    end_year: int,
+    max_scenes: int,
+    factor: int,
+    max_gb: float | None,
+    force: bool,
+    show_list: bool,
+    dry_run: bool,
+) -> None:
+    """Cache a real tile's coarse stack locally, for accuracy work.
+
+    Comparing two offset estimators means running both over the same scenes.
+    Without a fixture that is a STAC query and hundreds of gigabytes of coarse
+    reads per iteration, for an answer that is 600 floats. The first fetch is
+    slow; every later one is a local memory-map.
+
+    Size is arithmetic over the grid, so check it before you fetch:
+
+    \b
+        factor  2:  9000x9000  ->  97.2 GB    (production's offset grid)
+        factor  4:  4500x4500  ->  24.3 GB
+        factor  8:  2250x2250  ->   6.1 GB    (default)
+        factor 16:  1125x1125  ->   1.5 GB
+
+    Coarsening costs absolute accuracy, and this fixture answers a relative
+    question: both estimators read the same pixels, so the comparison is exact
+    at any factor. It cannot answer the memory question -- below the streaming
+    regime the stack fits in RAM and dask never streams. Use
+    `landsat-lst benchmark` for that.
+
+    Fetch through Planetary Computer, which is free from a laptop. Earth Search
+    is for AWS, where the read is same-region.
+    """
+    from landsat_lst.config import settings
+    from landsat_lst.fixture import (
+        DEFAULT_MAX_GB,
+        FixtureSpec,
+        build_fixture,
+        estimate_bytes,
+        grid_shape,
+        list_fixtures,
+    )
+
+    if show_list:
+        cached = list_fixtures()
+        if not cached:
+            console.print("[yellow]No fixtures built yet.[/yellow]")
+            return
+        for meta in cached:
+            spec = FixtureSpec(**meta.spec)
+            console.print(
+                f"  {spec.name:<34} {meta.scene_count:>5} scenes  "
+                f"{meta.bytes_on_disk / 1e9:>6.1f} GB  {meta.stac_url}"
+            )
+        return
+
+    spec = FixtureSpec(
+        tile=tile, year=year, end_year=end_year, max_scenes=max_scenes, factor=factor
+    )
+    height, width = grid_shape(spec)
+    planned = estimate_bytes(spec)
+    console.print(f"[bold]{spec.name}[/bold]")
+    console.print(f"  Grid:   {height} x {width} px at factor {factor}")
+    console.print(f"  Stack:  {max_scenes} scenes x 2 uint16 bands = {planned / 1e9:.1f} GB")
+    console.print(f"  STAC:   {settings.stac_url}")
+    console.print(f"  Path:   {spec.path}")
+
+    if dry_run:
+        return
+
+    try:
+        build_fixture(
+            spec,
+            max_gb=DEFAULT_MAX_GB if max_gb is None else max_gb,
+            force=force,
+            progress=lambda msg: console.print(f"  [dim]{msg}[/dim]"),
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @main.command()

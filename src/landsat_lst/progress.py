@@ -641,6 +641,7 @@ def capture_task_log(
     storage: StorageBackend,
     attempt: int = 1,
     max_bytes: int | None = None,
+    key: str | None = None,
 ) -> Iterator[str]:
     """Tee this process's output to storage, uploading it on the way out.
 
@@ -660,13 +661,19 @@ def capture_task_log(
         storage: Backend the log is uploaded to.
         max_bytes: Ceiling on the uploaded text (default
             ``settings.task_log_max_bytes``). The full log stays on local disk.
+        key: Where to upload, overriding the per-tile default. For a batch task
+            that is not a tile -- the synthetic sweep is the one caller --
+            writing under ``_runs/`` would make ``runs.classify`` read it as a
+            tile attempt and put it in a manifest. Such a caller owns its own
+            key grammar and passes the key here.
 
     Yields:
         The key the log will be uploaded to.
     """
     from pathlib import Path  # noqa: PLC0415
 
-    key = storage.log_key(run_id, tile, attempt)
+    if key is None:
+        key = storage.log_key(run_id, tile, attempt)
     limit = settings.task_log_max_bytes if max_bytes is None else max_bytes
 
     handle = tempfile.NamedTemporaryFile(  # noqa: SIM115 - closed in the finally below

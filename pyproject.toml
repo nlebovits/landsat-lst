@@ -94,7 +94,12 @@ dev = [
     # Portolan catalog validation (run in-process by `landsat-lst catalog validate`).
     # 0.1.4 minimum: 0.1.3 treats a missing file:checksum as an error and its
     # bundled schema requires the field, which this catalog deliberately omits.
-    "rashid>=0.1.4,<0.2",
+    # Below 0.1.6 for the same reason: 0.1.6 reinstated exactly that schema
+    # requirement, which 0.1.4 had relaxed. Twice in three releases suggests an
+    # upstream regression rather than a tightened profile, since Portolan's own
+    # spec makes file:checksum a SHOULD. The ceiling is temporary and #97 owns
+    # removing it -- do not widen it without resolving that first.
+    "rashid>=0.1.4,<0.1.6",
     # Pre-commit
     "prek>=0.1.0",
     # Profiling

@@ -27,7 +27,12 @@ hooks = [
   {
     id = "check-added-large-files",
     args = ["--maxkb=500"],
-    exclude = { glob = ["tests/fixtures/**"] },
+    # uv.lock is 728 KB and belongs in the repository: without it CI has
+    # nothing to install from and re-resolves against the ranges in
+    # pyproject.toml on every run. Excluded by name rather than by raising
+    # --maxkb, so the 500 KB ceiling still catches a COG or a parquet committed
+    # by accident.
+    exclude = { glob = ["tests/fixtures/**", "uv.lock"] },
   },
 ]
 
