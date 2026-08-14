@@ -74,6 +74,23 @@ peak near 85 GB at 2,930 scenes, consistent with the 46.5 GB and climbing that
 the OOM was caught at. Suggestive is not measured. The verdict below stays empty
 until a VM produces it.
 
+### Watching it
+
+`landsat-lst watch` will not work here. It lists `_runs/{run_id}/` and classifies every object as
+a tile attempt, and a sweep is not a tile. Neither does the Coiled dashboard, which describes a
+dask scheduler a batch task never registers with, nor `coiled logs`, which does not carry task
+stdout. Poll `--fetch` instead:
+
+```bash
+watch -n 60 'landsat-lst benchmark --fetch <run-id>'
+```
+
+The VM republishes the whole object after every scene count, carrying `status` and `completed`, so
+a partial read shows the points that have landed and names the ones still to run. It uploads its
+own stdout and stderr to `_benchmarks/{run_id}/sweep.log` on the way out either way. Both together
+are the only channel a batch task has, which is the same conclusion the tile path reached in issue
+\#68 and ADR-014.
+
 The sweep runs `landsat_lst.benchmarks.measure` once per scene count, each in a fresh subprocess:
 `getrusage` reports a high-water mark for the life of a process, so a second configuration measured
 inside the first one's interpreter would inherit its peak and draw a flat curve whatever the truth

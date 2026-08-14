@@ -551,6 +551,16 @@ def benchmark_key(run_id: str) -> str:
     return f"_benchmarks/{run_id}/synthetic_scaling.json"
 
 
+def benchmark_log_key(run_id: str) -> str:
+    """Where a sweep uploads its own stdout and stderr.
+
+    Same reasoning as the tile log: Coiled keeps a task's stdout on the VM and
+    reports the tee wrapper's exit code, so a task that dies explains itself
+    only if it uploads its own log. See issue #68 and ADR-014.
+    """
+    return f"_benchmarks/{run_id}/sweep.log"
+
+
 def submit_sweep(
     scene_counts: list[int],
     *,

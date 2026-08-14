@@ -253,7 +253,13 @@ Rules worth keeping:
 - **The trend file is the point, not the pass/fail.** A single green build cannot show a number
   drifting toward a cliff over five PRs. Nightly uploads `results/benchmark/trend.jsonl`.
 - **A sweep publishes under `_benchmarks/`, never `_runs/`.** `runs.py` classifies everything
-  under the run prefix as a tile attempt, and a sweep is not a tile.
+  under the run prefix as a tile attempt, and a sweep is not a tile. The corollary is that
+  `landsat-lst watch` and `explain` cannot see it, so the sweep republishes its whole result
+  object after **every** scene count with `status` and `completed`, and uploads its own stdout
+  to `_benchmarks/{run_id}/sweep.log`. Poll it with
+  `watch -n 60 'landsat-lst benchmark --fetch <run-id>'`. Publishing only at the end would be
+  25 minutes of silence and nothing at all on a crash, which is the mistake ADR-014 already
+  paid for once.
 
 ---
 

@@ -832,6 +832,49 @@ _VERDICTS = {
 }
 
 
+def _print_fetched_sweep(payload: dict, run_id: str) -> None:
+    """Render a published sweep, whether it has finished or is still working."""
+    from landsat_lst.benchmarks import Geometry, Measurement, benchmark_log_key
+
+    requested = payload.get("requested_scenes") or []
+    completed = payload.get("completed", 0)
+    status = payload.get("status", "unknown")
+
+    colour = "green" if status == "finished" else "yellow"
+    console.print(
+        f"[bold]{run_id}[/bold]  [{colour}]{status}[/{colour}]  {completed}/{len(requested)} points"
+    )
+
+    results = []
+    for row in payload.get("measurements", []):
+        geometry = Geometry(**row.pop("geometry"))
+        row.pop("peak_over_floor", None)
+        row.pop("native_passes", None)
+        results.append(Measurement(geometry=geometry, **row))
+    if results:
+        console.print()
+        _print_sweep_measurements(results)
+
+    report = payload.get("report") or {}
+    verdict = str(report.get("verdict") or "unknown")
+    if status != "finished":
+        remaining = [n for n in requested if n not in [m.geometry.scenes for m in results]]
+        console.print(
+            f"\n  [dim]Still to run: {', '.join(str(n) for n in remaining)}. "
+            f"Live output at {benchmark_log_key(run_id)}.[/dim]"
+        )
+        return
+
+    console.print(f"\n[bold]Verdict: {verdict}[/bold]")
+    console.print(f"  {_VERDICTS.get(verdict, '')}")
+    if report.get("streaming_regime"):
+        console.print(
+            f"\n  At {report['target_scenes']:,} scenes this geometry projects to "
+            f"{report['projected_peak_mb'] / 1024:.1f} GB, against a 64 GiB VM."
+        )
+    console.print("\n  [dim]Write the outcome into docs/findings-memory-model.md.[/dim]")
+
+
 @main.command()
 @click.option("--scenes", multiple=True, type=int, help="Scene count to measure; repeatable")
 @click.option("--blocks", type=int, default=8, help="Blocks per side, in chunks")
@@ -889,11 +932,11 @@ def benchmark(
     The verdict is the deliverable, not the numbers. Write it up in
     docs/findings-memory-model.md whichever way it lands.
     """
-    import json as json_module
 
     from landsat_lst.benchmarks import (
         DEFAULT_SWEEP_SCENES,
         benchmark_key,
+        benchmark_log_key,
         fetch_sweep,
         submit_sweep,
         sweep,
@@ -906,10 +949,12 @@ def benchmark(
         payload = fetch_sweep(fetch_id)
         if payload is None:
             raise click.ClickException(
-                f"Nothing published at {benchmark_key(fetch_id)} yet. The task may "
-                f"still be running, or it died before writing; check `coiled logs`."
+                f"Nothing published at {benchmark_key(fetch_id)} yet. The VM "
+                "publishes after its first scene count, so this means the sweep "
+                "has not finished one yet, or it died before it could. Its own "
+                f"stdout is at {benchmark_log_key(fetch_id)}."
             )
-        console.print(json_module.dumps(payload, indent=2))
+        _print_fetched_sweep(payload, fetch_id)
         return
 
     if distributed:
@@ -936,61 +981,128 @@ def benchmark(
     console.print(
         f"[bold]Sweep[/bold] {side}x{side} px ({blocks**2} blocks of {chunk}), {threads} threads"
     )
-    results = sweep(
-        counts,
-        blocks=blocks,
-        chunk=chunk,
-        threads=threads,
-        on_result=lambda m: console.print(
-            f"  [dim]{m.geometry.scenes:>5} scenes: "
-            + (
-                f"FAILED - {m.error.splitlines()[-1][:80]}"
-                if not m.ok
-                else f"{m.peak_rss_mb / 1024:.1f} GB, {m.wall_s / 60:.1f} min"
-            )
-            + "[/dim]"
-        ),
-    )
 
-    console.print()
-    _print_sweep_measurements(results)
+    # A batch task is only visible through what it publishes. Coiled keeps the
+    # task's stdout on the VM and the cluster dashboard describes a dask
+    # scheduler a batch task never registers with, so a sweep that reported only
+    # at the end would be 25 minutes of silence and nothing at all if it died.
+    # Same lesson as the tile path: issue #68 and ADR-014.
+    capture, publish = _sweep_publisher(run_id, counts, blocks, chunk, threads)
 
-    report = sweep_report(results)
-    console.print(f"\n[bold]Verdict: {report['verdict']}[/bold]")
-    console.print(f"  {_VERDICTS.get(report['verdict'], '')}")
-    if report.get("streaming_regime"):
-        projected = report["projected_peak_mb"] / 1024
-        console.print(
-            f"\n  At {report['target_scenes']:,} scenes this geometry projects to "
-            f"{projected:.1f} GB, against a 64 GiB VM."
+    with capture:
+        results = sweep(
+            counts,
+            blocks=blocks,
+            chunk=chunk,
+            threads=threads,
+            on_result=lambda m: (
+                console.print(
+                    f"  [dim]{m.geometry.scenes:>5} scenes: "
+                    + (
+                        f"FAILED - {m.error.splitlines()[-1][:80]}"
+                        if not m.ok
+                        else f"{m.peak_rss_mb / 1024:.1f} GB, {m.wall_s / 60:.1f} min"
+                    )
+                    + "[/dim]"
+                ),
+                publish(m),
+            ),
         )
-        if not report["projected_fits_vm"]:
+
+        console.print()
+        _print_sweep_measurements(results)
+
+        report = sweep_report(results)
+        console.print(f"\n[bold]Verdict: {report['verdict']}[/bold]")
+        console.print(f"  {_VERDICTS.get(report['verdict'], '')}")
+        if report.get("streaming_regime"):
+            projected = report["projected_peak_mb"] / 1024
             console.print(
-                "  [yellow]That does not fit. Cut threads or chunk size and re-run, "
-                "or plan on a larger instance.[/yellow]"
+                f"\n  At {report['target_scenes']:,} scenes this geometry projects to "
+                f"{projected:.1f} GB, against a 64 GiB VM."
             )
+            if not report["projected_fits_vm"]:
+                console.print(
+                    "  [yellow]That does not fit. Cut threads or chunk size and re-run, "
+                    "or plan on a larger instance.[/yellow]"
+                )
 
-    payload = {
-        "blocks": blocks,
-        "chunk": chunk,
-        "threads": threads,
-        "report": report,
-        "measurements": [m.as_dict() for m in results],
-    }
-    text = json_module.dumps(payload, indent=2)
-
-    if run_id:
-        # On the VM this is the only copy that outlives the machine.
-        from landsat_lst.storage import get_storage
-
-        key = benchmark_key(run_id)
-        get_storage().write_text(key, text)
-        console.print(f"\nPublished {key}")
+        text = publish(None, results=results, report=report)
 
     destination = out or Path("results/decision/synthetic_scaling.json")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(text)
     console.print(f"Wrote {destination}")
+
+
+def _sweep_publisher(run_id, counts, blocks, chunk, threads):
+    """A log capture and an incremental publisher for one sweep.
+
+    Returns ``(capture, publish)``. Without a ``run_id`` there is nowhere to
+    publish, so both are inert and the sweep behaves as a local command. With
+    one, every measurement rewrites the same object, carrying ``status`` and
+    ``completed`` so a reader can tell a sweep still working from one that
+    settled, and so a crash at the fourth point leaves the first three.
+
+    Publishing is best-effort, like every other instrument in this project: a
+    failed write is reported and swallowed, because losing a progress update
+    costs less than losing the sweep.
+    """
+    import json as json_module
+    from contextlib import nullcontext
+
+    from landsat_lst.benchmarks import benchmark_key, benchmark_log_key, sweep_report
+
+    done: list = []
+
+    def _payload(results, report) -> dict:
+        return {
+            "blocks": blocks,
+            "chunk": chunk,
+            "threads": threads,
+            "requested_scenes": list(counts),
+            "completed": len(results),
+            "status": "running" if report is None else "finished",
+            "report": report if report is not None else sweep_report(results),
+            "measurements": [m.as_dict() for m in results],
+        }
+
+    if run_id is None:
+
+        def publish(measurement, *, results=None, report=None) -> str:
+            if measurement is not None:
+                done.append(measurement)
+                return ""
+            return json_module.dumps(
+                _payload(results if results is not None else done, report), indent=2
+            )
+
+        return nullcontext(), publish
+
+    from landsat_lst.progress import capture_task_log
+    from landsat_lst.storage import get_storage
+
+    storage = get_storage()
+    key = benchmark_key(run_id)
+
+    def publish(measurement, *, results=None, report=None) -> str:
+        if measurement is not None:
+            done.append(measurement)
+        settled = results if results is not None else done
+        text = json_module.dumps(_payload(settled, report), indent=2)
+        try:
+            storage.write_text(key, text)
+        except Exception as e:
+            console.print(f"  [yellow]progress not published: {e}[/yellow]")
+        return text
+
+    capture = capture_task_log(
+        run_id=run_id,
+        tile="sweep",
+        storage=storage,
+        key=benchmark_log_key(run_id),
+    )
+    return capture, publish
 
 
 @main.command()

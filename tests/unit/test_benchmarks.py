@@ -178,3 +178,101 @@ class TestBenchmarkKey:
 
     def test_key_is_stable_for_a_run_id(self):
         assert benchmark_key("abc") == benchmark_key("abc")
+
+    def test_the_log_shares_the_prefix_and_not_the_object(self):
+        from landsat_lst.benchmarks import benchmark_log_key
+
+        assert benchmark_log_key("abc").startswith("_benchmarks/abc/")
+        assert benchmark_log_key("abc") != benchmark_key("abc")
+
+    def test_the_log_stays_out_of_the_run_prefix(self):
+        """runs.classify reads everything under _runs/ as a tile attempt."""
+        from landsat_lst.benchmarks import benchmark_log_key
+
+        assert not benchmark_log_key("abc").startswith("_runs/")
+
+
+class TestSweepIsVisibleWhileItRuns:
+    """A batch task is only visible through what it publishes.
+
+    Coiled keeps a task's stdout on the VM and the cluster dashboard describes a
+    dask scheduler a batch task never registers with. A sweep that reported only
+    at the end would be 25 minutes of silence, and nothing at all if it died.
+    Same lesson as the tile path: issue #68 and ADR-014.
+    """
+
+    @pytest.fixture
+    def published(self, tmp_path, monkeypatch):
+        from landsat_lst.config import settings
+
+        monkeypatch.setattr(settings, "output_dir", tmp_path)
+        monkeypatch.setattr(settings, "storage_backend", "local", raising=False)
+        return tmp_path
+
+    def _publisher(self, run_id, counts):
+        from landsat_lst.cli import _sweep_publisher
+
+        return _sweep_publisher(run_id, counts, 4, 256, 2)
+
+    def test_each_measurement_rewrites_the_object(self, published, monkeypatch):
+        import json
+
+        from landsat_lst.benchmarks import benchmark_key
+        from landsat_lst.storage import LocalStorage
+
+        storage = LocalStorage(output_dir=published)
+        monkeypatch.setattr("landsat_lst.storage.get_storage", lambda: storage)
+
+        _, publish = self._publisher("r1", [12, 24, 48])
+        publish(_point(12, 400.0))
+
+        payload = json.loads(storage.read_text(benchmark_key("r1")))
+        assert payload["status"] == "running"
+        assert payload["completed"] == 1
+        assert payload["requested_scenes"] == [12, 24, 48]
+
+    def test_a_crash_at_the_third_point_leaves_the_first_two(self, published, monkeypatch):
+        import json
+
+        from landsat_lst.benchmarks import benchmark_key
+        from landsat_lst.storage import LocalStorage
+
+        storage = LocalStorage(output_dir=published)
+        monkeypatch.setattr("landsat_lst.storage.get_storage", lambda: storage)
+
+        _, publish = self._publisher("r2", [12, 24, 48])
+        publish(_point(12, 400.0))
+        publish(_point(24, 600.0))
+        # Third point never lands; nothing calls publish again.
+
+        payload = json.loads(storage.read_text(benchmark_key("r2")))
+        assert payload["completed"] == 2
+        assert payload["status"] == "running"
+        assert [m["geometry"]["scenes"] for m in payload["measurements"]] == [12, 24]
+
+    def test_a_failed_write_does_not_kill_the_sweep(self, published, monkeypatch):
+        """Losing a progress update costs less than losing the sweep."""
+
+        class _Broken:
+            def write_text(self, *args, **kwargs):
+                raise OSError("bucket on fire")
+
+        broken = _Broken()
+        monkeypatch.setattr("landsat_lst.storage.get_storage", lambda: broken)
+
+        _, publish = self._publisher("r3", [12])
+        text = publish(_point(12, 400.0))  # must not raise
+
+        assert '"completed": 1' in text
+
+    def test_without_a_run_id_nothing_is_published(self, monkeypatch):
+        """A local sweep has nowhere to publish and stays a plain command."""
+
+        def _boom():  # pragma: no cover - must never run
+            raise AssertionError("get_storage was called for a local sweep")
+
+        monkeypatch.setattr("landsat_lst.storage.get_storage", _boom)
+
+        capture, publish = self._publisher(None, [12])
+        with capture:
+            publish(_point(12, 400.0))
