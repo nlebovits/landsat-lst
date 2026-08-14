@@ -12,7 +12,18 @@ Derives QGIS-ready COGs from a native-resolution composite level:
 The input is the encoded native-resolution dataset (``uint16`` LST DN + ``uint8``
 per-month counts), as produced by the pipeline before export.
 
-Three properties of the writer are load-bearing and easy to regress:
+Four properties of the writer are load-bearing and easy to regress:
+
+**Both intermediates are written by one shared compute.** ``lst_p95`` and
+``qa_count`` descend from the same de-biased stack, so writing them one after
+the other reads every scene twice: dask holds nothing between two ``compute``
+calls. :func:`cog_export` therefore defers both writes (``compute=False``) and
+hands them to a single :func:`dask.compute`, which retires the shared source
+blocks once. Measured on a synthetic tile, that is 1.0x one pass over the
+sources where sequential writes cost 2.0x, and the bytes written are identical.
+Exporting through :func:`export_lst_cog` and :func:`export_qa_cog` separately
+still costs two passes, which is why the pipeline calls :func:`cog_export`.
+See issue #80.
 
 **The intermediate GeoTIFF is streamed, never materialized.** ``rio.to_raster``
 only routes a dask array through ``dask.array.store`` when ``lock`` is truthy
@@ -23,9 +34,14 @@ and compresses the intermediate so a worker's scratch disk survives too.
 
 **Exact per-band statistics are embedded in the TIFF itself.** The Portolan
 validator (PTL-DAT-009/010) requires the five ``STATISTICS_*`` keys and reads
-them with PAM disabled, so a ``.aux.xml`` sidecar does not count. They are
-computed in one windowed pass over the intermediate and written as band tags,
-which ``cog_translate`` forwards **only** when ``forward_band_tags=True``
+them with PAM disabled, so a ``.aux.xml`` sidecar does not count. Every band is
+accumulated in a single windowed walk of the intermediate -- one walk, not one
+per band -- and the same walk sums the twelve monthly counts per pixel into the
+histogram behind ``valid_coverage_obs_per_pixel``. That log line used to be an
+eager ``.values`` on ``qa_count``, a third full pass over the native stack for
+four numbers; reading them off the written raster costs a local file scan the
+statistics already pay for. They are written as band tags, which
+``cog_translate`` forwards **only** when ``forward_band_tags=True``
 (default ``False`` silently drops them; ``rio_cogeo/cogeo.py:397``). Per GDAL
 convention the statistics describe raw DN, not decoded Celsius, and they are
 exact — hence no ``STATISTICS_APPROXIMATE`` tag.
@@ -48,22 +64,27 @@ import calendar
 import shutil
 import tempfile
 import threading
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import dask
 import numpy as np
 import rasterio
 import rioxarray  # noqa: F401 - needed for .rio accessor
+import structlog
 from rio_cogeo.cogeo import cog_translate, cog_validate
 from rio_cogeo.profiles import cog_profiles
 
 from landsat_lst.encoding import LST_FILL_VALUE, LST_OFFSET, LST_SCALE
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     import xarray as xr
+
+log = structlog.get_logger()
 
 # Month names for qa_count band descriptions (index 1..12).
 _MONTH_NAMES = tuple(calendar.month_name[m] for m in range(1, 13))
@@ -99,20 +120,47 @@ def _scratch_tif(prefix: str) -> Iterator[Path]:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _write_intermediate(da: xr.DataArray, src_tif: Path) -> None:
+def _write_intermediate(da: xr.DataArray, src_tif: Path, *, compute: bool = True) -> Any:
     """Write the pre-COG GeoTIFF, streaming block by block for dask inputs.
 
     The lock is what selects the streaming path: without it rioxarray materializes
     the full array in memory before writing anything.
+
+    Args:
+        da: Array to write. May be dask-backed or already in memory.
+        src_tif: Destination for the intermediate GeoTIFF.
+        compute: When ``False`` and ``da`` is dask-backed, write the header and
+            return the deferred store instead of running it, so several
+            intermediates can share one :func:`dask.compute`. A numpy-backed
+            array ignores this and writes eagerly, returning ``None``.
+
+    Returns:
+        The deferred store when one was created, else ``None``.
     """
-    da.rio.to_raster(
+    return da.rio.to_raster(
         src_tif,
         lock=threading.Lock(),
         tiled=True,
         blockxsize=_BLOCKSIZE,
         blockysize=_BLOCKSIZE,
         compress="deflate",
+        compute=compute,
     )
+
+
+def _write_intermediates(pairs: Sequence[tuple[xr.DataArray, Path]]) -> None:
+    """Write every ``(array, path)`` pair, sharing one pass over their sources.
+
+    The arrays here descend from a common stack, so their graphs share source
+    keys; handing the deferred stores to one :func:`dask.compute` retires each
+    of those keys once rather than once per output. Numpy-backed arrays have
+    already been written by :func:`_write_intermediate` and contribute nothing
+    to the compute.
+    """
+    deferred = [_write_intermediate(da, path, compute=False) for da, path in pairs]
+    pending = [d for d in deferred if d is not None]
+    if pending:
+        dask.compute(*pending)
 
 
 def _dataset_tags(attrs: Mapping[str, Any]) -> dict[str, str]:
@@ -141,45 +189,110 @@ def _statistics_tags(
     return {key: repr(float(value)) for key, value in zip(_STATISTIC_KEYS, values, strict=True)}
 
 
-def _band_statistics(
-    src: rasterio.io.DatasetWriter, bidx: int, nodata: float | None
-) -> dict[str, str]:
-    """Compute exact statistics for one band in a single windowed pass.
+class _BandMoments:
+    """Running moments for one band, exact in float64.
 
     Accumulators are float64 so a full 18,000 x 18,000 uint16 band sums without
     loss. Statistics are of raw DN, per GDAL convention.
     """
-    valid = total_sum = total_sumsq = 0.0
-    total = 0
-    minimum: float | None = None
-    maximum: float | None = None
-    for _, window in src.block_windows(1):
-        block = src.read(bidx, window=window).astype(np.float64)
-        total += block.size
+
+    __slots__ = ("maximum", "minimum", "total", "total_sum", "total_sumsq", "valid")
+
+    def __init__(self) -> None:
+        self.valid = self.total_sum = self.total_sumsq = 0.0
+        self.total = 0
+        self.minimum: float | None = None
+        self.maximum: float | None = None
+
+    def update(self, block: np.ndarray, nodata: float | None) -> None:
+        """Fold one window of one band in, ignoring ``nodata`` if there is one."""
+        self.total += block.size
         if nodata is not None:
             block = block[block != nodata]
         if block.size == 0:
-            continue
-        valid += block.size
-        total_sum += float(block.sum())
-        total_sumsq += float(np.square(block).sum())
+            return
+        self.valid += block.size
+        self.total_sum += float(block.sum())
+        self.total_sumsq += float(np.square(block).sum())
         block_min, block_max = float(block.min()), float(block.max())
-        minimum = block_min if minimum is None else min(minimum, block_min)
-        maximum = block_max if maximum is None else max(maximum, block_max)
-    return _statistics_tags(
-        valid=valid,
-        total=total,
-        total_sum=total_sum,
-        total_sumsq=total_sumsq,
-        minimum=minimum,
-        maximum=maximum,
-    )
+        self.minimum = block_min if self.minimum is None else min(self.minimum, block_min)
+        self.maximum = block_max if self.maximum is None else max(self.maximum, block_max)
+
+    def tags(self) -> dict[str, str]:
+        """Render the accumulated moments as GDAL ``STATISTICS_*`` tag values."""
+        return _statistics_tags(
+            valid=self.valid,
+            total=self.total,
+            total_sum=self.total_sum,
+            total_sumsq=self.total_sumsq,
+            minimum=self.minimum,
+            maximum=self.maximum,
+        )
 
 
-def _embed_statistics(src: rasterio.io.DatasetWriter, nodata: float | None) -> None:
-    """Attach exact ``STATISTICS_*`` band tags to an open, already-written raster."""
-    for bidx in range(1, src.count + 1):
-        src.update_tags(bidx, **_band_statistics(src, bidx, nodata))
+def _coverage_bins(src: rasterio.io.DatasetWriter) -> int:
+    """Number of histogram bins needed for the per-pixel sum over all bands."""
+    return int(np.iinfo(src.dtypes[0]).max) * src.count + 1
+
+
+def _embed_statistics(
+    src: rasterio.io.DatasetWriter, nodata: float | None, *, coverage: bool = False
+) -> np.ndarray | None:
+    """Attach exact ``STATISTICS_*`` band tags to an open, already-written raster.
+
+    One walk of the raster serves every band. Reading band by band would scan a
+    12-band QA intermediate twelve times for the same bytes.
+
+    Args:
+        src: Open raster, already written, in a mode that permits tag updates.
+        nodata: Value to exclude from the statistics, or ``None`` to count every
+            pixel as valid.
+        coverage: Also accumulate the distribution of the per-pixel sum across
+            bands. Only meaningful where the bands are counts (``qa_count``),
+            and it requires an integer dtype.
+
+    Returns:
+        The coverage histogram when ``coverage`` is set, else ``None``. Index
+        ``i`` holds the number of pixels whose bands sum to ``i``.
+    """
+    moments = [_BandMoments() for _ in range(src.count)]
+    histogram = np.zeros(_coverage_bins(src), dtype=np.int64) if coverage else None
+    for _, window in src.block_windows(1):
+        block = src.read(window=window)
+        for band, band_moments in zip(block, moments, strict=True):
+            band_moments.update(band.astype(np.float64), nodata)
+        if histogram is not None:
+            per_pixel = block.sum(axis=0, dtype=np.int64).ravel()
+            histogram += np.bincount(per_pixel, minlength=histogram.size)
+    for bidx, band_moments in enumerate(moments, start=1):
+        src.update_tags(bidx, **band_moments.tags())
+    return histogram
+
+
+def _coverage_summary(histogram: np.ndarray) -> dict[str, float]:
+    """Reduce the per-pixel observation histogram to the four reported numbers.
+
+    The median is the exact order statistic ``numpy.median`` would return, taken
+    from the cumulative counts rather than from a materialized array.
+    """
+    total = int(histogram.sum())
+    if total == 0:
+        return {"min": 0, "median": 0.0, "max": 0, "zero_frac": 0.0}
+    cumulative = np.cumsum(histogram)
+    half = total // 2
+    if total % 2:
+        median = float(np.searchsorted(cumulative, half + 1))
+    else:
+        lower = int(np.searchsorted(cumulative, half))
+        upper = int(np.searchsorted(cumulative, half + 1))
+        median = (lower + upper) / 2
+    populated = np.nonzero(histogram)[0]
+    return {
+        "min": int(populated[0]),
+        "median": median,
+        "max": int(populated[-1]),
+        "zero_frac": round(float(histogram[0] / total), 3),
+    }
 
 
 def _to_cog(src_tif: Path, cog_path: Path, *, nodata: float | None) -> None:
@@ -201,42 +314,119 @@ def _to_cog(src_tif: Path, cog_path: Path, *, nodata: float | None) -> None:
         raise RuntimeError(msg)
 
 
+@dataclass(frozen=True)
+class _Product:
+    """One COG to write: the array, its nodata, and how to finish the raster."""
+
+    da: xr.DataArray
+    nodata: float | None
+    cog_path: Path
+    scratch_prefix: str
+    #: Accumulate the per-pixel observation histogram during the statistics walk.
+    coverage: bool
+    #: Band-level touches applied to the open intermediate before statistics.
+    describe: Callable[[rasterio.io.DatasetWriter], None]
+
+
+def _lst_product(native: xr.Dataset, cog_path: Path) -> _Product:
+    """Describe the single-band ``lst_p95`` COG (uint16 DN with scale/offset)."""
+
+    def describe(src: rasterio.io.DatasetWriter) -> None:
+        # Embed GDAL band scale/offset so viewers auto-decode DN -> Celsius.
+        src.scales = (LST_SCALE,)
+        src.offsets = (LST_OFFSET,)
+
+    return _Product(
+        da=_prep(native["lst_p95"]).rio.write_nodata(LST_FILL_VALUE),
+        nodata=LST_FILL_VALUE,
+        cog_path=cog_path,
+        scratch_prefix="lst_cog_",
+        coverage=False,
+        describe=describe,
+    )
+
+
+def _qa_product(native: xr.Dataset, cog_path: Path) -> _Product:
+    """Describe the 12-band ``qa_count`` COG (uint8, one band per calendar month)."""
+    qa = _prep(native["qa_count"])
+    if "month" in qa.dims:
+        qa = qa.transpose("month", "latitude", "longitude")
+
+    def describe(src: rasterio.io.DatasetWriter) -> None:
+        # Label each band with its month so QGIS shows Jan..Dec, not Band 1..12.
+        for band_idx in range(1, src.count + 1):
+            src.set_band_description(band_idx, _MONTH_NAMES[band_idx - 1])
+
+    # No nodata anywhere on this product: 0 observations is data, not absence of
+    # data, and it has to stay visible for gap diagnosis.
+    return _Product(
+        da=qa,
+        nodata=None,
+        cog_path=cog_path,
+        scratch_prefix="qa_cog_",
+        coverage=True,
+        describe=describe,
+    )
+
+
+def _export(native: xr.Dataset, products: Sequence[_Product]) -> None:
+    """Write every product, sharing one pass over the sources they have in common.
+
+    All the intermediates are written first, in one compute, and only then
+    finished one at a time. Interleaving would put a ``cog_translate`` between
+    the two writes and cost the second one its shared source blocks. The price
+    is that every intermediate is on scratch disk at once rather than one at a
+    time, which is why they are deflate-compressed.
+    """
+    with ExitStack() as stack:
+        scratch = [stack.enter_context(_scratch_tif(p.scratch_prefix)) for p in products]
+        _write_intermediates([(p.da, tif) for p, tif in zip(products, scratch, strict=True)])
+        for product, src_tif in zip(products, scratch, strict=True):
+            with rasterio.open(src_tif, "r+") as src:
+                product.describe(src)
+                src.update_tags(**_dataset_tags(native.attrs))
+                histogram = _embed_statistics(src, product.nodata, coverage=product.coverage)
+            if histogram is not None:
+                _log_coverage(native.attrs, histogram)
+            _to_cog(src_tif, product.cog_path, nodata=product.nodata)
+
+
+def _log_coverage(attrs: Mapping[str, Any], histogram: np.ndarray) -> None:
+    """Report valid observations per pixel, the check on silent nodata fill.
+
+    ``load_scenes`` runs with ``fail_on_error=False``, so a read failure fills a
+    scene with nodata instead of aborting the tile. Occasional fill is the point;
+    mass fill is a broken run, and a low median or a high zero fraction is what
+    distinguishes them. Deriving it from the written raster keeps the check
+    without the full native pass the old eager reduction cost (issue #80).
+    """
+    log.info(
+        "valid_coverage_obs_per_pixel",
+        tile=attrs.get("tile"),
+        window=attrs.get("window"),
+        **_coverage_summary(histogram),
+    )
+
+
 def export_lst_cog(native: xr.Dataset, cog_path: Path) -> Path:
     """Write the single-band ``lst_p95`` COG (uint16 DN with scale/offset)."""
-    da = _prep(native["lst_p95"]).rio.write_nodata(LST_FILL_VALUE)
-    with _scratch_tif("lst_cog_") as src_tif:
-        _write_intermediate(da, src_tif)
-        with rasterio.open(src_tif, "r+") as src:
-            # Embed GDAL band scale/offset so viewers auto-decode DN -> Celsius.
-            src.scales = (LST_SCALE,)
-            src.offsets = (LST_OFFSET,)
-            src.update_tags(**_dataset_tags(native.attrs))
-            _embed_statistics(src, nodata=LST_FILL_VALUE)
-        _to_cog(src_tif, cog_path, nodata=LST_FILL_VALUE)
+    _export(native, [_lst_product(native, cog_path)])
     return cog_path
 
 
 def export_qa_cog(native: xr.Dataset, cog_path: Path) -> Path:
     """Write the 12-band ``qa_count`` COG (uint8, one band per calendar month)."""
-    qa = _prep(native["qa_count"])
-    if "month" in qa.dims:
-        qa = qa.transpose("month", "latitude", "longitude")
-    with _scratch_tif("qa_cog_") as src_tif:
-        _write_intermediate(qa, src_tif)  # 3D -> one band per month
-        with rasterio.open(src_tif, "r+") as src:
-            # Label each band with its month so QGIS shows Jan..Dec, not Band 1..12.
-            for band_idx in range(1, src.count + 1):
-                src.set_band_description(band_idx, _MONTH_NAMES[band_idx - 1])
-            src.update_tags(**_dataset_tags(native.attrs))
-            # Every pixel counts: 0 observations is data, not absence of data.
-            _embed_statistics(src, nodata=None)
-        # No nodata: 0 = "no valid obs this month" is the signal we want to see.
-        _to_cog(src_tif, cog_path, nodata=None)
+    _export(native, [_qa_product(native, cog_path)])
     return cog_path
 
 
 def cog_export(native: xr.Dataset, lst_cog: Path, qa_cog: Path) -> tuple[Path, Path]:
     """Export both LST and per-month QA COGs from a native composite level.
+
+    Both products come out of one pass over the source scenes. Calling
+    :func:`export_lst_cog` and :func:`export_qa_cog` in sequence instead would
+    read every scene twice, which at production geometry is roughly half an hour
+    of the tile thrown away (issue #80).
 
     Args:
         native: Decoded native-resolution level with ``lst_p95`` (uint16 DN) and
@@ -249,4 +439,5 @@ def cog_export(native: xr.Dataset, lst_cog: Path, qa_cog: Path) -> tuple[Path, P
     Returns:
         ``(lst_cog, qa_cog)`` paths written.
     """
-    return export_lst_cog(native, lst_cog), export_qa_cog(native, qa_cog)
+    _export(native, [_lst_product(native, lst_cog), _qa_product(native, qa_cog)])
+    return lst_cog, qa_cog

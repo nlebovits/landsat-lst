@@ -2,13 +2,14 @@
 
 import calendar
 
+import dask.array as da
 import numpy as np
 import pytest
 import rasterio
 import xarray as xr
 from rio_cogeo.cogeo import cog_validate
 
-from landsat_lst.cog import cog_export
+from landsat_lst.cog import cog_export, export_lst_cog, export_qa_cog
 from landsat_lst.encoding import LST_OFFSET, LST_SCALE
 
 # The five keys the Portolan validator requires on every band (PTL-DAT-009/010).
@@ -160,3 +161,80 @@ def test_cog_export_streams_a_dask_backed_composite(tmp_path):
         assert src.count == 12
         for bidx in range(1, 13):
             np.testing.assert_array_equal(src.read(bidx), np.full((256, 256), bidx, dtype=np.uint8))
+
+
+def _shared_source(reads: list, n: int = 64) -> tuple[xr.Dataset, int]:
+    """A composite whose two products descend from one stack, as production's do.
+
+    Every source block passes through ``_tally`` on its way into the graph, so
+    ``len(reads)`` counts how many times a block was produced -- the number of
+    passes over the scenes, in blocks. Counting executions rather than task keys
+    is what makes this survive graph fusion, which renames keys freely.
+    """
+
+    def _tally(block: np.ndarray) -> np.ndarray:
+        reads.append(1)  # list.append is atomic; the scheduler is threaded
+        return block
+
+    stack = da.random.default_rng(0).random((8, n, n), chunks=(4, n // 2, n // 2))
+    # An explicit meta keeps dask from calling _tally once on a sample block to
+    # infer the output type, which would show up as a phantom extra read.
+    stack = stack.map_blocks(_tally, dtype=stack.dtype, meta=np.array((), dtype=stack.dtype))
+    total = stack.sum(axis=0)
+    coords = {"latitude": np.linspace(-30.0, -35.0, n), "longitude": np.linspace(-65.0, -60.0, n)}
+    lst = xr.DataArray(
+        (total * 1000).astype(np.uint16), dims=["latitude", "longitude"], coords=coords
+    )
+    qa = xr.DataArray(
+        da.broadcast_to(total.astype(np.uint8), (12, n, n)).rechunk((12, n // 2, n // 2)),
+        dims=["month", "latitude", "longitude"],
+        coords={"month": np.arange(1, 13), **coords},
+    )
+    native = xr.Dataset({"lst_p95": lst, "qa_count": qa}, attrs=dict(PROVENANCE))
+    return native, stack.npartitions
+
+
+@pytest.mark.integration
+def test_cog_export_reads_each_source_block_once(tmp_path):
+    """One export, one pass over the scenes. See issue #80."""
+    reads: list[int] = []
+    native, blocks = _shared_source(reads)
+
+    cog_export(native, tmp_path / "lst.tif", tmp_path / "qa.tif")
+
+    assert len(reads) == blocks, f"{len(reads) / blocks:.1f} passes over the sources"
+
+
+@pytest.mark.integration
+def test_separate_exports_cost_a_pass_each(tmp_path):
+    """Why :func:`cog_export` exists: exporting one product at a time doubles the reads."""
+    reads: list[int] = []
+    native, blocks = _shared_source(reads)
+
+    export_lst_cog(native, tmp_path / "lst.tif")
+    export_qa_cog(native, tmp_path / "qa.tif")
+
+    assert len(reads) == 2 * blocks
+
+
+@pytest.mark.integration
+def test_cog_export_handles_a_half_lazy_composite(tmp_path):
+    """One dask product and one numpy product in the same export.
+
+    The numpy side writes during graph construction and contributes nothing to
+    the shared compute, so the deferred-store list has a hole in it.
+    """
+    native = _native(128)
+    native["lst_p95"] = native["lst_p95"].chunk({"latitude": 64, "longitude": 64})
+    assert native["lst_p95"].chunks is not None
+    assert native["qa_count"].chunks is None
+
+    lst_cog, qa_cog = tmp_path / "lst.tif", tmp_path / "qa.tif"
+    cog_export(native, lst_cog, qa_cog)
+
+    assert cog_validate(str(lst_cog))[0]
+    assert cog_validate(str(qa_cog))[0]
+    with rasterio.open(lst_cog) as src:
+        np.testing.assert_array_equal(src.read(1), np.full((128, 128), 8500, dtype=np.uint16))
+    with rasterio.open(qa_cog) as src:
+        np.testing.assert_array_equal(src.read(7), np.full((128, 128), 7, dtype=np.uint8))
