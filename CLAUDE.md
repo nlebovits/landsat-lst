@@ -112,9 +112,11 @@ See [ADR-010](docs/adr/010-coiled-batch-for-distributed-runs.md).
 Two phases that never share a process, plus a live view that needs neither:
 
 ```bash
-landsat-lst process --distributed   # submits, prints a run id, returns
-landsat-lst watch <run-id>          # live: phase and heartbeat age per tile
-landsat-lst reconcile <run-id>      # builds the manifest from S3 afterwards
+landsat-lst process --distributed        # submits, prints a run id, returns
+landsat-lst watch <run-id>               # live: phase, task rate, ETA, RSS trend, cost
+landsat-lst watch <run-id> --detail      # adds per-tile panels: sparklines, phase bars, headroom
+landsat-lst explain <run-id> [tile]      # every attempt: state, timings, profile, log tail
+landsat-lst reconcile <run-id>           # manifest, attempt series, and cost, from S3
 ```
 
 Rules worth keeping:
@@ -124,19 +126,44 @@ Rules worth keeping:
   no output.
 - **The submitting shell is disposable.** Nothing may require it to stay open. `submit_batch`
   writes `{run_id}.submission.json` before returning, and that file is all `reconcile_run` needs.
-- **Each VM reports for itself** to `_runs/{run_id}/{tile}.json` (duration, scene count, peak RSS,
-  error). A missing record is ordinary, not an error: preempted and timed-out VMs never write one.
+- **Each VM reports for itself, once per attempt**, to `_runs/{run_id}/{tile}.{attempt}.json`: one
+  merged state object carrying both the live phase and the outcome. A copy of the final state goes
+  to the unsuffixed `{tile}.json`, and its presence is how every reader tells a settled tile from a
+  running one. `status` is `null` until a tile settles, so use `phase` for liveness. A missing
+  object is ordinary, not an error: preempted and timed-out VMs never write one.
+- **Every artifact is keyed by attempt, and the number is resolved once per process.** Three Coiled
+  retries used to write the same three keys, so the manifest reported a 10-second failure against a
+  33-minute run and the attempt that reached `land_mask` was erased. `runs.resolve_attempt` counts
+  state objects, logs, *and* profiles, because a VM preempted before it published state still
+  leaves a log. Asking twice in one process would number the log higher than the state object, since
+  the log uploads last. `runs.py` owns the key grammar; do not re-derive suffixes anywhere else.
+- **An escaping exception writes the attempt object but not the pointer.** A transient failure
+  re-raises so Coiled retries it, and no reader should see a failed final answer mid-retry.
 - **A running tile is only visible through what it publishes.** The cluster dashboard describes a
   dask scheduler that a batch task never registers with, task stdout never reaches `coiled logs`,
-  and the exit code Coiled records is the tee wrapper's. So each tile beats to
-  `{tile}.progress.json` every 60s (`progress.TileHeartbeat`, rendered by `landsat-lst watch`) and
-  uploads its own stdout and stderr to `{tile}.log` on exit either way. Do not reason about a live
-  run from the dashboard, and do not trust an exit code. See issue #68.
+  and the exit code Coiled records is the tee wrapper's. So each tile republishes its state every
+  60s (`progress.TileHeartbeat`, rendered by `landsat-lst watch`) and uploads its own stdout and
+  stderr to `{tile}.{attempt}.log` on exit either way. Do not reason about a live run from the
+  dashboard, and do not trust an exit code. See issue #68 and ADR-014.
 - **Instrumentation never fails a tile.** Every heartbeat and log write is best-effort: a failure
   is logged and swallowed. Losing observability costs less than losing a two-hour composite.
 - **VMs carry 64 GiB.** A heavy tile OOMed at 28.77 GiB on a 32 GiB `r6i.xlarge`.
 - **Cost caps are `coiled_max_workers` (concurrent VMs) and `coiled_job_timeout`** (per-task
   wall clock), not a fixed cluster size.
+- **Cost is an estimate and a range, never a scalar.** `pricing.json` holds committed list prices
+  with an `as_of` date. Spot spans 0.30-0.75 of on-demand, sampled at 0.35x, 0.44x, and 0.71x on
+  one day, so a single discount factor would be wrong by more than 2x for one of the two configured
+  VM types. `spot_with_fallback` with no measured lifecycle spans 0.30 to 1.00. The instance type
+  is read from EC2 IMDS on the VM, not assumed from `coiled_vm_types[0]`, because the fallback type
+  costs 1.52x the primary for the same 64 GiB. EC2 bills per second with a 60-second minimum.
+- **The STAC client retries 429 and 5xx on every verb.** `pystac_client` mounts an adapter from a
+  plain int, which leaves `status_forcelist` empty and excludes POST, so a 500 on a search was
+  never retried and one blip killed a five-hour tile at second 10. Retry in the client, never by
+  raising `coiled_retries`: a VM restart destroys the tile's progress and an HTTP retry keeps it.
+- **Nothing may render tracebacks with frame locals.** `logging_config.configure_logging` installs
+  `structlog.dev.plain_traceback`, because the default `ConsoleRenderer` uses rich with
+  `show_locals=True` and one `logger.exception` rendered 3.8 MB of deserialized STAC collection,
+  evicting a tile's whole phase history from its log. Raising `task_log_max_bytes` is not the fix.
 
 ---
 

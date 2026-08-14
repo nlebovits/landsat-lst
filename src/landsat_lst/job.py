@@ -18,7 +18,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import tempfile
@@ -33,6 +32,7 @@ import structlog
 from landsat_lst.cog import cog_export
 from landsat_lst.config import settings
 from landsat_lst.encoding import encode_lst_uint16
+from landsat_lst.logging_config import configure_logging
 from landsat_lst.models import ProcessingJob
 from landsat_lst.pipeline import process_tile
 from landsat_lst.progress import (
@@ -41,7 +41,9 @@ from landsat_lst.progress import (
     peak_rss_mb,
     report_failed,
     report_phase,
+    write_final_state,
 )
+from landsat_lst.runs import resolve_attempt
 from landsat_lst.storage import StorageBackend, get_storage
 
 if TYPE_CHECKING:
@@ -81,6 +83,10 @@ class JobResult:
             "tile": self.job.tile.name,
             "year": self.job.year,
             "end_year": self.job.end_year,
+            # Without this a sampled run rebuilds the job with max_scenes None,
+            # so window_label loses its "-sample{n}" suffix and the manifest
+            # claims window "2021-2025" for COGs under "2021-2025-sample300".
+            "max_scenes": self.job.max_scenes,
             "status": self.status,
             "lst_key": self.lst_key,
             "qa_key": self.qa_key,
@@ -92,7 +98,15 @@ class JobResult:
 
     @classmethod
     def from_record(cls, record: dict) -> JobResult:
-        """Rebuild a result from :meth:`to_record` output."""
+        """Rebuild a result from :meth:`to_record` output.
+
+        Also reads the merged state object a running tile publishes, which
+        carries every field above plus its live half. Such an object has no
+        ``status`` until the tile settles, and an attempt whose VM was
+        preempted never settles. Reconciliation takes the real verdict from the
+        COG listing, so an unsettled object only has to produce a result rather
+        than a ``KeyError``.
+        """
         from landsat_lst.tiling import parse_tile_name  # noqa: PLC0415
 
         return cls(
@@ -100,8 +114,9 @@ class JobResult:
                 tile=parse_tile_name(record["tile"]),
                 year=record["year"],
                 end_year=record["end_year"],
+                max_scenes=record.get("max_scenes"),
             ),
-            status=record["status"],
+            status=record.get("status") or "failed",
             lst_key=record.get("lst_key"),
             qa_key=record.get("qa_key"),
             error=record.get("error"),
@@ -247,26 +262,6 @@ def _write_cogs(
     return lst_key, qa_key
 
 
-def _write_run_record(result: JobResult, storage: StorageBackend, run_id: str, logger) -> None:
-    """Leave this tile's outcome in storage for later reconciliation.
-
-    A batch run has no live driver holding the results, so each task reports
-    for itself. Reconciliation still takes tile completion from the COG
-    listing; the record supplies what a listing cannot know -- duration, scene
-    count, peak memory, and the error text behind a failure.
-
-    A record that cannot be written must not fail a tile whose COGs are already
-    safely uploaded, so the write is logged and swallowed.
-    """
-    try:
-        storage.write_text(
-            storage.run_record_key(run_id, result.job.tile.name),
-            json.dumps(result.to_record(), indent=2),
-        )
-    except Exception as e:
-        logger.warning("run_record_write_failed", run_id=run_id, error=str(e))
-
-
 def process_tile_job(
     job: ProcessingJob,
     *,
@@ -274,6 +269,7 @@ def process_tile_job(
     storage: StorageBackend | None = None,
     run_id: str | None = None,
     use_offset_cache: bool = True,
+    attempt: int | None = None,
 ) -> JobResult:
     """Process a single tile-window job with retry/resume support.
 
@@ -304,8 +300,15 @@ def process_tile_job(
     Returns:
         JobResult with status and asset keys
     """
+    # Plain tracebacks. Reached whether or not the CLI was the entry point, and
+    # idempotent, so a tile that fails cannot render a megabyte of frame locals
+    # into the log it is about to upload. See landsat_lst.logging_config.
+    configure_logging()
+
     storage = storage or get_storage()
     logger = log.bind(tile=job.tile.name, year=job.window_label)
+    if run_id is not None and attempt is None:
+        attempt = resolve_attempt(storage, run_id, job.tile.name)
 
     with _thread_cap():
         return _process_tile_job(
@@ -315,6 +318,7 @@ def process_tile_job(
             run_id=run_id,
             logger=logger,
             use_offset_cache=use_offset_cache,
+            attempt=attempt or 1,
         )
 
 
@@ -341,6 +345,7 @@ def _process_tile_job(
     run_id: str | None,
     logger,
     use_offset_cache: bool = True,
+    attempt: int = 1,
 ) -> JobResult:
     """The body of :func:`process_tile_job`, under whatever dask config it set."""
 
@@ -349,18 +354,24 @@ def _process_tile_job(
         logger.info("tile_skipped", reason="cogs_exist")
         result = JobResult(job=job, status="skipped")
         if run_id:
-            _write_run_record(result, storage, run_id, logger)
+            # Published once, with no beat thread: a tile that does no work has
+            # nothing to report while it runs.
+            write_final_state(
+                run_id=run_id,
+                job=job,
+                storage=storage,
+                attempt=attempt,
+                result=result,
+            )
         return result
 
     start = time.monotonic()
     # A tile with no run id has someone watching it directly, so it beats to
     # nobody. Nothing else about the tile changes.
-    heartbeat = (
-        TileHeartbeat(run_id=run_id, tile=job.tile.name, window=job.window_label, storage=storage)
-        if run_id
-        else nullcontext()
+    beat = (
+        TileHeartbeat(run_id=run_id, job=job, storage=storage, attempt=attempt) if run_id else None
     )
-    with heartbeat:
+    with beat or nullcontext():
         try:
             # Layer 2: Process tile through pipeline
             logger.info("tile_processing_start")
@@ -401,8 +412,12 @@ def _process_tile_job(
                 peak_rss_mb=peak_rss_mb(),
             )
 
-    if run_id:
-        _write_run_record(result, storage, run_id, logger)
+        # Folded in before the context exits, so the terminal beat carries the
+        # outcome. The state object and the run record used to be two keys that
+        # a retry could leave disagreeing with each other.
+        if beat is not None:
+            beat.set_result(result)
+
     return result
 
 

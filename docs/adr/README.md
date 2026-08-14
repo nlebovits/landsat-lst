@@ -19,6 +19,7 @@ ADRs are kept for history and link to their replacement.
 | [011](011-static-planning-and-synthetic-benchmarks.md) | Static graph planning, synthetic-geometry benchmarks, and per-key profiling | Accepted |
 | [012](012-cached-scene-offsets.md) | Input-keyed scene-offset cache and a standalone offset phase | Accepted |
 | [013](013-single-native-pass.md) | One pass over the native stack per tile: shared rechunk, fused export writes, coverage from the raster | Accepted |
+| [014](014-run-self-explanation.md) | One state object per attempt, priced runs, and a watch UI that keeps its history | Accepted |
 
 ## Adding an ADR
 

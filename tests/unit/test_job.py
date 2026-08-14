@@ -16,6 +16,18 @@ from landsat_lst.models import ProcessingJob, TileId
 from landsat_lst.storage import LocalStorage
 
 
+def _composite(scene_count: int = 412) -> MagicMock:
+    """A stand-in for what the pipeline returns.
+
+    ``attrs`` is a real dict rather than a mock attribute because the tile
+    publishes ``scene_count`` in its state object, and a ``MagicMock`` there is
+    not JSON serializable, so the whole object would be dropped.
+    """
+    composite = MagicMock()
+    composite.attrs = {"scene_count": scene_count}
+    return composite
+
+
 @pytest.fixture
 def sample_job():
     """Create a sample processing job."""
@@ -24,10 +36,22 @@ def sample_job():
 
 @pytest.fixture
 def mock_storage(tmp_path):
-    """Mock backend: real key layout, mocked existence checks and uploads."""
+    """Mock backend: real key layout, mocked existence checks and uploads.
+
+    Every key method is the real one. A ``MagicMock`` returns the same object
+    for every call regardless of arguments, so mocked key methods would make
+    an attempt key and the pointer key compare equal and hide the whole of the
+    per-attempt layout.
+    """
+    keys = LocalStorage(output_dir=tmp_path)
     storage = MagicMock()
     storage.cog_exists.return_value = False
-    storage.cog_key.side_effect = LocalStorage(output_dir=tmp_path).cog_key
+    storage.cog_key.side_effect = keys.cog_key
+    storage.run_record_key.side_effect = keys.run_record_key
+    storage.log_key.side_effect = keys.log_key
+    storage.profile_key.side_effect = keys.profile_key
+    # No artifacts yet, so a tile that resolves its own attempt gets 1.
+    storage.list_prefix.return_value = {}
     return storage
 
 
@@ -292,15 +316,20 @@ class TestIsTransient:
 class TestRunRecord:
     """A batch VM reports for itself; these records are all reconciliation gets."""
 
+    @staticmethod
+    def _written(storage) -> dict[str, dict]:
+        """Every object this tile published, keyed by the key it went to."""
+        return {
+            call.args[0]: json.loads(call.args[1]) for call in storage.write_text.call_args_list
+        }
+
     def _run(self, job, storage, run_id):
         with (
             patch("landsat_lst.job.process_tile") as mock_process,
             patch("landsat_lst.job._encode_native") as mock_encode,
             patch("landsat_lst.job.cog_export") as mock_export,
         ):
-            composite = MagicMock()
-            composite.attrs = {"scene_count": 412}
-            mock_process.return_value = composite
+            mock_process.return_value = _composite()
             mock_encode.return_value = MagicMock()
             mock_export.return_value = (MagicMock(), MagicMock())
             return process_tile_job(job, storage=storage, run_id=run_id)
@@ -311,22 +340,30 @@ class TestRunRecord:
         mock_storage.write_text.assert_not_called()
 
     def test_completed_record_carries_costing_metrics(self, sample_job, mock_storage):
+        """Both the attempt's own object and the pointer carry the outcome.
+
+        The pointer is written last, so reading only the final call would test
+        the copy and never the object the copy is made from.
+        """
         result = self._run(sample_job, mock_storage, "run-1")
 
-        key, text = mock_storage.write_text.call_args.args
-        assert key == mock_storage.run_record_key("run-1", "N40W075")
-        record = json.loads(text)
-        assert record["status"] == "completed"
-        assert record["scene_count"] == 412
-        assert record["duration_s"] == result.duration_s
-        assert record["peak_rss_mb"] is not None
+        written = self._written(mock_storage)
+        attempt_key = mock_storage.run_record_key("run-1", "N40W075", 1)
+        pointer_key = mock_storage.run_record_key("run-1", "N40W075")
+
+        for key in (attempt_key, pointer_key):
+            record = written[key]
+            assert record["status"] == "completed"
+            assert record["scene_count"] == 412
+            assert record["duration_s"] == result.duration_s
+            assert record["peak_rss_mb"] is not None
 
     def test_failed_record_carries_the_error(self, sample_job, mock_storage):
         with patch("landsat_lst.job.process_tile") as mock_process:
             mock_process.side_effect = ValueError("No scenes found")
             process_tile_job(sample_job, storage=mock_storage, run_id="run-1")
 
-        record = json.loads(mock_storage.write_text.call_args.args[1])
+        record = self._written(mock_storage)[mock_storage.run_record_key("run-1", "N40W075")]
         assert record["status"] == "failed"
         assert "No scenes found" in record["error"]
 
@@ -336,14 +373,15 @@ class TestRunRecord:
 
         process_tile_job(sample_job, storage=mock_storage, run_id="run-1")
 
-        record = json.loads(mock_storage.write_text.call_args.args[1])
+        record = self._written(mock_storage)[mock_storage.run_record_key("run-1", "N40W075")]
         assert record["status"] == "skipped"
 
-    def test_transient_failure_writes_no_record(self, sample_job, mock_storage):
-        """The retry on a fresh VM writes the record; a doomed attempt must not.
+    def test_transient_failure_writes_its_attempt_but_no_pointer(self, sample_job, mock_storage):
+        """A doomed attempt keeps its evidence and publishes no final answer.
 
-        It does still beat, and its last beat says why it died: that is what a
-        watcher sees while the retry is being scheduled.
+        The attempt's own object is written whatever happens, because a retry
+        that erased it is the failure this layout exists to stop. The pointer
+        waits: a retry is in flight, so no reader may see a settled verdict.
         """
         with (
             patch("landsat_lst.job.process_tile") as mock_process,
@@ -352,9 +390,39 @@ class TestRunRecord:
             mock_process.side_effect = TimeoutError("read timed out")
             process_tile_job(sample_job, storage=mock_storage, run_id="run-1")
 
-        written = [call.args[0] for call in mock_storage.write_text.call_args_list]
+        written = self._written(mock_storage)
         assert mock_storage.run_record_key("run-1", "N40W075") not in written
-        assert mock_storage.progress_key("run-1", "N40W075") in written
+        state = written[mock_storage.run_record_key("run-1", "N40W075", 1)]
+        assert state["phase"] == "failed"
+        assert "read timed out" in state["error"]
+
+    def test_deterministic_failure_writes_both(self, sample_job, mock_storage):
+        """No retry is coming, so the tile publishes its final answer."""
+        with patch("landsat_lst.job.process_tile") as mock_process:
+            mock_process.side_effect = ValueError("No scenes found")
+            process_tile_job(sample_job, storage=mock_storage, run_id="run-1")
+
+        written = self._written(mock_storage)
+        assert mock_storage.run_record_key("run-1", "N40W075", 1) in written
+        assert written[mock_storage.run_record_key("run-1", "N40W075")]["status"] == "failed"
+
+    def test_status_is_absent_until_the_tile_settles(self, sample_job, mock_storage):
+        """A mid-run beat must not hand reconciliation a verdict to read."""
+        mid_run = []
+
+        def pipeline(_job, **_kwargs):
+            mid_run.append(self._written(mock_storage))
+            return _composite()
+
+        with (
+            patch("landsat_lst.job.process_tile", side_effect=pipeline),
+            patch("landsat_lst.job._write_cogs", return_value=("a", "b")),
+        ):
+            process_tile_job(sample_job, storage=mock_storage, run_id="run-1")
+
+        attempt_key = mock_storage.run_record_key("run-1", "N40W075", 1)
+        assert mid_run[0][attempt_key]["status"] is None
+        assert self._written(mock_storage)[attempt_key]["status"] == "completed"
 
     def test_unwritable_record_does_not_fail_an_uploaded_tile(self, sample_job, mock_storage):
         mock_storage.write_text.side_effect = OSError("bucket on fire")
@@ -366,12 +434,43 @@ class TestRunRecord:
     def test_record_roundtrips(self, sample_job, mock_storage):
         result = self._run(sample_job, mock_storage, "run-1")
 
-        restored = JobResult.from_record(json.loads(mock_storage.write_text.call_args.args[1]))
+        pointer = self._written(mock_storage)[mock_storage.run_record_key("run-1", "N40W075")]
+        restored = JobResult.from_record(pointer)
 
         assert restored.job == result.job
         assert restored.status == result.status
         assert restored.scene_count == result.scene_count
         assert restored.lst_key == result.lst_key
+
+    def test_a_sampled_run_roundtrips_its_sample_size(self, mock_storage):
+        """Without ``max_scenes`` the rebuilt job loses its ``-sample{n}`` label.
+
+        The manifest would then claim window ``2021-2025`` for COGs that live
+        under ``2021-2025-sample300``, and reconciliation would look for them
+        in a prefix nothing was ever written to.
+        """
+        job = ProcessingJob(tile=TileId(lat=40, lon=-75), year=2021, end_year=2025, max_scenes=300)
+
+        self._run(job, mock_storage, "run-1")
+
+        pointer = self._written(mock_storage)[mock_storage.run_record_key("run-1", "N40W075")]
+        assert pointer["max_scenes"] == 300
+        restored = JobResult.from_record(pointer)
+        assert restored.job.max_scenes == 300
+        assert restored.job.window_label == "2021-2025-sample300"
+
+    def test_a_record_with_no_status_reads_as_failed(self):
+        """A preempted attempt never settles, so its object has no verdict.
+
+        Reconciliation takes the real answer from the COG listing. This side
+        only has to produce a result rather than a ``KeyError``.
+        """
+        restored = JobResult.from_record(
+            {"tile": "N40W075", "year": 2021, "end_year": 2025, "phase": "destriping"}
+        )
+
+        assert restored.status == "failed"
+        assert restored.job.tile.name == "N40W075"
 
 
 class _NoUploadStorage(LocalStorage):
@@ -392,9 +491,13 @@ class TestHeartbeat:
     def _storage(self, tmp_path) -> LocalStorage:
         return _NoUploadStorage(output_dir=tmp_path / "cogs")
 
+    def _state(self, storage: LocalStorage, tile: str = "N40W075", attempt: int = 1) -> dict | None:
+        raw = storage.read_text(storage.run_record_key("run-1", tile, attempt))
+        return None if raw is None else json.loads(raw)
+
     def _phases(self, storage: LocalStorage, tile: str = "N40W075") -> list[str]:
-        raw = storage.read_text(storage.progress_key("run-1", tile))
-        return [] if raw is None else [json.loads(raw)["phase"]]
+        state = self._state(storage, tile)
+        return [] if state is None else [state["phase"]]
 
     def _run(self, job, storage, *, run_id="run-1", pipeline=None):
         with (
@@ -402,7 +505,7 @@ class TestHeartbeat:
             patch("landsat_lst.job._encode_native") as mock_encode,
             patch("landsat_lst.job.cog_export") as mock_export,
         ):
-            mock_process.side_effect = pipeline or (lambda _job, **_kwargs: MagicMock())
+            mock_process.side_effect = pipeline or (lambda _job, **_kwargs: _composite())
             mock_encode.return_value = MagicMock()
             mock_export.return_value = (MagicMock(), MagicMock())
             return process_tile_job(job, storage=storage, run_id=run_id)
@@ -416,7 +519,7 @@ class TestHeartbeat:
 
         def pipeline(job, **_kwargs):
             report_phase("stac_query")
-            seen.append(json.loads(storage.read_text(storage.progress_key("run-1", "N40W075"))))
+            seen.append(self._state(storage))
             return MagicMock()
 
         self._run(sample_job, storage, pipeline=pipeline)
@@ -435,11 +538,12 @@ class TestHeartbeat:
         """Two of the longest phases; a flat dashboard here is what started #68."""
         storage = self._storage(tmp_path)
         phases = []
+        state_key = storage.run_record_key("run-1", "N40W075", 1)
 
         original = storage.write_text
 
         def spy(key, text, **kwargs):
-            if key.endswith(".progress.json"):
+            if key == state_key:
                 phases.append(json.loads(text)["phase"])
             original(key, text, **kwargs)
 
@@ -458,7 +562,7 @@ class TestHeartbeat:
 
         result = self._run(sample_job, storage, pipeline=pipeline)
 
-        published = json.loads(storage.read_text(storage.progress_key("run-1", "N40W075")))
+        published = self._state(storage)
         assert result.status == "failed"
         assert published["phase"] == "failed"
         assert published["error"] == "No scenes found for the window"
@@ -470,7 +574,23 @@ class TestHeartbeat:
 
         assert not (storage.output_dir / "_runs").exists()
 
-    def test_a_skipped_tile_writes_only_its_record(self, sample_job, tmp_path):
+    def test_a_skipped_tile_publishes_twice_and_never_beats(
+        self, sample_job, tmp_path, monkeypatch
+    ):
+        """A tile that does no work still reports, without paying for a thread.
+
+        It publishes the same two objects every other tile does, so the manifest
+        sees it. Starting a daemon thread to beat a number that never changes
+        would cost a resumed 700-tile run several hundred thread churns.
+        """
+        from landsat_lst.progress import TileHeartbeat
+
+        def never(_self):
+            msg = "a skipped tile must not start a heartbeat thread"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(TileHeartbeat, "__enter__", never)
+
         storage = self._storage(tmp_path)
         for product in ("lst_p95", "qa_count"):
             path = storage.output_dir / storage.cog_key("2023", "N40W075", product)
@@ -480,8 +600,94 @@ class TestHeartbeat:
         result = process_tile_job(sample_job, storage=storage, run_id="run-1")
 
         assert result.status == "skipped"
-        assert storage.read_text(storage.run_record_key("run-1", "N40W075")) is not None
-        assert storage.read_text(storage.progress_key("run-1", "N40W075")) is None
+        assert self._state(storage)["status"] == "skipped"
+        assert self._state(storage)["phase"] == "skipped"
+        pointer = json.loads(storage.read_text(storage.run_record_key("run-1", "N40W075")))
+        assert pointer["status"] == "skipped"
+        assert sorted(p.name for p in (storage.output_dir / "_runs" / "run-1").iterdir()) == [
+            "N40W075.1.json",
+            "N40W075.json",
+        ]
+
+
+class TestAttemptResolution:
+    """A retry numbers itself from the bucket, because Coiled will not say.
+
+    ``COILED_ARRAY_TASK_ID`` is the array index and is identical on every
+    retry, so the artifacts already in the run prefix are the only record of
+    how many times this tile has been tried.
+    """
+
+    def _run(self, job, storage, pipeline=None):
+        with (
+            patch("landsat_lst.job.process_tile") as mock_process,
+            patch("landsat_lst.job._encode_native") as mock_encode,
+            patch("landsat_lst.job.cog_export") as mock_export,
+        ):
+            mock_process.side_effect = pipeline or (lambda _job, **_kwargs: _composite())
+            mock_encode.return_value = MagicMock()
+            mock_export.return_value = (MagicMock(), MagicMock())
+            return process_tile_job(job, storage=storage, run_id="run-1")
+
+    def test_two_attempts_leave_two_state_objects(self, sample_job, tmp_path):
+        """The regression this layout exists for.
+
+        Both attempts used to write ``{tile}.json``, so the retry erased the
+        attempt before it. Run ``2021-2025-20260814T092642Z`` reported a
+        10-second failure against a 33-minute wall clock for exactly that
+        reason, and the attempt that got furthest is unrecoverable.
+        """
+        storage = _NoUploadStorage(output_dir=tmp_path / "cogs")
+
+        def dies(_job, **_kwargs):
+            msg = "No scenes found for the window"
+            raise ValueError(msg)
+
+        self._run(sample_job, storage, pipeline=dies)
+        self._run(sample_job, storage)
+
+        first = json.loads(storage.read_text(storage.run_record_key("run-1", "N40W075", 1)))
+        second = json.loads(storage.read_text(storage.run_record_key("run-1", "N40W075", 2)))
+        assert first["attempt"] == 1
+        assert first["phase"] == "failed"
+        assert first["error"] == "No scenes found for the window"
+        assert second["attempt"] == 2
+        assert second["status"] == "completed"
+        assert second["scene_count"] == 412
+
+    def test_the_pointer_holds_the_newest_attempt(self, sample_job, tmp_path):
+        """One answer per tile, and a retry that succeeds owns it."""
+        storage = _NoUploadStorage(output_dir=tmp_path / "cogs")
+
+        def dies(_job, **_kwargs):
+            msg = "boom"
+            raise ValueError(msg)
+
+        self._run(sample_job, storage, pipeline=dies)
+        self._run(sample_job, storage)
+
+        pointer = json.loads(storage.read_text(storage.run_record_key("run-1", "N40W075")))
+        assert pointer["status"] == "completed"
+        assert pointer["attempt"] == 2
+
+    def test_an_explicit_attempt_is_not_re_resolved(self, sample_job, tmp_path):
+        """The caller that already numbered this process wins.
+
+        The CLI resolves the attempt once, before the log capture opens, and
+        threads it down. Resolving again here would read this process's own
+        state object and number the tile one higher than its log.
+        """
+        storage = _NoUploadStorage(output_dir=tmp_path / "cogs")
+        storage.write_text(storage.run_record_key("run-1", "N40W075", 1), "{}")
+
+        with (
+            patch("landsat_lst.job.process_tile", return_value=_composite()),
+            patch("landsat_lst.job._write_cogs", return_value=("a", "b")),
+        ):
+            process_tile_job(sample_job, storage=storage, run_id="run-1", attempt=7)
+
+        assert storage.read_text(storage.run_record_key("run-1", "N40W075", 7)) is not None
+        assert storage.read_text(storage.run_record_key("run-1", "N40W075", 2)) is None
 
 
 class TestThreadCap:

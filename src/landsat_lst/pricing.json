@@ -1,0 +1,90 @@
+{
+  "_README": [
+    "List prices and billing rules for the VM types a batch tile can land on,",
+    "read by landsat_lst.pricing to turn a measured wall clock into dollars.",
+    "",
+    "This file is data, so a price change is an edit here rather than a code",
+    "change. Update as_of whenever a rate moves, because a stale rate that",
+    "reads as current is the failure this file exists to avoid.",
+    "",
+    "on_demand_usd_hour, memory_gib, vcpu and the billing minimum are published",
+    "by the vendor, so they carry provenance 'published'. A tile cost built",
+    "from them and a measured duration is 'derived'. Only the spot band is",
+    "'assumed', and it is the reason a spot cost is an interval.",
+    "",
+    "Both entries of settings.coiled_vm_types carry 64 GiB, which is why",
+    "profiling.DEFAULT_VM_GIB is a single 64.0 rather than a lookup. The other",
+    "two rows exist to price history, not to be scheduled: r6i.4xlarge is the",
+    "VM every figure in calibration.json was measured on, and r6i.xlarge is the",
+    "32 GiB machine that OOMed a heavy tile at 28.77 GiB.",
+    "",
+    "Regions are not interchangeable and are not interpolated. A region absent",
+    "from this table has no price here, and the caller reports that rather than",
+    "borrowing us-west-2 rates."
+  ],
+  "as_of": "2026-08-14",
+  "billing": {
+    "minimum_seconds": 60,
+    "granularity_seconds": 1,
+    "provenance": "published",
+    "note": "EC2 Linux bills per second with a 60 second minimum per instance launch. A task that ran 10.375 seconds and died still billed a full minute, which is why short failures are not free."
+  },
+  "spot_band": {
+    "low_fraction": 0.3,
+    "high_fraction": 0.75,
+    "provenance": "assumed",
+    "note": "Spot is priced per instance type, per availability zone, per minute, and a finished run cannot be repriced against the rate it actually paid. Nothing this pipeline publishes records it. So a spot cost is an interval spanning the observed spread, not a scalar. The samples below were quoted on one day in one region across one instance generation and still ranged from 0.35 to 0.71 of on-demand, so a single factor would be wrong by more than 2x for one of the two configured VM types.",
+    "samples": [
+      {
+        "instance_type": "r6i.2xlarge",
+        "region": "us-west-2",
+        "spot_usd_hour": 0.359,
+        "on_demand_usd_hour": 0.504,
+        "fraction": 0.71,
+        "sampled_on": "2026-08-14"
+      },
+      {
+        "instance_type": "r6i.4xlarge",
+        "region": "us-west-2",
+        "spot_usd_hour": 0.445,
+        "on_demand_usd_hour": 1.008,
+        "fraction": 0.44,
+        "sampled_on": "2026-08-14"
+      },
+      {
+        "instance_type": "m6i.4xlarge",
+        "region": "us-west-2",
+        "spot_usd_hour": 0.268,
+        "on_demand_usd_hour": 0.768,
+        "fraction": 0.35,
+        "sampled_on": "2026-08-14"
+      }
+    ]
+  },
+  "regions": {
+    "us-west-2": {
+      "r6i.xlarge": {
+        "on_demand_usd_hour": 0.252,
+        "memory_gib": 32.0,
+        "vcpu": 4,
+        "note": "Not scheduled. Kept to price the run that OOMed at 28.77 GiB."
+      },
+      "r6i.2xlarge": {
+        "on_demand_usd_hour": 0.504,
+        "memory_gib": 64.0,
+        "vcpu": 8
+      },
+      "r6i.4xlarge": {
+        "on_demand_usd_hour": 1.008,
+        "memory_gib": 128.0,
+        "vcpu": 16,
+        "note": "Not scheduled. Kept to price run 2021-2025-sample300-20260813T123249Z and every other calibration.json record."
+      },
+      "m6i.4xlarge": {
+        "on_demand_usd_hour": 0.768,
+        "memory_gib": 64.0,
+        "vcpu": 16
+      }
+    }
+  }
+}

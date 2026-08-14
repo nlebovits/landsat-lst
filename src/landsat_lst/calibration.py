@@ -19,30 +19,22 @@ nothing about an ``m6i.4xlarge`` or about 16 threads.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from enum import StrEnum
-from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
-import structlog
+from landsat_lst.provenance import Provenance, load_committed_json
 
-log = structlog.get_logger()
+__all__ = [
+    "CALIBRATION_PATH",
+    "PeakResidual",
+    "Provenance",
+    "Throughput",
+    "peak_residuals",
+    "throughput_for",
+    "wall_time_minutes",
+]
 
 CALIBRATION_PATH = Path(__file__).with_name("calibration.json")
-
-
-class Provenance(StrEnum):
-    """Where a printed figure came from.
-
-    Printed next to the figure rather than buried in a docstring: a reader
-    deciding whether to trust a number is looking at the number.
-    """
-
-    MEASURED = "measured"
-    DERIVED = "derived"
-    ASSUMED = "assumed"
 
 
 @dataclass(frozen=True)
@@ -70,21 +62,6 @@ class Throughput:
     source: str
 
 
-@lru_cache(maxsize=1)
-def _load() -> dict[str, Any]:
-    """Read ``calibration.json``, or an empty record if it cannot be read.
-
-    A missing or malformed calibration file must not stop a plan: the geometry
-    half of the answer is still exact, and the command says which half is
-    missing rather than refusing to run.
-    """
-    try:
-        return json.loads(CALIBRATION_PATH.read_text())
-    except (OSError, ValueError) as e:  # pragma: no cover - shipped with the package
-        log.warning("calibration_unreadable", path=str(CALIBRATION_PATH), error=str(e))
-        return {}
-
-
 def throughput_for(*, vm_type: str, threads: int, phase: str) -> Throughput | None:
     """The measured task rate for this VM, thread count, and phase, if recorded.
 
@@ -93,7 +70,7 @@ def throughput_for(*, vm_type: str, threads: int, phase: str) -> Throughput | No
     would manufacture a measurement -- which is the failure this module exists
     to prevent. No record means the caller prints nothing, not a guess.
     """
-    for row in _load().get("throughput", []):
+    for row in load_committed_json(CALIBRATION_PATH).get("throughput", []):
         if (
             row.get("vm_type") == vm_type
             and row.get("threads") == threads
@@ -120,7 +97,7 @@ def peak_residuals(
     itself the open question.
     """
     out = []
-    for row in _load().get("peak_residuals", []):
+    for row in load_committed_json(CALIBRATION_PATH).get("peak_residuals", []):
         if phase is not None and row.get("phase") != phase:
             continue
         if exclude_vm is not None and row.get("vm_type") == exclude_vm:

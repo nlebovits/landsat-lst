@@ -11,6 +11,7 @@ suite minutes long.
 """
 
 import json
+import time
 
 import dask.array as da
 import numpy as np
@@ -18,6 +19,7 @@ import pytest
 import xarray as xr
 
 from landsat_lst.config import settings
+from landsat_lst.models import ProcessingJob
 from landsat_lst.normalization import offset_graph
 from landsat_lst.pipeline import TIME_CHUNK, compute_annual_composite
 from landsat_lst.profiling import (
@@ -26,10 +28,13 @@ from landsat_lst.profiling import (
     MONTHS,
     PHASE_COMPOSITE,
     PHASE_OFFSETS,
+    PRODUCTION_SCENES,
     PlanTooLarge,
     destripe_disabled,
     estimate_raw_tasks,
     graph_stats,
+    plan_memory,
+    plan_memory_record,
     plan_tile,
     predict_peak,
     profile_compute,
@@ -299,6 +304,85 @@ def test_plan_phase_serializes_for_the_json_flag(planned):
     json.dumps(payload)  # must round-trip for `landsat-lst plan --json`
 
 
+# ---------------------------------------------------------------- plan_memory
+
+
+def test_plan_memory_agrees_with_plan_tile(planned):
+    """The anti-drift test: two pricing paths, one answer.
+
+    A submission stores what plan_memory says and reconcile diffs against it,
+    so a floor that disagreed with `landsat-lst plan` would make both useless.
+    """
+    offsets, composite = plan_memory(tile=parse_tile_name(TILE), scenes=12, threads=4)
+    assert offsets == planned[0].peak
+    assert composite == planned[1].peak
+
+
+def test_plan_memory_charges_a_climatology_only_to_the_offsets_phase():
+    """De-striping holds a resident float32 monthly reference. The composite does not.
+
+    Its twelve-month band is a uint8 `qa_count` streamed to the writer, so
+    charging it a climatology would put 14.5 GiB into every configuration.
+    """
+    offsets, composite = plan_memory(tile=parse_tile_name(TILE), scenes=300, threads=4)
+    assert offsets.months == MONTHS
+    assert offsets.climatology_bytes > 0
+    assert composite.months == 0
+    assert composite.climatology_bytes == 0
+
+
+def test_plan_memory_prices_the_offsets_phase_on_the_coarse_grid():
+    """Only the offset pass reads coarse, so only its floor moves with the factor."""
+    tile = parse_tile_name(TILE)
+    fine = plan_memory(tile=tile, scenes=300, threads=4, offset_factor=2)
+    coarser = plan_memory(tile=tile, scenes=300, threads=4, offset_factor=4)
+
+    assert coarser[0].height < fine[0].height
+    assert coarser[0].climatology_bytes < fine[0].climatology_bytes
+    assert coarser[0].total_bytes < fine[0].total_bytes
+    assert coarser[1] == fine[1]
+
+
+def test_plan_memory_builds_no_graph():
+    """Pure arithmetic, so a 700-tile submission can afford to price every tile.
+
+    Building the graphs for one production-scene tile runs into minutes, which
+    is why the submission record carries floors and not task counts.
+    """
+    start = time.perf_counter()
+    offsets, composite = plan_memory(tile=parse_tile_name(TILE), scenes=PRODUCTION_SCENES)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 0.5
+    assert offsets.scenes == PRODUCTION_SCENES
+    assert composite.total_gib > 0
+
+
+def test_plan_memory_record_round_trips_through_json():
+    """It is stored on a submission record, so it has to survive a dump and a load."""
+    record = plan_memory_record(tile=parse_tile_name(TILE), scenes=300, threads=4, chunk_size=512)
+    restored = json.loads(json.dumps(record))
+
+    assert restored == record
+    assert restored["scenes"] == 300
+    assert restored["chunk_size"] == 512
+    assert restored["threads"] == 4
+    assert restored["offset_factor"] == settings.destripe_offset_resolution_factor
+    assert set(restored["phases"]) == {PHASE_OFFSETS, PHASE_COMPOSITE}
+    assert restored["phases"][PHASE_OFFSETS]["floor_gib"] > 0
+    assert restored["phases"][PHASE_COMPOSITE]["climatology_gib"] == 0
+
+
+def test_plan_memory_record_matches_plan_memory():
+    """The serializer reports the same floors it was handed, not a second estimate."""
+    tile = parse_tile_name(TILE)
+    offsets, composite = plan_memory(tile=tile, scenes=300, threads=4)
+    record = plan_memory_record(tile=tile, scenes=300, threads=4)
+
+    assert record["phases"][PHASE_OFFSETS] == offsets.as_dict()
+    assert record["phases"][PHASE_COMPOSITE] == composite.as_dict()
+
+
 # ---------------------------------------------------------------- build guard
 
 
@@ -485,21 +569,27 @@ def test_profile_compute_adds_cache_records_only_when_asked(profiling_on, monkey
 
 
 def test_profile_compute_publishes_beside_the_heartbeat(profiling_on, monkeypatch):
-    """Inside a batch tile the dump lands in the run prefix reconciliation reads."""
+    """Inside a batch tile the dump lands in the run prefix reconciliation reads.
+
+    It carries the heartbeat's attempt number, so the profile of the attempt
+    that ran long is not overwritten by the retry that ran short.
+    """
     storage = LocalStorage(output_dir=profiling_on / "cogs")
+    job = ProcessingJob(tile=parse_tile_name(TILE), year=2021, end_year=2025)
     with (
-        TileHeartbeat(
-            run_id="run-1", tile=TILE, window="2021-2025", storage=storage, interval_s=3600
-        ),
+        TileHeartbeat(run_id="run-1", job=job, storage=storage, attempt=2, interval_s=3600),
         profile_compute("destripe_offsets"),
     ):
         _small_compute()
 
-    key = storage.profile_key("run-1", TILE, "destripe_offsets")
+    key = storage.profile_key("run-1", TILE, "destripe_offsets", 2)
     payload = json.loads(storage.read_text(key))
     assert payload["run_id"] == "run-1"
     assert payload["tile"] == TILE
     assert payload["resource"]["samples"] >= 0
+    # The state object the same process published, under the same number.
+    assert storage.read_text(storage.run_record_key("run-1", TILE, 2)) is not None
+    assert storage.read_text(storage.profile_key("run-1", TILE, "destripe_offsets", 1)) is None
 
 
 def test_profile_compute_never_fails_the_work_it_wraps(profiling_on, monkeypatch):

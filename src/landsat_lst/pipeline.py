@@ -656,13 +656,18 @@ def process_tile(
     offset_land_mask = None
     factor = settings.destripe_offset_resolution_factor
     if settings.destripe and factor > 1:
-        offset_source = load_scenes(
-            items,
-            job.tile.bbox,
-            patch_url=patch_url,
-            fail_on_error=False,
-            resolution_factor=factor,
-        )
+        # Timed in its own right. Building this graph is single-threaded Python
+        # over every scene in the window, and sitting untimed between two
+        # `land_mask` sections it billed its minutes to the mask and published
+        # the same phase name twice with a silence in the middle.
+        with timed_section("offset_load", scenes_found=len(items)):
+            offset_source = load_scenes(
+                items,
+                job.tile.bbox,
+                patch_url=patch_url,
+                fail_on_error=False,
+                resolution_factor=factor,
+            )
         with timed_section("land_mask"):
             offset_land_mask = _build_land_mask(
                 job.tile.bbox, offset_source.latitude, offset_source.longitude
