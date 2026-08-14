@@ -79,6 +79,24 @@ ITEMSIZE = 4
 #: only a starting constant -- ``predict_peak`` takes it as an argument.
 DEFAULT_BASELINE_GIB = 2.0
 
+#: Raw tasks per block-step (one spatial block at one time chunk), measured on
+#: real geometry: ~93 for the offset graph, ~47 for the composite. The larger is
+#: used for both, so the estimate errs toward refusing.
+TASKS_PER_BLOCK_STEP_OFFSETS = 95
+
+#: The composite graph is much cheaper per block-step than the offset graph:
+#: measured 41.8 at 2,048 squared over 100 scenes and 37.9 at 4,096 squared over
+#: 200 scenes, against 87.3 and 95.1 for offsets. Using the offset figure for
+#: both, as this module did, overstates the composite by ~2.4x -- which matters
+#: because the composite runs at the native grid and is the larger of the two
+#: graphs whatever the offset factor is.
+TASKS_PER_BLOCK_STEP_COMPOSITE = 40
+
+#: Kept as the conservative default for the pre-build guard, where erring high
+#: means refusing a graph that would have fitted rather than building one that
+#: takes the machine down.
+_TASKS_PER_BLOCK_STEP = TASKS_PER_BLOCK_STEP_OFFSETS
+
 #: Scenes a five-year land tile pulls, from run ``2021-2025-20260812T142408Z``.
 PRODUCTION_SCENES = 2930
 
@@ -340,8 +358,14 @@ def predict_peak(
     months: int = MONTHS,
     itemsize: int = ITEMSIZE,
     baseline_gib: float = DEFAULT_BASELINE_GIB,
+    tasks_per_block_step: int = TASKS_PER_BLOCK_STEP_OFFSETS,
 ) -> PeakEstimate:
-    """Compute the memory floor for one de-striping configuration.
+    """Compute the memory floor for one phase of a tile.
+
+    One phase, not one tile. The offsets pass and the composite pass run on
+    different grids and cost different amounts per block, so each gets its own
+    estimate and ``plan_memory`` returns both. Pass
+    :data:`TASKS_PER_BLOCK_STEP_COMPOSITE` and the native grid for the second.
 
     Args:
         scenes: Scenes pooled into the window.
@@ -371,7 +395,13 @@ def predict_peak(
         climatology_bytes=months * height * width * itemsize,
         baseline_bytes=int(baseline_gib * GIB),
         graph_bytes=int(
-            estimate_raw_tasks(height=height, width=width, chunk_size=chunk_size, scenes=scenes)
+            estimate_raw_tasks(
+                height=height,
+                width=width,
+                chunk_size=chunk_size,
+                scenes=scenes,
+                tasks_per_block_step=tasks_per_block_step,
+            )
             * BYTES_PER_TASK
         ),
     )
@@ -502,11 +532,6 @@ MAX_PLAN_TASKS = 50_000_000
 #: chunk to save data memory made a tile unbuildable. See #94.
 BYTES_PER_TASK = 2.8 * GIB / 1_800_000
 
-#: Raw tasks per block-step (one spatial block at one time chunk), measured on
-#: real geometry: ~93 for the offset graph, ~47 for the composite. The larger is
-#: used for both, so the estimate errs toward refusing.
-_TASKS_PER_BLOCK_STEP = 95
-
 
 class PlanTooLarge(RuntimeError):
     """Raised when building a graph would cost more memory than it is worth.
@@ -528,7 +553,14 @@ class PlanTooLarge(RuntimeError):
         )
 
 
-def estimate_raw_tasks(*, height: int, width: int, chunk_size: int, scenes: int) -> int:
+def estimate_raw_tasks(
+    *,
+    height: int,
+    width: int,
+    chunk_size: int,
+    scenes: int,
+    tasks_per_block_step: int = _TASKS_PER_BLOCK_STEP,
+) -> int:
     """Roughly how many raw tasks a graph over this geometry will hold.
 
     Cheap enough to run before allocating anything, which is the whole point:
@@ -548,7 +580,7 @@ def estimate_raw_tasks(*, height: int, width: int, chunk_size: int, scenes: int)
     blocks_per_side_h = -(-height // chunk_size)
     blocks_per_side_w = -(-width // chunk_size)
     time_chunks = -(-scenes // TIME_CHUNK)
-    return blocks_per_side_h * blocks_per_side_w * time_chunks * _TASKS_PER_BLOCK_STEP
+    return blocks_per_side_h * blocks_per_side_w * time_chunks * tasks_per_block_step
 
 
 def _guard(
@@ -656,7 +688,7 @@ def plan_memory(
     coarse_h, coarse_w = tile_geobox(tile, factor).shape
     native_h, native_w = tile_geobox(tile).shape
 
-    def floor(*, height: int, width: int, months: int) -> PeakEstimate:
+    def floor(*, height: int, width: int, months: int, per_step: int) -> PeakEstimate:
         return predict_peak(
             scenes=scenes,
             chunk_size=csize,
@@ -665,19 +697,30 @@ def plan_memory(
             width=width,
             months=months,
             baseline_gib=baseline_gib,
+            tasks_per_block_step=per_step,
         )
 
     return (
         # Only de-striping builds the float32 monthly climatology. Its blocks
         # are read by every scene's anomaly, so they stay resident and the whole
         # (12, h, w) array is charged. It runs on the coarse offsets grid.
-        floor(height=coarse_h, width=coarse_w, months=MONTHS),
+        floor(
+            height=coarse_h,
+            width=coarse_w,
+            months=MONTHS,
+            per_step=TASKS_PER_BLOCK_STEP_OFFSETS,
+        ),
         # The composite builds no such array. Its twelve-month band is
         # ``qa_count``, a uint8 result streamed to the COG writer block by
         # block, never a resident float32 cube. Charging it one put 14.5 GiB
         # into every row of a --sweep, swamping the levers the sweep exists to
         # rank: chunk 128 at 8 threads scored better than chunk 512 at 1.
-        floor(height=native_h, width=native_w, months=0),
+        floor(
+            height=native_h,
+            width=native_w,
+            months=0,
+            per_step=TASKS_PER_BLOCK_STEP_COMPOSITE,
+        ),
     )
 
 
