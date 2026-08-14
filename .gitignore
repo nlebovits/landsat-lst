@@ -28,7 +28,10 @@ env/
 
 # UV
 .python-version
-uv.lock
+# uv.lock IS committed. CI installs with --frozen, so without it here
+# every job re-resolved against the version ranges in pyproject and
+# tested a dependency set nobody had run. See the 2026-08-14 rashid
+# 0.1.5 -> 0.1.6 break.
 
 # Testing
 .tox/
