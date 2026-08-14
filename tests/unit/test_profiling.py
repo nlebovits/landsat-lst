@@ -146,14 +146,40 @@ def test_graph_stats_fusion_is_not_a_constant_factor():
 
 
 def test_predict_peak_matches_hand_arithmetic():
-    """The floor is three named terms, each checkable without running anything."""
+    """The floor is four named terms, each checkable without running anything."""
     peak = predict_peak(
         scenes=2930, chunk_size=512, threads=4, height=9000, width=9000, baseline_gib=2.0
     )
     assert peak.stack_bytes == 4 * 512 * 512 * 2930 * 4
     assert peak.climatology_bytes == MONTHS * 9000 * 9000 * 4
     assert peak.baseline_bytes == int(2.0 * GIB)
-    assert peak.total_bytes == (peak.stack_bytes + peak.climatology_bytes + peak.baseline_bytes)
+    assert peak.total_bytes == (
+        peak.stack_bytes + peak.climatology_bytes + peak.baseline_bytes + peak.graph_bytes
+    )
+
+
+def test_graph_term_dominates_and_is_quadratic_in_chunk_size():
+    """The term whose absence made a tile unbuildable while the floor looked fine.
+
+    Building a graph allocates a Python object per task whether or not you
+    compute it. Halving the chunk quarters the block count, so it quadruples
+    this term -- the opposite direction from the stack term, and larger. Leaving
+    it out is why chunk 256 read as a memory saving on 2026-08-14 when it in
+    fact put ~108 GB of task objects into the composite pass. See #94.
+    """
+    wide = predict_peak(scenes=2930, chunk_size=512, threads=1, height=18000, width=18000)
+    narrow = predict_peak(scenes=2930, chunk_size=256, threads=1, height=18000, width=18000)
+
+    assert narrow.graph_bytes > 3.5 * wide.graph_bytes
+    assert narrow.stack_bytes < wide.stack_bytes  # the term that looked like a win
+    assert narrow.total_bytes > wide.total_bytes  # the one that decides
+
+
+def test_chunk_256_is_disqualified_for_a_full_tile():
+    """The check that costs milliseconds and would have saved four days."""
+    assert not predict_peak(
+        scenes=2930, chunk_size=256, threads=1, height=18000, width=18000
+    ).fits_in(64)
 
 
 def test_predict_peak_stack_term_is_linear_in_threads_and_scenes():

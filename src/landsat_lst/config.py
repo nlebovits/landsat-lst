@@ -207,31 +207,30 @@ class Settings(BaseSettings):
     )
 
     load_chunk_size: int = Field(
-        default=256,
+        default=512,
         description="Spatial (lat/lon) chunk size for odc-stac scene loading. "
-        "256, not 512, because 512 provably cannot finish a production tile. "
-        "Measured on a production-type VM at 4096 squared px "
-        "(`landsat-lst benchmark`): at 800 scenes, chunk 512 with 4 threads was "
-        "SIGKILLed on 64 GiB while chunk 256 with 1 thread peaked at 16.2 GB. "
-        "Across 50-400 scenes the cut is 3.1x to 4.1x, roughly ten times what "
-        "the static floor predicts, because the unmodelled memory scales with "
-        "threads * chunk**2 too. Costs ~23% more tasks and, on real data with "
-        "real range requests, measured 2.9x slower at this size (see 7fda25c). "
-        "See docs/findings-memory-model.md.",
+        "512, and do not lower it. Chunk size sets task count quadratically, "
+        "and the composite pass runs at the native 18,000 squared grid whatever "
+        "the offset factor is: at chunk 512 that graph is 1,296 blocks and "
+        "~17.8M raw tasks (~28 GB of Python objects), at chunk 256 it is 5,041 "
+        "blocks and ~69M tasks (~108 GB) and cannot be built on a 64 GiB VM at "
+        "all. 256 was tried on 2026-08-14 because it cuts the *data* term, and "
+        "it does -- while making the binding constraint catastrophically worse. "
+        "Cap dask_max_threads instead: it cuts the same data term linearly and "
+        "leaves the graph alone. See docs/findings-memory-model.md.",
     )
 
     dask_max_threads: int | None = Field(
         default=1,
-        description="Cap on dask's threaded scheduler for one tile. The threaded "
-        "scheduler holds one chunk per thread, so peak memory during de-striping "
-        "is roughly threads * chunk_size**2 * scenes * 4 bytes: on a 16-vCPU VM "
-        "at chunk 512 over 2,930 scenes that is ~49 GB of concurrent chunks "
-        "alone. 1, not None, because None leaves dask's default of one thread "
-        "per core and a tile at 4 threads was already OOMing. Paired with "
-        "load_chunk_size 256 this measured 16.2 GB at 800 scenes where 4 threads "
-        "at chunk 512 was SIGKILLed, and projects to ~57 GB at a full 2,930-scene "
-        "window against 68.7 GB of VM. The phase is I/O bound, so the threads "
-        "removed are mostly concurrent waiting rather than useful work. "
+        description="Cap on dask's threaded scheduler for one tile. The "
+        "scheduler holds one chunk per thread, so the data term is roughly "
+        "threads * chunk_size**2 * scenes * 4 bytes. This is the *only* memory "
+        "lever that does not enlarge the task graph, which is why it carries "
+        "the whole load: at chunk 512 over 2,930 scenes, 4 threads is 12.3 GB "
+        "of concurrent chunks against 3.1 GB at one thread. Paired with "
+        "load_chunk_size 512 the full-tile arithmetic is ~28 GB of composite "
+        "graph plus ~3 GB of data against 68.7 GB of VM. The de-striping phase "
+        "is I/O bound, so the threads removed are mostly concurrent waiting. "
         "See docs/findings-memory-model.md.",
     )
     dask_workers: int = Field(

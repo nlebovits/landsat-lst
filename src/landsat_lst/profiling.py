@@ -303,10 +303,11 @@ class PeakEstimate:
     stack_bytes: int
     climatology_bytes: int
     baseline_bytes: int
+    graph_bytes: int = 0
 
     @property
     def total_bytes(self) -> int:
-        return self.stack_bytes + self.climatology_bytes + self.baseline_bytes
+        return self.stack_bytes + self.climatology_bytes + self.baseline_bytes + self.graph_bytes
 
     @property
     def total_gib(self) -> float:
@@ -369,6 +370,10 @@ def predict_peak(
         stack_bytes=threads * block_pixels * scenes * itemsize,
         climatology_bytes=months * height * width * itemsize,
         baseline_bytes=int(baseline_gib * GIB),
+        graph_bytes=int(
+            estimate_raw_tasks(height=height, width=width, chunk_size=chunk_size, scenes=scenes)
+            * BYTES_PER_TASK
+        ),
     )
 
 
@@ -488,6 +493,14 @@ PHASE_COMPOSITE = "composite"
 #: took a 64 GB desktop down. 50M sits above every configuration worth planning
 #: and below the ones that cannot finish.
 MAX_PLAN_TASKS = 50_000_000
+
+#: Bytes of Python objects per raw dask task, measured on this repo: the
+#: 18,000 squared composite at chunk 512 over 300 scenes holds 1.8M raw tasks in
+#: about 2.8 GB. Building a graph allocates these whether or not you compute it,
+#: and for a full window this term is the largest of the three -- ~28 GB for the
+#: composite pass at chunk 512, ~108 GB at chunk 256, which is why halving the
+#: chunk to save data memory made a tile unbuildable. See #94.
+BYTES_PER_TASK = 2.8 * GIB / 1_800_000
 
 #: Raw tasks per block-step (one spatial block at one time chunk), measured on
 #: real geometry: ~93 for the offset graph, ~47 for the composite. The larger is
