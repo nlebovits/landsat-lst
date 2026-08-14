@@ -184,6 +184,70 @@ def load_scenes(
     )
 
 
+def scene_cloud_cover(
+    items: list,
+    bbox: tuple[float, float, float, float],
+    time: xr.DataArray,
+    resolution_factor: int = 1,
+) -> xr.DataArray:
+    """Aggregate each STAC item's ``eo:cloud_cover`` onto a loaded time axis.
+
+    ``load_scenes`` groups items by solar day, so several items collapse into
+    one time step and there is no item-indexed axis to join a per-item property
+    against. This reproduces that grouping and returns the mean cloud cover of
+    the items behind each step.
+
+    Replicating a grouping rule invites silent drift, so ``time`` is required
+    rather than optional: the timestamps derived here are checked against the
+    axis the caller actually loaded, and a mismatch raises. Skipping that check
+    would let a changed upstream rule misalign the join, and every statistic
+    drawn from it would then be wrong rather than absent.
+
+    Args:
+        items: The same STAC items handed to :func:`load_scenes`.
+        bbox: The same bounding box.
+        time: The ``time`` coordinate of the array :func:`load_scenes` returned.
+        resolution_factor: The same factor. It reaches the grouping through the
+            geobox centroid, which sets the solar-time shift.
+
+    Returns:
+        Cloud cover percentage per solar-day scene, on ``time``.
+
+    Raises:
+        ValueError: If the reproduced grouping does not match ``time``.
+    """
+    from odc.stac._mdtools import parse_items  # noqa: PLC0415
+    from odc.stac._stac_load import _extract_timestamps, _group_items  # noqa: PLC0415
+
+    parsed = list(parse_items(items))
+    gbox = geobox_for_bbox(bbox, resolution_factor)
+    ((mid_lon, _),) = gbox.extent.centroid.to_crs("epsg:4326").points
+
+    grouped = _group_items(items, parsed, "solar_day", mid_lon)
+    stamps = np.array(
+        _extract_timestamps([[parsed[i] for i in g] for g in grouped]), dtype="datetime64[ns]"
+    )
+
+    loaded = time.values.astype("datetime64[ns]")
+    if stamps.shape != loaded.shape or not np.array_equal(stamps, loaded):
+        msg = (
+            f"solar-day grouping does not reproduce the loaded time axis "
+            f"({stamps.size} scenes derived vs {loaded.size} loaded). "
+            "odc-stac's grouping rule has changed; scene_cloud_cover must follow it."
+        )
+        raise ValueError(msg)
+
+    cover = [
+        float(np.mean([items[i].properties["eo:cloud_cover"] for i in group])) for group in grouped
+    ]
+    return xr.DataArray(
+        np.array(cover, dtype="float64"),
+        dims=["time"],
+        coords={"time": time.values},
+        name="eo_cloud_cover",
+    )
+
+
 def _build_land_mask(
     bbox: tuple[float, float, float, float],
     latitude: xr.DataArray,
