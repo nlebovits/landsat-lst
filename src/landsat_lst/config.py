@@ -72,8 +72,15 @@ class Settings(BaseSettings):
 
     max_cloud_cover: int = Field(
         default=100,
-        description="Maximum cloud cover percentage for scene filtering. "
-        "Set to 100 to disable scene-level filtering and rely on pixel-level QA.",
+        description="Scene-level cloud filter, applied as eo:cloud_cover < this. "
+        "The default is not the no-op it looks like: strict less-than still drops "
+        "every scene reported at exactly 100% cloud, 154 of 2,912 for N40W075 over "
+        "2021-2025. Use 101 for a true no-op. Below 100 the filter starts removing "
+        "scenes that carry data, and eo:cloud_cover describes a whole ~185km "
+        "footprint rather than the part of it a tile sees, so it is a weak proxy for "
+        "what a tile actually gets. Score a candidate threshold with "
+        "scripts/analyze_cloud_cover_filter.py before lowering it; see "
+        "docs/findings-cloud-cover-filter.md.",
     )
 
     pixels_per_degree: int = Field(
@@ -135,9 +142,13 @@ class Settings(BaseSettings):
     destripe_min_scene_pixels: int = Field(
         default=500,
         description="Coverage floor, in native-resolution pixels: discard a scene "
-        "covering less valid land than this. Counts from a coarse offset grid are "
-        "scaled up before comparison, so the threshold keeps one meaning whatever "
-        "destripe_offset_resolution_factor is set to.",
+        "covering less valid land than this. Applies only when offsets are estimated "
+        "at native resolution; a coarse grid uses destripe_min_offset_samples on its "
+        "own pixels instead. The two floors replace each other rather than converting "
+        "into each other, because a coarse count cannot be scaled back to a native "
+        "one: GDAL's average ignores nodata, so one valid fine pixel still yields a "
+        "valid coarse pixel (1 native pixel read as 13 at factor 8). See "
+        "normalization.rejection_floor and docs/findings-offset-subsampling.md.",
     )
     destripe_min_offset_samples: int = Field(
         default=200,
@@ -151,11 +162,16 @@ class Settings(BaseSettings):
         description="Estimate per-scene offsets from a stack loaded at "
         "resolution * factor, served from the source COGs' internal overviews "
         "([2,4,8,16,32,64]). 1 keeps offsets at native resolution. Validated at "
-        "Pergamino: factor 2 reproduces native offsets to a median of 0.002 degC "
-        "(p99 0.063, max 0.188) with zero keep/reject flips, and 4 is the largest "
-        "that passes. Offset error grows linearly in the factor, so do not raise "
-        "this without re-running scripts/validate_offset_subsampling.py. The saving "
-        "caps out near 2x regardless, since the P95 still needs a native pass.",
+        "Pergamino, 2026-08-14: factor 2 reproduces native offsets to a median of "
+        "0.0017 degC (p99 0.072, max 0.219) with zero keep/reject flips, and is now "
+        "the largest that passes. Factor 4 was tried for issue #81 and rejected: its "
+        "max |delta| is 0.546 degC against a pre-registered bound of 0.5. It would "
+        "have cut the offset pass from 613,240 tasks to 155,239. Offset error grows "
+        "linearly in the factor, so do not raise this without re-running "
+        "scripts/validate_offset_subsampling.py -- and re-run it rather than citing "
+        "an older table, since the shipped grid and the offset code have both moved "
+        "since the first sweep. The saving caps out near 2x regardless, because the "
+        "P95 still needs a native pass.",
     )
 
     # COG output. Literal rather than str so an unsupported codec fails at

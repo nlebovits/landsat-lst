@@ -331,6 +331,24 @@ Consequences worth remembering:
   in the factor, so raising it requires re-running
   `scripts/validate_offset_subsampling.py`; the ceiling is ~2× regardless, since
   the P95 still needs a native pass.
+- **Factor 4 was tried for #81 and rejected.** It would have cut the offset pass
+  from 613,240 tasks to 155,239, and it fails the pre-registered accuracy bound:
+  max |Δ| 0.546 °C against a limit of 0.5. It *passed* at 0.431 in August, so the
+  gate must be **re-run, never cited** — the shipped grid moved under ADR-008
+  (3600×3601 → 3600×3600) and `scene_offsets` fused its two reductions since.
+  That same re-run has the factor-1 reference reproducing the committed cap
+  calibration to 0.0701 °C rather than 0.0005, which is why the script now prints
+  `NO -- not comparable to the shipped cap`. Harmless against a 15 °C cap, but do
+  not silence it. See [findings](docs/findings-offset-subsampling.md).
+- **A scene-level cloud filter is not a free cost lever, and `max_cloud_cover=100`
+  is not a no-op.** The query is `eo:cloud_cover <`, so the default already drops
+  every scene reported at exactly 100% cloud (154 of 2,912 for N40W075); 101 is the
+  true no-op. Lowering it thins the monthly climatology, which shifts the offsets of
+  the scenes that *stay* by up to 3.0 °C at a 90% threshold and 4.4 °C at 80 — six
+  times the bound that disqualified offset factor 4, for a fifth of the saving. The
+  keep-set is stable (zero decision flips); it is the correction that moves. Issue
+  #34's "redundant" verdict predates de-striping and could not see this. See
+  [findings](docs/findings-cloud-cover-filter.md) and #81.
 - `destripe_min_scene_pixels` applies on the **native** path;
   `destripe_min_offset_samples` applies on a **coarse** path. A coarse valid-pixel
   count cannot be scaled back to a native one — averaging spreads data across

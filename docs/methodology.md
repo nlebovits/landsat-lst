@@ -29,14 +29,18 @@ per-year percentiles would be a percentile of percentiles, which is not the same
 
 ## Quality filtering
 
-Quality control uses the standard Landsat Collection 2 Level-2 quality flags. Rather than
-excluding entire scenes based on reported cloud cover, every scene is retained and filtering
-happens at the pixel level. Pixels affected by cloud, cloud shadow, cirrus, dilated cloud, or
-snow and ice are excluded before compositing.
+Quality control uses the standard Landsat Collection 2 Level-2 quality flags. Almost every scene
+is retained and filtering happens at the pixel level. Pixels affected by cloud, cloud shadow,
+cirrus, dilated cloud, or snow and ice are excluded before compositing.
 
-Scene-level cloud filtering was tested and abandoned. Tightening the threshold from 100% to 70%
-dropped 34 of 170 scenes and moved the composite mean by 0.01 C, with a spatial correlation of
-0.98 against the unfiltered result. It cost observations and bought nothing.
+Scene-level cloud filtering as a *quality* measure was tested and abandoned. Tightening the
+threshold from 100% to 70% dropped 34 of 170 scenes and moved the composite mean by 0.01 C, with
+a spatial correlation of 0.98 against the unfiltered result. It cost observations and improved
+nothing, so pixel-level QA carries the work.
+
+One filter does still apply. The query asks for `eo:cloud_cover` strictly below the threshold, so
+the default of 100 excludes scenes reported at exactly 100% cloud: 154 of 2,912 for a five-year
+N40W075 window. Those scenes have no unclouded pixel to contribute by their own metadata.
 
 After conversion to land surface temperature, observations outside a conservative physically
 plausible range (-50 to 80 C) are discarded. These primarily represent fill values, reprojection

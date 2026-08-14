@@ -216,6 +216,16 @@ changed the product **negligibly**: Δmean **+0.01 °C**, spatial correlation
 Once pixel-level QA is good, scene-level filtering is redundant. This **vindicates
 the earlier issue-#34 decision** to disable scene-level cloud filtering.
 
+> **Revisited 2026-08-14 as a cost lever, and rejected again on stronger grounds.**
+> The test above ran *before* season-aware de-striping shipped, so it could not see
+> the interaction that now decides the question: a smaller scene set builds a thinner
+> monthly climatology, which shifts the offsets of the scenes that remain by up to
+> **3.0 °C** even at a 90% threshold. That is 6× the bound that disqualified offset
+> factor 4. See [findings-cloud-cover-filter.md](findings-cloud-cover-filter.md) and
+> [#81](https://github.com/nlebovits/landsat-lst/issues/81). Note also that the
+> default is not the no-op this section implies: `lt 100` already drops every scene
+> reported at exactly 100% cloud.
+
 ### Cross-sensor harmonization — non-issue
 Landsat 8/9 share the C2 ST algorithm and are cross-calibrated. There is nothing to
 harmonize; it is not the seam source.
@@ -239,7 +249,7 @@ removes only the deviation-from-expected.
 | Window length | **5-year** default (WRI-aligned); 3-year lighter fallback | Adopted (5yr) |
 | Improved QA mask (dilated cloud + cirrus) | **In pipeline** | Shipped (`qa.py`) |
 | Physical-plausibility clamp (−50/80 °C) | **In pipeline** | Shipped (`config.py`, `convert_to_celsius`) |
-| Scene-level cloud filter | **Disabled** (redundant) | Confirmed (issue #34) |
+| Scene-level cloud filter | **Disabled** (redundant, and it moves the offsets) | Confirmed twice (issues #34, #81) |
 | Season-aware per-scene normalization | **Chosen approach** | **In pipeline** — `normalization.py`, [ADR-007](adr/007-scene-normalization.md) |
 
 **Winning recipe:** 3-year (or 5-year) P95 + improved QA masking (+ clamp) +
