@@ -23,7 +23,7 @@ jobs:
         run: uv python install 3.11
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
       - name: Install mutmut
         run: uv pip install mutmut
@@ -90,7 +90,7 @@ jobs:
         run: uv python install 3.11
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
       - name: Run slow tests
         run: uv run pytest tests/ -v -m slow --timeout=300
@@ -111,7 +111,7 @@ jobs:
         run: uv python install 3.11
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
       - name: Cache test data
         uses: actions/cache@v6
@@ -138,7 +138,7 @@ jobs:
         run: uv python install 3.11
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
       # Regression guards, not measurements. A runner is smaller than the dev
       # box and much smaller than a production VM, so these assert on the shape
@@ -175,7 +175,7 @@ jobs:
         run: uv python install 3.11
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
       - name: Full dependency audit
         run: |
