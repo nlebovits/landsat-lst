@@ -22,12 +22,22 @@ uncorrected bias in the stack, which is worse than dropping the scene. See
 issue #46 and ADR-007.
 """
 
+from __future__ import annotations
+
+import time
+from typing import TYPE_CHECKING
+
 import dask
 import numpy as np
-import xarray as xr
 
+from landsat_lst.config import settings
 from landsat_lst.profiling import PROFILE_DESTRIPE_OFFSETS, profile_compute
 from landsat_lst.progress import GraphProgress
+
+if TYPE_CHECKING:
+    import xarray as xr
+
+    from landsat_lst.offsets import OffsetCache
 
 _TIME_DIM = "time"
 
@@ -71,16 +81,29 @@ def offset_graph(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
     return anomaly.median(dim=spatial, skipna=True), lst.notnull().sum(dim=spatial)
 
 
-def scene_offsets(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
+def scene_offsets(
+    lst: xr.DataArray, *, cache: OffsetCache | None = None
+) -> tuple[xr.DataArray, xr.DataArray]:
     """Estimate one scalar offset per scene, plus each scene's valid-pixel count.
 
     Split out from ``seasonal_debias`` so the cap can be calibrated: computing
     the offsets is the expensive part, and a sweep over candidate caps should
-    pay it once.
+    pay it once. With ``cache`` supplied it pays it once across *processes* too,
+    which is what makes that sentence true outside a single sweep script.
+
+    Args:
+        lst: The stack to estimate against, already masked to land.
+        cache: Optional :class:`~landsat_lst.offsets.OffsetCache`. A hit returns
+            immediately; a miss computes and then writes. The cache never
+            raises, so passing one cannot fail a tile that would have succeeded.
 
     Returns:
         ``(offset, n_valid)``, both indexed on time and eagerly evaluated.
     """
+    if cache is not None and (hit := cache.read(lst.time)) is not None:
+        return hit
+
+    started = time.monotonic()
     # Both reductions read the same stack, so they are computed together: two
     # `.compute()` calls would walk it twice, and on a 5-year tile that second
     # walk is a full re-read of every scene for a reduction that costs almost
@@ -92,7 +115,52 @@ def scene_offsets(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
     # records which task prefixes the hours went to, and is off by default.
     with GraphProgress(), profile_compute(PROFILE_DESTRIPE_OFFSETS):
         offset, n_valid = dask.compute(*offset_graph(lst))
+
+    if cache is not None:
+        cache.write(offset, n_valid, duration_s=time.monotonic() - started)
     return offset, n_valid
+
+
+def scene_keep_mask(
+    offset: xr.DataArray,
+    n_valid: xr.DataArray,
+    *,
+    max_offset_c: float,
+    floor: int,
+) -> xr.DataArray:
+    """Which scenes survive rejection, given their offsets and sample counts.
+
+    Split out so a caller that only wants the *decision* -- ``landsat-lst
+    offsets`` reporting a rejection fraction, a sweep over candidate caps --
+    applies the identical rule rather than a re-implementation of it that drifts.
+
+    Args:
+        offset: One scalar per scene.
+        n_valid: Valid-pixel count per scene, on the grid the offset was
+            estimated on.
+        max_offset_c: Discard a scene whose absolute offset exceeds this.
+        floor: Minimum valid pixels, in that same grid's pixels.
+
+    Returns:
+        Boolean mask on the scene axis.
+    """
+    return offset.notnull() & (n_valid >= floor) & (np.abs(offset) <= max_offset_c)
+
+
+def rejection_floor(*, offset_source_given: bool) -> int:
+    """The sparse floor that applies, in the grid the offset actually rests on.
+
+    A coarse count cannot be scaled up to stand in for a native one: GDAL's
+    average ignores nodata, so a block holding one valid fine pixel still yields
+    a valid coarse pixel. Measured at Pergamino, a scene with exactly 1 valid
+    native pixel reported 13 at factor 8; scaling that by 64 would claim 816 and
+    wave through a scene the native path rejects outright. So the two floors
+    replace each other rather than converting into each other. See
+    docs/findings-offset-subsampling.md.
+    """
+    if offset_source_given:
+        return settings.destripe_min_offset_samples
+    return settings.destripe_min_scene_pixels
 
 
 def seasonal_debias(
@@ -102,6 +170,7 @@ def seasonal_debias(
     min_scene_pixels: int,
     min_offset_samples: int = 0,
     offset_source: xr.DataArray | None = None,
+    cache: OffsetCache | None = None,
 ) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
     """De-bias each scene against a per-pixel monthly climatology.
 
@@ -127,6 +196,11 @@ def seasonal_debias(
             count cannot be scaled back to a native one (see below).
         offset_source: Optional coarser stack to estimate offsets from. Must
             share ``lst``'s time coordinate. Defaults to ``lst`` itself.
+        cache: Optional offset cache. Only the estimate is cached, never the
+            rejection: ``max_offset_c`` and both floors are applied to whatever
+            the cache returns, so sweeping a cap costs one lookup per candidate
+            instead of one 27-minute pass. This is the whole point of caching
+            here rather than caching ``debiased``.
 
     Returns:
         ``(debiased, offset, keep)``. ``debiased`` covers only the surviving
@@ -147,21 +221,15 @@ def seasonal_debias(
         )
         raise ValueError(msg)
 
-    offset, n_valid = scene_offsets(source)
+    offset, n_valid = scene_offsets(source, cache=cache)
 
     # The sparse guard is stated on whichever grid the offset was estimated on,
-    # because that is the grid the median actually rests on.
-    #
-    # A coarse count cannot be scaled back up to stand in for the native one.
-    # Coarse loading inflates apparent validity: GDAL's average ignores nodata,
-    # so a block holding one valid fine pixel still yields a valid coarse pixel,
-    # and qa_pixel is nearest-sampled independently of it. Measured at Pergamino,
-    # a scene with exactly 1 valid native pixel reported 13 valid pixels at
-    # factor 8 -- scaling that by 64 would claim 816 and wave through a scene the
-    # native path rejects outright. See docs/findings-offset-subsampling.md.
+    # because that is the grid the median actually rests on. See
+    # :func:`rejection_floor` for why the two floors replace rather than convert
+    # into each other.
     floor = min_scene_pixels if offset_source is None else min_offset_samples
 
-    keep = offset.notnull() & (n_valid >= floor) & (np.abs(offset) <= max_offset_c)
+    keep = scene_keep_mask(offset, n_valid, max_offset_c=max_offset_c, floor=floor)
 
     kept_idx = np.flatnonzero(np.asarray(keep.values))
     if kept_idx.size == 0:

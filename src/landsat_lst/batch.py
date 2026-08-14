@@ -146,6 +146,7 @@ def _task_command(
     end_year: int | None,
     force: bool,
     max_scenes: int | None = None,
+    use_offset_cache: bool = True,
 ) -> str:
     """The shell script one VM runs for one tile.
 
@@ -179,6 +180,8 @@ def _task_command(
     # 2,930-scene run that looked like a sample from the submitting side.
     if max_scenes is not None:
         parts += ["--max-scenes", str(max_scenes)]
+    if not use_offset_cache:
+        parts.append("--no-offset-cache")
     quoted = shlex.join(parts)
     # Expanded by bash on the VM, not by the submitting shell.
     return f'#!/bin/bash\n{quoted} --tile "${TASK_INPUT_VAR}"\n'
@@ -223,6 +226,7 @@ def submit_batch(
     force: bool = False,
     run_id: str | None = None,
     storage: StorageBackend | None = None,
+    use_offset_cache: bool = True,
 ) -> BatchSubmission:
     """Submit tiles to Coiled Batch and return without waiting.
 
@@ -238,6 +242,9 @@ def submit_batch(
             omitted.
         storage: Storage backend used for the resume listing (default from
             :func:`landsat_lst.storage.get_storage`).
+        use_offset_cache: Forwarded to every task as ``--no-offset-cache`` when
+            False. On by default, which is what makes a preempted tile's retry
+            skip the offset pass its first attempt already paid for.
 
     Returns:
         The :class:`BatchSubmission`, also written to
@@ -281,6 +288,7 @@ def submit_batch(
         end_year=jobs[0].end_year,
         force=force,
         max_scenes=jobs[0].max_scenes,
+        use_offset_cache=use_offset_cache,
     )
 
     log.info(

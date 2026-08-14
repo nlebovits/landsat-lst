@@ -55,14 +55,24 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 #: Phases one tile passes through, in order. Wall clock concentrates in
-#: ``destriping`` (the coarse offset pass), ``compositing`` (the native P95),
-#: and ``exporting`` (the COG write); the rest are seconds.
+#: ``destriping`` (the coarse offset pass), ``coverage_check`` and ``exporting``
+#: (two separate full passes over the native stack; see issue #77 item 4).
+#:
+#: Split finer than the work is, on purpose. A label covering three unrelated
+#: things cannot point at any of them: ``compositing`` used to span lazy graph
+#: construction, an eager coverage reduction, and the handoff to export, and a
+#: nine-minute silence inside it was unattributable. ``composite_graph`` and
+#: ``land_mask`` run no dask graph at all and take single-threaded Python time
+#: that every concurrency lever we have is blind to, which is exactly why they
+#: are named.
 PHASES = (
     "starting",
     "stac_query",
     "loading",
+    "land_mask",
     "destriping",
-    "compositing",
+    "composite_graph",
+    "coverage_check",
     "exporting",
     "uploading",
 )
@@ -70,6 +80,14 @@ PHASES = (
 #: Phases after which no further heartbeat is expected. A tile sitting on one of
 #: these is finished, not stale, however old its heartbeat is.
 TERMINAL_PHASES = ("done", "failed")
+
+#: A dask graph is running and :class:`GraphProgress` is reporting it.
+GRAPH_RUNNING = "running"
+
+#: No dask graph is running. Distinct from "a graph is running but has not
+#: reported yet", which is what a bare ``tasks_total=None`` used to mean and
+#: could not be told apart from an uninstrumented silence.
+GRAPH_IDLE = "idle"
 
 _PUMP_CHUNK_BYTES = 65536
 _PUMP_JOIN_TIMEOUT_S = 5.0
@@ -138,6 +156,10 @@ class TileHeartbeat:
         # between graphs reports no fraction rather than a stale one.
         self._tasks_done: int | None = None
         self._tasks_total: int | None = None
+        # Whether a dask graph is running at all, which a task count cannot say:
+        # `None` counts mean both "no graph here" and "a graph that has not
+        # reported yet", and those need different reactions from a watcher.
+        self._graph_state = GRAPH_IDLE
 
     def payload(self) -> dict:
         """The heartbeat object as it is stored."""
@@ -151,6 +173,7 @@ class TileHeartbeat:
                 phase_seconds.get(phase, 0.0) + (now - self._phase_started), 1
             )
             done, total = self._tasks_done, self._tasks_total
+            graph_state = self._graph_state
         return {
             "run_id": self.run_id,
             "tile": self.tile,
@@ -160,6 +183,7 @@ class TileHeartbeat:
             "phase_seconds": phase_seconds,
             "tasks_done": done,
             "tasks_total": total,
+            "graph_state": graph_state,
             "peak_rss_mb": peak_rss_mb(),
             "host": self._host,
             "pid": os.getpid(),
@@ -173,6 +197,17 @@ class TileHeartbeat:
         with self._lock:
             self._tasks_done = done
             self._tasks_total = total
+
+    def set_graph_state(self, state: str) -> None:
+        """Record whether a dask graph is running. Never raises.
+
+        Owned by :class:`GraphProgress` rather than by :meth:`set_phase`,
+        because a phase boundary and a graph boundary are different events: the
+        composite's graph construction and its coverage reduction are two phases
+        inside one stretch of work, and only one of them runs a graph.
+        """
+        with self._lock:
+            self._graph_state = state
 
     def write(self) -> None:
         """Publish the current state. Never raises."""
@@ -284,6 +319,10 @@ class GraphProgress:
         from dask.callbacks import Callback  # noqa: PLC0415
 
         heartbeat = self._heartbeat
+        # Published before the first task retires, so the window between
+        # entering a compute and dask's first callback reads as "running with no
+        # count yet" rather than as no graph at all.
+        heartbeat.set_graph_state(GRAPH_RUNNING)
 
         class _Reporter(Callback):
             # Same state dask's own ProgressBar reads: the scheduler keeps
@@ -309,7 +348,59 @@ class GraphProgress:
             self._callback = None
         if self._heartbeat is not None:
             self._heartbeat.set_task_progress(None, None)
+            self._heartbeat.set_graph_state(GRAPH_IDLE)
         return False
+
+
+#: Set while a caller is building pipeline graphs for inspection rather than
+#: running a tile. See :func:`silence_sections`.
+_silenced: ContextVar[bool] = ContextVar("landsat_lst_sections_silenced", default=False)
+
+
+@contextmanager
+def silence_sections() -> Iterator[None]:
+    """Stop :func:`timed_section` narrating, for a caller that is not a tile.
+
+    ``landsat-lst plan`` builds the pipeline's real graphs against synthetic
+    data to count their tasks. That runs the same instrumented code a tile does,
+    but nothing about it is a tile: there is no work to attribute, and one
+    ``phase_complete`` line on stdout makes ``plan --json`` unparsable.
+
+    A context variable rather than reconfiguring structlog, which is global,
+    order-dependent, and caches bound loggers -- muting it worked in isolation
+    and leaked in a full test run.
+    """
+    token = _silenced.set(True)
+    try:
+        yield
+    finally:
+        _silenced.reset(token)
+
+
+@contextmanager
+def timed_section(phase: str, **counts: int | None) -> Iterator[None]:
+    """Enter ``phase`` and log what it cost on the way out.
+
+    For the stretches that run no dask graph and so publish no task count:
+    graph construction, the land-mask rasterization, the STAC query. Each is
+    single-threaded Python, invisible to every concurrency lever we have, and
+    none had ever been measured. Anything that can exceed roughly ten seconds
+    belongs in one. See issue #77 item 4.
+
+    The duration is logged rather than published, because the heartbeat already
+    carries per-phase seconds; this puts the same number in the task log, where
+    a post-mortem reads it without a running watcher.
+    """
+    if _silenced.get():
+        yield
+        return
+
+    report_phase(phase, **counts)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        log.info("phase_complete", phase=phase, seconds=round(time.monotonic() - started, 1))
 
 
 def report_phase(phase: str, **counts: int | None) -> None:

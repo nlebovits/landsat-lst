@@ -183,6 +183,53 @@ Rules worth keeping:
 
 ---
 
+## The offset pass is cached — do not pay it twice
+
+`scene_offsets` is 27 of the ~35 minutes in a 300-scene tile (598,604 tasks) and its whole
+output is ~600 float64 values. It is cached at
+`_offsets/{tile}/{window}/f{factor}/v{version}-{digest}.json`. See
+[ADR-012](docs/adr/012-cached-scene-offsets.md) and issue #77.
+
+```bash
+landsat-lst offsets   -t N40W075   # estimate, persist, report the rejection fraction
+landsat-lst composite -t N40W075   # one tile to COGs, reading whatever is cached
+landsat-lst process --distributed  # unchanged fleet driver; forwards the cache flag
+```
+
+Rules worth keeping:
+
+- **The cache is keyed, not versioned.** The digest covers the sorted scene ids,
+  `destripe_offset_resolution_factor`, and the clamp bounds; `offsets.ALGORITHM_VERSION`
+  covers code changes a hash cannot see. **Bump it** when you change `offset_graph`, the QA
+  bits in `create_qa_mask`, or the DN-to-Celsius conversion. Nothing else detects that.
+- **Only the estimate is cached, never the rejection.** `max_offset_c` and the sparse floors
+  are applied to whatever the cache returns, so a cap sweep pays the estimator once. Do not
+  "optimize" this by caching the debiased stack.
+- **A cache failure never fails a tile.** Same rule as the heartbeat: log and swallow, then
+  recompute. Losing 27 minutes beats losing the run.
+- **`--no-offset-cache` and `--force` are different.** The first disables both halves and
+  leaves the record alone (validating the estimator). The second skips the read and still
+  writes (rebuilding an estimate whose inputs did not change). `--force` on `composite` and
+  `process` is unrelated: it is about the output COGs.
+- **A sampled window cannot check a rejection fraction.** 300 scenes over five years leaves
+  each month ~25 scenes for its climatology instead of 244, and the noisy reference inflates
+  offsets: 69% rejected on the sample against 21.8% at Pergamino.
+- **`rejection_floor` and `scene_keep_mask` are shared** between `seasonal_debias` and
+  `landsat-lst offsets` on purpose. A second copy of the rule would drift.
+
+Phases are split finer than the work is, so a silence is attributable
+(`stac_query`, `loading`, `land_mask`, `destriping`, `composite_graph`, `coverage_check`,
+`exporting`, `uploading`). `graph_state` in the heartbeat says whether a dask graph is
+running at all, which a `None` task count could not. Wrap anything that can exceed ~10s in
+`progress.timed_section`. A caller that builds pipeline graphs without being a tile — only
+`landsat-lst plan` — wraps them in `progress.silence_sections`, or `plan --json` stops
+being parseable.
+
+**Known, not fixed:** `process_tile` computes `qa_count` eagerly for the coverage log and
+`cog_export` then walks the same native stack again. Two full passes per tile.
+
+---
+
 ## Output grid — one shared grid, always
 
 `settings.pixels_per_degree` (3600) is the grid definition; `settings.resolution` is a

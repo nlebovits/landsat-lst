@@ -22,6 +22,19 @@ def main() -> None:
     """Landsat Land Surface Temperature annual composites."""
 
 
+#: Shared by every command that runs the offset pass. Off means neither read
+#: nor write, so a run meant to validate the estimator cannot be served its own
+#: stale answer and cannot overwrite a good record with a suspect one.
+_offset_cache_option = click.option(
+    "--no-offset-cache",
+    is_flag=True,
+    help="Recompute the per-scene offsets instead of reading them from "
+    "_offsets/, and do not write what this run computes. Use when validating a "
+    "change to the estimator itself; everything downstream of it reuses the "
+    "cache safely, because the key covers every input that moves the result.",
+)
+
+
 def _build_jobs(
     year: int | None,
     end_year: int | None,
@@ -100,6 +113,7 @@ def _build_jobs(
     "machinery at tile geometry in minutes; output is a sample, not the product, "
     "and is written under a -sampleN window so it cannot overwrite a real tile.",
 )
+@_offset_cache_option
 def process(
     *,
     year: int | None,
@@ -112,6 +126,7 @@ def process(
     run_id: str | None,
     limit: int | None,
     max_scenes: int | None,
+    no_offset_cache: bool,
 ) -> None:
     """Process Landsat data to COG composites.
 
@@ -146,9 +161,15 @@ def process(
             return
 
         if distributed:
-            _process_distributed(jobs, force=force, run_id=run_id, wait=wait)
+            _process_distributed(
+                jobs,
+                force=force,
+                run_id=run_id,
+                wait=wait,
+                use_offset_cache=not no_offset_cache,
+            )
         else:
-            _process_local(jobs, force=force, run_id=run_id)
+            _process_local(jobs, force=force, run_id=run_id, use_offset_cache=not no_offset_cache)
 
 
 def _task_log(tiles: tuple[str, ...], run_id: str | None):
@@ -178,7 +199,9 @@ def _task_log(tiles: tuple[str, ...], run_id: str | None):
     return capture_task_log(run_id=run_id, tile=safe, storage=get_storage())
 
 
-def _process_local(jobs: list, *, force: bool, run_id: str | None = None) -> None:
+def _process_local(
+    jobs: list, *, force: bool, run_id: str | None = None, use_offset_cache: bool = True
+) -> None:
     """Process jobs sequentially in this process with a progress bar.
 
     This is also the code path a Coiled Batch VM runs, with one tile and a
@@ -200,7 +223,9 @@ def _process_local(jobs: list, *, force: bool, run_id: str | None = None) -> Non
 
         for job in jobs:
             progress.update(task, description=f"Processing {job.tile.name}...")
-            result = process_tile_job(job, force=force, run_id=run_id)
+            result = process_tile_job(
+                job, force=force, run_id=run_id, use_offset_cache=use_offset_cache
+            )
 
             if result.status == "completed":
                 completed += 1
@@ -237,7 +262,9 @@ def _print_results(results: list) -> None:
             console.print(f"    [red]{r.job.tile.name}: {r.error}[/red]")
 
 
-def _process_distributed(jobs: list, *, force: bool, run_id: str | None, wait: bool) -> None:
+def _process_distributed(
+    jobs: list, *, force: bool, run_id: str | None, wait: bool, use_offset_cache: bool = True
+) -> None:
     """Submit jobs to Coiled Batch and hand back the run token.
 
     No per-tile progress bar and no held connection: `watch` is the live view,
@@ -254,7 +281,7 @@ def _process_distributed(jobs: list, *, force: bool, run_id: str | None, wait: b
         f"Types: {', '.join(settings.coiled_vm_types)}"
     )
 
-    submission = submit_batch(jobs, force=force, run_id=run_id)
+    submission = submit_batch(jobs, force=force, run_id=run_id, use_offset_cache=use_offset_cache)
     console.print(f"  Run id: [bold]{submission.run_id}[/bold]")
 
     if submission.cluster_id is None:
@@ -278,6 +305,160 @@ def _process_distributed(jobs: list, *, force: bool, run_id: str | None, wait: b
     console.print(f"  Final job state: {state or 'unknown'}")
     _print_results(reconcile_run(submission.run_id))
     console.print(f"  Manifest: {settings.manifest_dir / (submission.run_id + '.json')}")
+
+
+def _window_options(command):
+    """The window and sampling options every per-tile phase command shares."""
+    for option in reversed(
+        [
+            click.option(
+                "-t",
+                "--tile",
+                "tiles",
+                multiple=True,
+                required=True,
+                help="Tile to run (e.g. N40W075); repeatable",
+            ),
+            click.option(
+                "-y",
+                "--year",
+                type=int,
+                default=None,
+                help="Start year. Omit for the production window.",
+            ),
+            click.option("--end-year", type=int, default=None, help="End year (inclusive)"),
+            click.option(
+                "--max-scenes",
+                type=int,
+                default=None,
+                help="Keep at most N scenes, sampled evenly across the window.",
+            ),
+        ]
+    ):
+        command = option(command)
+    return command
+
+
+@main.command()
+@_window_options
+@_offset_cache_option
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    help="Recompute and overwrite the stored offsets even on a cache hit",
+)
+def offsets(
+    *,
+    tiles: tuple[str, ...],
+    year: int | None,
+    end_year: int | None,
+    max_scenes: int | None,
+    no_offset_cache: bool,
+    force: bool,
+) -> None:
+    """Estimate one tile-window's per-scene offsets and persist them.
+
+    The offset pass is the longest compute in a tile and its result is a few
+    kilobytes: 26.9 minutes and 598,604 dask tasks for roughly 600 float64
+    values on the 300-scene N40W075 sample. Running it here writes those values
+    under `_offsets/`, so the next `process` on the same scene set skips it. See
+    issue #77 item 2.
+
+    Two things this is for. Warming the cache before a batch of experiments that
+    cannot change the offsets, which is most of them: the rejection cap, both
+    sparse floors, the land mask, the encoding, the COG writer. And reading a
+    tile's rejection fraction on its own, which is the number
+    `destripe_max_offset_c` was calibrated against on mid-latitude cropland and
+    the one worth checking before trusting it on a humid tropical tile.
+
+    Nothing here is written to the published prefix, so this never produces or
+    overwrites a tile's COGs.
+    """
+    from landsat_lst.pipeline import compute_tile_offsets
+
+    jobs = _build_jobs(year, end_year, tiles, max_scenes)
+    console.print(f"[bold]Offsets for window {jobs[0].window_label}[/bold]")
+
+    for job in jobs:
+        estimate = compute_tile_offsets(job, use_offset_cache=not no_offset_cache, refresh=force)
+        source = "[green]cached[/green]" if estimate.cached else "computed"
+        diagnostics = estimate.diagnostics
+        console.print(
+            f"  {job.tile.name}  {estimate.scenes} scenes  {source} in {estimate.duration_s:.0f}s"
+        )
+        console.print(
+            f"    kept      {int(diagnostics['n_kept'])}/{int(diagnostics['n_scenes'])}  "
+            f"rejected {100 * estimate.rejected_frac:.1f}%"
+        )
+        if "p50" in diagnostics:
+            console.print(
+                f"    offset    p1 {diagnostics['p1']:+.2f}  p50 {diagnostics['p50']:+.2f}  "
+                f"p99 {diagnostics['p99']:+.2f}  std {diagnostics['std']:.2f} degC"
+            )
+        console.print(f"    key       {estimate.key.storage_key}")
+
+    # The cap was fitted at Pergamino, where 21.8 percent of scenes were
+    # rejected. A tile far from that is telling you something about either the
+    # cap or the climate, and it is cheaper to notice here than in a composite.
+    console.print(
+        "\n  [dim]Calibration reference: 21.8% rejected at Pergamino "
+        "(mid-latitude cropland, 2021-2025). A sampled window rejects more, "
+        "because a thinner climatology inflates apparent offsets.[/dim]"
+    )
+
+
+@main.command()
+@_window_options
+@_offset_cache_option
+@click.option("--force", "-f", is_flag=True, help="Rebuild even if the COGs exist")
+def composite(
+    *,
+    tiles: tuple[str, ...],
+    year: int | None,
+    end_year: int | None,
+    max_scenes: int | None,
+    no_offset_cache: bool,
+    force: bool,
+) -> None:
+    """Build and export one tile-window's COGs, reading any cached offsets.
+
+    The single-tile companion to `process`, which is the fleet driver: no Coiled
+    path, no job list, no progress bar over tiles. Reach for this when iterating
+    on one tile, and pair it with `offsets` to pay the estimator once across
+    however many attempts follow.
+
+    Skipping is by output, not by input: a tile whose COGs already exist is left
+    alone unless --force. That check answers "did this tile produce output?" and
+    deliberately not "is that output current" -- the offset cache is where input
+    identity is enforced, because its key covers the scene set and the settings
+    that shape the estimate. See issue #77 item 1.
+    """
+    from landsat_lst.job import process_tile_job
+
+    jobs = _build_jobs(year, end_year, tiles, max_scenes)
+    console.print(f"[bold]Compositing window {jobs[0].window_label}[/bold]")
+
+    failed = 0
+    for job in jobs:
+        result = process_tile_job(job, force=force, use_offset_cache=not no_offset_cache)
+        if result.status == "completed":
+            console.print(
+                f"  [green]OK[/green] {job.tile.name}  {result.scene_count} scenes  "
+                f"{result.duration_s:.0f}s  peak {result.peak_rss_mb or 0:.0f} MB"
+            )
+            console.print(f"       {result.lst_key}")
+            console.print(f"       {result.qa_key}")
+        elif result.status == "skipped":
+            console.print(
+                f"  [yellow]skipped[/yellow] {job.tile.name}: COGs exist (--force to rebuild)"
+            )
+        else:
+            failed += 1
+            console.print(f"  [red]FAIL[/red] {job.tile.name}: {result.error}")
+
+    if failed:
+        raise SystemExit(1)
 
 
 def _print_plan_phases(phases: tuple, vm_gib: float) -> None:

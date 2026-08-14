@@ -402,7 +402,7 @@ class TestHeartbeat:
             patch("landsat_lst.job._encode_native") as mock_encode,
             patch("landsat_lst.job.cog_export") as mock_export,
         ):
-            mock_process.side_effect = pipeline or (lambda _job: MagicMock())
+            mock_process.side_effect = pipeline or (lambda _job, **_kwargs: MagicMock())
             mock_encode.return_value = MagicMock()
             mock_export.return_value = (MagicMock(), MagicMock())
             return process_tile_job(job, storage=storage, run_id=run_id)
@@ -414,7 +414,7 @@ class TestHeartbeat:
         storage = self._storage(tmp_path)
         seen = []
 
-        def pipeline(job):
+        def pipeline(job, **_kwargs):
             report_phase("stac_query")
             seen.append(json.loads(storage.read_text(storage.progress_key("run-1", "N40W075"))))
             return MagicMock()
@@ -452,7 +452,7 @@ class TestHeartbeat:
     def test_a_failed_tile_ends_on_failed_with_its_error(self, sample_job, tmp_path):
         storage = self._storage(tmp_path)
 
-        def pipeline(job):
+        def pipeline(job, **_kwargs):
             msg = "No scenes found for the window"
             raise ValueError(msg)
 
@@ -499,7 +499,7 @@ class TestThreadCap:
         monkeypatch.setattr(settings, "dask_max_threads", None)
         seen = {}
 
-        def fake_process(job):
+        def fake_process(job, **_kwargs):
             seen["num_workers"] = dask.config.get("num_workers", None)
             return MagicMock()
 
@@ -519,7 +519,7 @@ class TestThreadCap:
         monkeypatch.setattr(settings, "dask_max_threads", 3)
         seen = {}
 
-        def fake_process(job):
+        def fake_process(job, **_kwargs):
             seen["num_workers"] = dask.config.get("num_workers", None)
             seen["scheduler"] = dask.config.get("scheduler", None)
             return MagicMock()

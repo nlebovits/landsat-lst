@@ -273,6 +273,7 @@ def process_tile_job(
     force: bool = False,
     storage: StorageBackend | None = None,
     run_id: str | None = None,
+    use_offset_cache: bool = True,
 ) -> JobResult:
     """Process a single tile-window job with retry/resume support.
 
@@ -293,6 +294,12 @@ def process_tile_job(
             :func:`landsat_lst.batch.reconcile_run` to collect, and a heartbeat
             at ``_runs/{run_id}/{tile}.progress.json`` reports the tile's phase
             while it runs, for `landsat-lst watch` to render.
+        use_offset_cache: Read and write the per-scene offset cache. On a warm
+            cache this removes the tile's longest compute; ``False`` forces the
+            recompute. Note that ``force`` and this are independent: ``force``
+            is about the *output* COGs, this is about an *input* the pipeline
+            derives, and re-deriving an unchanged input to overwrite a corrupt
+            object would be 27 minutes bought for nothing.
 
     Returns:
         JobResult with status and asset keys
@@ -301,7 +308,14 @@ def process_tile_job(
     logger = log.bind(tile=job.tile.name, year=job.window_label)
 
     with _thread_cap():
-        return _process_tile_job(job, force=force, storage=storage, run_id=run_id, logger=logger)
+        return _process_tile_job(
+            job,
+            force=force,
+            storage=storage,
+            run_id=run_id,
+            logger=logger,
+            use_offset_cache=use_offset_cache,
+        )
 
 
 def _thread_cap():
@@ -326,6 +340,7 @@ def _process_tile_job(
     storage: StorageBackend,
     run_id: str | None,
     logger,
+    use_offset_cache: bool = True,
 ) -> JobResult:
     """The body of :func:`process_tile_job`, under whatever dask config it set."""
 
@@ -349,7 +364,7 @@ def _process_tile_job(
         try:
             # Layer 2: Process tile through pipeline
             logger.info("tile_processing_start")
-            composite = process_tile(job)
+            composite = process_tile(job, use_offset_cache=use_offset_cache, storage=storage)
 
             # Layer 3: Export COGs and upload them
             lst_key, qa_key = _write_cogs(composite, storage, job, logger)
@@ -396,6 +411,7 @@ def run_batch(
     *,
     force: bool = False,
     storage: StorageBackend | None = None,
+    use_offset_cache: bool = True,
 ) -> list[JobResult]:
     """Run a batch of tile-year jobs sequentially (local execution).
 
@@ -405,6 +421,7 @@ def run_batch(
         jobs: Iterable of processing jobs
         force: If True, reprocess even if the COGs exist
         storage: Storage backend (defaults to configured backend)
+        use_offset_cache: Read and write the per-scene offset cache
 
     Returns:
         List of JobResult for each job
@@ -413,7 +430,9 @@ def run_batch(
     results = []
 
     for job in jobs:
-        result = process_tile_job(job, force=force, storage=storage)
+        result = process_tile_job(
+            job, force=force, storage=storage, use_offset_cache=use_offset_cache
+        )
         results.append(result)
 
     return results
