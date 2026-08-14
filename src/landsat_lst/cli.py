@@ -148,6 +148,7 @@ def process(
     capture, attempt = _task_log(tiles, run_id)
     with capture:
         jobs = _build_jobs(year, end_year, tiles, max_scenes)
+        _profile_sampled_run(max_scenes)
         if limit is not None:
             jobs = jobs[:limit]
         console.print(f"[bold]Processing window {jobs[0].window_label}[/bold]")
@@ -184,6 +185,39 @@ def process(
                 use_offset_cache=not no_offset_cache,
                 attempt=attempt,
             )
+
+
+def _profile_sampled_run(max_scenes: int | None) -> None:
+    """Turn per-task profiling on for a sampled run, unless the operator spoke.
+
+    ``--max-scenes`` means a sample, and a sample exists to be measured: it
+    writes no product, it runs in minutes, and the question it was started to
+    answer is nearly always which operation owns the wall clock. Leaving the
+    dump behind a second flag is how the run that mattered on 2026-08-14
+    produced one only because ``LST_PROFILE_DASK`` happened to be set by hand.
+
+    ``settings.profile_dask``'s own docstring reasoning still holds for a
+    700-tile build, and that path passes no ``--max-scenes``, so it is untouched.
+    ``profile_dask_cache`` stays gated on its own: it retains a record per task,
+    and a sampled de-striping graph still reaches hundreds of thousands.
+
+    An explicit ``LST_PROFILE_DASK`` wins either way. The environment is read
+    directly rather than through ``settings.model_fields_set``: pydantic adds a
+    field to that set on plain attribute assignment, so anything that toggled
+    ``settings.profile_dask`` at runtime would read as an operator decision.
+    """
+    import os
+
+    from landsat_lst.config import settings
+
+    spoken = any(key.upper() == "LST_PROFILE_DASK" for key in os.environ)
+    if max_scenes is None or spoken:
+        return
+    settings.profile_dask = True
+    console.print(
+        f"  [dim]Sampled run ({max_scenes} scenes): dask profiling on. "
+        f"Set LST_PROFILE_DASK=0 to opt out.[/dim]"
+    )
 
 
 def _task_log(tiles: tuple[str, ...], run_id: str | None):
@@ -738,6 +772,325 @@ def plan(
         "de-striping holds resident, and a process baseline. It is a lower bound: "
         "read the residual line for what a real run did.[/dim]"
     )
+
+
+#: Scenes this command will build locally without being told twice. The dev box
+#: carries less memory than a production VM, and an unbounded local graph build
+#: has taken a 64 GB desktop down before. Execution belongs on the VM; the
+#: laptop gets the graph-inspection tier and a small smoke sweep.
+LOCAL_SCENE_CEILING = 200
+
+
+def _print_sweep_measurements(results: list) -> None:
+    """One row per configuration, with the ratio the sweep exists to produce."""
+    from rich.table import Table
+
+    table = Table(box=None, pad_edge=False)
+    for column, justify in (
+        ("scenes", "right"),
+        ("peak GB", "right"),
+        ("floor GB", "right"),
+        ("ratio", "right"),
+        ("offset tasks", "right"),
+        ("min", "right"),
+    ):
+        table.add_column(column, justify=justify)
+
+    for m in results:
+        if not m.ok:
+            table.add_row(f"{m.geometry.scenes:,}", "[red]FAILED[/red]", "", "", "", "")
+            continue
+        table.add_row(
+            f"{m.geometry.scenes:,}",
+            f"{m.peak_rss_mb / 1024:.1f}",
+            f"{m.floor_mb / 1024:.1f}",
+            f"{m.peak_over_floor:.1f}",
+            f"{m.offset_tasks:,}",
+            f"{m.wall_s / 60:.1f}",
+        )
+    console.print(table)
+
+
+#: What each verdict means for `plan`, stated once so a reader does not have to
+#: re-derive it from the fit. These are the three outcomes issue #94 enumerates.
+_VERDICTS = {
+    "constant_ratio": (
+        "The ratio holds across the sweep. Give predict_peak this correction "
+        "factor and `landsat-lst plan` becomes predictive rather than one-sided."
+    ),
+    "growing_ratio": (
+        "The ratio grows with scene count. Something scales that the model "
+        "treats as fixed, which localizes the leak to the groupby shuffle or "
+        "the anomaly broadcast. Direct evidence for issue #93."
+    ),
+    "not_streaming": (
+        "Peak RSS barely moved: the stack still fits in RAM at this geometry, "
+        "so dask never streams and there is no memory scaling to fit. Per "
+        "ADR-011 no projection is printed. Raise --blocks or --scenes."
+    ),
+    "insufficient": "Too few configurations survived to fit a curve.",
+}
+
+
+@main.command()
+@click.option("--scenes", multiple=True, type=int, help="Scene count to measure; repeatable")
+@click.option("--blocks", type=int, default=8, help="Blocks per side, in chunks")
+@click.option("--chunk", type=int, default=512, help="Spatial chunk edge in px")
+@click.option("--threads", type=int, default=4, help="Concurrent dask threads")
+@click.option(
+    "--distributed",
+    "-d",
+    is_flag=True,
+    help="Run the sweep on one Coiled VM of the production instance type",
+)
+@click.option("--fetch", "fetch_id", default=None, help="Read a published sweep back by run id")
+@click.option(
+    "--run-id",
+    default=None,
+    help="Publish the result under this run id. Set by the VM; rarely useful locally.",
+)
+@click.option(
+    "--force-local",
+    is_flag=True,
+    help=f"Build more than {LOCAL_SCENE_CEILING} scenes on this machine anyway",
+)
+@click.option(
+    "--out", type=click.Path(path_type=Path), default=None, help="Where to write the JSON"
+)
+def benchmark(
+    *,
+    scenes: tuple[int, ...],
+    blocks: int,
+    chunk: int,
+    threads: int,
+    distributed: bool,
+    fetch_id: str | None,
+    run_id: str | None,
+    force_local: bool,
+    out: Path | None,
+) -> None:
+    """Measure peak RSS against scene count on synthetic data at real geometry.
+
+    `landsat-lst plan` reports a memory **floor**: the concurrent block stacks,
+    the resident climatology, and a process baseline. A configuration that
+    cannot fit the floor is disqualified for free, but one that fits may still
+    OOM, and the size of that gap is what this measures. On the 300-scene
+    N40W075 sample the floor landed far under the 78.6 GB actually observed.
+
+    Run it on a VM, not here. The dev box carries less memory than the VM, so
+    the ceiling under test is unreachable; the answer is about production
+    hardware, which is the only hardware whose peak RSS matters; and synthetic
+    data means the VM does no I/O, so the sweep is about 20 minutes and well
+    under a dollar.
+
+        landsat-lst benchmark --distributed     # submits, prints a run id
+        landsat-lst benchmark --fetch <run-id>  # reads the result back
+
+    The verdict is the deliverable, not the numbers. Write it up in
+    docs/findings-memory-model.md whichever way it lands.
+    """
+    import json as json_module
+
+    from landsat_lst.benchmarks import (
+        DEFAULT_SWEEP_SCENES,
+        benchmark_key,
+        fetch_sweep,
+        submit_sweep,
+        sweep,
+        sweep_report,
+    )
+
+    counts = list(scenes) if scenes else list(DEFAULT_SWEEP_SCENES)
+
+    if fetch_id:
+        payload = fetch_sweep(fetch_id)
+        if payload is None:
+            raise click.ClickException(
+                f"Nothing published at {benchmark_key(fetch_id)} yet. The task may "
+                f"still be running, or it died before writing; check `coiled logs`."
+            )
+        console.print(json_module.dumps(payload, indent=2))
+        return
+
+    if distributed:
+        submission = submit_sweep(counts, blocks=blocks, chunk=chunk, threads=threads)
+        console.print(f"[bold]Submitted[/bold] {submission['run_id']}")
+        console.print(f"  Cluster: {submission['cluster_id']}")
+        console.print(f"  Result:  {submission['key']}")
+        console.print(
+            f"\n  Read it back with: landsat-lst benchmark --fetch {submission['run_id']}"
+        )
+        return
+
+    over = [n for n in counts if n > LOCAL_SCENE_CEILING]
+    if over and not force_local:
+        raise click.UsageError(
+            f"{', '.join(str(n) for n in over)} scenes is past the "
+            f"{LOCAL_SCENE_CEILING}-scene local ceiling. Building a graph "
+            "allocates Python objects whether or not you compute it, and an "
+            "unbounded local build has taken a 64 GB desktop down. Use "
+            "--distributed for the real sweep, or --force-local to override."
+        )
+
+    side = blocks * chunk
+    console.print(
+        f"[bold]Sweep[/bold] {side}x{side} px ({blocks**2} blocks of {chunk}), {threads} threads"
+    )
+    results = sweep(
+        counts,
+        blocks=blocks,
+        chunk=chunk,
+        threads=threads,
+        on_result=lambda m: console.print(
+            f"  [dim]{m.geometry.scenes:>5} scenes: "
+            + (
+                f"FAILED - {m.error.splitlines()[-1][:80]}"
+                if not m.ok
+                else f"{m.peak_rss_mb / 1024:.1f} GB, {m.wall_s / 60:.1f} min"
+            )
+            + "[/dim]"
+        ),
+    )
+
+    console.print()
+    _print_sweep_measurements(results)
+
+    report = sweep_report(results)
+    console.print(f"\n[bold]Verdict: {report['verdict']}[/bold]")
+    console.print(f"  {_VERDICTS.get(report['verdict'], '')}")
+    if report.get("streaming_regime"):
+        projected = report["projected_peak_mb"] / 1024
+        console.print(
+            f"\n  At {report['target_scenes']:,} scenes this geometry projects to "
+            f"{projected:.1f} GB, against a 64 GiB VM."
+        )
+        if not report["projected_fits_vm"]:
+            console.print(
+                "  [yellow]That does not fit. Cut threads or chunk size and re-run, "
+                "or plan on a larger instance.[/yellow]"
+            )
+
+    payload = {
+        "blocks": blocks,
+        "chunk": chunk,
+        "threads": threads,
+        "report": report,
+        "measurements": [m.as_dict() for m in results],
+    }
+    text = json_module.dumps(payload, indent=2)
+
+    if run_id:
+        # On the VM this is the only copy that outlives the machine.
+        from landsat_lst.storage import get_storage
+
+        key = benchmark_key(run_id)
+        get_storage().write_text(key, text)
+        console.print(f"\nPublished {key}")
+
+    destination = out or Path("results/decision/synthetic_scaling.json")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text)
+    console.print(f"Wrote {destination}")
+
+
+@main.command()
+@click.option("--tile", "-t", default="N40W075", help="Tile to cache")
+@click.option("--year", "-y", type=int, default=2021, help="First year of the window")
+@click.option("--end-year", type=int, default=2025, help="Last year, inclusive")
+@click.option("--max-scenes", type=int, default=300, help="Scenes to keep, sampled evenly")
+@click.option(
+    "--factor",
+    type=int,
+    default=8,
+    help="Resolution factor. Each doubling divides the stack by four. "
+    "Production estimates offsets at 2, which for a five-degree tile is 97 GB.",
+)
+@click.option("--max-gb", type=float, default=None, help="Refuse a fetch larger than this")
+@click.option("--force", "-f", is_flag=True, help="Refetch even if the fixture exists")
+@click.option("--list", "show_list", is_flag=True, help="Show what is already cached")
+@click.option("--dry-run", is_flag=True, help="Print the size arithmetic and stop")
+def fixture(
+    *,
+    tile: str,
+    year: int,
+    end_year: int,
+    max_scenes: int,
+    factor: int,
+    max_gb: float | None,
+    force: bool,
+    show_list: bool,
+    dry_run: bool,
+) -> None:
+    """Cache a real tile's coarse stack locally, for accuracy work.
+
+    Comparing two offset estimators means running both over the same scenes.
+    Without a fixture that is a STAC query and hundreds of gigabytes of coarse
+    reads per iteration, for an answer that is 600 floats. The first fetch is
+    slow; every later one is a local memory-map.
+
+    Size is arithmetic over the grid, so check it before you fetch:
+
+    \b
+        factor  2:  9000x9000  ->  97.2 GB    (production's offset grid)
+        factor  4:  4500x4500  ->  24.3 GB
+        factor  8:  2250x2250  ->   6.1 GB    (default)
+        factor 16:  1125x1125  ->   1.5 GB
+
+    Coarsening costs absolute accuracy, and this fixture answers a relative
+    question: both estimators read the same pixels, so the comparison is exact
+    at any factor. It cannot answer the memory question -- below the streaming
+    regime the stack fits in RAM and dask never streams. Use
+    `landsat-lst benchmark` for that.
+
+    Fetch through Planetary Computer, which is free from a laptop. Earth Search
+    is for AWS, where the read is same-region.
+    """
+    from landsat_lst.config import settings
+    from landsat_lst.fixture import (
+        DEFAULT_MAX_GB,
+        FixtureSpec,
+        build_fixture,
+        estimate_bytes,
+        grid_shape,
+        list_fixtures,
+    )
+
+    if show_list:
+        cached = list_fixtures()
+        if not cached:
+            console.print("[yellow]No fixtures built yet.[/yellow]")
+            return
+        for meta in cached:
+            spec = FixtureSpec(**meta.spec)
+            console.print(
+                f"  {spec.name:<34} {meta.scene_count:>5} scenes  "
+                f"{meta.bytes_on_disk / 1e9:>6.1f} GB  {meta.stac_url}"
+            )
+        return
+
+    spec = FixtureSpec(
+        tile=tile, year=year, end_year=end_year, max_scenes=max_scenes, factor=factor
+    )
+    height, width = grid_shape(spec)
+    planned = estimate_bytes(spec)
+    console.print(f"[bold]{spec.name}[/bold]")
+    console.print(f"  Grid:   {height} x {width} px at factor {factor}")
+    console.print(f"  Stack:  {max_scenes} scenes x 2 uint16 bands = {planned / 1e9:.1f} GB")
+    console.print(f"  STAC:   {settings.stac_url}")
+    console.print(f"  Path:   {spec.path}")
+
+    if dry_run:
+        return
+
+    try:
+        build_fixture(
+            spec,
+            max_gb=DEFAULT_MAX_GB if max_gb is None else max_gb,
+            force=force,
+            progress=lambda msg: console.print(f"  [dim]{msg}[/dim]"),
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @main.command()

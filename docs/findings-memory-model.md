@@ -1,0 +1,94 @@
+# How far a real peak lands above the predicted floor
+
+**Status:** Harness built, measurement not yet run. The verdict section below is empty on purpose.
+**Date:** 2026-08-14
+**Tracking:** [#94](https://github.com/nlebovits/landsat-lst/issues/94), [ADR-011](adr/011-static-planning-and-synthetic-benchmarks.md)
+
+## The question
+
+`landsat-lst plan` reports a memory **floor** in three terms: the concurrent per-block time stacks
+(`threads * chunk**2 * scenes * itemsize`), the resident monthly climatology
+(`12 * height * width * itemsize`), and a process baseline. The floor is honest arithmetic and it
+earns its place, because a configuration that cannot fit even this is disqualified without
+spending twenty minutes finding out.
+
+What it is not is a forecast. On run `2021-2025-20260814T102049Z` (N40W075, 2021-2025, 2,930
+scenes, offset factor 2 on a 9,000 squared grid, chunk 512, four threads) the floor came to about
+17 GB. The tile OOMed on a 64 GiB VM at 46.5 GB and still climbing, 2% into the de-striping graph.
+An earlier 300-scene sample peaked at 78.6 GB against a floor of a few GB.
+
+The model is not naive about the part it covers: `stack_bytes` is precisely what a monthly median
+holds when each block carries its whole time axis. What it does not model is the `groupby` rechunk
+shuffle, the anomaly broadcast that materializes a second stack, and the spatial median holding
+full planes. The size of that gap decides whether `plan` can be trusted at all.
+
+## Three tiers, and why the middle one is not optional
+
+Confusing the tiers is its own failure mode. Ten validation attempts on 2026-08-13 produced zero
+completed tiles, at twenty minutes a turn, because every lever was tested serially in the cloud.
+The failure was not spending money. It was spending time on the wrong tier.
+
+| Tier | Instrument | Cost | Answers |
+|---|---|---|---|
+| Instant, local | `graph_stats`, `predict_peak`, `landsat-lst plan` | seconds, no data moves | task counts, the memory floor |
+| Cloud, sampled | `landsat-lst benchmark --distributed` | ~20 min, well under a dollar | peak RSS at production geometry |
+| Cloud, full window | `landsat-lst process --distributed` | hours, real money | the product |
+
+The middle tier runs on a VM and not on the dev box for three reasons. The dev box carries 54 GB
+against a 64 GiB VM, so the ceiling under test is unreachable. Synthetic data means the VM does no
+I/O, so the sweep is minutes rather than the hours a real load takes. And the answer is about
+production hardware, which is the only hardware whose peak RSS matters.
+
+Only the graph-inspection tier runs locally, and it stays bounded there: an unbounded
+`plan --sweep` has crashed the machine before. `landsat-lst benchmark` refuses more than 200 scenes
+locally for the same reason, and `plan` carries `--max-tasks`.
+
+## Running it
+
+```bash
+export LST_COILED_RETRIES=0        # a retry would destroy the evidence
+landsat-lst benchmark --distributed
+landsat-lst benchmark --fetch <run-id>
+```
+
+The sweep runs `landsat_lst.benchmarks.measure` once per scene count, each in a fresh subprocess:
+`getrusage` reports a high-water mark for the life of a process, so a second configuration measured
+inside the first one's interpreter would inherit its peak and draw a flat curve whatever the truth
+was. Retries are pinned to zero regardless of `settings.coiled_retries`, because on a diagnostic
+run the failure is the product.
+
+## The three ways this can land
+
+The interpretation is the deliverable, not the numbers. `sweep_report` returns one of these as its
+`verdict`.
+
+**`constant_ratio`** — the ratio holds across the sweep. Give `predict_peak` this correction factor
+and `plan` becomes predictive rather than one-sided.
+
+**`growing_ratio`** — the ratio grows with scene count. Something scales that the model treats as
+fixed, which localizes the leak to the `groupby` shuffle or the anomaly broadcast, and is direct
+evidence for [#93](https://github.com/nlebovits/landsat-lst/issues/93).
+
+**`not_streaming`** — peak RSS did not move with scene count. The configuration is too small to
+stream, the stack fits in RAM, and a line fitted through the process baseline describes the
+interpreter rather than the pipeline. Per ADR-011 no projection is printed; raise `--blocks` or
+`--scenes` rather than trusting the result.
+
+## Verdict
+
+Not yet measured. Run the sweep and record the table, the fitted slope, and the verdict here.
+
+## What the regression tier catches meanwhile
+
+`tests/benchmark/` runs on every nightly build at reduced geometry, asserting on shape rather than
+magnitude. It cannot reproduce a production peak and does not try. Two numbers proved out while the
+guards were being written, both at 24 scenes on a 1,024 squared grid with chunk 256 and two threads:
+
+- Deleting the shared time rechunk from `_composite_graph` takes the composite from **828 tasks to
+  1,326** and composite-only peak RSS from **308 MB to 842 MB**, a factor of 2.73. Both guards fail
+  on it.
+- The read tally stays at **1.0 passes either way**, because both consumers descend from the same
+  source keys and within one `dask.compute` each key is produced once whatever is downstream. An
+  earlier draft of the guard asserted the pass count, passed with the rechunk deleted, and would
+  have shipped the regression it was written to catch. The pass count is the right guard for
+  `cog_export`, where the two products are separate computes, and the wrong one here.

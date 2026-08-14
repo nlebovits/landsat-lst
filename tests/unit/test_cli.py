@@ -585,3 +585,55 @@ class TestProcessOffsetCacheFlag:
         assert "--no-offset-cache" not in _task_command(
             run_id="r", year=2021, end_year=2025, force=False
         )
+
+
+class TestSampledRunsProfileThemselves:
+    """``--max-scenes`` is a sample by definition, and a sample exists to be measured.
+
+    The run that prompted issue #94 produced a profile only because
+    ``LST_PROFILE_DASK`` happened to be set by hand. See issue #94 item 3.
+    """
+
+    @pytest.fixture
+    def profile_off(self, monkeypatch):
+        from landsat_lst.config import settings
+
+        monkeypatch.delenv("LST_PROFILE_DASK", raising=False)
+        monkeypatch.setattr(settings, "profile_dask", False)
+        return settings
+
+    def _run(self, runner, *extra):
+        with patch("landsat_lst.job.process_tile_job") as mock:
+            mock.return_value = JobResult(
+                job=ProcessingJob(tile=parse_tile_name("N40W075"), year=2024),
+                status="completed",
+            )
+            runner.invoke(main, ["process", "-t", "N40W075", "-y", "2024", *extra])
+
+    def test_max_scenes_turns_profiling_on(self, runner, profile_off):
+        self._run(runner, "--max-scenes", "300")
+        assert profile_off.profile_dask is True
+
+    def test_a_full_run_leaves_it_alone(self, runner, profile_off):
+        """The docstring's reasoning still holds for a 700-tile build."""
+        self._run(runner)
+        assert profile_off.profile_dask is False
+
+    def test_an_explicit_setting_wins(self, runner, monkeypatch):
+        """Somebody who turned profiling off on purpose does not get it back."""
+        from landsat_lst.config import settings
+
+        monkeypatch.setenv("LST_PROFILE_DASK", "0")
+        monkeypatch.setattr(settings, "profile_dask", False)
+
+        self._run(runner, "--max-scenes", "300")
+
+        assert settings.profile_dask is False
+
+    def test_cache_profiling_stays_gated_on_its_own(self, runner, profile_off, monkeypatch):
+        """CacheProfiler retains a record per task; a sampled graph still has many."""
+        monkeypatch.setattr(profile_off, "profile_dask_cache", False)
+
+        self._run(runner, "--max-scenes", "300")
+
+        assert profile_off.profile_dask_cache is False

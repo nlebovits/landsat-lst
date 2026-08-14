@@ -123,6 +123,43 @@ jobs:
         run: uv run pytest tests/ -v -m "integration or network" --timeout=120
         timeout-minutes: 30
 
+  benchmarks:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      # Regression guards, not measurements. A runner is smaller than the dev
+      # box and much smaller than a production VM, so these assert on the shape
+      # of the answer at reduced geometry: task count at a pinned
+      # configuration, and peak RSS growing or not growing with scene count.
+      # Production numbers come from `landsat-lst benchmark --distributed`.
+      - name: Run benchmarks
+        run: uv run pytest tests/benchmark -v -m benchmark --timeout=600
+        timeout-minutes: 20
+
+      # A single pass or fail cannot show a number drifting toward a cliff over
+      # five PRs. The trend file is what a human reads afterwards.
+      - name: Upload trend
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-trend
+          path: results/benchmark/trend.jsonl
+          if-no-files-found: warn
+          retention-days: 90
+
   dependency-audit:
     name: Dependency Audit
     runs-on: ubuntu-latest

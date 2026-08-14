@@ -196,17 +196,92 @@ Rules worth keeping:
   (`12 * height * width * 4`), and a process baseline. A configuration that cannot fit the
   floor is disqualified for free. One that fits may still OOM — the 300-scene N40W075 sample
   peaked at 78.6 GB against a floor of a few GB.
-- **Benchmark memory with `scripts/synthetic_scaling.py`, never against a small AOI.**
+- **Benchmark memory with `landsat-lst benchmark`, never against a small AOI.**
   Below roughly one degree the whole stack fits in RAM and dask never streams; a five degree
   tile streams from its first block. `scripts/measure_memory_scaling.py` is deprecated for
-  exactly this reason, and the new script refuses to extrapolate when peak RSS did not move.
+  exactly this reason, and the sweep refuses to extrapolate when peak RSS did not move.
+  `scripts/synthetic_scaling.py` is now a thin wrapper over the same code, which lives in
+  `landsat_lst.benchmarks` because Coiled ships the installed package, not `scripts/`.
 - **Keep `pipeline.TIME_CHUNK` and `profiling.synthetic_dataset` in step.** A synthetic stack
   chunked differently from a real load builds a different graph, which would make planning
-  against it worthless.
+  against it worthless. `tests/benchmark/conftest.py` fails loudly if `TIME_CHUNK` moves.
 - **`settings.profile_dask` answers *which* tasks.** A heartbeat fraction of `4182/18600` reads
-  the same whether the hour is in `median-aggregate` or a rechunk shuffle. Turn it on for a
-  sampled run, not a 700-tile build. `settings.profile_dask_cache` is gated separately: it
-  retains one record per task, and these graphs hold hundreds of thousands.
+  the same whether the hour is in `median-aggregate` or a rechunk shuffle. It is **on by
+  default for any run passing `--max-scenes`**, because a sample exists to be measured; a
+  700-tile build passes no `--max-scenes` and is untouched. An explicit `LST_PROFILE_DASK`
+  wins either way, read from the environment rather than from `settings.model_fields_set`,
+  which pydantic mutates on plain attribute assignment. `settings.profile_dask_cache` is gated
+  separately: it retains one record per task, and these graphs hold hundreds of thousands.
+
+---
+
+## Three benchmark tiers, and never confuse them
+
+Ten validation attempts on 2026-08-13 produced zero completed tiles because every lever was
+tested serially in the cloud. The failure was not spending money. It was spending time on the
+wrong tier. See [findings](docs/findings-memory-model.md) and issue #94.
+
+| Tier | Command | Cost | Answers |
+|---|---|---|---|
+| Instant, local | `landsat-lst plan` | seconds | task counts, the memory floor |
+| CI regression | `pytest tests/benchmark` | ~30s | did a change move the number |
+| Cloud, sampled | `landsat-lst benchmark --distributed` | ~20 min, under a dollar | peak RSS at production geometry |
+| Cloud, full window | `landsat-lst process --distributed` | hours | the product |
+
+Rules worth keeping:
+
+- **`plan` reports a floor; only a VM reports a peak.** The floor landed at ~17 GB for the run
+  that OOMed at 46.5 GB. The gap is the `groupby` shuffle, the anomaly broadcast, and the
+  spatial median, none of which the three-term model covers. Do not quote a floor as a forecast.
+- **Execution goes to the VM; the laptop gets graph inspection.** `landsat-lst benchmark`
+  refuses more than 200 scenes locally, `plan` carries `--max-tasks`, and an unbounded local
+  build has taken a 64 GB desktop down. Building a graph allocates Python objects whether or
+  not you compute it.
+- **Every measurement runs in a fresh subprocess.** `getrusage` reports a high-water mark for
+  the life of a process, so a second configuration in the first one's interpreter inherits its
+  peak and draws a flat curve whatever the truth is.
+- **`tests/benchmark/` asserts on bands, never on values.** A benchmark that fails on 3% drift
+  gets disabled within a month. The bands are sized against a known regression: deleting the
+  shared rechunk in `_composite_graph` moves the composite from 828 tasks to 1,326 (1.60x) and
+  peak RSS from 308 MB to 842 MB (2.73x), so the composite band is 1.4x where the offset band
+  is 2.0x.
+- **The read tally does not catch the `_composite_graph` regression.** It stays at 1.0 pass
+  either way: both consumers descend from the same source keys, and within one `dask.compute`
+  each key is produced once whatever is downstream. Pass count is the right guard for
+  `cog_export`, where the products are separate computes, and the wrong one here. An earlier
+  draft asserted it, passed with the fix deleted, and would have shipped the regression.
+- **The trend file is the point, not the pass/fail.** A single green build cannot show a number
+  drifting toward a cliff over five PRs. Nightly uploads `results/benchmark/trend.jsonl`.
+- **A sweep publishes under `_benchmarks/`, never `_runs/`.** `runs.py` classifies everything
+  under the run prefix as a tile attempt, and a sweep is not a tile.
+
+---
+
+## A cached fixture for accuracy work, and what it cannot answer
+
+Comparing two offset estimators means running both over the same scenes. Without a fixture that
+is a STAC query and hundreds of gigabytes of coarse reads per iteration, for an answer that is
+600 floats.
+
+```bash
+landsat-lst fixture --tile N40W075 --factor 8    # ~6.1 GB, fetched once
+landsat-lst fixture --list
+landsat-lst fixture --factor 2 --dry-run         # prints the arithmetic, fetches nothing
+```
+
+- **Check the size before you fetch, because the command does.** A five-degree tile at
+  production's offset factor 2 is a 9,000 squared grid, and 300 scenes of two `uint16` bands
+  over it is **97 GB**. Factor 4 is 24.3, factor 8 is 6.1, factor 16 is 1.5. The guard refuses
+  above 8 GB and names both ways out; it runs before the STAC query, not after the download.
+- **The fixture answers a relative question, not an absolute one.** Offset error grows linearly
+  in the factor, but both estimators read the same pixels, so a comparison is exact at any
+  factor. Do not quote a fixture offset as a production offset.
+- **It cannot answer the memory question.** Below the streaming regime the stack fits in RAM and
+  dask never streams, which is the behaviour under test there. Use `landsat-lst benchmark`.
+- **Stored uncompressed, deliberately.** Plain `.npy` per band means `load_fixture` memory-maps
+  it and hands dask a lazy array at production chunking, so the graph built on a fixture is the
+  graph a real tile builds. Compressing it would force a materialized stack and make every
+  downstream measurement describe a pipeline that does not stream.
 
 ---
 
