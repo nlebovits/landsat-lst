@@ -1,6 +1,6 @@
 # How far a real peak lands above the predicted floor
 
-**Status:** Harness built, measurement not yet run. The verdict section below is empty on purpose.
+**Status:** Measured. Verdict `growing_ratio`; `predict_peak` is not correctable by a factor.
 **Date:** 2026-08-14
 **Tracking:** [#94](https://github.com/nlebovits/landsat-lst/issues/94), [ADR-011](adr/011-static-planning-and-synthetic-benchmarks.md)
 
@@ -31,7 +31,7 @@ The failure was not spending money. It was spending time on the wrong tier.
 | Tier | Instrument | Cost | Answers |
 |---|---|---|---|
 | Instant, local | `graph_stats`, `predict_peak`, `landsat-lst plan` | seconds, no data moves | task counts, the memory floor |
-| Cloud, sampled | `landsat-lst benchmark --distributed` | ~20 min, well under a dollar | peak RSS at production geometry |
+| Cloud, sampled | `landsat-lst benchmark --distributed` | ~12 min, a dime | peak RSS at production geometry |
 | Cloud, full window | `landsat-lst process --distributed` | hours, real money | the product |
 
 The middle tier runs on a VM and not on the dev box for three reasons. The dev box carries 54 GB
@@ -51,28 +51,14 @@ landsat-lst benchmark --distributed
 landsat-lst benchmark --fetch <run-id>
 ```
 
-Budget about 25 minutes of compute plus VM start, and under a dollar. Three
-points measured on the dev box at the sweep's own geometry (4096 squared, chunk
-512, four threads) fit `5.9 + 0.876 * scenes` seconds, which puts the default
-`(50, 100, 200, 400, 800)` sweep at 23 minutes:
+Budget about twelve minutes and a dime. `SWEEP_JOB_TIMEOUT` is one hour rather than the six-hour
+tile ceiling, which leaves 5x headroom; at $0.504/hr for `r6i.2xlarge` and $0.768/hr for
+`m6i.4xlarge`, spot floor to on-demand fallback, even the full hour lands under a dollar.
 
-| scenes | wall | peak RSS | floor | ratio |
-|---:|---:|---:|---:|---:|
-| 25 | 27.8s | 3.95 GB | 2.85 GB | 1.39 |
-| 50 | 39.6s | 6.17 GB | 2.95 GB | 2.09 |
-| 100 | 93.5s | 9.64 GB | 3.14 GB | 3.07 |
-
-`SWEEP_JOB_TIMEOUT` is one hour rather than the six-hour tile ceiling, which
-leaves better than 2x headroom over that fit. At $0.504/hr for `r6i.2xlarge` and
-$0.768/hr for `m6i.4xlarge`, spot floor to on-demand fallback, 25 minutes costs
-$0.06 to $0.32 and the full hour still lands under a dollar.
-
-**These three points are a pre-flight expectation, not the finding.** They were
-measured on a laptop with 54 GB against a 64 GiB VM, which is the substitution
-this whole document exists to warn against. They suggest `growing_ratio` and a
-peak near 85 GB at 2,930 scenes, consistent with the 46.5 GB and climbing that
-the OOM was caught at. Suggestive is not measured. The verdict below stays empty
-until a VM produces it.
+A pre-flight estimate off the dev box put this at 23 minutes, from a fit of `5.9 + 0.876 * scenes`
+seconds through 25, 50, and 100 scenes. The VM ran it in twelve, and its 800-scene point died
+where the laptop's fit had no opinion at all. The estimate was useful for sizing the timeout and
+worthless for anything else, which is the whole argument for the middle tier.
 
 ### Watching it
 
@@ -97,7 +83,7 @@ describes a dask scheduler a batch task never registers with, and `coiled logs` 
 task stdout. The only channel is what the VM publishes, so it republishes the whole result object
 when it starts each scene count and again when that point lands, and uploads its own stdout to
 `_benchmarks/{run_id}/sweep.log` on exit either way. One line per transition is the real
-resolution of the work: the top point runs for twelve minutes. Same conclusion the tile path
+resolution of the work: the largest point that completed ran for 3.2 minutes. Same conclusion the tile path
 reached in issue \#68 and ADR-014.
 
 The sweep runs `landsat_lst.benchmarks.measure` once per scene count, each in a fresh subprocess:
@@ -123,9 +109,55 @@ stream, the stack fits in RAM, and a line fitted through the process baseline de
 interpreter rather than the pipeline. Per ADR-011 no projection is printed; raise `--blocks` or
 `--scenes` rather than trusting the result.
 
-## Verdict
+## Verdict: `growing_ratio`
 
-Not yet measured. Run the sweep and record the table, the fitted slope, and the verdict here.
+Run `scaling-20260814T140131Z`, one `r6i.2xlarge`-class VM, 4096 squared px at chunk 512 and
+four threads, twelve minutes wall clock and under a dime.
+
+| scenes | peak RSS | floor | ratio | offset tasks | wall |
+|---:|---:|---:|---:|---:|---:|
+| 50 | 6.4 GB | 2.9 GB | **2.16** | 19,943 | 33s |
+| 100 | 10.0 GB | 3.1 GB | **3.18** | 35,782 | 50s |
+| 200 | 16.3 GB | 3.5 GB | **4.63** | 83,069 | 96s |
+| 400 | 27.5 GB | 4.3 GB | **6.37** | 132,435 | 193s |
+| 800 | **OOM** | — | — | — | died at 337s, `exit -9` |
+
+**`predict_peak` cannot be corrected with a factor.** The ratio nearly triples across an 8x span
+of scene count, 2.16 to 6.37. There is no constant to multiply the floor by, so `plan` stays what
+it already was: a disqualifier, not a forecast. A configuration that cannot fit the floor is ruled
+out for free; one that fits tells you nothing.
+
+**The growth is accelerating, not settling.** Peak rises by 1.57x, then 1.64x, then 1.68x per
+doubling of scene count — exponents of 0.65, 0.71, 0.75. A model whose error grows with the axis
+it is being extrapolated along is worse than no model at the far end.
+
+**800 scenes killed the VM.** `exit -9` is SIGKILL at 337 seconds. That is 27% of the 2,930 scenes
+a five-year land tile pulls, on the instance type production runs, and it could not finish. This
+is the single most useful number the sweep produced, and it is a failure rather than a
+measurement.
+
+**A production tile needs somewhere between 123 GB and 179 GB.** The linear fit the tool prints
+says 179; a power law through the top pair says 123. Both are extrapolations past a point that
+OOMed, so treat the range as a lower bound on the problem rather than a target. Either way a
+64 GiB VM is not close, which is exactly consistent with the production run that OOMed at 46.5 GB
+and still climbing, 2% into the de-striping graph.
+
+### What this means
+
+The gap is not overhead to be trimmed. At 400 scenes the pipeline holds 6.4x its own floor, and
+the multiple grows with the window. Something scales that the three-term model treats as fixed,
+which points at the `groupby` rechunk shuffle or the anomaly broadcast materializing a second
+stack — direct evidence for [#93](https://github.com/nlebovits/landsat-lst/issues/93).
+
+It also means **#93 alone may not be sufficient**. Halving the offset pass takes a 123 GB tile to
+roughly 62 GB, which is at the ceiling rather than under it. Before optimizing, re-run this sweep
+at a lower `threads` and `chunk` to establish whether the growth is a property of the
+configuration or of the graph. That is another twelve minutes and another dime, and it decides
+whether the fix is a setting or a rewrite.
+
+The laptop pre-flight projected ~85 GB and `growing_ratio`. It called the verdict correctly and
+understated the magnitude by a third to a half. That is the substitution this document warns
+against, now measured rather than asserted.
 
 ## What the regression tier catches meanwhile
 
