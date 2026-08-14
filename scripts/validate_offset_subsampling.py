@@ -184,8 +184,8 @@ def main() -> int:  # noqa: PLR0915
 
     from landsat_lst.azure_auth import enable_pc_azure_refresh  # noqa: PLC0415
     from landsat_lst.config import STAC_PLANETARY_COMPUTER, settings  # noqa: PLC0415
-    from landsat_lst.normalization import _spatial_dims, scene_offsets  # noqa: PLC0415
-    from landsat_lst.pipeline import load_scenes  # noqa: PLC0415
+    from landsat_lst.normalization import _spatial_dims, offset_graph  # noqa: PLC0415
+    from landsat_lst.pipeline import load_scenes, scene_cloud_cover  # noqa: PLC0415
     from landsat_lst.qa import apply_qa_mask, convert_to_celsius  # noqa: PLC0415
 
     settings.stac_url = STAC_PLANETARY_COMPUTER
@@ -252,10 +252,25 @@ def main() -> int:  # noqa: PLR0915
                 raise ValueError(msg)
         log.info("time_axes_aligned", n_scenes=int(base_time.size))
 
+        # Recorded here rather than measured in a second run: this session
+        # already holds the exact scene set, so a cloud-cover threshold can be
+        # scored against the offsets and valid-pixel counts it would discard
+        # without paying for another full-resolution pass. See issue #81.
+        cloud_cover = scene_cloud_cover(items, bbox, base_time, args.factors[0])
+        log.info(
+            "cloud_cover_joined",
+            median=round(float(np.median(cloud_cover.values)), 1),
+            max=round(float(cloud_cover.values.max()), 1),
+        )
+
         log.info("computing_offsets", factors=args.factors)
         t0 = time.perf_counter()
         # One compute call so dask can share whatever the graphs have in common.
-        results = dask.compute(*[scene_offsets(stacks[f]) for f in args.factors])
+        # offset_graph rather than scene_offsets: the latter computes eagerly
+        # (it has its own dask.compute since the two reductions were fused),
+        # so passing it here would hand this call finished values and run every
+        # factor as its own separate pass.
+        results = dask.compute(*[offset_graph(stacks[f]) for f in args.factors])
         log.info("offsets_computed", secs=round(time.perf_counter() - t0, 1))
 
         for run, (offset, n_valid) in zip(runs, results, strict=True):
@@ -322,6 +337,10 @@ def main() -> int:  # noqa: PLR0915
                     "window": f"{args.year}-{args.end_year}",
                     "bbox": list(bbox),
                     "n_items": len(items),
+                    "scene_times": [str(t) for t in np.datetime_as_string(base_time.values, "D")],
+                    "scene_cloud_cover": [float(v) for v in cloud_cover.values],
+                    "min_scene_pixels": settings.destripe_min_scene_pixels,
+                    "min_offset_samples": settings.destripe_min_offset_samples,
                     "cap_c": cap,
                     "acceptance": ACCEPT,
                     "largest_passing_factor": best,

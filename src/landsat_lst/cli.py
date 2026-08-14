@@ -564,6 +564,13 @@ def _print_sweep(rows: tuple) -> None:
 )
 @click.option("--chunk", type=int, default=None, help="Spatial chunk edge in px")
 @click.option("--threads", type=int, default=None, help="Concurrent dask threads")
+@click.option(
+    "--offset-factor",
+    type=int,
+    default=None,
+    help="Resolution factor for the offset pass, to price it before changing "
+    "the default. Task count falls as factor**2.",
+)
 @click.option("--vm-gib", type=float, default=None, help="VM memory to judge against")
 @click.option("--sweep", is_flag=True, help="Cross chunk size with thread count instead")
 @click.option(
@@ -584,6 +591,7 @@ def plan(
     scenes: int | None,
     chunk: int | None,
     threads: int | None,
+    offset_factor: int | None,
     vm_gib: float | None,
     sweep: bool,
     fast: bool,
@@ -666,6 +674,7 @@ def plan(
             scenes=n_scenes,
             chunk_size=chunk,
             threads=threads,
+            offset_factor=offset_factor,
             optimize=not fast,
             max_tasks=ceiling,
         )

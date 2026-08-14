@@ -1,0 +1,99 @@
+{
+  "source": "results/decision/offset_subsampling_validation_f124.json",
+  "bbox": [
+    -61.1,
+    -34.4,
+    -60.1,
+    -33.4
+  ],
+  "window": "2021-2025",
+  "n_scenes": 390,
+  "n_kept_by_destripe": 305,
+  "cap_c": 15.0,
+  "min_scene_pixels": 500,
+  "total_valid_obs": 2207469126.0,
+  "cloud_cover_vs_valid_fraction_corr": -0.7524493533394875,
+  "thresholds": [
+    {
+      "threshold": 30,
+      "scenes_dropped": 180,
+      "scenes_dropped_frac": 0.46153846153846156,
+      "dropped_already_rejected": 82,
+      "dropped_already_rejected_frac": 0.45555555555555555,
+      "obs_lost": 376422987.0,
+      "obs_lost_frac": 0.17052242433038675
+    },
+    {
+      "threshold": 40,
+      "scenes_dropped": 159,
+      "scenes_dropped_frac": 0.4076923076923077,
+      "dropped_already_rejected": 81,
+      "dropped_already_rejected_frac": 0.5094339622641509,
+      "obs_lost": 251040322.0,
+      "obs_lost_frac": 0.11372314069682712
+    },
+    {
+      "threshold": 50,
+      "scenes_dropped": 142,
+      "scenes_dropped_frac": 0.3641025641025641,
+      "dropped_already_rejected": 81,
+      "dropped_already_rejected_frac": 0.5704225352112676,
+      "obs_lost": 171283421.0,
+      "obs_lost_frac": 0.07759266889968726
+    },
+    {
+      "threshold": 60,
+      "scenes_dropped": 113,
+      "scenes_dropped_frac": 0.28974358974358977,
+      "dropped_already_rejected": 71,
+      "dropped_already_rejected_frac": 0.6283185840707964,
+      "obs_lost": 105388238.0,
+      "obs_lost_frac": 0.04774165887926443
+    },
+    {
+      "threshold": 70,
+      "scenes_dropped": 84,
+      "scenes_dropped_frac": 0.2153846153846154,
+      "dropped_already_rejected": 58,
+      "dropped_already_rejected_frac": 0.6904761904761905,
+      "obs_lost": 59409429.0,
+      "obs_lost_frac": 0.026912915021217832
+    },
+    {
+      "threshold": 80,
+      "scenes_dropped": 60,
+      "scenes_dropped_frac": 0.15384615384615385,
+      "dropped_already_rejected": 47,
+      "dropped_already_rejected_frac": 0.7833333333333333,
+      "obs_lost": 28522246.0,
+      "obs_lost_frac": 0.012920790449143522
+    },
+    {
+      "threshold": 90,
+      "scenes_dropped": 30,
+      "scenes_dropped_frac": 0.07692307692307693,
+      "dropped_already_rejected": 27,
+      "dropped_already_rejected_frac": 0.9,
+      "obs_lost": 6608056.0,
+      "obs_lost_frac": 0.0029934987185863816
+    },
+    {
+      "threshold": 95,
+      "scenes_dropped": 21,
+      "scenes_dropped_frac": 0.05384615384615385,
+      "dropped_already_rejected": 19,
+      "dropped_already_rejected_frac": 0.9047619047619048,
+      "obs_lost": 3478032.0,
+      "obs_lost_frac": 0.0015755744707978308
+    },
+    {
+      "threshold": 100,
+      "scenes_dropped": 0,
+      "scenes_dropped_frac": 0.0,
+      "dropped_already_rejected": 0,
+      "dropped_already_rejected_frac": 0.0,
+      "obs_lost": 0.0,
+      "obs_lost_frac": 0.0
+    }
+  ]
+}

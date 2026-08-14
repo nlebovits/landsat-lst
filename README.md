@@ -68,12 +68,12 @@ data-quality and performance settings:
 | `lst_valid_min` | `LST_LST_VALID_MIN` | `-50.0` | Drop physically implausible cold LST (e.g. ~-124 °C DN=0 / resampling artifacts) |
 | `lst_valid_max` | `LST_LST_VALID_MAX` | `80.0` | Drop high-DN saturation/fill artifacts without clipping real extreme heat |
 | `load_chunk_size` | `LST_LOAD_CHUNK_SIZE` | `512` | odc-stac spatial (lat/lon) chunk; smaller (e.g. 256) cuts peak memory for the P95 quantile on multi-year / large-tile runs |
-| `max_cloud_cover` | `LST_MAX_CLOUD_COVER` | `100` | Scene-level cloud filter; 100 disables it and relies on pixel-level QA |
+| `max_cloud_cover` | `LST_MAX_CLOUD_COVER` | `100` | Scene-level cloud filter, applied as `eo:cloud_cover <` this. Not the no-op it looks like: strict less-than already drops every scene reported at exactly 100% cloud (154 of 2,912 for N40W075). Use 101 for a true no-op. See [findings](docs/findings-cloud-cover-filter.md) before lowering it |
 | `destripe` | `LST_DESTRIPE` | `True` | Normalize each scene against a monthly climatology before compositing; disable to benchmark raw composites |
 | `destripe_max_offset_c` | `LST_DESTRIPE_MAX_OFFSET_C` | `15.0` | Discard a scene whose offset exceeds this rather than adjusting it. Calibrated at Pergamino ([ADR-007](docs/adr/007-scene-normalization.md)); re-check with `scripts/calibrate_destripe_cap.py` for other climates |
-| `destripe_min_scene_pixels` | `LST_DESTRIPE_MIN_SCENE_PIXELS` | `500` | Sparse floor when offsets are estimated at native resolution |
+| `destripe_min_scene_pixels` | `LST_DESTRIPE_MIN_SCENE_PIXELS` | `500` | Sparse floor when offsets are estimated at native resolution. Replaced by, never converted into, `destripe_min_offset_samples` on a coarse grid |
 | `destripe_min_offset_samples` | `LST_DESTRIPE_MIN_OFFSET_SAMPLES` | `200` | Sparse floor when offsets come from a coarse grid, stated in that grid's pixels |
-| `destripe_offset_resolution_factor` | `LST_DESTRIPE_OFFSET_RESOLUTION_FACTOR` | `2` | Estimate offsets from a stack loaded at `resolution × factor`, served from the source COGs' overviews. Cuts the offset pass from 20.2 GB to 5.1 GB. See [findings](docs/findings-offset-subsampling.md) |
+| `destripe_offset_resolution_factor` | `LST_DESTRIPE_OFFSET_RESOLUTION_FACTOR` | `2` | Estimate offsets from a stack loaded at `resolution × factor`, served from the source COGs' overviews. Cuts the offset pass from 20.2 GB to 5.1 GB. The largest factor that passes validation; 4 was measured and rejected for [#81](https://github.com/nlebovits/landsat-lst/issues/81). See [findings](docs/findings-offset-subsampling.md) |
 
 ## Usage
 
@@ -423,7 +423,13 @@ Notable scripts in [`scripts/`](scripts/):
   15 °C default; re-run it for a climate unlike mid-latitude cropland.
 - `validate_offset_subsampling.py` — checks that offsets estimated from coarse overviews match
   full-resolution ones, scene by scene. Produced the shipped
-  `destripe_offset_resolution_factor`; re-run before raising it.
+  `destripe_offset_resolution_factor`; re-run before raising it, and re-run it rather than
+  citing an older table, since a factor that passed in August failed on the current grid.
+- `analyze_cloud_cover_filter.py` — prices a candidate `max_cloud_cover` in the scenes it skips
+  against the valid observations it destroys, reading the validation output rather than loading
+  anything.
+- `measure_climatology_thinning.py` — measures the indirect cost of that filter: a smaller scene
+  set builds a thinner monthly climatology, which moves the offsets of the scenes that remain.
 - `compare_destripe_composites.py` — builds the raw, natively de-striped, and coarse-offset P95
   composites from one load and reports how far apart they are. `--cogs` writes them for QGIS.
 - `aster_gap_urban_analysis.py` — measures ASTER GED coverage gaps against GHS-SMOD to

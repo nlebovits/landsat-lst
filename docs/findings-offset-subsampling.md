@@ -203,10 +203,61 @@ already on the record in
 column-based stripe metric reported the opposite conclusion because it assumed vertical seams,
 and the seams run diagonally at about 10°.
 
+## Re-validation, 2026-08-14: factor 4 no longer passes
+
+[Issue #81](https://github.com/nlebovits/landsat-lst/issues/81) proposed raising the factor from
+2 to 4, gated on re-running this validation. The offset pass is the largest single phase in a
+tile — 1,616 s of a ~35-minute 300-scene run — and a factor of 4 cuts its task count nearly
+fourfold. `landsat-lst plan -t N40W075 --scenes 300 --threads 4`, which costs nothing to run:
+
+| offset factor | offset grid | offset tasks | memory floor | composite tasks |
+|--:|--:|--:|--:|--:|
+| 2 | 9000² | 613,240 | 6.79 GiB | 276,060 |
+| 4 | 4500² | 155,239 | 4.08 GiB | 276,060 |
+
+That is the prize, and the gate refuses it. Re-running the sweep on current code, same AOI, same
+window, same 757 items and 390 solar-day scenes:
+
+| factor | grid | MB read | med \|Δ\| | p99 \|Δ\| | max \|Δ\| | flips | passes |
+|--:|--:|--:|--:|--:|--:|--:|:--|
+| 1 | 3600×3600 | 20218 | *reference* | | | | |
+| 2 | 1800×1800 | 5054 | 0.0017 | 0.0723 | 0.219 | 0 | **yes** |
+| 4 | 900×900 | 1264 | 0.0051 | 0.1737 | **0.546** | 0 | **no** |
+
+Factor 4 fails on max \|Δ\|, which the pre-registered criteria cap at 0.5 °C. In August it
+measured 0.431 and passed with 16% of headroom; it now measures 0.546. Median and p99 are
+comfortable, and there are still zero keep/reject flips, so the failure is one scene in a tail —
+but the bound is the bound, and it was fixed before any result was seen precisely so that a
+borderline number could not be argued down afterwards.
+
+**The factor stays at 2.** It clears every criterion with room to spare, most tightly on max
+\|Δ\| at 0.219 against 0.5.
+
+Two things moved between the runs, and both argue for re-running a gate rather than citing one:
+
+- **The grid changed.** [ADR-008](adr/008-global-mosaic-topology.md) cut every tile from one
+  global grid, so the AOI is 3600×3600 where it was 3600×3601. Offsets are estimated on that
+  grid, so they moved with it.
+- **The offset code changed.** `scene_offsets` fused its two reductions into one traversal.
+
+The second shows up in this script's own cross-check, which now reports the factor-1 reference
+reproducing the committed cap calibration to **0.0701 °C** rather than the 0.0005 °C of the
+original run, and therefore prints `NO -- not comparable to the shipped cap`. At 0.07 °C against
+a 15 °C cap the calibration itself is undisturbed, but the strict check is doing its job: these
+offsets are no longer the same numbers to the fourth decimal, and a validation that had simply
+cited the older table would never have noticed.
+
+Note that the script's closing line now reads `Recommended (one step more conservative): 1`. That
+rule is for choosing a value from a fresh sweep, where the step above the largest passing factor
+is untested. Factor 2 is not untested: it has now cleared the criteria directly, twice, on two
+different grids. Retreating to 1 would quadruple the offset pass to buy margin that has been
+measured and does not need buying.
+
 ## Reproducing
 
 ```bash
 uv run python scripts/validate_offset_subsampling.py
+uv run python scripts/validate_offset_subsampling.py --factors 1 2 4  # the #81 gate
 uv run python scripts/compare_destripe_composites.py --cogs
 ```
 
