@@ -150,10 +150,33 @@ which points at the `groupby` rechunk shuffle or the anomaly broadcast materiali
 stack — direct evidence for [#93](https://github.com/nlebovits/landsat-lst/issues/93).
 
 It also means **#93 alone may not be sufficient**. Halving the offset pass takes a 123 GB tile to
-roughly 62 GB, which is at the ceiling rather than under it. Before optimizing, re-run this sweep
-at a lower `threads` and `chunk` to establish whether the growth is a property of the
-configuration or of the graph. That is another twelve minutes and another dime, and it decides
-whether the fix is a setting or a rewrite.
+roughly 62 GB, which is at the ceiling rather than under it.
+
+### The configuration levers were already pulled, and did not hold
+
+Worth stating plainly, because it is easy to remember this the other way round. Commit `7fda25c`
+established that peak is roughly `threads * chunk**2 * scenes * 4`, that halving
+`load_chunk_size` cuts that term, and that doing so measured **2.9x slower** locally through
+per-chunk overhead — four times the graph nodes and four times the range requests. So the project
+capped threads instead, deliberately, and chunk stayed at 512.
+
+The memory half of that argument was arithmetic on the floor. The only thing measured was the
+slowdown. And the tile that OOMed ran at **chunk 512 with four threads**: the cap was in effect,
+and it died anyway, at 46.5 GB against a 17 GB floor.
+
+That is not a wrong formula. `stack_bytes` is precisely what concurrent block stacks cost. It is
+the wrong *dominant term* — at 400 scenes the pipeline holds 6.37x its floor, so the part the
+levers control is a shrinking minority of the total.
+
+**So the next measurement is a fork, not a confirmation.** Re-run this sweep at `--threads 1
+--chunk 256`, twelve minutes and a dime:
+
+- Ratio falls toward 1 → the excess is concurrent block stacks after all, the levers work, and
+  #93 is an optimization.
+- Ratio holds near 6.4x → the excess is the shuffle or the broadcast, both levers are dead ends,
+  and #93 is structural work no setting can avoid.
+
+Do this before starting #93. It costs a dime and it decides how much #93 has to accomplish.
 
 The laptop pre-flight projected ~85 GB and `growing_ratio`. It called the verdict correctly and
 understated the magnitude by a third to a half. That is the substitution this document warns
