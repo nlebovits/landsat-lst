@@ -5,9 +5,38 @@ from datetime import UTC, datetime
 
 import pytest
 
+from landsat_lst import pricing
 from landsat_lst.job import JobResult
 from landsat_lst.manifest import write_run_manifest
 from landsat_lst.models import ProcessingJob, TileId
+
+
+def _write(results, tmp_path, **extra):
+    """Write one manifest under a fixed run id and read it back."""
+    path = write_run_manifest(
+        results,
+        run_id="r",
+        window="2021-2025",
+        started_at=datetime(2026, 8, 12, 14, 0, tzinfo=UTC),
+        retries=3,
+        out_dir=tmp_path,
+        **extra,
+    )
+    return json.loads(path.read_text())
+
+
+def _attempt(number: int, **fields) -> dict:
+    row = {
+        "attempt": number,
+        "phase": "composite_graph",
+        "status": None,
+        "duration_s": 800.0,
+        "peak_rss_mb": 41200.0,
+        "error": None,
+        "log_key": f"_runs/r/N40W075.{number}.log",
+    }
+    row.update(fields)
+    return row
 
 
 @pytest.fixture
@@ -121,3 +150,66 @@ def test_cluster_is_null_when_nothing_was_submitted(results, tmp_path):
 
     payload = json.loads(path.read_text())
     assert payload["cluster_id"] is None
+
+
+class TestAttempts:
+    def test_series_and_summary(self, results, tmp_path):
+        payload = _write(
+            results,
+            tmp_path,
+            attempts={"N40W075": [_attempt(1, status="failed"), _attempt(2, status="completed")]},
+        )
+
+        by_tile = {t["tile"]: t for t in payload["tiles"]}
+        assert payload["attempts"] == {"tiles_retried": 1, "total": 2, "max": 2}
+        assert by_tile["N40W075"]["attempt"] == 2
+        assert [row["attempt"] for row in by_tile["N40W075"]["attempts"]] == [1, 2]
+
+    def test_tile_with_no_series_reports_none(self, results, tmp_path):
+        """A skipped tile never ran, and a pre-attempt run numbered nothing."""
+        payload = _write(results, tmp_path)
+
+        by_tile = {t["tile"]: t for t in payload["tiles"]}
+        assert by_tile["S05W060"]["attempts"] == []
+        assert by_tile["S05W060"]["attempt"] == 0
+        assert payload["attempts"] == {"tiles_retried": 0, "total": 0, "max": 0}
+
+
+class TestCost:
+    def test_totals_the_run_and_projects_a_fleet(self, results, tmp_path):
+        estimate = pricing.tile_cost(
+            duration_s=3600.0, instance_type="m6i.4xlarge", lifecycle="on-demand"
+        )
+
+        payload = _write(results, tmp_path, costs={"N40W075": estimate})
+
+        by_tile = {t["tile"]: t for t in payload["tiles"]}
+        assert by_tile["N40W075"]["cost"]["low"] == 0.768
+        assert by_tile["N40W075"]["cost"]["provenance"] == "derived"
+        assert by_tile["S05W060"]["cost"] is None
+        assert payload["cost"]["priced_tiles"] == 1
+        assert payload["cost"]["total"]["low"] == 0.768
+        assert payload["cost"]["fleet"]["tiles"] == pricing.FLEET_TILES
+        assert payload["cost"]["fleet"]["mean_usd_per_tile"]["low"] == 0.768
+        assert payload["cost"]["disclaimer"] == pricing.DISCLAIMER
+
+    def test_nothing_priced_projects_nothing(self, results, tmp_path):
+        payload = _write(results, tmp_path)
+
+        assert payload["cost"]["total"] is None
+        assert payload["cost"]["fleet"] is None
+        assert payload["cost"]["priced_tiles"] == 0
+
+
+class TestPlan:
+    def test_block_is_written_when_one_was_supplied(self, results, tmp_path):
+        plan = {"planned": {"scenes": 2930}, "memory": {"floor_gib": 51.4, "ratio": 1.53}}
+
+        payload = _write(results, tmp_path, plan=plan)
+
+        assert payload["plan"] == plan
+
+    def test_block_is_absent_when_the_run_stored_no_plan(self, results, tmp_path):
+        payload = _write(results, tmp_path)
+
+        assert "plan" not in payload

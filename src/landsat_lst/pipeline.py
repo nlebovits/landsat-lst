@@ -12,6 +12,8 @@ import pystac_client
 import structlog
 import xarray as xr
 from odc.stac import stac_load
+from pystac_client.stac_api_io import StacApiIO
+from urllib3.util.retry import Retry
 
 from landsat_lst.config import settings
 from landsat_lst.encoding import LST_MIN_TRUSTED_C
@@ -44,6 +46,52 @@ _PC_URL_PREFIX = "https://planetarycomputer.microsoft.com"
 #: a synthetic stack chunked differently from the real one builds a different
 #: graph, and the whole value of planning against it is that it does not.
 TIME_CHUNK = 10
+
+
+#: Statuses worth trying again. 429 is throttling; the 5xx codes are the ones a
+#: load balancer or a gateway returns while the API behind it is briefly
+#: unwell. A 4xx other than 429 says the request itself is wrong, and repeating
+#: it would only spend the retry budget.
+_RETRY_STATUSES = (429, 500, 502, 503, 504)
+
+
+def _stac_retry() -> Retry:
+    """Build the retry policy for STAC requests.
+
+    ``pystac_client`` already mounts an adapter, but it builds one from a plain
+    integer, and ``Retry.from_int`` leaves ``status_forcelist`` empty, the
+    backoff at zero, and ``allowed_methods`` restricted to idempotent verbs. So
+    a 500 was never retried, a search is a POST and was not retried either, and
+    nothing waited between attempts. That is how one transient HTTP 500 ended a
+    tile at second 10 of a five-hour budget on 2026-08-14.
+
+    ``allowed_methods=None`` retries every verb, which is what lets the POST
+    search retry. A STAC search is a read, so replaying it is safe. The jitter
+    keeps concurrent VMs from retrying in lockstep through a single outage.
+    """
+    return Retry(
+        total=settings.stac_retries,
+        backoff_factor=settings.stac_retry_backoff_s,
+        status_forcelist=_RETRY_STATUSES,
+        allowed_methods=None,
+        respect_retry_after_header=True,
+        backoff_jitter=0.5,
+    )
+
+
+def open_catalog() -> pystac_client.Client:
+    """Open the configured STAC catalog with a retry policy that covers 5xx.
+
+    Retrying here rather than through ``settings.coiled_retries`` is deliberate:
+    a VM restart costs minutes and destroys everything the tile had computed,
+    while an HTTP retry costs seconds and keeps it. A genuine outage still
+    exhausts the budget in well under a minute and fails the tile, rather than
+    holding a VM for ``settings.coiled_job_timeout``.
+    """
+    return pystac_client.Client.open(
+        settings.stac_url,
+        stac_io=StacApiIO(max_retries=_stac_retry(), timeout=settings.stac_timeout_s),
+    )
 
 
 def _is_planetary_computer() -> bool:
@@ -110,7 +158,7 @@ def query_stac(job: ProcessingJob) -> list:
     if not _is_planetary_computer():
         _configure_requester_pays()
 
-    catalog = pystac_client.Client.open(settings.stac_url)
+    catalog = open_catalog()
 
     search = catalog.search(
         collections=[settings.collection],
@@ -608,13 +656,18 @@ def process_tile(
     offset_land_mask = None
     factor = settings.destripe_offset_resolution_factor
     if settings.destripe and factor > 1:
-        offset_source = load_scenes(
-            items,
-            job.tile.bbox,
-            patch_url=patch_url,
-            fail_on_error=False,
-            resolution_factor=factor,
-        )
+        # Timed in its own right. Building this graph is single-threaded Python
+        # over every scene in the window, and sitting untimed between two
+        # `land_mask` sections it billed its minutes to the mask and published
+        # the same phase name twice with a silence in the middle.
+        with timed_section("offset_load", scenes_found=len(items)):
+            offset_source = load_scenes(
+                items,
+                job.tile.bbox,
+                patch_url=patch_url,
+                fail_on_error=False,
+                resolution_factor=factor,
+            )
         with timed_section("land_mask"):
             offset_land_mask = _build_land_mask(
                 job.tile.bbox, offset_source.latitude, offset_source.longitude

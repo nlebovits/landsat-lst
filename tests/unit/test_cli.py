@@ -186,7 +186,7 @@ class TestProcessLocal:
 
         storage = LocalStorage(output_dir=tmp_path / "cogs")
         assert result.exit_code == 0
-        assert storage.read_text(storage.log_key("run-1", "N40W075")) is not None
+        assert storage.read_text(storage.log_key("run-1", "N40W075", 1)) is not None
 
     def test_a_failed_tile_still_leaves_its_log(self, runner, tmp_path):
         from landsat_lst.storage import LocalStorage
@@ -197,7 +197,7 @@ class TestProcessLocal:
 
         storage = LocalStorage(output_dir=tmp_path / "cogs")
         assert result.exit_code == 1
-        assert storage.read_text(storage.log_key("run-1", "N40W075")) is not None
+        assert storage.read_text(storage.log_key("run-1", "N40W075", 1)) is not None
 
     def test_an_unusable_tile_argument_still_leaves_its_log(self, tmp_path):
         """The one failure mode that used to leave no evidence at all.
@@ -220,9 +220,52 @@ class TestProcessLocal:
             )
 
         storage = LocalStorage(output_dir=tmp_path / "cogs")
-        log = storage.read_text(storage.log_key("run-1", "_N40W075_"))
+        log = storage.read_text(storage.log_key("run-1", "_N40W075_", 1))
         assert log is not None
         assert "Invalid tile name format" in log
+
+    def test_one_process_numbers_every_artifact_alike(self, runner, tmp_path):
+        """The log and the state object carry the same attempt number.
+
+        The attempt is resolved once, before the capture opens, and threaded
+        down. A second caller asking the bucket would see this process's own
+        state object and number itself one higher, and the log uploads last, so
+        the split would land on exactly the two artifacts that have to agree.
+        """
+        from landsat_lst.storage import LocalStorage
+
+        storage = LocalStorage(output_dir=tmp_path / "cogs")
+        # An earlier attempt already left a state object, so this one is 2.
+        storage.write_text(storage.run_record_key("run-1", "N40W075", 1), "{}")
+
+        with patch("landsat_lst.job.process_tile_job") as mock_job:
+            mock_job.return_value = _result("N40W075", "completed")
+            result = runner.invoke(main, ["process", "-t", "N40W075", "--run-id", "run-1"])
+
+        assert result.exit_code == 0
+        assert mock_job.call_args.kwargs["attempt"] == 2
+        assert storage.read_text(storage.log_key("run-1", "N40W075", 2)) is not None
+        assert storage.read_text(storage.log_key("run-1", "N40W075", 3)) is None
+
+    def test_the_first_attempt_is_numbered_one(self, runner, tmp_path):
+        """An empty run prefix means nothing has been tried yet."""
+        from landsat_lst.storage import LocalStorage
+
+        with patch("landsat_lst.job.process_tile_job") as mock_job:
+            mock_job.return_value = _result("N40W075", "completed")
+            runner.invoke(main, ["process", "-t", "N40W075", "--run-id", "run-1"])
+
+        storage = LocalStorage(output_dir=tmp_path / "cogs")
+        assert mock_job.call_args.kwargs["attempt"] == 1
+        assert storage.read_text(storage.log_key("run-1", "N40W075", 1)) is not None
+
+    def test_a_local_run_resolves_no_attempt(self, runner, tmp_path):
+        """No run id means no artifacts to number, so nothing is listed."""
+        with patch("landsat_lst.job.process_tile_job") as mock_job:
+            mock_job.return_value = _result("N40W075", "completed")
+            runner.invoke(main, ["process", "-t", "N40W075"])
+
+        assert mock_job.call_args.kwargs["attempt"] is None
 
     def test_a_local_run_uploads_nothing(self, runner, tmp_path):
         """Output is already in front of somebody; do not pay S3 to repeat it."""

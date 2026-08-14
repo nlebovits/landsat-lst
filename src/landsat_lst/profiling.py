@@ -29,7 +29,9 @@ a forecast. The floor is worth having on its own: a configuration whose floor
 already exceeds the VM is disqualified for free. It is emphatically not a
 measurement. On the 300-scene N40W075 sample the floor came to a few GB against
 78.6 GB of observed RSS, and closing that gap is what
-``scripts/synthetic_scaling.py`` exists to do.
+``scripts/synthetic_scaling.py`` exists to do. :func:`plan_memory` applies it to
+a named tile without building anything, which is cheap enough that a 700-tile
+submission can record the plan it was submitted against.
 
 :func:`profile_compute` is the third layer, and the only one that costs a real
 run anything. It wraps a compute in ``dask.diagnostics`` profilers and dumps the
@@ -41,6 +43,7 @@ a tile. See issue #76.
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections import Counter, defaultdict
 from contextlib import ExitStack, contextmanager, suppress
@@ -572,36 +575,145 @@ class PlanPhase:
         }
 
 
-def _phase(
-    name: str,
-    collection: Any,
-    *,
-    height: int,
-    width: int,
-    scenes: int,
-    chunk_size: int,
-    threads: int,
-    baseline_gib: float,
-    optimize: bool,
-    months: int,
-) -> PlanPhase:
+def _phase(name: str, collection: Any, *, peak: PeakEstimate, optimize: bool) -> PlanPhase:
     """Pair a built graph with the memory floor for the configuration behind it."""
     return PlanPhase(
         name=name,
-        height=height,
-        width=width,
-        scenes=scenes,
+        height=peak.height,
+        width=peak.width,
+        scenes=peak.scenes,
         graph=graph_stats(collection, optimize=optimize),
-        peak=predict_peak(
+        peak=peak,
+    )
+
+
+def _levers(
+    chunk_size: int | None, threads: int | None, offset_factor: int | None
+) -> tuple[int, int, int]:
+    """Fill in whatever a caller left to settings, as ``(chunk, threads, factor)``.
+
+    One resolution site, so :func:`plan_memory` and :func:`plan_tile` cannot
+    disagree about what "the default configuration" means.
+    """
+    csize = settings.load_chunk_size if chunk_size is None else chunk_size
+    nthreads = threads or settings.dask_max_threads or os.cpu_count() or 1
+    factor = settings.destripe_offset_resolution_factor if offset_factor is None else offset_factor
+    return csize, nthreads, factor
+
+
+def plan_memory(
+    *,
+    tile: Any,
+    scenes: int = PRODUCTION_SCENES,
+    chunk_size: int | None = None,
+    threads: int | None = None,
+    offset_factor: int | None = None,
+    baseline_gib: float = DEFAULT_BASELINE_GIB,
+) -> tuple[PeakEstimate, PeakEstimate]:
+    """Price both phases of a tile from arithmetic alone, offsets first.
+
+    Pure arithmetic over the tile's grid. No graph is built and no synthetic
+    stack is allocated, so this returns in microseconds even at production
+    scene counts. That is what lets a 700-tile submission record the plan it
+    submitted against, which is the only way a later reconcile can tell whether
+    the planner was right. Recomputing a plan at reconcile time would price
+    whatever the settings say then, not what the run actually ran.
+
+    :func:`plan_tile` reports these same two floors alongside task counts, and
+    calls this function to get them.
+
+    Args:
+        tile: A :class:`~landsat_lst.models.TileId`.
+        scenes: Scenes in the window. Defaults to :data:`PRODUCTION_SCENES`.
+        chunk_size: Spatial chunk edge. Defaults to ``settings.load_chunk_size``.
+        threads: Concurrent dask threads. Defaults to
+            ``settings.dask_max_threads``, or the machine's CPU count when that
+            is unset, which is what dask itself would use.
+        offset_factor: Resolution factor for the offset pass. Defaults to
+            ``settings.destripe_offset_resolution_factor``.
+        baseline_gib: Process memory before any data is loaded.
+
+    Returns:
+        The offsets-phase floor and the composite-phase floor, in that order.
+        Each is a floor rather than a forecast. See :class:`PeakEstimate`.
+    """
+    from landsat_lst.tiling import tile_geobox  # noqa: PLC0415
+
+    csize, nthreads, factor = _levers(chunk_size, threads, offset_factor)
+    coarse_h, coarse_w = tile_geobox(tile, factor).shape
+    native_h, native_w = tile_geobox(tile).shape
+
+    def floor(*, height: int, width: int, months: int) -> PeakEstimate:
+        return predict_peak(
             scenes=scenes,
-            chunk_size=chunk_size,
-            threads=threads,
+            chunk_size=csize,
+            threads=nthreads,
             height=height,
             width=width,
             months=months,
             baseline_gib=baseline_gib,
-        ),
+        )
+
+    return (
+        # Only de-striping builds the float32 monthly climatology. Its blocks
+        # are read by every scene's anomaly, so they stay resident and the whole
+        # (12, h, w) array is charged. It runs on the coarse offsets grid.
+        floor(height=coarse_h, width=coarse_w, months=MONTHS),
+        # The composite builds no such array. Its twelve-month band is
+        # ``qa_count``, a uint8 result streamed to the COG writer block by
+        # block, never a resident float32 cube. Charging it one put 14.5 GiB
+        # into every row of a --sweep, swamping the levers the sweep exists to
+        # rank: chunk 128 at 8 threads scored better than chunk 512 at 1.
+        floor(height=native_h, width=native_w, months=0),
     )
+
+
+def plan_memory_record(
+    *,
+    tile: Any,
+    scenes: int = PRODUCTION_SCENES,
+    chunk_size: int | None = None,
+    threads: int | None = None,
+    offset_factor: int | None = None,
+    baseline_gib: float = DEFAULT_BASELINE_GIB,
+) -> dict[str, Any]:
+    """A JSON-safe :func:`plan_memory`, for storing on a submission record.
+
+    Carries the levers as well as the floors, because a floor read back without
+    the configuration that produced it cannot be argued with.
+
+    Args:
+        tile: A :class:`~landsat_lst.models.TileId`.
+        scenes: Scenes in the window. Defaults to :data:`PRODUCTION_SCENES`.
+        chunk_size: Spatial chunk edge. Defaults to ``settings.load_chunk_size``.
+        threads: Concurrent dask threads. Defaults as in :func:`plan_memory`.
+        offset_factor: Resolution factor for the offset pass. Defaults to
+            ``settings.destripe_offset_resolution_factor``.
+        baseline_gib: Process memory before any data is loaded.
+
+    Returns:
+        Plain lists, dicts, and numbers, keyed by :data:`PHASE_OFFSETS` and
+        :data:`PHASE_COMPOSITE` under ``phases``.
+    """
+    csize, nthreads, factor = _levers(chunk_size, threads, offset_factor)
+    offsets, composite = plan_memory(
+        tile=tile,
+        scenes=scenes,
+        chunk_size=csize,
+        threads=nthreads,
+        offset_factor=factor,
+        baseline_gib=baseline_gib,
+    )
+    return {
+        "scenes": scenes,
+        "chunk_size": csize,
+        "threads": nthreads,
+        "offset_factor": factor,
+        "phases": {
+            PHASE_OFFSETS: offsets.as_dict(),
+            PHASE_COMPOSITE: composite.as_dict(),
+        },
+    }
 
 
 def plan_tile(
@@ -628,6 +740,9 @@ def plan_tile(
     an upper bound: in a real run de-striping has already discarded roughly 22%
     of scenes by the time the composite is built.
 
+    Memory floors come from :func:`plan_memory`, which builds nothing. Call that
+    directly when the task counts are not worth the graph.
+
     Args:
         tile: A :class:`~landsat_lst.models.TileId`.
         scenes: Scenes in the window. Defaults to :data:`PRODUCTION_SCENES`.
@@ -650,74 +765,52 @@ def plan_tile(
         PlanTooLarge: If either graph would allocate past ``max_tasks``. Checked
             before anything is built, so the refusal costs nothing.
     """
-    import os  # noqa: PLC0415
-
     from landsat_lst.normalization import offset_graph  # noqa: PLC0415
     from landsat_lst.pipeline import compute_annual_composite  # noqa: PLC0415
     from landsat_lst.qa import apply_qa_mask, convert_to_celsius  # noqa: PLC0415
-    from landsat_lst.tiling import tile_geobox  # noqa: PLC0415
 
-    csize = settings.load_chunk_size if chunk_size is None else chunk_size
-    nthreads = threads or settings.dask_max_threads or os.cpu_count() or 1
-    factor = settings.destripe_offset_resolution_factor if offset_factor is None else offset_factor
-    common = {
-        "chunk_size": csize,
-        "threads": nthreads,
-        "baseline_gib": baseline_gib,
-        "optimize": optimize,
-    }
+    # The floors, the two grids, and the months charged against each all come
+    # from plan_memory, so a plan and a stored submission record can never price
+    # the same tile differently.
+    offsets_peak, composite_peak = plan_memory(
+        tile=tile,
+        scenes=scenes,
+        chunk_size=chunk_size,
+        threads=threads,
+        offset_factor=offset_factor,
+        baseline_gib=baseline_gib,
+    )
+    csize = offsets_peak.chunk_size
 
     # Both shapes are checked before either graph is built. A refusal has to
     # arrive before the allocation it is refusing, or it is worth nothing.
-    coarse_h, coarse_w = tile_geobox(tile, factor).shape
-    native_h, native_w = tile_geobox(tile).shape
-    for phase_name, (h, w) in (
-        (PHASE_OFFSETS, (coarse_h, coarse_w)),
-        (PHASE_COMPOSITE, (native_h, native_w)),
-    ):
+    for phase_name, peak in ((PHASE_OFFSETS, offsets_peak), (PHASE_COMPOSITE, composite_peak)):
         _guard(
             phase=phase_name,
-            height=h,
-            width=w,
+            height=peak.height,
+            width=peak.width,
             chunk_size=csize,
             scenes=scenes,
             limit=max_tasks,
         )
 
-    coarse = synthetic_dataset(shape=(coarse_h, coarse_w), scenes=scenes, chunk_size=csize)
+    coarse_shape = (offsets_peak.height, offsets_peak.width)
+    coarse = synthetic_dataset(shape=coarse_shape, scenes=scenes, chunk_size=csize)
     offsets = offset_graph(convert_to_celsius(apply_qa_mask(coarse)["lwir11"]))
 
-    native = synthetic_dataset(shape=(native_h, native_w), scenes=scenes, chunk_size=csize)
+    native_shape = (composite_peak.height, composite_peak.width)
+    native = synthetic_dataset(shape=native_shape, scenes=scenes, chunk_size=csize)
     with destripe_disabled():
         composite = compute_annual_composite(native)
 
     return (
-        # Only de-striping builds the float32 monthly climatology. Its blocks
-        # are read by every scene's anomaly, so they stay resident and the whole
-        # (12, h, w) array is charged.
         _phase(
             PHASE_OFFSETS,
             xr.Dataset({"offset": offsets[0], "n_valid": offsets[1]}),
-            height=coarse_h,
-            width=coarse_w,
-            scenes=scenes,
-            months=MONTHS,
-            **common,
+            peak=offsets_peak,
+            optimize=optimize,
         ),
-        # The composite builds no such array. Its twelve-month band is
-        # ``qa_count``, a uint8 result streamed to the COG writer block by
-        # block, never a resident float32 cube. Charging it one put 14.5 GiB
-        # into every row of a --sweep, swamping the levers the sweep exists to
-        # rank: chunk 128 at 8 threads scored better than chunk 512 at 1.
-        _phase(
-            PHASE_COMPOSITE,
-            composite,
-            height=native_h,
-            width=native_w,
-            scenes=scenes,
-            months=0,
-            **common,
-        ),
+        _phase(PHASE_COMPOSITE, composite, peak=composite_peak, optimize=optimize),
     )
 
 
@@ -963,7 +1056,9 @@ def _profile_destination(label: str) -> tuple[Any, str] | None:
     """
     heartbeat = active_heartbeat()
     if heartbeat is not None:
-        key = heartbeat.storage.profile_key(heartbeat.run_id, heartbeat.tile, label)
+        key = heartbeat.storage.profile_key(
+            heartbeat.run_id, heartbeat.tile, label, heartbeat.attempt
+        )
         return heartbeat.storage, key
 
     from landsat_lst.storage import LocalStorage  # noqa: PLC0415

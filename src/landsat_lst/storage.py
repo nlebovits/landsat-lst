@@ -17,18 +17,27 @@ uploaded asset is a half-written tile and has to be rebuilt, so
 :meth:`StorageBackend.cog_exists` always checks both.
 
 Each backend also stores small per-tile objects under ``_runs/{run_id}/``, the
-only channel a batch VM has back to whoever is watching:
+only channel a batch VM has back to whoever is watching. Every one of them is
+keyed by attempt, because ``settings.coiled_retries`` is 3 and a retry used to
+overwrite the attempt before it:
 
-- ``{tile}.json`` -- the **run record**, written once when the tile finishes.
-  A distributed run has no live driver to collect results, so the VM reports its
-  own duration, scene count, peak memory, and error;
-  :func:`landsat_lst.batch.reconcile_run` reads them back.
-- ``{tile}.progress.json`` -- the **heartbeat**, rewritten every
-  ``settings.heartbeat_interval_s`` while the tile runs, so a wedged tile is
-  distinguishable from a busy one (:mod:`landsat_lst.progress`).
-- ``{tile}.log`` -- the task's captured stdout and stderr, uploaded when it
-  exits either way. Coiled's own logs never carry it and its exit code is the
-  tee wrapper's, so a failed tile explains itself here or nowhere.
+- ``{tile}.{attempt}.json`` -- the **state object**, rewritten every
+  ``settings.heartbeat_interval_s`` while the tile runs and once more when it
+  settles. It carries both the live phase and the outcome, so a wedged tile is
+  distinguishable from a busy one and a finished tile reports its own duration,
+  scene count, peak memory, and error (:mod:`landsat_lst.progress`).
+- ``{tile}.json`` -- a copy of the final state, written once when the tile
+  stops. A reader that knows only this key finds a superset of what the old
+  run record held, and its presence is what tells every reader the tile
+  settled.
+- ``{tile}.{attempt}.log`` -- the task's captured stdout and stderr, uploaded
+  when it exits either way. Coiled's own logs never carry it and its exit code
+  is the tee wrapper's, so a failed tile explains itself here or nowhere.
+- ``{tile}.{attempt}.{label}.profile.json`` -- a dask profile dump, only when
+  ``settings.profile_dask`` is on.
+
+:mod:`landsat_lst.runs` owns the grammar of these names and is the one place
+that parses them. :func:`landsat_lst.batch.reconcile_run` reads them back.
 
 The prefix is a sibling of the collection directories and is invisible to the
 catalog, which only ever reads ``lst-p95-*``.
@@ -78,6 +87,11 @@ def offset_cache_key(
     return f"{OFFSET_PREFIX}/{tile}/{window}/f{factor}/v{algorithm_version}-{digest}.json"
 
 
+def _attempt_segment(attempt: int | None) -> str:
+    """``".2"`` for attempt 2, and nothing at all for the settled pointer."""
+    return "" if attempt is None else f".{attempt}"
+
+
 def collection_prefix(window: str) -> str:
     """The published collection id for one window, e.g. ``lst-p95-2021-2025``.
 
@@ -116,54 +130,56 @@ class StorageBackend(ABC):
         """
         return f"{RUN_RECORD_PREFIX}/{run_id}/"
 
-    def run_record_key(self, run_id: str, tile: str) -> str:
-        """Backend-relative key for one tile's run record.
+    def run_record_key(self, run_id: str, tile: str, attempt: int | None = None) -> str:
+        """Backend-relative key for one tile's state object.
+
+        ``attempt`` selects one attempt's own object. ``None`` gives the
+        unsuffixed key, which a settled tile copies its final state to and
+        which a run written before this scheme used for its only record.
+
+        Every Coiled retry used to write the one unsuffixed key here, so the
+        last attempt erased the ones before it. That is why run
+        ``2021-2025-20260814T092642Z`` reported a 10-second failure against a
+        33-minute wall clock. See issue #92.
 
         Args:
-            run_id: Run token the record belongs to.
+            run_id: Run token the object belongs to.
             tile: Tile name (``"N40W075"``).
+            attempt: Attempt number, or ``None`` for the settled-state pointer.
 
         Returns:
-            ``_runs/{run_id}/{tile}.json``
+            ``_runs/{run_id}/{tile}.{attempt}.json``, or
+            ``_runs/{run_id}/{tile}.json`` when ``attempt`` is ``None``.
         """
-        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.json"
+        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}{_attempt_segment(attempt)}.json"
 
-    def progress_key(self, run_id: str, tile: str) -> str:
-        """Backend-relative key for one tile's heartbeat.
-
-        Distinct from :meth:`run_record_key` because the two have opposite
-        lifetimes: the heartbeat is overwritten every minute while the tile
-        runs, the record is written once at the end and never touched again.
-
-        Returns:
-            ``_runs/{run_id}/{tile}.progress.json``
-        """
-        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.progress.json"
-
-    def profile_key(self, run_id: str, tile: str, label: str) -> str:
+    def profile_key(self, run_id: str, tile: str, label: str, attempt: int | None = None) -> str:
         """Backend-relative key for one dask profile dump.
 
         Written at most once per labelled compute, and only when
-        ``settings.profile_dask`` is on, so it sits beside the heartbeat and
+        ``settings.profile_dask`` is on, so it sits beside the state object and
         the log rather than replacing either.
 
         Args:
             run_id: Run token the profile belongs to.
             tile: Tile name (``"N40W075"``).
             label: Which compute was profiled (``"destripe_offsets"``).
+            attempt: Attempt number, or ``None`` for an unsuffixed key.
 
         Returns:
-            ``_runs/{run_id}/{tile}.{label}.profile.json``
+            ``_runs/{run_id}/{tile}.{attempt}.{label}.profile.json``
         """
-        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.{label}.profile.json"
+        segment = _attempt_segment(attempt)
+        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}{segment}.{label}.profile.json"
 
-    def log_key(self, run_id: str, tile: str) -> str:
+    def log_key(self, run_id: str, tile: str, attempt: int | None = None) -> str:
         """Backend-relative key for one tile's captured task log.
 
         Returns:
-            ``_runs/{run_id}/{tile}.log``
+            ``_runs/{run_id}/{tile}.{attempt}.log``, or
+            ``_runs/{run_id}/{tile}.log`` when ``attempt`` is ``None``.
         """
-        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}.log"
+        return f"{RUN_RECORD_PREFIX}/{run_id}/{tile}{_attempt_segment(attempt)}.log"
 
     @abstractmethod
     def cog_exists(self, window: str, tile: str) -> bool:
@@ -200,6 +216,11 @@ class StorageBackend(ABC):
     @abstractmethod
     def list_prefix(self, prefix: str) -> dict[str, datetime]:
         """Every key under ``prefix``, mapped to when it was last written.
+
+        ``prefix`` is matched as a key prefix, not as a directory path, so a
+        partial final segment such as ``_runs/{run_id}/N40W075.`` selects one
+        tile's artifacts. Both backends must honour that, because a caller
+        holding a :class:`StorageBackend` cannot know which one it has.
 
         The timestamp comes from the store rather than from the object's own
         contents, so a watcher measures heartbeat age against one clock instead
@@ -265,15 +286,23 @@ class LocalStorage(StorageBackend):
         return path.read_text() if path.is_file() else None
 
     def list_prefix(self, prefix: str) -> dict[str, datetime]:
-        root = self.output_dir / prefix
+        """Every key under ``prefix``, mapped to when it was last written.
+
+        ``prefix`` is a key prefix, not a directory path, so
+        ``_runs/{run_id}/N40W075.`` lists one tile's artifacts here exactly as
+        it does on S3. Reading it as a directory returned nothing locally for a
+        partial final segment while returning the right answer in production,
+        which would have made every test of a tile-scoped listing pass
+        vacuously against the one fake backend this repo has.
+        """
+        head, _, _ = prefix.rpartition("/")
+        root = self.output_dir / head if head else self.output_dir
         if not root.is_dir():
             return {}
         return {
-            str(path.relative_to(self.output_dir)): datetime.fromtimestamp(
-                path.stat().st_mtime, tz=UTC
-            )
+            key: datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
             for path in sorted(root.rglob("*"))
-            if path.is_file()
+            if path.is_file() and (key := str(path.relative_to(self.output_dir))).startswith(prefix)
         }
 
 

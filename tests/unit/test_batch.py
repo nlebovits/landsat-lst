@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from landsat_lst import pricing
 from landsat_lst.batch import (
     BatchSubmission,
     _task_command,
@@ -20,6 +21,7 @@ from landsat_lst.batch import (
     submit_batch,
     wait_for_batch,
 )
+from landsat_lst.config import settings
 from landsat_lst.models import ProcessingJob
 from landsat_lst.storage import PRODUCTS, LocalStorage, collection_prefix
 from landsat_lst.tiling import parse_tile_name
@@ -101,6 +103,45 @@ def _task(index: int, *, state="done", exit_code=0, start=None, stop=None) -> di
         "start": start,
         "stop": stop,
     }
+
+
+def _submit_run(storage, *tiles: str):
+    """Submit one run under the fixed id the reconcile tests read back."""
+    return submit_batch(_jobs(*tiles), storage=storage, run_id="r")
+
+
+def _write_state(storage, tile: str, attempt: int | None, **fields) -> None:
+    """Publish one tile state object, in the shape a VM writes it.
+
+    ``attempt=None`` writes the unsuffixed key, which is both the pointer a
+    settled tile copies its final state to and the whole of what a run written
+    before attempts were numbered leaves behind.
+    """
+    body = {
+        "schema": 2,
+        "run_id": "r",
+        "tile": tile,
+        "window": "2021-2025",
+        "attempt": attempt,
+        "year": 2021,
+        "end_year": 2025,
+        "max_scenes": None,
+        "phase": "composite_graph",
+        "status": None,
+        "elapsed_s": None,
+        "duration_s": None,
+        "peak_rss_mb": None,
+        "scene_count": None,
+        "lst_key": None,
+        "qa_key": None,
+        "error": None,
+    }
+    body.update(fields)
+    storage.write_text(storage.run_record_key("r", tile, attempt), json.dumps(body))
+
+
+def _manifest(runs_dir) -> dict:
+    return json.loads((runs_dir / "r.json").read_text())
 
 
 class TestTaskCommand:
@@ -550,6 +591,329 @@ def test_missing_coiled_is_reported_clearly(runs_dir, storage, monkeypatch):
 
     with pytest.raises(ImportError, match="Coiled is required"):
         submit_batch(_jobs("N40W075"), storage=storage)
+
+
+class TestAttemptSeries:
+    """A retried tile has to explain every VM the run paid for."""
+
+    def test_reports_every_attempt(self, fake_coiled, runs_dir, storage):
+        """Attempt 1 failed, attempt 2 died mid-land_mask, attempt 3 wrote the tile.
+
+        The middle attempt never settled, so it has no status and no duration.
+        Dropping it would hide the most expensive half hour of the tile, which
+        is what the shared-key layout used to do.
+        """
+        _submit_run(storage, "N40W075")
+        _write_state(
+            storage,
+            "N40W075",
+            1,
+            phase="loading",
+            status="failed",
+            duration_s=612.0,
+            peak_rss_mb=18000.0,
+            error="RasterioIOError on scene 41",
+        )
+        _write_state(
+            storage, "N40W075", 2, phase="land_mask", elapsed_s=1980.0, peak_rss_mb=48000.0
+        )
+        _write_state(
+            storage,
+            "N40W075",
+            3,
+            phase="uploading",
+            status="completed",
+            duration_s=2100.0,
+            peak_rss_mb=41200.0,
+            scene_count=907,
+        )
+        storage.write_text(storage.log_key("r", "N40W075", 2), "Killed", content_type="text/plain")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.status == "completed"
+        assert result.duration_s == 2100.0
+        tile = _manifest(runs_dir)["tiles"][0]
+        assert tile["attempt"] == 3
+        assert [row["attempt"] for row in tile["attempts"]] == [1, 2, 3]
+        assert tile["attempts"][1] == {
+            "attempt": 2,
+            "phase": "land_mask",
+            "status": None,
+            "duration_s": 1980.0,
+            "peak_rss_mb": 48000.0,
+            "error": None,
+            "log_key": "_runs/r/N40W075.2.log",
+        }
+
+    def test_summarises_retries_across_the_run(self, fake_coiled, runs_dir, storage):
+        _submit_run(storage, "N40W075", "S05W060")
+        _write_state(storage, "N40W075", 1, status="failed", duration_s=10.0, error="boom")
+        _write_state(storage, "N40W075", 2, status="completed", duration_s=800.0)
+        _write_state(storage, "S05W060", 1, status="completed", duration_s=700.0)
+        for tile in ("N40W075", "S05W060"):
+            _finish_tile(storage.output_dir, "2021-2025", tile)
+        _set_tasks(fake_coiled, _task(0), _task(1))
+
+        reconcile_run("r", storage=storage)
+
+        assert _manifest(runs_dir)["attempts"] == {"tiles_retried": 1, "total": 3, "max": 2}
+
+    def test_verdict_comes_from_the_newest_attempt(self, fake_coiled, runs_dir, storage):
+        """An earlier attempt's error must not outlive the attempt that worked."""
+        _submit_run(storage, "N40W075")
+        _write_state(storage, "N40W075", 1, status="failed", duration_s=10.0, error="boom")
+        _write_state(storage, "N40W075", 2, status="completed", duration_s=812.3)
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.error is None
+        assert result.duration_s == 812.3
+
+    def test_healthy_tile_costs_one_read(self, fake_coiled, runs_dir, storage):
+        """A settled tile publishes its attempt and a copy at the pointer key.
+
+        Reading both would double the request count of a 700-tile run to buy a
+        second copy of the same body.
+        """
+        _submit_run(storage, "N40W075")
+        _write_state(storage, "N40W075", 1, status="completed", duration_s=800.0)
+        _write_state(storage, "N40W075", None, status="completed", duration_s=800.0)
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        reads: list[str] = []
+        original = storage.read_text
+        storage.read_text = lambda key: (reads.append(key), original(key))[1]
+        _set_tasks(fake_coiled, _task(0))
+
+        reconcile_run("r", storage=storage)
+
+        assert reads == [storage.run_record_key("r", "N40W075", 1)]
+
+    def test_legacy_run_reconciles_unchanged(self, fake_coiled, runs_dir, storage):
+        """A run written before attempts were numbered still reads back whole.
+
+        Its outcome lived at the unsuffixed key and its liveness at a separate
+        ``.progress.json``. Neither carries an attempt number, so the series is
+        empty rather than invented.
+        """
+        _submit_run(storage, "N40W075")
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        storage.write_text(
+            storage.run_record_key("r", "N40W075"),
+            json.dumps(
+                {
+                    "tile": "N40W075",
+                    "year": 2021,
+                    "end_year": 2025,
+                    "status": "completed",
+                    "duration_s": 1834.2,
+                    "scene_count": 907,
+                    "peak_rss_mb": 41200.0,
+                }
+            ),
+        )
+        storage.write_text(
+            f"{storage.run_prefix('r')}N40W075.progress.json",
+            json.dumps({"tile": "N40W075", "phase": "exporting"}),
+        )
+        _set_tasks(fake_coiled, _task(0))
+
+        (result,) = reconcile_run("r", storage=storage)
+
+        assert result.status == "completed"
+        assert result.duration_s == 1834.2
+        tile = _manifest(runs_dir)["tiles"][0]
+        assert tile["attempts"] == []
+        assert tile["attempt"] == 0
+
+
+class TestCost:
+    """What the run cost, as a range that says how much of it is assumed."""
+
+    def test_prices_a_tile_from_its_own_instance_type(self, fake_coiled, runs_dir, storage):
+        """An on-demand VM of a known type is a published rate, so it is a point."""
+        _submit_run(storage, "N40W075")
+        _write_state(
+            storage,
+            "N40W075",
+            1,
+            status="completed",
+            duration_s=3600.0,
+            instance_type="m6i.4xlarge",
+            instance_lifecycle="on-demand",
+        )
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        reconcile_run("r", storage=storage)
+
+        payload = _manifest(runs_dir)
+        cost = payload["tiles"][0]["cost"]
+        assert cost["instance_type"] == "m6i.4xlarge"
+        assert cost["lifecycle"] == "on-demand"
+        assert cost["low"] == cost["high"] == 0.768
+        assert cost["provenance"] == "derived"
+        assert payload["cost"]["priced_tiles"] == 1
+        assert payload["cost"]["total"]["low"] == 0.768
+        assert payload["cost"]["fleet"]["tiles"] == pricing.FLEET_TILES
+        assert payload["cost"]["fleet"]["observed_tiles"] == 1
+        assert payload["cost"]["disclaimer"] == pricing.DISCLAIMER
+
+    def test_tile_without_an_instance_type_is_assumed(self, fake_coiled, runs_dir, storage):
+        """A VM that never said what it was is priced as the type the fleet asks
+        for first, on a lifecycle the purchase policy does not pin down. Both
+        substitutions widen the band and both are labelled.
+        """
+        _submit_run(storage, "N40W075")
+        _write_state(storage, "N40W075", 1, status="completed", duration_s=1800.0)
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        reconcile_run("r", storage=storage)
+
+        cost = _manifest(runs_dir)["tiles"][0]["cost"]
+        assert cost["instance_type"] == settings.coiled_vm_types[0]
+        assert cost["lifecycle"] == "unknown"
+        assert cost["provenance"] == "assumed"
+        assert cost["low"] < cost["high"]
+
+    def test_short_failure_is_billed_a_full_minute(self, fake_coiled, runs_dir, storage):
+        """A task that died in ten seconds still launched an instance."""
+        _submit_run(storage, "N40W075")
+        _write_state(storage, "N40W075", 1, status="failed", duration_s=10.375, error="boom")
+        _set_tasks(fake_coiled, _task(0, state="error", exit_code=1))
+
+        reconcile_run("r", storage=storage)
+
+        assert _manifest(runs_dir)["tiles"][0]["cost"]["billed_s"] == 60.0
+
+    def test_unpriceable_run_projects_nothing(self, fake_coiled, runs_dir, storage):
+        """Zero dollars for 700 tiles is a claim, and it would be false."""
+        _submit_run(storage, "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        reconcile_run("r", storage=storage)
+
+        payload = _manifest(runs_dir)
+        assert payload["tiles"][0]["cost"] is None
+        assert payload["cost"]["priced_tiles"] == 0
+        assert payload["cost"]["total"] is None
+        assert payload["cost"]["fleet"] is None
+
+
+class TestPlanComparison:
+    """The floor the run was submitted expecting, against what it reached."""
+
+    def test_submission_stores_a_plan(self, fake_coiled, runs_dir, storage, monkeypatch):
+        monkeypatch.setattr(settings, "dask_max_threads", 4)
+
+        submission = _submit_run(storage, "N40W075")
+
+        assert submission.plan["threads"] == 4
+        assert submission.plan["threads_source"] == "settings.dask_max_threads"
+        assert submission.plan["phases"]["composite"]["floor_gib"] > 0
+        assert load_submission("r").plan == submission.plan
+
+    def test_plan_says_when_the_thread_count_came_from_this_host(
+        self, fake_coiled, runs_dir, storage, monkeypatch
+    ):
+        """The default reads the submitting laptop's cores, not the VM's."""
+        monkeypatch.setattr(settings, "dask_max_threads", None)
+
+        submission = _submit_run(storage, "N40W075")
+
+        assert submission.plan["threads_source"] == "cpu_count of the submitting host"
+
+    def test_plan_failure_does_not_stop_a_submission(
+        self, fake_coiled, runs_dir, storage, monkeypatch
+    ):
+        def explode(**kwargs):
+            msg = "no geometry for you"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr("landsat_lst.profiling.plan_memory_record", explode)
+
+        submission = _submit_run(storage, "N40W075")
+
+        assert submission.plan is None
+        assert submission.cluster_id == 4242
+
+    def test_manifest_reports_a_ratio_rather_than_a_verdict(self, fake_coiled, runs_dir, storage):
+        """The floor is a lower bound, so a run above it is the ordinary case.
+
+        The gap is the finding: a 300-scene N40W075 sample peaked at 78.6 GB
+        against a floor of a few GB, which is how the offset pass was found to
+        fan out rather than stream.
+        """
+        _submit_run(storage, "N40W075")
+        _write_state(
+            storage,
+            "N40W075",
+            1,
+            status="completed",
+            duration_s=2100.0,
+            peak_rss_mb=51200.0,
+            scene_count=907,
+        )
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        reconcile_run("r", storage=storage)
+
+        plan = _manifest(runs_dir)["plan"]
+        memory = plan["memory"]
+        assert set(memory) == {
+            "floor_gib",
+            "floor_phase",
+            "observed_peak_gib",
+            "observed_tiles",
+            "ratio",
+        }
+        assert memory["observed_peak_gib"] == 50.0
+        assert memory["ratio"] == round(50.0 / memory["floor_gib"], 2)
+        assert memory["floor_phase"] in {"destripe_offsets", "composite"}
+        assert plan["scenes"]["planned"] == plan["planned"]["scenes"]
+        assert plan["scenes"]["observed_max"] == 907
+
+    def test_no_plan_block_when_the_submission_stored_none(self, fake_coiled, runs_dir, storage):
+        """An old submission record has no plan, and inventing one is worse."""
+        _submit_run(storage, "N40W075")
+        path = submission_path("r")
+        payload = json.loads(path.read_text())
+        del payload["plan"]
+        path.write_text(json.dumps(payload))
+        _finish_tile(storage.output_dir, "2021-2025", "N40W075")
+        _set_tasks(fake_coiled, _task(0))
+
+        reconcile_run("r", storage=storage)
+
+        assert "plan" not in _manifest(runs_dir)
+
+
+def test_submission_roundtrips_with_and_without_a_plan():
+    fields = {
+        "run_id": "r",
+        "window": "2021-2025",
+        "cluster_id": 4242,
+        "job_id": 77,
+        "submitted_at": "2026-08-12T14:00:00+00:00",
+        "submitted_tiles": ["N40W075"],
+        "year": 2021,
+        "end_year": 2025,
+    }
+    planned = BatchSubmission(**fields, plan={"scenes": 2930, "phases": {}})
+    unplanned = BatchSubmission(**fields)
+
+    assert BatchSubmission.from_dict(planned.to_dict()) == planned
+    assert BatchSubmission.from_dict(unplanned.to_dict()) == unplanned
+
+    legacy = unplanned.to_dict()
+    del legacy["plan"]
+    assert BatchSubmission.from_dict(legacy) == unplanned
 
 
 def test_credentials_are_resolved_only_when_a_cluster_starts(

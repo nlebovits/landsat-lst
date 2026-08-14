@@ -20,6 +20,13 @@ console = Console()
 @click.version_option()
 def main() -> None:
     """Landsat Land Surface Temperature annual composites."""
+    # Plain tracebacks, before anything can raise. structlog's default console
+    # renderer formats exceptions through rich with frame locals on, and one
+    # such traceback rendered 3.8 MB of deserialized STAC collection into a
+    # tile's log and evicted its phase history. See landsat_lst.logging_config.
+    from landsat_lst.logging_config import configure_logging
+
+    configure_logging()
 
 
 #: Shared by every command that runs the offset pass. Off means neither read
@@ -138,7 +145,8 @@ def process(
     """
     # The capture opens before the jobs are built, so an unusable --tile is
     # explained by an uploaded log rather than by silence on a dead VM.
-    with _task_log(tiles, run_id):
+    capture, attempt = _task_log(tiles, run_id)
+    with capture:
         jobs = _build_jobs(year, end_year, tiles, max_scenes)
         if limit is not None:
             jobs = jobs[:limit]
@@ -169,11 +177,20 @@ def process(
                 use_offset_cache=not no_offset_cache,
             )
         else:
-            _process_local(jobs, force=force, run_id=run_id, use_offset_cache=not no_offset_cache)
+            _process_local(
+                jobs,
+                force=force,
+                run_id=run_id,
+                use_offset_cache=not no_offset_cache,
+                attempt=attempt,
+            )
 
 
 def _task_log(tiles: tuple[str, ...], run_id: str | None):
-    """Capture this process's output when it is a batch task running one tile.
+    """Capture this process's output, and settle which attempt this is.
+
+    Returns the capture context and the attempt number, or ``None`` for a run
+    that is not a batch task.
 
     Coiled keeps a task's stdout on the VM and reports the tee wrapper's exit
     code rather than the pipeline's, so a tile that dies explains itself only if
@@ -190,17 +207,29 @@ def _task_log(tiles: tuple[str, ...], run_id: str | None):
     from contextlib import nullcontext
 
     if run_id is None or len(tiles) != 1:
-        return nullcontext()
+        return nullcontext(), None
 
     from landsat_lst.progress import capture_task_log
+    from landsat_lst.runs import resolve_attempt
     from landsat_lst.storage import get_storage
 
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tiles[0]) or "unnamed-tile"
-    return capture_task_log(run_id=run_id, tile=safe, storage=get_storage())
+    storage = get_storage()
+    # Resolved once, here, and threaded down. Every artifact this process
+    # writes has to carry the same attempt number, and the log is uploaded
+    # last: a second caller asking the bucket again would see this process's
+    # own state object and number itself one higher.
+    attempt = resolve_attempt(storage, run_id, safe)
+    return capture_task_log(run_id=run_id, tile=safe, storage=storage, attempt=attempt), attempt
 
 
 def _process_local(
-    jobs: list, *, force: bool, run_id: str | None = None, use_offset_cache: bool = True
+    jobs: list,
+    *,
+    force: bool,
+    run_id: str | None = None,
+    use_offset_cache: bool = True,
+    attempt: int | None = None,
 ) -> None:
     """Process jobs sequentially in this process with a progress bar.
 
@@ -224,7 +253,11 @@ def _process_local(
         for job in jobs:
             progress.update(task, description=f"Processing {job.tile.name}...")
             result = process_tile_job(
-                job, force=force, run_id=run_id, use_offset_cache=use_offset_cache
+                job,
+                force=force,
+                run_id=run_id,
+                use_offset_cache=use_offset_cache,
+                attempt=attempt,
             )
 
             if result.status == "completed":
@@ -289,14 +322,24 @@ def _process_distributed(
         _print_results(reconcile_run(submission.run_id))
         return
 
+    # The cluster id stays, because it is the right handle for billing and for
+    # Coiled support. Its dashboard does not: a batch task never registers with
+    # the dask scheduler, so that page describes a scheduler this run never
+    # joined, and `coiled logs` never receives task stdout either. See ADR-010.
     console.print(f"  Cluster: {submission.cluster_id}  Tasks: {len(submission.submitted_tiles)}")
-    console.print(f"  Progress: {submission.dashboard_url}")
 
     if not wait:
+        from rich.panel import Panel
+
         console.print(
-            f"\n  Submitted. This shell is free to close.\n"
-            f"  Live progress: [bold]landsat-lst watch {submission.run_id}[/bold]\n"
-            f"  When it finishes: [bold]landsat-lst reconcile {submission.run_id}[/bold]"
+            Panel(
+                f"Submitted. This shell is free to close.\n\n"
+                f"Live view:   [bold]landsat-lst watch {submission.run_id}[/bold]\n"
+                f"Explain one: [bold]landsat-lst explain {submission.run_id} <tile>[/bold]\n"
+                f"When done:   [bold]landsat-lst reconcile {submission.run_id}[/bold]",
+                title=f"Run {submission.run_id}",
+                title_align="left",
+            )
         )
         return
 
@@ -726,7 +769,12 @@ def reconcile(run_id: str) -> None:
 )
 @click.option("--once", is_flag=True, help="Poll a single time and exit")
 @click.option("--all", "show_all", is_flag=True, help="Show every tile, not only the live ones")
-def watch(run_id: str, interval: float | None, once: bool, show_all: bool) -> None:
+@click.option(
+    "--detail",
+    is_flag=True,
+    help="Add a per-tile panel: memory trend, task rate, phase history, and cost",
+)
+def watch(run_id: str, interval: float | None, once: bool, show_all: bool, detail: bool) -> None:
     """Follow a running batch run's tiles from their heartbeats.
 
     Each tile republishes its phase, elapsed time, and memory every minute
@@ -747,7 +795,12 @@ def watch(run_id: str, interval: float | None, once: bool, show_all: bool) -> No
 
     try:
         snapshot = watch_run(
-            run_id, interval_s=interval, once=once, show_all=show_all, console=console
+            run_id,
+            interval_s=interval,
+            once=once,
+            show_all=show_all,
+            detail=detail,
+            console=console,
         )
     except KeyboardInterrupt:
         console.print("\n  Stopped watching. The run is untouched.")
@@ -757,6 +810,171 @@ def watch(run_id: str, interval: float | None, once: bool, show_all: bool) -> No
         console.print(
             f"\n  Every tile has stopped. Next: [bold]landsat-lst reconcile {run_id}[/bold]"
         )
+
+
+#: Log lines shown per attempt. The uploaded log is a tail already, capped at
+#: ``settings.task_log_max_bytes``, so this is a tail of a tail: enough to carry
+#: a traceback, short enough to read.
+_LOG_TAIL_LINES = 40
+
+
+def _explain_storage(run_id: str):
+    """The backend the run wrote to, falling back to this machine's config."""
+    from landsat_lst.batch import load_submission
+    from landsat_lst.storage import get_storage
+
+    try:
+        return load_submission(run_id).storage()
+    except Exception:
+        return get_storage()
+
+
+def _read_json(storage, key: str | None) -> dict | None:
+    """One published object, or ``None`` if it is missing or unreadable."""
+    import json as json_module
+
+    if key is None:
+        return None
+    try:
+        raw = storage.read_text(key)
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return json_module.loads(raw)
+    except ValueError:
+        return None
+
+
+def _print_attempt_state(state: dict, phase: str, status: str) -> None:
+    """The attempt's own numbers, and where its time went."""
+    from landsat_lst.render import format_duration, phase_rows, truncate
+
+    elapsed = state.get("duration_s") or state.get("elapsed_s")
+    console.print(
+        f"  elapsed {format_duration(elapsed)}"
+        f"   peak RSS {(state.get('peak_rss_mb') or 0) / 1024:.1f}G"
+        f"   host {state.get('host', '-')}"
+    )
+    if state.get("instance_type"):
+        console.print(
+            f"  instance {state['instance_type']}"
+            f" ({state.get('instance_lifecycle', 'unknown')},"
+            f" {state.get('instance_source', 'unknown')})"
+        )
+
+    for name, duration, bar_text in phase_rows(
+        state.get("phase_seconds") or {}, current=phase if status == "unsettled" else None
+    ):
+        console.print(f"    {name:<16}{duration:>8}  {bar_text}")
+
+    if state.get("error"):
+        console.print(f"  [red]{truncate(state['error'], 200)}[/red]")
+
+
+def _print_attempt_profiles(storage, artifacts, attempt: int) -> None:
+    """The dask profile dump, which nothing surfaced before this command."""
+    from landsat_lst.render import format_duration
+
+    for label, key in sorted(artifacts.profiles.get(attempt, {}).items()):
+        profile = _read_json(storage, key) or {}
+        tasks = profile.get("tasks", {})
+        console.print(
+            f"  profile {label}: {format_duration(profile.get('wall_s'))}"
+            f" over {tasks.get('count', '?')} tasks"
+        )
+        for entry in (tasks.get("by_prefix") or [])[:5]:
+            console.print(f"      {entry.get('prefix', '?'):<28}{entry.get('seconds', 0):>8.1f}s")
+
+
+def _print_attempt_log(storage, artifacts, attempt: int) -> None:
+    """The tail of the uploaded log, which is already a tail.
+
+    Coiled never carries task stdout, so this object is the only place a failed
+    tile explains itself.
+    """
+    from landsat_lst.render import strip_ansi, truncate
+
+    log_key = artifacts.logs.get(attempt)
+    if log_key is None:
+        console.print("  [dim]no log uploaded[/dim]")
+        return
+    try:
+        text = storage.read_text(log_key)
+    except Exception:
+        text = None
+    if not text:
+        console.print(f"  [dim]log at {log_key} is empty or unreadable[/dim]")
+        return
+    console.print(f"  [dim]log tail ({log_key}):[/dim]")
+    for line in strip_ansi(text).splitlines()[-_LOG_TAIL_LINES:]:
+        # markup=False: a captured log is data, and rich would read a bracketed
+        # token in a traceback as a style tag.
+        console.print(f"    {truncate(line, 160)}", style="dim", markup=False)
+
+
+def _print_attempt(storage, artifacts, attempt: int) -> None:
+    """Everything one attempt published, in the order it becomes useful."""
+    state = _read_json(storage, artifacts.states.get(attempt)) or {}
+    phase = state.get("phase", "unknown")
+    status = state.get("status") or "unsettled"
+
+    console.print(f"\n[bold]Attempt {attempt}[/bold]  {phase}  ({status})")
+    _print_attempt_state(state, phase, status)
+    _print_attempt_profiles(storage, artifacts, attempt)
+    _print_attempt_log(storage, artifacts, attempt)
+
+
+@main.command()
+@click.argument("run_id")
+@click.argument("tile", required=False)
+def explain(run_id: str, tile: str | None) -> None:
+    """Print everything one run, or one tile, published about itself.
+
+    Diagnosing the STAC failure of 2026-08-14 took four manual steps: read the
+    manifest, list the run prefix, download the task log, then slice its head
+    and tail. Every input was already in `_runs/{run_id}/`. This reads that
+    prefix and nothing else, so it works from any machine, including one that
+    did not submit the run.
+
+    With a tile, prints each attempt in turn: its state object, where its time
+    went, the dask profile when one exists, and the tail of its log. A tile that
+    was retried shows every attempt, because a tile that succeeded on the third
+    try after two infrastructure failures has to read differently from one that
+    succeeded on the first.
+    """
+    from landsat_lst.render import format_duration
+    from landsat_lst.runs import classify
+
+    storage = _explain_storage(run_id)
+    found = classify(storage.list_prefix(storage.run_prefix(run_id)))
+    if not found:
+        console.print(f"[yellow]Nothing published under run {run_id}.[/yellow]")
+        return
+
+    if tile is None:
+        console.print(f"[bold]Run {run_id}[/bold]  {len(found)} tiles reported")
+        for name in sorted(found):
+            artifacts = found[name]
+            state = _read_json(storage, artifacts.body_key) or {}
+            attempts = artifacts.attempts or [0]
+            console.print(
+                f"  {name:<10}{state.get('phase', 'unknown'):<16}"
+                f"{format_duration(state.get('duration_s') or state.get('elapsed_s')):>8}"
+                f"   attempts {len(attempts)}"
+            )
+        console.print(f"\n  Detail: [bold]landsat-lst explain {run_id} <tile>[/bold]")
+        return
+
+    artifacts = found.get(tile)
+    if artifacts is None:
+        console.print(f"[yellow]Tile {tile} published nothing under run {run_id}.[/yellow]")
+        return
+
+    console.print(f"[bold]{tile}[/bold] in run {run_id}")
+    for attempt in artifacts.attempts or [0]:
+        _print_attempt(storage, artifacts, attempt)
 
 
 @main.command()

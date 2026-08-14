@@ -216,27 +216,55 @@ class TestRunRecords:
     """Per-tile run records: what a batch VM leaves behind for reconciliation."""
 
     def test_key_layout(self, tmp_path):
+        """The unsuffixed key is the pointer a settled tile copies its state to."""
         storage = LocalStorage(output_dir=tmp_path)
 
         assert storage.run_record_key("2021-2025-abc", "N40W075") == (
             "_runs/2021-2025-abc/N40W075.json"
         )
 
-    def test_a_run_keeps_its_record_heartbeat_and_log_apart(self, tmp_path):
-        """Three objects per tile, three lifetimes, one prefix a watcher lists."""
+    def test_each_attempt_gets_its_own_keys(self, tmp_path):
+        """Three artifacts per attempt, three lifetimes, one prefix a watcher lists.
+
+        Without the attempt segment every Coiled retry wrote the same keys and
+        erased the attempt before it. See issue #92.
+        """
         storage = LocalStorage(output_dir=tmp_path)
 
-        assert storage.progress_key("r", "N40W075") == "_runs/r/N40W075.progress.json"
-        assert storage.log_key("r", "N40W075") == "_runs/r/N40W075.log"
+        assert storage.run_record_key("r", "N40W075", 2) == "_runs/r/N40W075.2.json"
+        assert storage.log_key("r", "N40W075", 2) == "_runs/r/N40W075.2.log"
+        assert storage.profile_key("r", "N40W075", "destripe_offsets", 2) == (
+            "_runs/r/N40W075.2.destripe_offsets.profile.json"
+        )
         assert storage.run_prefix("r") == "_runs/r/"
+
+    def test_no_attempt_gives_the_unsuffixed_key(self, tmp_path):
+        """What a reader that knows nothing about attempts asks for."""
+        storage = LocalStorage(output_dir=tmp_path)
+
+        assert storage.run_record_key("r", "N40W075") == "_runs/r/N40W075.json"
+        assert storage.log_key("r", "N40W075") == "_runs/r/N40W075.log"
+        assert storage.profile_key("r", "N40W075", "destripe_offsets") == (
+            "_runs/r/N40W075.destripe_offsets.profile.json"
+        )
+
+    def test_two_attempts_do_not_share_a_key(self, tmp_path):
+        """The whole point of the attempt segment, stated directly."""
+        storage = LocalStorage(output_dir=tmp_path)
+
+        assert storage.run_record_key("r", "N40W075", 1) != storage.run_record_key(
+            "r", "N40W075", 2
+        )
+        assert storage.log_key("r", "N40W075", 1) != storage.log_key("r", "N40W075", 2)
 
     def test_backends_agree_on_layout(self, tmp_path):
         local = LocalStorage(output_dir=tmp_path)
         s3 = S3Storage(bucket="b", prefix="p", region="r")
 
         assert local.run_record_key("r", "N40W075") == s3.run_record_key("r", "N40W075")
-        assert local.progress_key("r", "N40W075") == s3.progress_key("r", "N40W075")
-        assert local.log_key("r", "N40W075") == s3.log_key("r", "N40W075")
+        assert local.run_record_key("r", "N40W075", 2) == s3.run_record_key("r", "N40W075", 2)
+        assert local.log_key("r", "N40W075", 2) == s3.log_key("r", "N40W075", 2)
+        assert local.profile_key("r", "N40W075", "x", 2) == s3.profile_key("r", "N40W075", "x", 2)
 
     def test_records_sit_outside_the_published_collections(self, tmp_path):
         """The catalog reads lst-p95-*; run records must not land in there."""
@@ -324,13 +352,13 @@ class TestListPrefix:
 
     def test_local_lists_keys_with_their_modification_times(self, tmp_path):
         storage = LocalStorage(output_dir=tmp_path)
-        storage.write_text("_runs/r/N40W075.progress.json", "{}")
+        storage.write_text("_runs/r/N40W075.1.json", "{}")
         storage.write_text("_runs/r/N40W075.json", "{}")
         storage.write_text("_runs/other/S05W060.json", "{}")
 
         listed = storage.list_prefix("_runs/r/")
 
-        assert set(listed) == {"_runs/r/N40W075.progress.json", "_runs/r/N40W075.json"}
+        assert set(listed) == {"_runs/r/N40W075.1.json", "_runs/r/N40W075.json"}
         assert all(stamp.tzinfo is not None for stamp in listed.values())
 
     def test_local_reports_the_stored_mtime(self, tmp_path):
@@ -339,20 +367,64 @@ class TestListPrefix:
         from datetime import UTC, datetime
 
         storage = LocalStorage(output_dir=tmp_path)
-        storage.write_text("_runs/r/N40W075.progress.json", "{}")
+        storage.write_text("_runs/r/N40W075.1.json", "{}")
         backdated = datetime(2026, 8, 13, 9, 0, tzinfo=UTC)
         os.utime(
-            tmp_path / "_runs/r/N40W075.progress.json",
+            tmp_path / "_runs/r/N40W075.1.json",
             (backdated.timestamp(), backdated.timestamp()),
         )
 
-        assert storage.list_prefix("_runs/r/")["_runs/r/N40W075.progress.json"] == backdated
+        assert storage.list_prefix("_runs/r/")["_runs/r/N40W075.1.json"] == backdated
 
     def test_local_absent_prefix_is_empty(self, tmp_path):
         """A run whose first VM has not written anything yet is not an error."""
         storage = LocalStorage(output_dir=tmp_path)
 
         assert storage.list_prefix("_runs/never/") == {}
+
+    def test_local_matches_a_partial_final_segment(self, tmp_path):
+        """One tile's artifacts, not the whole run.
+
+        Reading the prefix as a directory returned nothing here while S3
+        returned the right answer, so attempt discovery would have looked
+        correct in every test and found nothing in production.
+        """
+        storage = LocalStorage(output_dir=tmp_path)
+        storage.write_text("_runs/r/N40W075.1.json", "{}")
+        storage.write_text("_runs/r/N40W075.1.log", "")
+        storage.write_text("_runs/r/N40W075.2.json", "{}")
+        storage.write_text("_runs/r/S05W060.1.json", "{}")
+
+        listed = storage.list_prefix("_runs/r/N40W075.")
+
+        assert set(listed) == {
+            "_runs/r/N40W075.1.json",
+            "_runs/r/N40W075.1.log",
+            "_runs/r/N40W075.2.json",
+        }
+
+    def test_local_partial_segment_does_not_match_a_longer_tile_name(self, tmp_path):
+        """The trailing dot is what stops N40W07 selecting N40W075."""
+        storage = LocalStorage(output_dir=tmp_path)
+        storage.write_text("_runs/r/N40W075.1.json", "{}")
+
+        assert storage.list_prefix("_runs/r/N40W07.") == {}
+
+    def test_s3_matches_a_partial_final_segment(self):
+        """The behaviour LocalStorage now matches."""
+        from datetime import UTC, datetime
+
+        stamp = datetime(2026, 8, 13, 9, 0, tzinfo=UTC)
+        storage = S3Storage(bucket="b", prefix="p", region="r")
+        storage._client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"Contents": [{"Key": "p/_runs/r/N40W075.1.json", "LastModified": stamp}]},
+        ]
+        storage._client.get_paginator.return_value = paginator
+
+        assert storage.list_prefix("_runs/r/N40W075.") == {"_runs/r/N40W075.1.json": stamp}
+        paginator.paginate.assert_called_once_with(Bucket="b", Prefix="p/_runs/r/N40W075.")
 
     def test_s3_strips_the_bucket_prefix(self):
         from datetime import UTC, datetime
@@ -362,16 +434,16 @@ class TestListPrefix:
         storage._client = MagicMock()
         paginator = MagicMock()
         paginator.paginate.return_value = [
-            {"Contents": [{"Key": "p/_runs/r/N40W075.progress.json", "LastModified": stamp}]},
-            {"Contents": [{"Key": "p/_runs/r/N40W075.log", "LastModified": stamp}]},
+            {"Contents": [{"Key": "p/_runs/r/N40W075.1.json", "LastModified": stamp}]},
+            {"Contents": [{"Key": "p/_runs/r/N40W075.1.log", "LastModified": stamp}]},
         ]
         storage._client.get_paginator.return_value = paginator
 
         listed = storage.list_prefix("_runs/r/")
 
         assert listed == {
-            "_runs/r/N40W075.progress.json": stamp,
-            "_runs/r/N40W075.log": stamp,
+            "_runs/r/N40W075.1.json": stamp,
+            "_runs/r/N40W075.1.log": stamp,
         }
         paginator.paginate.assert_called_once_with(Bucket="b", Prefix="p/_runs/r/")
 

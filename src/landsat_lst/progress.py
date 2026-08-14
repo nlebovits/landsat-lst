@@ -40,6 +40,7 @@ import traceback
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -48,8 +49,9 @@ from landsat_lst.config import settings
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
+    from landsat_lst.job import JobResult
+    from landsat_lst.models import ProcessingJob
     from landsat_lst.storage import StorageBackend
 
 log = structlog.get_logger()
@@ -75,6 +77,7 @@ PHASES = (
     "stac_query",
     "loading",
     "land_mask",
+    "offset_load",
     "destriping",
     "composite_graph",
     "exporting",
@@ -83,7 +86,16 @@ PHASES = (
 
 #: Phases after which no further heartbeat is expected. A tile sitting on one of
 #: these is finished, not stale, however old its heartbeat is.
-TERMINAL_PHASES = ("done", "failed")
+#:
+#: ``skipped`` is terminal too: a tile whose COGs already exist does no work and
+#: publishes once. It needs an honest phase of its own rather than borrowing
+#: ``done``, which would claim it computed something.
+TERMINAL_PHASES = ("done", "failed", "skipped")
+
+#: Version of the published state object. 1 was the split pair of a heartbeat
+#: at ``{tile}.progress.json`` and a run record at ``{tile}.json``; 2 merges
+#: them and keys them by attempt. A body with no ``schema`` key is 1.
+SCHEMA_VERSION = 2
 
 #: A dask graph is running and :class:`GraphProgress` is reporting it.
 GRAPH_RUNNING = "running"
@@ -114,6 +126,25 @@ def peak_rss_mb() -> float | None:
         return None
 
 
+def rss_mb() -> float | None:
+    """Resident set size right now, in MiB, or ``None`` where unmeasurable.
+
+    Distinct from :func:`peak_rss_mb`, which is a high-water mark and so can
+    only rise. A watcher plotting the peak draws a staircase that never falls,
+    cannot show a phase releasing memory, and cannot tell "holding 35 GB now"
+    from "touched 35 GB an hour ago and is at 4 GB". Headroom against the VM's
+    memory needs the current figure, and the alarm needs both.
+
+    Reads ``/proc/self/statm``, so it answers on the Linux VMs that run tiles
+    and returns ``None`` on a machine without ``/proc``.
+    """
+    try:
+        fields = Path("/proc/self/statm").read_text().split()
+        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (OSError, IndexError, ValueError, AttributeError):  # pragma: no cover
+        return None
+
+
 class TileHeartbeat:
     """Periodic proof that one tile is still working, written to storage.
 
@@ -130,18 +161,31 @@ class TileHeartbeat:
         self,
         *,
         run_id: str,
-        tile: str,
-        window: str,
+        job: ProcessingJob,
         storage: StorageBackend,
+        attempt: int = 1,
         interval_s: float | None = None,
     ) -> None:
         self.run_id = run_id
-        self.tile = tile
-        self.window = window
+        self.job = job
+        self.tile = job.tile.name
+        self.window = job.window_label
+        self.attempt = attempt
         self.storage = storage
         self.interval_s = settings.heartbeat_interval_s if interval_s is None else interval_s
-        self.key = storage.progress_key(run_id, tile)
+        self.key = storage.run_record_key(run_id, self.tile, attempt)
+        self.pointer_key = storage.run_record_key(run_id, self.tile)
 
+        # The tile's outcome, folded in by :meth:`set_result` and published by
+        # the terminal beat. Holding it here rather than writing it to a second
+        # key is the whole of the merge: the run record and the last heartbeat
+        # were one object described twice.
+        self._result: dict[str, Any] | None = None
+        # Which graph is running, counted from the tile's start. A watcher
+        # cannot otherwise tell two graphs apart, and a task rate spliced
+        # across that boundary would be an ETA for a graph that already
+        # finished.
+        self._graph_seq = 0
         self._host = socket.gethostname()
         self._started = time.monotonic()
         self._lock = threading.Lock()
@@ -165,8 +209,43 @@ class TileHeartbeat:
         # reported yet", and those need different reactions from a watcher.
         self._graph_state = GRAPH_IDLE
 
+    def _identity(self) -> dict[str, Any]:
+        """The fields that never change for the life of this attempt."""
+        from landsat_lst.instance import instance_identity  # noqa: PLC0415
+
+        machine = instance_identity()
+        return {
+            # What this tile actually ran on, so a cost estimate reads the
+            # machine rather than the preference list. Resolved through an
+            # lru_cache, so the first beat pays for the probe and no other
+            # beat does.
+            "instance_type": machine.instance_type,
+            "instance_lifecycle": machine.lifecycle.value,
+            "instance_source": machine.source,
+            "schema": SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "tile": self.tile,
+            "window": self.window,
+            "attempt": self.attempt,
+            "year": self.job.year,
+            "end_year": self.job.end_year,
+            # Carried so a reader can rebuild the job exactly. Without it a
+            # sampled run reconciles to window "2021-2025" for tiles whose
+            # COGs live under "2021-2025-sample300".
+            "max_scenes": self.job.max_scenes,
+            "host": self._host,
+            "pid": os.getpid(),
+        }
+
     def payload(self) -> dict:
-        """The heartbeat object as it is stored."""
+        """The tile's state object as it is stored.
+
+        One object carries both halves. The live half is rewritten every beat;
+        the outcome half is ``None`` until :meth:`set_result` folds a result in,
+        and ``status`` stays ``None`` for exactly that long. A running tile with
+        a status would give a mid-run reconcile a verdict to read and would
+        give ``watch`` a second liveness signal to disagree with ``phase``.
+        """
         now = time.monotonic()
         with self._lock:
             phase, error, counts = self._phase, self._error, dict(self._counts)
@@ -177,23 +256,30 @@ class TileHeartbeat:
                 phase_seconds.get(phase, 0.0) + (now - self._phase_started), 1
             )
             done, total = self._tasks_done, self._tasks_total
-            graph_state = self._graph_state
+            graph_state, graph_seq = self._graph_state, self._graph_seq
+            result = dict(self._result) if self._result else {}
         return {
-            "run_id": self.run_id,
-            "tile": self.tile,
-            "window": self.window,
+            **self._identity(),
             "phase": phase,
+            "status": None,
             "elapsed_s": round(now - self._started, 1),
+            "duration_s": None,
             "phase_seconds": phase_seconds,
             "tasks_done": done,
             "tasks_total": total,
             "graph_state": graph_state,
+            "graph_seq": graph_seq,
+            "rss_mb": rss_mb(),
             "peak_rss_mb": peak_rss_mb(),
-            "host": self._host,
-            "pid": os.getpid(),
+            "scene_count": None,
+            "lst_key": None,
+            "qa_key": None,
             "updated_at": datetime.now(tz=UTC).isoformat(),
             "error": error,
             **counts,
+            # The outcome wins where the two overlap. Its identity fields are
+            # the same job's, so the merge cannot contradict itself.
+            **result,
         }
 
     def set_task_progress(self, done: int | None, total: int | None) -> None:
@@ -211,7 +297,23 @@ class TileHeartbeat:
         of work, and only the second one runs a graph.
         """
         with self._lock:
+            if state == GRAPH_RUNNING and self._graph_state != GRAPH_RUNNING:
+                # Counted on the idle-to-running edge only, so a repeated call
+                # cannot inflate it. A watcher divides task counts by time
+                # within one sequence number and never across two.
+                self._graph_seq += 1
             self._graph_state = state
+
+    def set_result(self, result: JobResult) -> None:
+        """Fold this tile's outcome into the object, without publishing.
+
+        The terminal beat publishes it. Keeping the result here rather than
+        writing it to a second key is the whole of the merge: the run record
+        and the last heartbeat were one object described twice, and the two
+        could disagree because a retry overwrote one of them.
+        """
+        with self._lock:
+            self._result = result.to_record()
 
     def write(self) -> None:
         """Publish the current state. Never raises."""
@@ -222,6 +324,24 @@ class TileHeartbeat:
             log.warning(
                 "heartbeat_write_failed", tile=self.tile, phase=payload["phase"], error=str(e)
             )
+
+    def write_pointer(self) -> None:
+        """Copy the settled state to the unsuffixed key. Never raises.
+
+        The body is identical to the attempt's own object, so a reader that
+        knows only ``{tile}.json`` finds a superset of what the old run record
+        held, with no attempt logic at all. Its presence is also how every
+        reader tells a settled tile from a running one.
+
+        Written once, at the terminal boundary, and never from the beat loop. A
+        pointer refreshed every minute would double the run's PUT bill to buy a
+        key that is already published under its own name.
+        """
+        payload = self.payload()
+        try:
+            self.storage.write_text(self.pointer_key, json.dumps(payload, indent=2))
+        except Exception as e:
+            log.warning("pointer_write_failed", tile=self.tile, error=str(e))
 
     def set_phase(self, phase: str, **counts: int | None) -> None:
         """Move to ``phase`` and publish immediately.
@@ -250,6 +370,14 @@ class TileHeartbeat:
             self._phase = "failed"
             self._error = error
         self.write()
+
+    def set_terminal(self, phase: str) -> None:
+        """Move straight to a terminal phase and publish, folding its time in.
+
+        Used by a tile that never beat, so its ``phase_seconds`` records the
+        phase it settled in rather than an invented history.
+        """
+        self.set_phase(phase)
 
     @property
     def phase(self) -> str:
@@ -283,11 +411,21 @@ class TileHeartbeat:
             # A failure reported from inside the tile is more specific than
             # anything reconstructable from the exception here, so it wins.
             if self.phase in TERMINAL_PHASES:
-                pass
+                # Republish rather than skip. A tile that reported its own
+                # failure reached this phase before `set_result` folded the
+                # outcome in, so its attempt object still carries a null
+                # status, which the schema reads as "still running".
+                self.write()
             elif exc is not None:
                 self.set_failed(f"{type(exc).__name__}: {exc}")
             else:
                 self.set_phase("done")
+            if exc is None:
+                # An escaping exception means a retry is being scheduled, so
+                # this attempt is not the tile's final answer. Its own object
+                # is written either way and keeps the evidence; only the
+                # settled-state pointer waits for an attempt that finishes.
+                self.write_pointer()
         finally:
             if self._token is not None:
                 _active.reset(self._token)
@@ -431,6 +569,32 @@ def active_heartbeat() -> TileHeartbeat | None:
     return _active.get()
 
 
+def write_final_state(
+    *,
+    run_id: str,
+    job: ProcessingJob,
+    storage: StorageBackend,
+    attempt: int,
+    result: JobResult,
+    phase: str = "skipped",
+) -> None:
+    """Publish one settled tile-state object without ever beating.
+
+    A tile whose COGs already exist does no work, so it has nothing to report
+    while it runs and no phase history to keep. Constructing the heartbeat and
+    publishing twice gives it the same schema every other tile has, for two
+    PUTs and no thread. Starting a daemon thread, beating, and joining it would
+    cost a resumed 700-tile run several hundred thread churns to publish a
+    number that never changes.
+
+    Best-effort, like every write in this module.
+    """
+    beat = TileHeartbeat(run_id=run_id, job=job, storage=storage, attempt=attempt)
+    beat.set_result(result)
+    beat.set_terminal(phase)
+    beat.write_pointer()
+
+
 def _pump(read_fd: int, mirror_fd: int, sink: Any) -> None:
     """Copy everything written to the pipe into both the log file and stdout.
 
@@ -475,6 +639,7 @@ def capture_task_log(
     run_id: str,
     tile: str,
     storage: StorageBackend,
+    attempt: int = 1,
     max_bytes: int | None = None,
 ) -> Iterator[str]:
     """Tee this process's output to storage, uploading it on the way out.
@@ -501,7 +666,7 @@ def capture_task_log(
     """
     from pathlib import Path  # noqa: PLC0415
 
-    key = storage.log_key(run_id, tile)
+    key = storage.log_key(run_id, tile, attempt)
     limit = settings.task_log_max_bytes if max_bytes is None else max_bytes
 
     handle = tempfile.NamedTemporaryFile(  # noqa: SIM115 - closed in the finally below

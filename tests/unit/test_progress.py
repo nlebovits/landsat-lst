@@ -12,10 +12,16 @@ import sys
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+from landsat_lst.job import JobResult
+from landsat_lst.models import ProcessingJob
 from landsat_lst.progress import (
+    GRAPH_IDLE,
+    GRAPH_RUNNING,
+    SCHEMA_VERSION,
     TERMINAL_PHASES,
     GraphProgress,
     TileHeartbeat,
@@ -24,10 +30,18 @@ from landsat_lst.progress import (
     peak_rss_mb,
     report_failed,
     report_phase,
+    rss_mb,
+    write_final_state,
 )
 from landsat_lst.storage import LocalStorage
+from landsat_lst.tiling import parse_tile_name
 
 RUN, TILE, WINDOW = "run-1", "N40W075", "2021-2025"
+
+#: The job every heartbeat here reports for. A heartbeat takes the job rather
+#: than a tile and a window because the object it publishes has to carry enough
+#: of the job for a reader to rebuild it, ``max_scenes`` included.
+JOB = ProcessingJob(tile=parse_tile_name(TILE), year=2021, end_year=2025)
 
 
 class RecordingStorage(LocalStorage):
@@ -84,18 +98,24 @@ def stdio_on_descriptors():
 def _beat(storage, **overrides) -> TileHeartbeat:
     kwargs = {
         "run_id": RUN,
-        "tile": TILE,
-        "window": WINDOW,
+        "job": JOB,
         "storage": storage,
         "interval_s": 3600,
     }
     return TileHeartbeat(**{**kwargs, **overrides})
 
 
-def _published(storage) -> dict:
-    raw = storage.read_text(storage.progress_key(RUN, TILE))
-    assert raw is not None, "no heartbeat was published"
+def _published(storage, attempt: int = 1) -> dict:
+    """One attempt's own state object, which is rewritten on every beat."""
+    raw = storage.read_text(storage.run_record_key(RUN, TILE, attempt))
+    assert raw is not None, f"no state was published for attempt {attempt}"
     return json.loads(raw)
+
+
+def _pointer(storage) -> dict | None:
+    """The copy of the settled state, written once when a tile stops."""
+    raw = storage.read_text(storage.run_record_key(RUN, TILE))
+    return None if raw is None else json.loads(raw)
 
 
 class TestHeartbeat:
@@ -108,6 +128,8 @@ class TestHeartbeat:
         assert payload["tile"] == TILE
         assert payload["window"] == WINDOW
         assert payload["run_id"] == RUN
+        assert payload["attempt"] == 1
+        assert payload["schema"] == SCHEMA_VERSION
         assert payload["elapsed_s"] >= 0
         assert datetime.fromisoformat(payload["updated_at"]).tzinfo is not None
 
@@ -136,9 +158,10 @@ class TestHeartbeat:
 
     def test_beats_without_being_asked(self, storage):
         """The point of the thread: a long phase keeps proving it is alive."""
+        state_key = storage.run_record_key(RUN, TILE, 1)
         with _beat(storage, interval_s=0.05):
             time.sleep(0.3)
-            beats = sum(1 for key, _ in storage.writes if key.endswith(".progress.json"))
+            beats = sum(1 for key, _ in storage.writes if key == state_key)
 
         assert beats >= 2
 
@@ -187,6 +210,89 @@ class TestHeartbeat:
 
         assert payload["peak_rss_mb"] == pytest.approx(peak_rss_mb(), rel=0.5)
 
+    def test_current_rss_is_reported_alongside_the_peak(self, storage):
+        """The peak alone draws a staircase that never falls.
+
+        It cannot show a phase releasing memory, and cannot tell "holding 35 GB
+        now" from "touched 35 GB an hour ago". Headroom against the VM needs the
+        current figure and the alarm needs both, so both are published.
+        """
+        with _beat(storage):
+            payload = _published(storage)
+
+        assert payload["rss_mb"] == pytest.approx(rss_mb(), rel=0.5)
+        assert payload["peak_rss_mb"] is not None
+
+    def test_rss_is_none_where_proc_is_unavailable(self, monkeypatch):
+        """A machine without ``/proc`` reports no current RSS rather than dying."""
+
+        def no_proc(*_args, **_kwargs):
+            msg = "/proc/self/statm"
+            raise FileNotFoundError(msg)
+
+        monkeypatch.setattr(Path, "read_text", no_proc)
+
+        assert rss_mb() is None
+
+    def test_status_is_none_until_the_tile_settles(self, storage):
+        """A running tile must not publish a verdict.
+
+        A mid-run reconcile reads whatever status it finds, and ``watch`` would
+        gain a second liveness signal to disagree with ``phase``. The status
+        appears only when the terminal beat publishes the folded-in result.
+        """
+        with _beat(storage) as beat:
+            assert _published(storage)["status"] is None
+            beat.set_phase("destriping")
+            assert _published(storage)["status"] is None
+            beat.set_result(JobResult(job=JOB, status="completed", scene_count=412))
+
+        settled = _published(storage)
+        assert settled["status"] == "completed"
+        assert settled["scene_count"] == 412
+
+    def test_the_settled_state_is_copied_to_the_pointer(self, storage):
+        """A reader that knows only ``{tile}.json`` still gets the whole object.
+
+        The pointer is a copy of the attempt's own final state, so the old run
+        record's fields are a subset of it and no reader needs attempt logic.
+        """
+        with _beat(storage) as beat:
+            beat.set_result(JobResult(job=JOB, status="completed", duration_s=12.5))
+
+        pointer, attempt_state = _pointer(storage), _published(storage)
+        # Both are rendered from the same live object, so only the clock fields
+        # differ between the two writes.
+        volatile = {"updated_at", "elapsed_s", "phase_seconds", "rss_mb", "peak_rss_mb"}
+        assert {k: v for k, v in pointer.items() if k not in volatile} == {
+            k: v for k, v in attempt_state.items() if k not in volatile
+        }
+        assert pointer["status"] == "completed"
+        assert pointer["duration_s"] == 12.5
+        assert pointer["phase"] == "done"
+
+    def test_the_pointer_is_written_once_at_the_end(self, storage):
+        """Refreshing it every beat would double the run's PUT bill for nothing."""
+        pointer_key = storage.run_record_key(RUN, TILE)
+        with _beat(storage, interval_s=0.05):
+            time.sleep(0.3)
+            assert not [key for key, _ in storage.writes if key == pointer_key]
+
+        assert len([key for key, _ in storage.writes if key == pointer_key]) == 1
+
+    def test_an_escaping_exception_leaves_no_pointer(self, storage):
+        """An escaping failure means a retry is in flight, so nothing has settled.
+
+        The attempt still publishes its own object, which is the evidence the
+        retry would otherwise destroy. Only the settled-state pointer waits.
+        """
+        with pytest.raises(TimeoutError), _beat(storage):
+            msg = "read timed out"
+            raise TimeoutError(msg)
+
+        assert _published(storage)["phase"] == "failed"
+        assert _pointer(storage) is None
+
     def test_terminal_phases_are_the_ones_the_context_writes(self, storage):
         """Whatever a watcher treats as terminal has to be what is published."""
         with _beat(storage) as beat:
@@ -222,9 +328,9 @@ class TestReporting:
         assert active_heartbeat() is None
 
 
-def _log(storage) -> str:
-    raw = storage.read_text(storage.log_key(RUN, TILE))
-    assert raw is not None, "no task log was uploaded"
+def _log(storage, attempt: int = 1) -> str:
+    raw = storage.read_text(storage.log_key(RUN, TILE, attempt))
+    assert raw is not None, f"no task log was uploaded for attempt {attempt}"
     return raw
 
 
@@ -237,7 +343,7 @@ class TestCaptureTaskLog:
             print("composite written")
             print("warning: overview 5 is short", file=sys.stderr)
 
-        assert key == storage.log_key(RUN, TILE)
+        assert key == storage.log_key(RUN, TILE, 1)
         assert "composite written" in _log(storage)
         assert "overview 5 is short" in _log(storage)
 
@@ -313,7 +419,7 @@ class TestCaptureTaskLog:
         with stdio_on_descriptors(), capture_task_log(run_id=RUN, tile=TILE, storage=storage):
             print("hello")
 
-        assert (storage.log_key(RUN, TILE), "text/plain") in storage.writes
+        assert (storage.log_key(RUN, TILE, 1), "text/plain") in storage.writes
 
     def test_an_unuploadable_log_does_not_fail_the_tile(self, tmp_path):
         with (
@@ -342,13 +448,134 @@ class TestCaptureTaskLog:
         assert _log(storage) == ""
 
 
-def test_heartbeat_and_log_share_the_run_prefix(storage):
+def test_state_and_log_share_the_run_prefix(storage):
     """Everything one tile reports lands where reconciliation already looks."""
     prefix = storage.run_prefix(RUN)
 
-    assert storage.progress_key(RUN, TILE).startswith(prefix)
-    assert storage.log_key(RUN, TILE).startswith(prefix)
+    assert storage.run_record_key(RUN, TILE, 1).startswith(prefix)
+    assert storage.log_key(RUN, TILE, 1).startswith(prefix)
+    assert storage.profile_key(RUN, TILE, "destripe_offsets", 1).startswith(prefix)
     assert storage.run_record_key(RUN, TILE).startswith(prefix)
+
+
+def test_every_artifact_of_one_attempt_shares_one_tile_prefix(storage):
+    """One attempt's objects are selectable without reading the whole run.
+
+    ``resolve_attempt`` lists ``{tile}.`` rather than the run, so the next
+    attempt is numbered from a listing that stays small as the run grows.
+    """
+    prefix = f"{storage.run_prefix(RUN)}{TILE}."
+
+    assert storage.run_record_key(RUN, TILE, 2).startswith(prefix)
+    assert storage.log_key(RUN, TILE, 2).startswith(prefix)
+    assert storage.profile_key(RUN, TILE, "destripe_offsets", 2).startswith(prefix)
+
+
+class TestAttemptKeying:
+    """A retry must not erase the attempt before it (issue #92).
+
+    Every attempt used to write the same keys, so the last write won. Run
+    ``2021-2025-20260814T092642Z`` reported a 10-second failure against a
+    33-minute wall clock, and the attempt that reached ``land_mask`` -- further
+    than that tile had ever gone -- was unrecoverable.
+    """
+
+    def test_two_attempts_leave_two_state_objects(self, storage):
+        with _beat(storage, attempt=1) as first:
+            first.set_phase("land_mask")
+            first.set_result(JobResult(job=JOB, status="failed", error="killed"))
+        with _beat(storage, attempt=2) as second:
+            second.set_result(JobResult(job=JOB, status="completed", scene_count=412))
+
+        assert _published(storage, 1)["status"] == "failed"
+        assert _published(storage, 1)["phase_seconds"].get("land_mask") is not None
+        assert _published(storage, 2)["status"] == "completed"
+
+    def test_the_pointer_holds_the_last_attempt_to_settle(self, storage):
+        """One answer per tile, and it is the newest one."""
+        with _beat(storage, attempt=1) as first:
+            first.set_result(JobResult(job=JOB, status="failed", error="killed"))
+        with _beat(storage, attempt=2) as second:
+            second.set_result(JobResult(job=JOB, status="completed"))
+
+        assert _pointer(storage)["status"] == "completed"
+        assert _pointer(storage)["attempt"] == 2
+
+    def test_an_attempt_states_which_attempt_it_is(self, storage):
+        """The number is in the body as well as the key, so a read is enough."""
+        with _beat(storage, attempt=3):
+            pass
+
+        assert _published(storage, 3)["attempt"] == 3
+
+
+class TestGraphSequence:
+    """Which graph a task count belongs to.
+
+    A tile runs two hour-scale graphs. A rate spliced across the boundary would
+    be an ETA for a graph that already finished, so each one is numbered.
+    """
+
+    def test_each_graph_gets_its_own_number(self, storage):
+        beat = _beat(storage)
+
+        assert beat.payload()["graph_seq"] == 0
+        beat.set_graph_state(GRAPH_RUNNING)
+        assert beat.payload()["graph_seq"] == 1
+        beat.set_graph_state(GRAPH_IDLE)
+        beat.set_graph_state(GRAPH_RUNNING)
+        assert beat.payload()["graph_seq"] == 2
+
+    def test_a_repeated_running_state_does_not_count_twice(self, storage):
+        """Counted on the idle-to-running edge, so a re-report cannot inflate it."""
+        beat = _beat(storage)
+
+        beat.set_graph_state(GRAPH_RUNNING)
+        beat.set_graph_state(GRAPH_RUNNING)
+
+        assert beat.payload()["graph_seq"] == 1
+
+    def test_two_graph_progress_blocks_number_themselves(self, storage):
+        """The real path: one number per ``GraphProgress``, not per compute."""
+        import dask.array as da
+
+        with _beat(storage) as beat:
+            with GraphProgress():
+                da.ones((4, 4), chunks=2).sum().compute()
+            assert beat.payload()["graph_seq"] == 1
+            with GraphProgress():
+                da.ones((4, 4), chunks=2).sum().compute()
+            assert beat.payload()["graph_seq"] == 2
+
+
+def test_write_final_state_publishes_without_beating(storage, monkeypatch):
+    """A tile that does no work publishes twice and starts no thread.
+
+    Entering a heartbeat to publish a number that never changes would cost a
+    resumed 700-tile run several hundred thread churns.
+    """
+
+    def never(_self):
+        msg = "a settled tile must not start a heartbeat thread"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(TileHeartbeat, "__enter__", never)
+
+    write_final_state(
+        run_id=RUN,
+        job=JOB,
+        storage=storage,
+        attempt=1,
+        result=JobResult(job=JOB, status="skipped"),
+    )
+
+    assert [key for key, _ in storage.writes] == [
+        storage.run_record_key(RUN, TILE, 1),
+        storage.run_record_key(RUN, TILE),
+    ]
+    assert _published(storage)["phase"] == "skipped"
+    assert _published(storage)["status"] == "skipped"
+    assert _pointer(storage)["status"] == "skipped"
 
 
 def test_utc_is_used_for_published_timestamps(storage):
@@ -362,9 +589,7 @@ class TestPhaseTimings:
     """A tile that took three hours should say which phase took them."""
 
     def test_time_accrues_per_phase(self, storage):
-        with TileHeartbeat(
-            run_id=RUN, tile=TILE, window=WINDOW, storage=storage, interval_s=3600
-        ) as hb:
+        with TileHeartbeat(run_id=RUN, job=JOB, storage=storage, interval_s=3600) as hb:
             hb.set_phase("loading")
             hb.set_phase("destriping")
             payload = hb.payload()
@@ -374,9 +599,7 @@ class TestPhaseTimings:
 
     def test_current_phase_is_counted_before_it_ends(self, storage):
         """A tile killed mid-phase still reports where its hours went."""
-        with TileHeartbeat(
-            run_id=RUN, tile=TILE, window=WINDOW, storage=storage, interval_s=3600
-        ) as hb:
+        with TileHeartbeat(run_id=RUN, job=JOB, storage=storage, interval_s=3600) as hb:
             hb.set_phase("destriping")
             time.sleep(0.05)
             payload = hb.payload()
@@ -391,9 +614,7 @@ class TestGraphProgress:
         import dask
         import dask.array as da
 
-        with TileHeartbeat(
-            run_id=RUN, tile=TILE, window=WINDOW, storage=storage, interval_s=3600
-        ) as hb:
+        with TileHeartbeat(run_id=RUN, job=JOB, storage=storage, interval_s=3600) as hb:
             seen = []
             original = hb.set_task_progress
 
@@ -415,9 +636,7 @@ class TestGraphProgress:
         import dask
         import dask.array as da
 
-        with TileHeartbeat(
-            run_id=RUN, tile=TILE, window=WINDOW, storage=storage, interval_s=3600
-        ) as hb:
+        with TileHeartbeat(run_id=RUN, job=JOB, storage=storage, interval_s=3600) as hb:
             with GraphProgress():
                 dask.compute(da.ones((20, 20), chunks=(10, 10)).sum())
             payload = hb.payload()
@@ -447,12 +666,7 @@ class TestGraphState:
         from landsat_lst.progress import TileHeartbeat
         from landsat_lst.storage import LocalStorage
 
-        return TileHeartbeat(
-            run_id="r",
-            tile="N40W075",
-            window="2021-2025",
-            storage=LocalStorage(output_dir=tmp_path),
-        )
+        return TileHeartbeat(run_id="r", job=JOB, storage=LocalStorage(output_dir=tmp_path))
 
     def test_defaults_to_idle(self, tmp_path):
         assert self._beat(tmp_path).payload()["graph_state"] == "idle"
@@ -480,12 +694,7 @@ class TestTimedSection:
         from landsat_lst.progress import TileHeartbeat, timed_section
         from landsat_lst.storage import LocalStorage
 
-        heartbeat = TileHeartbeat(
-            run_id="r",
-            tile="N40W075",
-            window="2021-2025",
-            storage=LocalStorage(output_dir=tmp_path),
-        )
+        heartbeat = TileHeartbeat(run_id="r", job=JOB, storage=LocalStorage(output_dir=tmp_path))
         with heartbeat, timed_section("composite_graph"):
             assert heartbeat.payload()["phase"] == "composite_graph"
 
@@ -493,12 +702,7 @@ class TestTimedSection:
         from landsat_lst.progress import TileHeartbeat, timed_section
         from landsat_lst.storage import LocalStorage
 
-        heartbeat = TileHeartbeat(
-            run_id="r",
-            tile="N40W075",
-            window="2021-2025",
-            storage=LocalStorage(output_dir=tmp_path),
-        )
+        heartbeat = TileHeartbeat(run_id="r", job=JOB, storage=LocalStorage(output_dir=tmp_path))
         with heartbeat:
             with timed_section("land_mask"):
                 pass
@@ -515,12 +719,7 @@ class TestTimedSection:
         from landsat_lst.progress import TileHeartbeat, silence_sections, timed_section
         from landsat_lst.storage import LocalStorage
 
-        heartbeat = TileHeartbeat(
-            run_id="r",
-            tile="N40W075",
-            window="2021-2025",
-            storage=LocalStorage(output_dir=tmp_path),
-        )
+        heartbeat = TileHeartbeat(run_id="r", job=JOB, storage=LocalStorage(output_dir=tmp_path))
         with heartbeat, silence_sections(), timed_section("composite_graph"):
             assert heartbeat.payload()["phase"] != "composite_graph"
 
@@ -528,12 +727,7 @@ class TestTimedSection:
         from landsat_lst.progress import TileHeartbeat, timed_section
         from landsat_lst.storage import LocalStorage
 
-        heartbeat = TileHeartbeat(
-            run_id="r",
-            tile="N40W075",
-            window="2021-2025",
-            storage=LocalStorage(output_dir=tmp_path),
-        )
+        heartbeat = TileHeartbeat(run_id="r", job=JOB, storage=LocalStorage(output_dir=tmp_path))
         with heartbeat:
             with pytest.raises(RuntimeError), timed_section("destriping"):
                 raise RuntimeError("boom")
