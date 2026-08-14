@@ -24,7 +24,13 @@ from landsat_lst.benchmarks import (
 pytestmark = pytest.mark.benchmark
 
 #: Measured on the pinned configuration (24 scenes, 4x4 blocks of 256, 2
-#: threads). Deterministic to the task across runs.
+#: threads). Deterministic to the task across runs *for a given dependency set*,
+#: which is not the same as constant: upgrading dask to 2026.7.1 and xarray to
+#: 2026.7.0 moved the composite from 828 to 845 while the offset graph did not
+#: budge. That is 2.1%, against a band that tolerates 40% and fails at the 1.60x
+#: a deleted rechunk costs -- the bands are sized for exactly this. Left at the
+#: originally measured values rather than re-pinned on every upgrade, since a
+#: constant that chases the measurement stops being a reference.
 OFFSET_TASKS = 2_668
 COMPOSITE_TASKS = 828
 
