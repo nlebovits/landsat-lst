@@ -28,6 +28,25 @@ class Settings(BaseSettings):
         default="landsat-c2-l2",
         description="STAC collection ID",
     )
+    # pystac-client mounts its own adapter, but from a plain int, which leaves
+    # status retries off entirely. These three drive an explicit policy that
+    # covers 429 and 5xx on every verb. See pipeline._stac_retry.
+    stac_retries: int = Field(
+        default=5,
+        ge=0,
+        description="Retry attempts for a STAC request that returns 429 or 5xx.",
+    )
+    stac_retry_backoff_s: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="urllib3 backoff factor. At 1.0 five attempts span about 30s, "
+        "so a real outage fails the tile long before coiled_job_timeout.",
+    )
+    stac_timeout_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Per-request timeout for STAC calls, in seconds.",
+    )
 
     # Storage backend selection
     storage_backend: Literal["local", "s3"] = Field(
