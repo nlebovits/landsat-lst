@@ -147,6 +147,28 @@ class TestSweepReport:
         assert report["projected_offset_tasks"] == pytest.approx(100_000, rel=0.01)
 
 
+class TestSweepBudget:
+    def test_the_sweep_does_not_inherit_the_tile_timeout(self):
+        """Six hours is sized for a tile streaming five years off S3.
+
+        The default sweep is about 23 minutes of compute. Inheriting the tile
+        ceiling would let a wedged diagnostic run bill six hours at up to
+        $0.768/hr, five times the budget that justifies the exercise.
+        """
+        from landsat_lst.benchmarks import SWEEP_JOB_TIMEOUT
+        from landsat_lst.config import settings
+
+        assert settings.coiled_job_timeout != SWEEP_JOB_TIMEOUT
+        assert SWEEP_JOB_TIMEOUT == "1 hour"
+
+    def test_the_default_sweep_spans_enough_to_fit_a_curve(self):
+        """An 8x span between the ends, or a fitted slope means little."""
+        from landsat_lst.benchmarks import DEFAULT_SWEEP_SCENES
+
+        assert len(DEFAULT_SWEEP_SCENES) >= 4
+        assert max(DEFAULT_SWEEP_SCENES) / min(DEFAULT_SWEEP_SCENES) >= 8
+
+
 class TestBenchmarkKey:
     def test_key_is_outside_the_run_prefix(self):
         """A sweep is not a tile and must never appear in a run manifest."""

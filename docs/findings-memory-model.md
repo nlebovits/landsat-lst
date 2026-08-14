@@ -51,6 +51,29 @@ landsat-lst benchmark --distributed
 landsat-lst benchmark --fetch <run-id>
 ```
 
+Budget about 25 minutes of compute plus VM start, and under a dollar. Three
+points measured on the dev box at the sweep's own geometry (4096 squared, chunk
+512, four threads) fit `5.9 + 0.876 * scenes` seconds, which puts the default
+`(50, 100, 200, 400, 800)` sweep at 23 minutes:
+
+| scenes | wall | peak RSS | floor | ratio |
+|---:|---:|---:|---:|---:|
+| 25 | 27.8s | 3.95 GB | 2.85 GB | 1.39 |
+| 50 | 39.6s | 6.17 GB | 2.95 GB | 2.09 |
+| 100 | 93.5s | 9.64 GB | 3.14 GB | 3.07 |
+
+`SWEEP_JOB_TIMEOUT` is one hour rather than the six-hour tile ceiling, which
+leaves better than 2x headroom over that fit. At $0.504/hr for `r6i.2xlarge` and
+$0.768/hr for `m6i.4xlarge`, spot floor to on-demand fallback, 25 minutes costs
+$0.06 to $0.32 and the full hour still lands under a dollar.
+
+**These three points are a pre-flight expectation, not the finding.** They were
+measured on a laptop with 54 GB against a 64 GiB VM, which is the substitution
+this whole document exists to warn against. They suggest `growing_ratio` and a
+peak near 85 GB at 2,930 scenes, consistent with the 46.5 GB and climbing that
+the OOM was caught at. Suggestive is not measured. The verdict below stays empty
+until a VM produces it.
+
 The sweep runs `landsat_lst.benchmarks.measure` once per scene count, each in a fresh subprocess:
 `getrusage` reports a high-water mark for the life of a process, so a second configuration measured
 inside the first one's interpreter would inherit its peak and draw a flat curve whatever the truth

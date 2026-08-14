@@ -410,6 +410,16 @@ MIN_PEAK_SPREAD = 1.2
 #: Memory carried by both entries in ``settings.coiled_vm_types``.
 VM_GIB = 64.0
 
+#: Wall-clock ceiling for one sweep, deliberately *not*
+#: ``settings.coiled_job_timeout``. That is six hours, sized for a tile that
+#: streams a five-year window off S3. The default sweep is about 23 minutes of
+#: compute (measured at 4096 squared, chunk 512, four threads: 27.8s at 25
+#: scenes, 39.6s at 50, 93.5s at 100, fitting 5.9 + 0.876 per scene). Inheriting
+#: six hours would let a wedged diagnostic run bill 6h at up to $0.768/hr, which
+#: is five times the budget the whole exercise is justified by. An hour leaves
+#: better than 2x headroom over the fit and still costs under a dollar.
+SWEEP_JOB_TIMEOUT = "1 hour"
+
 
 def sweep(
     scene_counts: list[int],
@@ -610,7 +620,7 @@ def submit_sweep(
         ntasks=1,
         # Not settings.coiled_retries: a failure here is the evidence.
         max_retries=0,
-        job_timeout=settings.coiled_job_timeout,
+        job_timeout=SWEEP_JOB_TIMEOUT,
         env=_worker_environ(),
         tag={"project": "landsat-lst", "run_id": run_id, "kind": "benchmark"},
         forward_aws_credentials=False,
