@@ -55,6 +55,12 @@ log = structlog.get_logger()
 #: :func:`landsat_lst.qa.create_qa_mask` masks, or the DN-to-Celsius conversion.
 #: The scene ids, the resolution factor, and the plausibility clamp are hashed
 #: into the key and need no bump. See ADR-007.
+#:
+#: "Moves the offsets" is the operative clause. The 2026-08-15 month-loop
+#: reformulation of ``offset_graph`` rebuilt the dask graph and left the
+#: values bit-identical -- pinned in the unit tests against the preserved
+#: groupby formulation and measured at max |delta| = 0.0 over 300 real
+#: scenes -- so it takes no bump: cached estimates stay valid answers.
 ALGORITHM_VERSION = 1
 
 #: Hex characters kept from the input digest. 16 is 64 bits: collision odds stay
