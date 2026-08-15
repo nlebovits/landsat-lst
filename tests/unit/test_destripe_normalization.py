@@ -321,6 +321,89 @@ class TestCompositeIntegration:
         assert result["lst_p95"].values[GRID // 2 :, :].max() == settings.nodata
 
 
+class TestOffsetGraphFormulation:
+    """The month-loop graph must reproduce the groupby formulation bit for bit.
+
+    The 2026-08-15 reformulation exists because the groupby shuffle's graph
+    grows superlinearly in scene count (>48.5 GB at 2,930 scenes, measured)
+    while the month-loop holds the same values in 13.8 GB. These tests are the
+    claim that lets it ship without an ALGORITHM_VERSION bump: same input,
+    identical offsets, identical valid counts -- including under missing data,
+    missing months, and NaN-only slices.
+    """
+
+    @staticmethod
+    def _pair(lst):
+        import dask
+
+        from landsat_lst.normalization import _offset_graph_groupby, offset_graph
+
+        new_o, new_n = dask.compute(*offset_graph(lst))
+        old_o, old_n = dask.compute(*_offset_graph_groupby(lst))
+        return (new_o, new_n), (old_o, old_n)
+
+    def _assert_identical(self, lst):
+        (new_o, new_n), (old_o, old_n) = self._pair(lst)
+        np.testing.assert_array_equal(np.asarray(new_o.values), np.asarray(old_o.values))
+        np.testing.assert_array_equal(np.asarray(new_n.values), np.asarray(old_n.values))
+        assert list(new_o.time.values) == list(old_o.time.values)
+
+    def test_bitwise_equal_on_chunked_input_with_gaps(self):
+        """Random NaN holes, one all-NaN scene, one never-valid pixel."""
+        import dask.array as da
+
+        rng = np.random.default_rng(7)
+        lst = _seasonal_stack()
+        values = lst.values.copy()
+        values[rng.random(values.shape) < 0.3] = np.nan
+        values[4] = np.nan  # a scene with no data at all
+        values[:, 3, 5] = np.nan  # a pixel with no data in any scene
+        lst = lst.copy(data=values)
+        lazy = lst.copy(data=da.from_array(values, chunks=(6, 20, 20)))
+
+        self._assert_identical(lazy)
+
+    def test_bitwise_equal_on_eager_input(self):
+        self._assert_identical(_seasonal_stack())
+
+    def test_bitwise_equal_when_months_are_missing(self):
+        """A window covering three calendar months only."""
+        import dask.array as da
+
+        rng = np.random.default_rng(3)
+        stamps = pd.to_datetime([f"{y}-{m:02d}-15" for y in (2021, 2022) for m in (1, 2, 3)]).values
+        data = rng.normal(20.0, 5.0, (len(stamps), GRID, GRID))
+        data[rng.random(data.shape) < 0.2] = np.nan
+        lst = xr.DataArray(
+            data,
+            dims=["time", "latitude", "longitude"],
+            coords={
+                "time": stamps,
+                "latitude": np.linspace(-33.4, -34.4, GRID),
+                "longitude": np.linspace(-61.1, -60.1, GRID),
+            },
+        )
+        self._assert_identical(lst.copy(data=da.from_array(data, chunks=(2, 20, 20))))
+
+    def test_graph_carries_no_shuffle_layers(self):
+        """The property the reformulation exists for.
+
+        The groupby shuffle is the measured construction cliff; its key
+        prefixes must not reappear in the graph the scheduler runs.
+        """
+        import dask.array as da
+
+        from landsat_lst.normalization import offset_graph
+        from landsat_lst.profiling import graph_stats
+
+        lst = _seasonal_stack()
+        lazy = lst.copy(data=da.from_array(lst.values, chunks=(6, 20, 20)))
+        offset, n_valid = offset_graph(lazy)
+        stats = graph_stats(xr.Dataset({"o": offset, "n": n_valid}), optimize=True)
+        shuffled = [p.prefix for p in stats.by_prefix if "shuffle" in p.prefix]
+        assert shuffled == [], f"shuffle layers back in the offset graph: {shuffled}"
+
+
 class TestDaskDebias:
     """The lazy path must match the eager one."""
 

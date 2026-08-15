@@ -29,14 +29,13 @@ from typing import TYPE_CHECKING
 
 import dask
 import numpy as np
+import xarray as xr
 
 from landsat_lst.config import settings
 from landsat_lst.profiling import PROFILE_DESTRIPE_OFFSETS, profile_compute
 from landsat_lst.progress import GraphProgress
 
 if TYPE_CHECKING:
-    import xarray as xr
-
     from landsat_lst.offsets import OffsetCache
 
 _TIME_DIM = "time"
@@ -52,15 +51,43 @@ def _pixel_count(lst: xr.DataArray) -> int:
     return int(np.prod([lst.sizes[d] for d in _spatial_dims(lst)]))
 
 
+def _offset_graph_groupby(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
+    """The original groupby formulation, kept as the equivalence oracle.
+
+    Production does not call this: at 2,930 scenes the groupby shuffle costs
+    more than 48.5 GB of graph to materialize, which is what killed every
+    full-window run (measured 2026-08-14, results/batch1-investigation/).
+    ``tests/unit/test_destripe_normalization.py`` pins :func:`offset_graph`
+    against this bit for bit, which is the claim that lets the reformulation
+    ship without an :data:`~landsat_lst.offsets.ALGORITHM_VERSION` bump.
+    """
+    spatial = _spatial_dims(lst)
+    ref_month = lst.groupby("time.month").median(skipna=True)
+    anomaly = lst.groupby("time.month") - ref_month
+    return anomaly.median(dim=spatial, skipna=True), lst.notnull().sum(dim=spatial)
+
+
 def offset_graph(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
     """Build the lazy ``(offset, n_valid)`` pair without computing either.
 
     Separate from :func:`scene_offsets` so the graph can be inspected before it
-    is paid for. This is the graph that turned out to hold 598,604 tasks on a
-    300-scene N40W075 sample, and its size follows from array shape and
-    chunking alone. ``landsat-lst plan`` reads it through
+    is paid for. ``landsat-lst plan`` reads it through
     :func:`landsat_lst.profiling.graph_stats` in seconds, on a laptop, against
     a stack with no data behind it. See issue #76.
+
+    The estimator is a per-pixel monthly-median climatology, an anomaly
+    against it, and a spatial median per scene -- unchanged since ADR-007.
+    The *graph* is not the textbook ``groupby("time.month")`` spelling:
+    xarray's groupby routes both the median and the broadcast through a
+    shuffle whose materialized size grows superlinearly in scene count.
+    5.4 GB at 1,500 scenes became >48.5 GB at 2,930 and OOMed every
+    full-window run (measured 2026-08-14). Twelve explicit per-month
+    reductions plus a month-selection broadcast hold the same values in a
+    13.8 GB graph at 2,930 scenes, and the fused graph carries no shuffle
+    layers at all. Values are bit-identical: pinned against
+    :func:`_offset_graph_groupby` in the unit tests and measured at
+    max |delta| = 0.0 over 300 real scenes. See
+    results/batch1-investigation/report.md.
 
     Args:
         lst: Celsius LST on ``(time, latitude, longitude)``, chunked.
@@ -69,12 +96,28 @@ def offset_graph(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
         ``(offset, n_valid)`` as unevaluated DataArrays indexed on time.
     """
     spatial = _spatial_dims(lst)
+    months = lst.time.dt.month.values
 
     # Per-pixel, per-calendar-month median, pooling every year in the window.
     # Median rather than mean so residual cloud cannot drag the reference.
-    ref_month = lst.groupby("time.month").median(skipna=True)
+    # One explicit reduction per month; the median needs each month's whole
+    # time axis in one chunk, and stating that rechunk directly keeps the
+    # groupby shuffle out of the graph. ~244 scenes x 512^2 x 4 B is a 256 MB
+    # block, which is the price the median was always going to charge.
+    parts = []
+    for month in np.unique(months):
+        sub = lst.isel(time=np.flatnonzero(months == month))
+        if sub.chunks is not None:
+            sub = sub.chunk({_TIME_DIM: -1})
+        parts.append(sub.median(_TIME_DIM, skipna=True).expand_dims(month=[int(month)]))
+    ref_month = xr.concat(parts, dim="month")
 
-    anomaly = lst.groupby("time.month") - ref_month
+    # Broadcast by selection over the 12-deep month dim: one indexing layer,
+    # then a plain blockwise subtract.
+    ref_full = ref_month.sel(month=lst.time.dt.month)
+    if "month" in ref_full.coords:
+        ref_full = ref_full.drop_vars("month")
+    anomaly = lst - ref_full
 
     # One scalar per scene. Spatial median again for robustness: a handful of
     # contaminated pixels cannot move it.
