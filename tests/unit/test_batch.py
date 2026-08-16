@@ -239,7 +239,7 @@ class TestSubmit:
         assert fake_coiled["spot_policy"] == "spot_with_fallback"
         assert fake_coiled["max_workers"] == 4
         assert fake_coiled["max_retries"] == 3
-        assert fake_coiled["job_timeout"] == "6 hours"
+        assert fake_coiled["job_timeout"] == "24 hours"
         assert fake_coiled["name"] == "lst-test-run"
         assert fake_coiled["tag"] == {"project": "landsat-lst", "run_id": "test-run"}
         assert fake_coiled["forward_aws_credentials"] is False

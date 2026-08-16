@@ -33,7 +33,7 @@ import xarray as xr
 
 from landsat_lst.config import settings
 from landsat_lst.profiling import PROFILE_DESTRIPE_OFFSETS, profile_compute
-from landsat_lst.progress import GraphProgress
+from landsat_lst.progress import GraphProgress, report_phase, timed_section
 
 if TYPE_CHECKING:
     from landsat_lst.offsets import OffsetCache
@@ -124,6 +124,214 @@ def offset_graph(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
     return anomaly.median(dim=spatial, skipna=True), lst.notnull().sum(dim=spatial)
 
 
+def _chunk_sizes(lst: xr.DataArray, dim: str) -> tuple[int, ...] | None:
+    """Source chunk lengths along ``dim``, or None for an eager array."""
+    if lst.chunks is None:
+        return None
+    sizes = dict(zip([str(d) for d in lst.dims], lst.chunks, strict=True))
+    return tuple(int(c) for c in sizes[dim])
+
+
+def _io_block_edge(lst: xr.DataArray, budget_gb: float) -> int:
+    """Largest power-of-two block edge whose stack fits the resident budget.
+
+    Phase A holds one block's whole time series, so the block edge is what
+    bounds memory. Solving ``edge^2 * scenes * 4 <= budget`` and rounding down
+    to a power of two keeps unit memory flat as the window grows: a five-year
+    tile gets a smaller block than a one-year tile and costs the same RAM.
+
+    Never smaller than the source's spatial chunk, whatever the budget says. A
+    block below the chunk edge would make neighbouring blocks re-read the same
+    chunk, turning a memory saving into extra reads over the network.
+    """
+    scenes = int(lst.sizes[_TIME_DIM])
+    spatial = _spatial_dims(lst)
+    largest = min(int(lst.sizes[d]) for d in spatial)
+    edge = 64
+    while edge * 2 <= largest and (edge * 2) ** 2 * scenes * 4 <= budget_gb * 1024**3:
+        edge *= 2
+
+    floor = 1
+    for dim in spatial:
+        chunks = _chunk_sizes(lst, dim)
+        if chunks:
+            floor = max(floor, *chunks)
+    return max(edge, min(floor, largest))
+
+
+def _scene_batches(lst: xr.DataArray, batch: int) -> list[tuple[int, int]]:
+    """Half-open scene ranges to read, aligned to the source's time chunks.
+
+    A batch that straddles a chunk boundary makes that chunk materialize twice,
+    once for each batch touching it. With the shipped ``TIME_CHUNK = 10`` and a
+    batch of 8 the boundaries never line up, and the offset pass pays roughly a
+    quarter of an extra read of the whole stack for nothing. Grouping whole
+    chunks instead keeps the promise phase B is supposed to make: one traversal.
+    """
+    n_scenes = int(lst.sizes[_TIME_DIM])
+    chunks = _chunk_sizes(lst, _TIME_DIM)
+    if not chunks:
+        return [(s, min(s + batch, n_scenes)) for s in range(0, n_scenes, batch)]
+
+    out: list[tuple[int, int]] = []
+    start = pos = 0
+    for length in chunks:
+        pos += length
+        if pos - start >= batch:
+            out.append((start, pos))
+            start = pos
+    if start < n_scenes:
+        out.append((start, n_scenes))
+    return out
+
+
+def _panel_median(panel: np.ndarray) -> np.ndarray:
+    """Per-pixel median over time for one panel, NaNs skipped.
+
+    ``np.nanmedian`` over axis 0 rather than anything cleverer, because E1
+    established bit-exactness against the shipped graph with exactly this call
+    and a faster kernel would have to re-earn that.
+    """
+    return np.nanmedian(panel, axis=0)
+
+
+def climatology_by_blocks(
+    lst: xr.DataArray,
+    *,
+    block: int | None = None,
+    panel: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Phase A: the 12-month per-pixel climatology, one spatial block at a time.
+
+    Sharded over space, which is the axis the per-pixel median is parallel in.
+    Each block is read with one small dask graph and reduced in memory, so the
+    scheduler never sees the whole stack and there is no rechunk gathering
+    space. The I/O block and the compute panel are separate on purpose: reads
+    want to be few and large, the kernel wants a working set that stays in
+    cache, and E3 measured 256 running 1.8x faster than any larger panel while
+    producing an identical checksum.
+
+    Args:
+        lst: Land-masked, QA-masked stack in Celsius.
+        block: I/O block edge. Defaults to the largest power of two fitting
+            ``settings.destripe_unit_memory_gb``.
+        panel: Compute panel edge. Defaults to ``settings.destripe_compute_panel``.
+
+    Returns:
+        ``(ref, months)`` where ``ref`` is ``(n_months, y, x)`` float32 and
+        ``months`` holds the calendar month of each ``ref`` plane.
+    """
+    block = block or _io_block_edge(lst, settings.destripe_unit_memory_gb)
+    panel = panel or settings.destripe_compute_panel
+    y_dim, x_dim = _spatial_dims(lst)
+    height, width = int(lst.sizes[y_dim]), int(lst.sizes[x_dim])
+
+    # The input dtype is carried through rather than pinned. Production
+    # loads float32 and the graph form reduces in float32; forcing a cast here
+    # would make the two forms differ in the last bits on any other input,
+    # which is exactly the equivalence the unit tests exist to hold.
+    dtype = np.dtype(lst.dtype)
+    scene_months = lst[_TIME_DIM].dt.month.values.astype(np.int16)
+    uniq = np.unique(scene_months)
+    ref = np.empty((uniq.size, height, width), dtype=dtype)
+
+    y_starts = range(0, height, block)
+    x_starts = range(0, width, block)
+    total = len(list(y_starts)) * len(list(x_starts))
+    done = 0
+    for y0 in range(0, height, block):
+        y1 = min(y0 + block, height)
+        for x0 in range(0, width, block):
+            x1 = min(x0 + block, width)
+            # One bounded graph per block. Everything after this is numpy.
+            data = np.asarray(
+                lst.isel({y_dim: slice(y0, y1), x_dim: slice(x0, x1)}).values,
+                dtype=dtype,
+            )
+            for py in range(0, y1 - y0, panel):
+                py1 = min(py + panel, y1 - y0)
+                for px in range(0, x1 - x0, panel):
+                    px1 = min(px + panel, x1 - x0)
+                    tile = data[:, py:py1, px:px1]
+                    for i, month in enumerate(uniq):
+                        ref[i, y0 + py : y0 + py1, x0 + px : x0 + px1] = _panel_median(
+                            tile[scene_months == month]
+                        )
+            del data
+            done += 1
+            report_phase("destripe_climatology", blocks_done=done, blocks_total=total)
+    return ref, uniq
+
+
+def offsets_by_scene(
+    lst: xr.DataArray,
+    ref: np.ndarray,
+    months: np.ndarray,
+    *,
+    batch: int | None = None,
+) -> tuple[xr.DataArray, xr.DataArray]:
+    """Phase B: one scalar offset and one valid count per scene, independently.
+
+    Sharded over scene, which is the axis the spatial median is parallel in.
+    A scene's offset depends on nothing but that scene and the climatology, so
+    the loop carries no state and a failure costs one scene rather than a tile.
+    Scenes are read in batches only to give the reader something to overlap;
+    E2 measured the compute at 12.4 ms per scene, constant from 50 to 300, so
+    the batch size is an I/O lever and not a compute one.
+
+    Args:
+        lst: The same stack phase A reduced.
+        ref: ``(n_months, y, x)`` climatology from :func:`climatology_by_blocks`.
+        months: Calendar month of each ``ref`` plane.
+        batch: Scenes per read. Defaults to ``settings.destripe_scene_batch``.
+
+    Returns:
+        ``(offset, n_valid)`` on the time axis, matching :func:`offset_graph`.
+    """
+    batch = batch or settings.destripe_scene_batch
+    scene_months = lst[_TIME_DIM].dt.month.values.astype(np.int16)
+    plane = {int(m): i for i, m in enumerate(months)}
+    n_scenes = int(lst.sizes[_TIME_DIM])
+
+    dtype = np.dtype(ref.dtype)
+    offset = np.empty(n_scenes, dtype=dtype)
+    n_valid = np.empty(n_scenes, dtype=np.int64)
+
+    for start, stop in _scene_batches(lst, batch):
+        chunk = np.asarray(lst.isel({_TIME_DIM: slice(start, stop)}).values, dtype=dtype)
+        for j in range(stop - start):
+            scene = chunk[j]
+            anomaly = scene - ref[plane[int(scene_months[start + j])]]
+            offset[start + j] = np.nanmedian(anomaly)
+            n_valid[start + j] = int(np.isfinite(scene).sum())
+        del chunk
+        report_phase("destripe_offsets", scenes_done=stop, scenes_total=n_scenes)
+
+    coord = {_TIME_DIM: lst[_TIME_DIM]}
+    return (
+        xr.DataArray(offset, dims=[_TIME_DIM], coords=coord),
+        xr.DataArray(n_valid, dims=[_TIME_DIM], coords=coord),
+    )
+
+
+def offsets_as_units(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
+    """The two phases, run back to back. Bit-exact against :func:`offset_graph`.
+
+    Equivalence is not assumed. E1 ran both forms over a real 300-scene fixture
+    and compared: ``max |delta| = 0``, identical NaN patterns, identical valid
+    counts, and the same result at two block sizes and from two median kernels.
+    ``tests/unit/test_destripe_normalization.py`` pins it on synthetic stacks so
+    a regression fails in CI rather than in a five-hour tile.
+    """
+    with timed_section("destripe_climatology"):
+        ref, months = climatology_by_blocks(lst)
+    try:
+        with timed_section("destripe_offsets"):
+            return offsets_by_scene(lst, ref, months)
+    finally:
+        del ref
+
+
 def scene_offsets(
     lst: xr.DataArray, *, cache: OffsetCache | None = None
 ) -> tuple[xr.DataArray, xr.DataArray]:
@@ -156,8 +364,19 @@ def scene_offsets(
     #
     # GraphProgress publishes the task fraction to the heartbeat; profile_compute
     # records which task prefixes the hours went to, and is off by default.
-    with GraphProgress(), profile_compute(PROFILE_DESTRIPE_OFFSETS):
-        offset, n_valid = dask.compute(*offset_graph(lst))
+    if settings.destripe_bounded_units:
+        # No GraphProgress: there is no single graph to report a task fraction
+        # against. Each phase publishes its own unit counts instead, which is
+        # the more useful number anyway -- "block 44 of 81" localizes a stall
+        # where a task fraction over a fused graph never could.
+        offset, n_valid = offsets_as_units(lst)
+    else:
+        # Both reductions read the same stack, so they are computed together:
+        # two `.compute()` calls would walk it twice, and on a 5-year tile that
+        # second walk is a full re-read of every scene for a reduction that
+        # costs almost nothing on its own.
+        with GraphProgress(), profile_compute(PROFILE_DESTRIPE_OFFSETS):
+            offset, n_valid = dask.compute(*offset_graph(lst))
 
     if cache is not None:
         cache.write(offset, n_valid, duration_s=time.monotonic() - started)

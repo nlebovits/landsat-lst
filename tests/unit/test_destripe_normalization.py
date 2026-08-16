@@ -11,6 +11,7 @@ cap must be absent from the output stack and absent from qa_count, not present
 with a bounded correction.
 """
 
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import numpy as np
@@ -81,8 +82,8 @@ def _debias(lst, *, max_offset_c=15.0, min_scene_pixels=500):
 class TestSceneOffsets:
     """The offset pass is the expensive half of de-striping on a real tile."""
 
-    def test_reads_the_stack_once(self):
-        """Both reductions share one traversal.
+    def test_graph_form_reads_the_stack_once(self):
+        """Both reductions share one traversal, in the graph form.
 
         They read the same stack, and the valid-pixel count is trivial next to
         the monthly median. Computing them separately would walk every scene a
@@ -100,11 +101,55 @@ class TestSceneOffsets:
             calls.append(args)
             return real_compute(*args, **kwargs)
 
-        with patch.object(normalization.dask, "compute", counting_compute):
+        with (
+            patch.object(settings, "destripe_bounded_units", False),
+            patch.object(normalization.dask, "compute", counting_compute),
+        ):
             offset, n_valid = scene_offsets(_seasonal_stack())
 
         assert len(calls) == 1, "the stack must be traversed once, not per reduction"
         assert len(calls[0]) == 2, "both reductions belong to the same graph"
+        assert offset.sizes["time"] == n_valid.sizes["time"]
+
+    def test_unit_form_reads_the_stack_exactly_twice(self):
+        """C1 trades one read for bounded memory, and trades exactly one.
+
+        Sharding the climatology over space and the offsets over scene means
+        the two phases cannot share a traversal: they are parallel in
+        orthogonal axes, which is the whole reason the single graph had to
+        materialize the stack. Two passes is therefore the accepted cost, and
+        pinning it is what stops it quietly becoming three -- a per-scene read
+        inside phase A, or a re-read of the climatology, would not otherwise
+        show up until a tile ran hours long.
+
+        Counted as block *executions* via ``map_blocks``, the same trick
+        ``tests/integration/test_cog.py`` uses on export. Counting task keys
+        would answer a different question, since fusion renames keys freely.
+        """
+        import dask.array as da
+
+        reads: list[int] = []
+
+        def tally(block):
+            # dask probes the function with a zero-size block to infer meta.
+            # That is instrument overhead, not a read.
+            if block.size:
+                reads.append(1)  # list.append is atomic; the scheduler is threaded
+            return block
+
+        eager = _seasonal_stack()
+        source = da.from_array(eager.values, chunks=(6, 20, 20))
+        counted = source.map_blocks(tally, dtype=source.dtype)
+        lst = eager.copy(data=counted)
+        n_blocks = len(source.to_delayed().ravel())
+
+        with patch.object(settings, "destripe_bounded_units", True):
+            offset, n_valid = scene_offsets(lst)
+
+        passes = len(reads) / n_blocks
+        assert passes == pytest.approx(2.0, abs=0.01), (
+            f"bounded units must read the stack twice, measured {passes:.2f}"
+        )
         assert offset.sizes["time"] == n_valid.sizes["time"]
 
 
@@ -647,3 +692,110 @@ class TestRejectionRuleIsShared:
 
         assert rejection_floor(offset_source_given=False) == 500
         assert rejection_floor(offset_source_given=True) == 200
+
+
+class TestBoundedUnitsMatchTheGraph:
+    """The bounded-unit form must be the same estimator, not a similar one.
+
+    E1 established this on a real 300-scene fixture (max |delta| = 0, identical
+    NaN patterns, identical valid counts, stable across two block sizes and two
+    median kernels). These pin it on synthetic stacks so a regression fails in
+    CI rather than five hours into a tile.
+    """
+
+    def _pair(self, lst, **kwargs):
+        import dask
+
+        from landsat_lst.normalization import offset_graph, offsets_as_units
+
+        graph_o, graph_n = dask.compute(*offset_graph(lst))
+        # ExitStack, not a bare setattr inside the patch block: a plain setattr
+        # is never restored, and it leaked destripe_compute_panel into every
+        # later test in the same process.
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(settings, "destripe_bounded_units", True))
+            for key, val in kwargs.items():
+                stack.enter_context(patch.object(settings, key, val))
+            unit_o, unit_n = offsets_as_units(lst)
+        return (graph_o, graph_n), (unit_o, unit_n)
+
+    def _assert_identical(self, lst, **kwargs):
+        (g_o, g_n), (u_o, u_n) = self._pair(lst, **kwargs)
+        np.testing.assert_array_equal(
+            np.asarray(u_o.values, dtype="float64"),
+            np.asarray(g_o.values, dtype="float64"),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(u_n.values, dtype="int64"), np.asarray(g_n.values, dtype="int64")
+        )
+        assert list(u_o.time.values) == list(g_o.time.values)
+
+    def test_bitwise_equal_on_eager_input(self):
+        self._assert_identical(_seasonal_stack())
+
+    def test_bitwise_equal_on_chunked_input_with_gaps(self):
+        """Random holes, an all-NaN scene, and a pixel valid in no scene."""
+        import dask.array as da
+
+        rng = np.random.default_rng(7)
+        lst = _seasonal_stack()
+        values = lst.values.copy()
+        values[rng.random(values.shape) < 0.3] = np.nan
+        values[4] = np.nan
+        values[:, 3, 5] = np.nan
+        self._assert_identical(lst.copy(data=da.from_array(values, chunks=(6, 20, 20))))
+
+    def test_bitwise_equal_when_months_are_missing(self):
+        stamps = pd.to_datetime([f"{y}-{m:02d}-15" for y in (2021, 2022) for m in (1, 2, 3)]).values
+        rng = np.random.default_rng(3)
+        data = rng.normal(20.0, 5.0, (len(stamps), GRID, GRID))
+        data[rng.random(data.shape) < 0.2] = np.nan
+        lst = xr.DataArray(
+            data,
+            dims=["time", "latitude", "longitude"],
+            coords={
+                "time": stamps,
+                "latitude": np.linspace(-33.4, -34.4, GRID),
+                "longitude": np.linspace(-61.1, -60.1, GRID),
+            },
+        )
+        self._assert_identical(lst)
+
+    @pytest.mark.parametrize("panel", [8, 16, GRID])
+    def test_panel_size_changes_nothing(self, panel):
+        """E3 measured 256 as 1.8x faster; it must also be 1.0x different."""
+        self._assert_identical(_seasonal_stack(), destripe_compute_panel=panel)
+
+    @pytest.mark.parametrize("batch", [1, 3, 512])
+    def test_scene_batch_changes_nothing(self, batch):
+        """Phase B carries no state across scenes, so the batch is I/O only."""
+        self._assert_identical(_seasonal_stack(), destripe_scene_batch=batch)
+
+    def test_partial_edge_blocks(self):
+        """A grid divisible by no block edge, which production also is not."""
+        lst = _seasonal_stack().isel(latitude=slice(0, 37), longitude=slice(0, 23))
+        self._assert_identical(lst, destripe_compute_panel=16)
+
+    def test_block_edge_shrinks_as_the_window_grows(self):
+        """Unit memory is meant to stay flat as scenes accumulate."""
+        from landsat_lst.normalization import _io_block_edge
+
+        lst = _seasonal_stack()
+        wide = _io_block_edge(lst.isel(time=slice(0, 10)), 4.0)
+        deep = _io_block_edge(lst, 4.0)
+        assert deep <= wide
+        assert wide & (wide - 1) == 0  # power of two
+
+    def test_scene_offsets_dispatches_on_the_setting(self):
+        """Both paths reachable, and the flag is what chooses."""
+        from landsat_lst.normalization import scene_offsets
+
+        lst = _seasonal_stack()
+        with patch.object(settings, "destripe_bounded_units", True):
+            unit_o, _ = scene_offsets(lst)
+        with patch.object(settings, "destripe_bounded_units", False):
+            graph_o, _ = scene_offsets(lst)
+        np.testing.assert_array_equal(
+            np.asarray(unit_o.values, dtype="float64"),
+            np.asarray(graph_o.values, dtype="float64"),
+        )

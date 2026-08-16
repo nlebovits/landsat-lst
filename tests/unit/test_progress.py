@@ -263,7 +263,16 @@ class TestHeartbeat:
         pointer, attempt_state = _pointer(storage), _published(storage)
         # Both are rendered from the same live object, so only the clock fields
         # differ between the two writes.
-        volatile = {"updated_at", "elapsed_s", "phase_seconds", "rss_mb", "peak_rss_mb"}
+        volatile = {
+            "updated_at",
+            "elapsed_s",
+            "phase_seconds",
+            "rss_mb",
+            "peak_rss_mb",
+            # Appended to on every beat, so the pointer write always carries
+            # one more sample than the attempt write it copies.
+            "rss_series",
+        }
         assert {k: v for k, v in pointer.items() if k not in volatile} == {
             k: v for k, v in attempt_state.items() if k not in volatile
         }

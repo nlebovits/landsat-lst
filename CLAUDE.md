@@ -476,6 +476,54 @@ See [docs/adr/007-scene-normalization.md](docs/adr/007-scene-normalization.md),
 [docs/methodology.md](docs/methodology.md), and
 [docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md).
 
+### The offset pass runs as bounded work units, not one graph
+
+`offset_graph` holds two medians reducing along **orthogonal axes** — a per-pixel median
+over time, a per-scene median over space. No chunking satisfies both, so one graph
+serving both materializes the stack: construction alone exceeded 26 GB above 2,000 scenes
+and execution held a scene-independent ~21 GB plateau. The month-loop reformulation
+(PR #99) removed the shuffle but not the two rechunks, because they are the estimator's
+shape rather than its spelling.
+
+`scene_offsets` therefore dispatches on `settings.destripe_bounded_units` (default on) to
+`offsets_as_units`: `climatology_by_blocks` shards over space, `offsets_by_scene` shards
+over scene, and neither builds a graph spanning the window. See
+[ADR-015](docs/adr/015-bounded-work-unit-offsets.md).
+
+Rules worth keeping:
+
+- **Bit-exact, so `offsets.ALGORITHM_VERSION` is not bumped.** `max |Δ| = 0` against the
+  graph form on 300 real scenes, at two block sizes, from two median kernels, with
+  identical NaN patterns and valid counts. The version invalidates caches when *values*
+  change; these do not. `offset_graph` stays as the equivalence oracle and is pinned in
+  `tests/unit`, `tests/integration`, and `tests/benchmark`.
+- **The I/O block and the compute panel are different parameters.** Reads want few and
+  large; the kernel wants a working set in cache. Measured on 2250² at 300 scenes: panel
+  256 runs in 65.8 s against 116–122 s at 512/1024/2048, which are flat within 5% of each
+  other. A cache cliff, not a trend. Every panel size gives an identical checksum.
+- **Both phases align to source chunks, and this is correctness-adjacent, not tuning.**
+  `_scene_batches` groups **whole** `TIME_CHUNK` chunks; a batch of 8 against
+  `TIME_CHUNK = 10` never aligns, every boundary chunk materializes twice, and the pass
+  pays ~25% of an extra full read. `_io_block_edge` refuses to go below the spatial chunk
+  edge for the same reason. Measured 2.51 passes before the fix, 2.00 after, and pinned by
+  `test_unit_form_reads_the_stack_exactly_twice`.
+- **Two passes is the accepted cost.** Sharding in orthogonal axes means the phases cannot
+  share a traversal. The test pins exactly two so it cannot quietly become three.
+- **Phase A memory climbs to a bound; that is not a leak.** `ref` is
+  `12 × 9000² × 4 B = 3.89 GB` of lazily-allocated pages touched block by block, so RSS
+  rises ~12 MB per block and converges. Phase B is scene-count *independent*: the batch is
+  one `TIME_CHUNK` at any window depth.
+- **Progress is units, not a task fraction.** `blocks_done/blocks_total` and
+  `scenes_done/scenes_total` reach the heartbeat; there is no `GraphProgress` here because
+  there is no single graph. A block index localizes a stall where a fraction cannot.
+- **Graph construction is not a cost.** 617 slices against a 379,728-chunk array cost 13.5 s
+  total, 0.024% of a tile. Do not optimize it.
+- **`notnull` and `isfinite` diverge on ±inf.** The graph form counts `n_valid` with the
+  first, the unit form with the second. `convert_to_celsius`'s clamp makes this unreachable
+  today. It is latent, not fixed.
+- **There is no intra-tile checkpoint.** A failure costs the whole tile, and a tile is
+  hours. Checkpointing `ref` after phase A would halve the worst case; it is not built.
+
 ---
 
 ## Testing
