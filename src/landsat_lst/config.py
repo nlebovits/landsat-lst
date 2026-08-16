@@ -193,6 +193,49 @@ class Settings(BaseSettings):
         "P95 still needs a native pass.",
     )
 
+    destripe_bounded_units: bool = Field(
+        default=True,
+        description="Estimate offsets as bounded work units rather than as one dask "
+        "graph. The graph form holds two medians reducing along orthogonal axes -- a "
+        "per-pixel median over time and a per-scene median over space -- so no "
+        "chunking satisfies both and the scheduler materializes the stack. Measured "
+        "2026-08-15: construction alone exceeds 26 GB above 2,000 scenes and the "
+        "execution plateau is scene-independent at ~21 GB. The unit form computes the "
+        "climatology one spatial block at a time and each scene's offset "
+        "independently, which is bit-exact against the graph (E1: max |delta| = 0 on "
+        "three variants, identical NaN patterns) while holding memory to one unit. "
+        "Set False to run the graph form, which is retained as the equivalence oracle.",
+    )
+    destripe_unit_memory_gb: float = Field(
+        default=4.0,
+        ge=0.25,
+        description="Resident budget for one phase-A spatial block. The block edge is "
+        "chosen as the largest power of two whose stack (edge^2 * scenes * 4 bytes) "
+        "fits, so unit memory stays flat as the window grows rather than scaling with "
+        "it. Raising this enlarges the I/O unit and cuts the number of COG opens; it "
+        "does not change any value.",
+    )
+    destripe_compute_panel: int = Field(
+        default=256,
+        ge=32,
+        description="Edge of the panel the climatology kernel actually reduces over, "
+        "within each I/O block. Decoupled from the block because the two want "
+        "opposite things: I/O wants few large reads, the kernel wants a working set "
+        "that stays in cache. Measured 2026-08-15 (E3, 300 scenes, 2250^2): 256 runs "
+        "in 65.8 s against 116-122 s at 512, 1024, and 2048, which are flat within "
+        "5% of each other. A 256^2 panel of one month is ~6.5 MB and L3-resident. "
+        "The climatology checksum is identical at every panel size.",
+    )
+    destripe_scene_batch: int = Field(
+        default=8,
+        ge=1,
+        description="Scenes per phase-B read. Each batch is one small dask graph over "
+        "the full tile footprint, so the batch trades resident memory (batch * "
+        "pixels * 4 bytes) against the number of graphs. Phase B costs 12.4 ms of CPU "
+        "per scene (E2, constant across 50-300 scenes), so this setting is about read "
+        "concurrency rather than compute.",
+    )
+
     # COG output. Literal rather than str so an unsupported codec fails at
     # settings load instead of deep inside the GeoTIFF write.
     cog_compression: Literal["deflate", "zstd", "lzw"] = Field(
@@ -221,18 +264,21 @@ class Settings(BaseSettings):
     )
 
     dask_max_threads: int | None = Field(
-        default=1,
-        description="Cap on dask's threaded scheduler for one tile. The threaded "
-        "scheduler holds one chunk per thread, so peak memory during de-striping "
-        "is roughly threads * chunk_size**2 * scenes * 4 bytes: on a 16-vCPU VM "
-        "at chunk 512 over 2,930 scenes that is ~49 GB of concurrent chunks "
-        "alone. 1, not None, because None leaves dask's default of one thread "
-        "per core and a tile at 4 threads was already OOMing. Paired with "
-        "load_chunk_size 256 this measured 16.2 GB at 800 scenes where 4 threads "
-        "at chunk 512 was SIGKILLed, and projects to ~57 GB at a full 2,930-scene "
-        "window against 68.7 GB of VM. The phase is I/O bound, so the threads "
-        "removed are mostly concurrent waiting rather than useful work. "
-        "See docs/findings-memory-model.md.",
+        default=4,
+        description="Cap on dask's threaded scheduler for one tile. Was 1, for the "
+        "fused offset graph: that graph made the threaded scheduler hold one chunk "
+        "per thread across the whole time axis, so peak memory ran to roughly "
+        "threads * chunk_size**2 * scenes * 4 bytes -- ~49 GB on a 16-vCPU VM at "
+        "chunk 512 over 2,930 scenes, and a tile at 4 threads was OOMing. "
+        "ADR-015's bounded work units removed that term: each block read is a "
+        "graph over one block, so a thread costs one chunk (~2.6 MB) rather than "
+        "one time series. Measured 2026-08-16 on r6i.2xlarge at production "
+        "geometry, 40 scenes, four arms: peak RSS 14.60 / 14.66 / 14.15 / 14.25 GB "
+        "at 1 / 2 / 4 / 8 threads -- flat within 3.6%, no trend -- while wall time "
+        "went 1776 / 1377 / 1235 / 1445 s. 4 is the optimum; 8 is slower than 4 "
+        "and burns 46% more CPU, because past 4 the threads contend rather than "
+        "overlap. Every arm returned identical offsets. Raising this above 4 "
+        "costs time, not just memory. See docs/findings-memory-model.md.",
     )
     dask_workers: int = Field(
         default=8,
@@ -280,9 +326,17 @@ class Settings(BaseSettings):
         "700-tile job never runs 700 machines.",
     )
     coiled_job_timeout: str = Field(
-        default="6 hours",
+        default="24 hours",
         description="Wall-clock budget per batch task. A tile that runs past "
-        "this is stuck, not slow; the timeout stops it from billing all night.",
+        "this is stuck, not slow; the timeout stops it from billing all night. "
+        "Was 6 hours, which no longer bounds a real tile and would have killed "
+        "every one of them mid-climatology. A 2,930-scene offset pass reads "
+        "949.3 GB twice and projects to 15.75 h from the rates measured at "
+        "production geometry (26.7 MB/s phase A, 44.9 MB/s phase B, 2026-08-16); "
+        "the native composite is a further 3,797 GB and is not yet measured. "
+        "24 leaves ~50% headroom over the destriping projection while still "
+        "catching a tile that has genuinely hung. Revisit once one end-to-end "
+        "tile has completed and the composite has been characterized.",
     )
     aws_profile: str = Field(
         default="radiant-earth",

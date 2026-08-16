@@ -81,7 +81,7 @@ def test_writes_manifest_with_counts_and_tiles(results, tmp_path):
     assert payload["config"]["retries"] == 3
     assert payload["config"]["region"] == "us-west-2"
     assert payload["config"]["max_workers"] == 4
-    assert payload["config"]["job_timeout"] == "6 hours"
+    assert payload["config"]["job_timeout"] == "24 hours"
 
     by_tile = {t["tile"]: t for t in payload["tiles"]}
     assert by_tile["N40W075"]["duration_s"] == 812.3

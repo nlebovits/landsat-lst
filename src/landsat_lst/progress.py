@@ -105,6 +105,12 @@ GRAPH_RUNNING = "running"
 #: could not be told apart from an uninstrumented silence.
 GRAPH_IDLE = "idle"
 
+#: Samples kept in a heartbeat's RSS series. At the default 60 s interval this
+#: is 20 hours before any thinning, and the object stays a few kilobytes. Past
+#: it the series is halved rather than truncated, so a long run keeps its whole
+#: shape at coarser resolution instead of losing its beginning.
+_RSS_SERIES_MAX = 1200
+
 _PUMP_CHUNK_BYTES = 65536
 _PUMP_JOIN_TIMEOUT_S = 5.0
 
@@ -208,6 +214,9 @@ class TileHeartbeat:
         # `None` counts mean both "no graph here" and "a graph that has not
         # reported yet", and those need different reactions from a watcher.
         self._graph_state = GRAPH_IDLE
+        # Memory as a time series. See the append in the beat builder for why
+        # the per-beat reading alone was not enough.
+        self._rss_series: list[tuple[float, float | None]] = []
 
     def _identity(self) -> dict[str, Any]:
         """The fields that never change for the life of this attempt."""
@@ -258,6 +267,19 @@ class TileHeartbeat:
             done, total = self._tasks_done, self._tasks_total
             graph_state, graph_seq = self._graph_state, self._graph_seq
             result = dict(self._result) if self._result else {}
+            # A single beat carries the current RSS, but every beat overwrites
+            # the same key, so the object only ever held the last reading. A
+            # tile that dies leaves one number and no way to tell a bounded
+            # plateau from a climb into an OOM. The series is appended here,
+            # inside the same lock that guards the rest of the beat.
+            self._rss_series.append((round(now - self._started, 1), rss_mb()))
+            if len(self._rss_series) > _RSS_SERIES_MAX:
+                # Halve by dropping every other sample rather than dropping the
+                # oldest. A long run keeps its whole shape at coarser
+                # resolution; a FIFO would discard exactly the early growth an
+                # OOM post-mortem needs.
+                self._rss_series = self._rss_series[::2]
+            rss_series = list(self._rss_series)
         return {
             **self._identity(),
             "phase": phase,
@@ -271,6 +293,10 @@ class TileHeartbeat:
             "graph_seq": graph_seq,
             "rss_mb": rss_mb(),
             "peak_rss_mb": peak_rss_mb(),
+            # [[elapsed_s, rss_mb], ...] since the tile started. Memory as a
+            # curve rather than a final reading, so a post-mortem can separate
+            # a bounded plateau from a climb.
+            "rss_series": rss_series,
             "scene_count": None,
             "lst_key": None,
             "qa_key": None,
