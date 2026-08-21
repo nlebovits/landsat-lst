@@ -38,6 +38,7 @@ from landsat_lst.config import settings
 from landsat_lst.kernels import sort_median_axis0
 from landsat_lst.profiling import PROFILE_DESTRIPE_OFFSETS, profile_compute
 from landsat_lst.progress import GraphProgress, report_phase, timed_section
+from landsat_lst.shards import block_spans
 
 if TYPE_CHECKING:
     from landsat_lst.offsets import OffsetCache
@@ -255,6 +256,7 @@ def climatology_by_blocks(
     block: int | None = None,
     panel: int | None = None,
     land_mask: xr.DataArray | None = None,
+    spans: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Phase A: the 12-month per-pixel climatology, blocks run concurrently.
 
@@ -283,6 +285,15 @@ def climatology_by_blocks(
             with no land pixel is filled with NaN and never read: its every
             panel median would be a median of an all-NaN stack, which is NaN,
             so the skip is value-identical and the tests hold it to that.
+        spans: Compute only these blocks, which must come from
+            :func:`landsat_lst.shards.block_spans` at this ``block`` so their
+            indices mean the same thing here as in the plan. One shard of the
+            phase-A stage passes its own slice of that list. ``ref`` is still
+            allocated at full height and width: ``np.empty`` touches no page it
+            does not write, so an unrequested block costs address space rather
+            than resident memory, and the returned array can be sliced by span
+            index without an offset table. **Blocks outside ``spans`` are left
+            uninitialized** -- read only the spans you asked for.
 
     Returns:
         ``(ref, months)`` where ``ref`` is ``(n_months, y, x)`` float32 and
@@ -313,11 +324,7 @@ def climatology_by_blocks(
                 "same grid offsets are estimated on"
             )
 
-    spans = [
-        (y0, min(y0 + block, height), x0, min(x0 + block, width))
-        for y0 in range(0, height, block)
-        for x0 in range(0, width, block)
-    ]
+    spans = list(spans) if spans is not None else block_spans((height, width), block)
     total = len(spans)
     n_scenes = int(lst.sizes[_TIME_DIM])
 
@@ -356,6 +363,7 @@ def offsets_by_scene(
     months: np.ndarray,
     *,
     batch: int | None = None,
+    batches: list[tuple[int, int]] | None = None,
 ) -> tuple[xr.DataArray, xr.DataArray]:
     """Phase B: one scalar offset and one valid count per scene, independently.
 
@@ -371,6 +379,14 @@ def offsets_by_scene(
         ref: ``(n_months, y, x)`` climatology from :func:`climatology_by_blocks`.
         months: Calendar month of each ``ref`` plane.
         batch: Scenes per read. Defaults to ``settings.destripe_scene_batch``.
+        batches: Compute only these half-open scene ranges, which must come
+            from :func:`_scene_batches` so they still group whole source time
+            chunks -- a range cut anywhere else makes its boundary chunk
+            materialize twice. One shard of the phase-B stage passes its own
+            slice of that list, and the returned arrays then span only the
+            scenes it computed, so the partial it publishes carries the time
+            coordinate the merge joins on. Defaults to every batch, which
+            reproduces the whole-tile result exactly.
 
     Returns:
         ``(offset, n_valid)`` on the time axis, matching :func:`offset_graph`.
@@ -386,7 +402,7 @@ def offsets_by_scene(
     offset = np.empty(n_scenes, dtype=dtype)
     n_valid = np.empty(n_scenes, dtype=np.int64)
 
-    batches = _scene_batches(lst, batch)
+    batches = list(batches) if batches is not None else _scene_batches(lst, batch)
 
     def _one_batch(span: tuple[int, int]) -> int:
         start, stop = span
@@ -405,6 +421,7 @@ def offsets_by_scene(
     # native-resolution stack _unit_workers shrinks the count to keep
     # in-flight memory inside the phase-A envelope.
     max_batch = max((stop - start) for start, stop in batches)
+    requested = sum(stop - start for start, stop in batches)
     workers = _unit_workers(footprint * max_batch * dtype.itemsize)
     scenes_done = 0
     progress = threading.Lock()
@@ -417,13 +434,19 @@ def offsets_by_scene(
                 report_phase(
                     "destripe_offsets",
                     scenes_done=scenes_done,
-                    scenes_total=n_scenes,
+                    scenes_total=requested,
                 )
 
-    coord = {_TIME_DIM: lst[_TIME_DIM]}
+    # Return only what was computed. With the default batches this is every
+    # scene in order, so ``taken`` is ``arange(n_scenes)`` and the arrays are
+    # the whole-tile ones untouched; a shard gets a stack it can publish
+    # without a separate index telling a reader which entries are real.
+    taken = np.concatenate([np.arange(start, stop) for start, stop in batches])
+    time_coord = lst[_TIME_DIM].isel({_TIME_DIM: taken})
+    coord = {_TIME_DIM: time_coord}
     return (
-        xr.DataArray(offset, dims=[_TIME_DIM], coords=coord),
-        xr.DataArray(n_valid, dims=[_TIME_DIM], coords=coord),
+        xr.DataArray(offset[taken], dims=[_TIME_DIM], coords=coord),
+        xr.DataArray(n_valid[taken], dims=[_TIME_DIM], coords=coord),
     )
 
 
@@ -547,6 +570,85 @@ def rejection_floor(*, offset_source_given: bool) -> int:
     return settings.destripe_min_scene_pixels
 
 
+def debias_with_offsets(
+    lst: xr.DataArray,
+    offset: xr.DataArray,
+    n_valid: xr.DataArray,
+    *,
+    max_offset_c: float,
+    min_scene_pixels: int,
+    min_offset_samples: int = 0,
+    offset_source_given: bool,
+) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
+    """Apply rejection and subtraction to an estimate that already exists.
+
+    The tail of :func:`seasonal_debias`, split out because the estimate and its
+    application no longer have to happen in the same process. A sharded tile
+    estimates the offsets once, over the whole tile, and then hands the *same*
+    600 floats to every row band -- which is what makes the bands' composites
+    concatenate into the tile's composite rather than into a striped
+    approximation of it.
+
+    **Offsets are joined to ``lst`` by time coordinate value, never by
+    position.** A shard's stack is a spatial subset, and a spatial subset can
+    lose time steps: ``odc-stac`` drops a step whose scenes miss the band's
+    rows entirely, and ``fail_on_error=False`` can leave one band a scene the
+    others have. Aligning by index would then apply scene *k*'s offset to
+    scene *k+1* from the first missing step onward -- a silent, plausible,
+    entirely wrong correction. Where the axes do match, which is every
+    whole-tile call, the join is a no-op and the arithmetic is bit-for-bit what
+    the fused function did.
+
+    Args:
+        lst: Celsius LST to correct. Its time coordinate must be a subset of
+            ``offset``'s.
+        offset: One scalar per scene, on the estimation stack's time axis.
+        n_valid: Valid-pixel count per scene, on that same axis and grid.
+        max_offset_c: Discard a scene whose absolute offset exceeds this.
+        min_scene_pixels: Sparse floor for a native-resolution estimate.
+        min_offset_samples: Sparse floor for a coarse estimate.
+        offset_source_given: Whether the estimate came off a coarser grid,
+            which selects between the two floors. They replace rather than
+            convert into each other; see :func:`rejection_floor`.
+
+    Returns:
+        ``(debiased, offset, keep)``, as :func:`seasonal_debias` returns them.
+        ``offset`` and ``keep`` stay on the estimate's own time axis so a
+        caller can report what was rejected across the whole tile.
+
+    Raises:
+        ValueError: If ``lst`` carries a time step the estimate does not, or if
+            no scene survives rejection.
+    """
+    floor = min_offset_samples if offset_source_given else min_scene_pixels
+    keep = scene_keep_mask(offset, n_valid, max_offset_c=max_offset_c, floor=floor)
+
+    try:
+        keep_here = keep.sel({_TIME_DIM: lst[_TIME_DIM]})
+        offset_here = offset.sel({_TIME_DIM: lst[_TIME_DIM]})
+    except KeyError as e:
+        msg = (
+            "lst carries a time step the offsets do not: the estimate must "
+            "cover every scene the stack holds. Both must come from the same "
+            f"items and groupby ({e})."
+        )
+        raise ValueError(msg) from e
+
+    kept_idx = np.flatnonzero(np.asarray(keep_here.values))
+    if kept_idx.size == 0:
+        msg = (
+            f"All {keep.sizes['time']} scenes rejected by de-striping "
+            f"(max_offset_c={max_offset_c}, min_scene_pixels={min_scene_pixels}, "
+            f"min_offset_samples={min_offset_samples}). "
+            "Refusing to emit an empty composite."
+        )
+        raise ValueError(msg)
+
+    debiased = lst.isel(time=kept_idx) - offset_here.isel(time=kept_idx)
+
+    return debiased, offset, keep
+
+
 def seasonal_debias(
     lst: xr.DataArray,
     *,
@@ -616,23 +718,15 @@ def seasonal_debias(
     # because that is the grid the median actually rests on. See
     # :func:`rejection_floor` for why the two floors replace rather than convert
     # into each other.
-    floor = min_scene_pixels if offset_source is None else min_offset_samples
-
-    keep = scene_keep_mask(offset, n_valid, max_offset_c=max_offset_c, floor=floor)
-
-    kept_idx = np.flatnonzero(np.asarray(keep.values))
-    if kept_idx.size == 0:
-        msg = (
-            f"All {keep.sizes['time']} scenes rejected by de-striping "
-            f"(max_offset_c={max_offset_c}, min_scene_pixels={min_scene_pixels}, "
-            f"min_offset_samples={min_offset_samples}). "
-            "Refusing to emit an empty composite."
-        )
-        raise ValueError(msg)
-
-    debiased = lst.isel(time=kept_idx) - offset.isel(time=kept_idx)
-
-    return debiased, offset, keep
+    return debias_with_offsets(
+        lst,
+        offset,
+        n_valid,
+        max_offset_c=max_offset_c,
+        min_scene_pixels=min_scene_pixels,
+        min_offset_samples=min_offset_samples,
+        offset_source_given=offset_source is not None,
+    )
 
 
 def offset_diagnostics(offset: xr.DataArray, keep: xr.DataArray) -> dict[str, float]:
