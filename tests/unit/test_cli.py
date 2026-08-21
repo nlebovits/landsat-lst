@@ -639,6 +639,14 @@ class TestSampledRunsProfileThemselves:
         assert profile_off.profile_dask_cache is False
 
 
+@pytest.fixture
+def s3_backend(monkeypatch):
+    """The only backend the driver will submit Coiled work against."""
+    from landsat_lst.config import settings
+
+    monkeypatch.setattr(settings, "storage_backend", "s3")
+
+
 class TestShardGroup:
     """The two commands a person runs, and the five a VM runs."""
 
@@ -651,7 +659,22 @@ class TestShardGroup:
         for stage in (*STAGES, "process", "resume"):
             assert stage in result.output
 
-    def test_process_prints_the_resume_line_before_it_starts(self, runner):
+    def test_a_local_backend_fails_before_a_run_id_is_printed(self, runner, monkeypatch):
+        """The acceptance run printed one and then hung: the driver polled the
+        laptop while the VMs wrote S3. A resume hint for a run that never
+        started is worse than no output at all.
+        """
+        from landsat_lst.config import settings
+
+        monkeypatch.setattr(settings, "storage_backend", "local")
+
+        result = runner.invoke(main, ["shard", "process", "--tile", "N40W075"])
+
+        assert result.exit_code != 0
+        assert "LST_STORAGE_BACKEND=s3" in result.output
+        assert "shard resume" not in result.output
+
+    def test_process_prints_the_resume_line_before_it_starts(self, runner, s3_backend):
         """The run id is the only thing a resume needs, so it is printed first.
 
         A driver killed mid-run is ordinary; a driver whose run id was never
@@ -665,7 +688,7 @@ class TestShardGroup:
         assert "shard resume" in result.output
         assert drive.call_args.kwargs["run_id"] in result.output
 
-    def test_a_stage_that_never_finished_fails_the_command(self, runner):
+    def test_a_stage_that_never_finished_fails_the_command(self, runner, s3_backend):
         from landsat_lst.shard_driver import ShardStageFailed
 
         with patch(

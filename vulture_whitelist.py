@@ -29,3 +29,4 @@ _.mock_lwir_band  # noqa: F821
 _.fixtures_dir  # noqa: F821
 _.data_cache_dir  # noqa: F821
 _.fast_barriers  # noqa: F821
+_.s3_backend  # noqa: F821

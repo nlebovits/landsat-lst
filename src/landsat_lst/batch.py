@@ -40,6 +40,7 @@ only claim worth trusting.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 from dataclasses import dataclass, field, fields
@@ -67,6 +68,11 @@ MIB_PER_GIB = 1024.0
 
 #: Coiled sets this per task from the values passed to ``map_over_values``.
 TASK_INPUT_VAR = "COILED_BATCH_TASK_INPUT"
+
+#: Ceiling on a cluster name. The observed collision arrived already truncated
+#: at this length, which is what made appending a round marker useless -- see
+#: :func:`stage_cluster_name`, which stays far under it instead.
+_CLUSTER_NAME_MAX = 60
 
 
 @dataclass
@@ -414,11 +420,11 @@ def submit_batch(
 class StageSubmission:
     """What one ``submit_shard_stage`` call handed to Coiled.
 
-    Not persisted, unlike :class:`BatchSubmission`. A sharded tile's driver is
-    the thing that outlives a stage, and everything it needs to resume is
-    derivable from the shard prefix in the bucket; a submission record would be
-    a second answer to "which shards are done" that could disagree with the
-    only one that counts. See ADR-016.
+    The driver persists a summary of this under the shard prefix (see
+    :func:`landsat_lst.shards.stage_submission_key`). That record is never an
+    answer to "which shards are done" -- only the artifacts are -- but it is
+    the answer to "has anyone started this stage yet", which the artifacts
+    cannot give while the VMs are still booting. See ADR-016.
     """
 
     stage: str
@@ -427,6 +433,28 @@ class StageSubmission:
     cluster_id: int | None
     job_id: int | None
     command: str
+    name: str = ""
+    submission_round: int = 1
+
+
+def stage_cluster_name(run_id: str, tile: str, stage: str, submission_round: int) -> str:
+    """A cluster name unique per stage *and per round*, short enough to survive.
+
+    ``coiled.batch_run`` refuses a name that matches a running cluster, and a
+    resumed driver resubmitting a stage whose first cluster is still in flight
+    hits exactly that: observed as ``Unable to add batch jobs to existing
+    cluster 'lst-shard-S30W065-2021-2025-20260821T194111Z-S30W065-climato'``.
+    Two things go wrong in that name at once. It has no round marker, and it
+    was truncated mid-stage, so appending one would have been eaten.
+
+    So the run id is hashed to eight characters rather than spelled out -- it
+    already contains the tile and the window, both of which appear here anyway
+    -- and the round goes last in a name that is far short of the limit. Every
+    component is deterministic, so two drivers computing round 2 of one stage
+    agree on the name and collide *loudly* rather than paying twice.
+    """
+    digest = hashlib.sha256(run_id.encode()).hexdigest()[:8]
+    return f"lst-{digest}-{tile}-{stage[:5]}-r{submission_round}"[:_CLUSTER_NAME_MAX]
 
 
 def _shard_task_command(
@@ -469,6 +497,7 @@ def submit_shard_stage(
     tile: str,
     indexes: Sequence[int],
     job: ProcessingJob | None = None,
+    submission_round: int = 1,
 ) -> StageSubmission:
     """Start one stage's shards as a Coiled Batch array, and return.
 
@@ -497,6 +526,9 @@ def submit_shard_stage(
         indexes: Which shards to start. A resubmission passes only the missing
             ones.
         job: Required by ``resolve``; unused otherwise.
+        submission_round: Which attempt at this stage this is, counting from 1.
+            It names the cluster, so a resubmission cannot collide with a
+            previous round whose cluster is still in flight.
 
     Returns:
         The :class:`StageSubmission`, with the cluster it started.
@@ -520,10 +552,11 @@ def submit_shard_stage(
 
     command = _shard_task_command(stage=stage, run_id=run_id, tile=tile, job=job)
     environ = _worker_environ()
+    name = stage_cluster_name(run_id, tile, stage, submission_round)
 
     kwargs: dict[str, Any] = {
         "command": command,
-        "name": f"lst-{run_id}-{tile}-{stage}"[:60],
+        "name": name,
         "region": settings.coiled_region,
         "vm_type": settings.coiled_vm_types,
         "spot_policy": settings.coiled_spot_policy,
@@ -532,7 +565,13 @@ def submit_shard_stage(
         "job_timeout": settings.coiled_job_timeout,
         "map_over_values": [str(i) for i in indexes],
         "env": environ,
-        "tag": {"project": "landsat-lst", "run_id": run_id, "tile": tile, "stage": stage},
+        "tag": {
+            "project": "landsat-lst",
+            "run_id": run_id,
+            "tile": tile,
+            "stage": stage,
+            "round": str(submission_round),
+        },
         "forward_aws_credentials": False,
     }
 
@@ -549,6 +588,8 @@ def submit_shard_stage(
         stage=stage,
         shards=len(indexes),
         vm_type=kwargs["vm_type"],
+        name=name,
+        submission_round=submission_round,
     )
     result = coiled.batch_run(**kwargs)
     submission = StageSubmission(
@@ -558,6 +599,8 @@ def submit_shard_stage(
         cluster_id=result.get("cluster_id"),
         job_id=result.get("job_id"),
         command=command,
+        name=name,
+        submission_round=submission_round,
     )
     log.info(
         "shard_stage_submitted",
@@ -566,6 +609,7 @@ def submit_shard_stage(
         stage=stage,
         cluster_id=submission.cluster_id,
         job_id=submission.job_id,
+        name=name,
     )
     return submission
 

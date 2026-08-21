@@ -61,6 +61,56 @@ pure function of its index, and every shard checks its own output first and exit
 is already there. That idempotency is load-bearing, not a nicety: the driver cannot
 distinguish a slow shard from a dead one and must never need to.
 
+### The driver and its shards must share one namespace
+
+The barrier's premise is that both halves read and write the same place. The first
+acceptance run did not. `landsat-lst shard process --tile S30W065` ran with the default
+`storage_backend=local`, so the driver listed a directory on the laptop while the VMs —
+which inherit `LST_STORAGE_BACKEND=s3` from `_worker_environ` — published to the bucket.
+`plan.json` was on S3 within 3.5 minutes and the resolve barrier never closed.
+
+`require_shared_storage` now refuses, before anything is submitted, when the driver is
+bound to Coiled and the backend is not S3. It does not quietly switch: a caller who asked
+for local storage and got their COGs in a bucket would be a second surprise on top of the
+first. A caller that injects its own submitter is driving something local deliberately,
+and both halves then share `LocalStorage`; that case is allowed.
+
+A barrier that cannot see its artifacts fails as a *hang*, which is the most expensive
+shape a failure can take — nothing is wrong until the deadline, and the deadline is hours.
+
+### A stage already in flight is adopted, never restarted
+
+Artifacts alone cannot distinguish "still booting" from "nobody has started this": a shard
+publishes nothing until it finishes. A resumed driver arriving during the first driver's
+boot therefore saw zero climatology artifacts, concluded the stage had not started, and
+resubmitted — which Coiled refused outright:
+
+```
+RuntimeError: Unable to add batch jobs to existing cluster
+'lst-shard-S30W065-2021-2025-20260821T194111Z-S30W065-climato'
+```
+
+Two things are wrong in that name at once. It carries no round marker, and it was
+truncated mid-stage, so appending one would have been eaten. `stage_cluster_name` hashes
+the run id to eight characters instead — it already contains the tile and window, both of
+which appear in the name anyway — and puts the round last in a name far short of the
+limit.
+
+A unique name alone would only turn a refusal into duplicated work, so the driver also
+publishes a **submission record** at `_shards/{run_id}/{tile}/state/{stage}.submission.{round}.json`
+*before* it submits. A record younger than `shard_barrier_timeout_s` means somebody's
+cluster is in flight: watch it, do not submit. Past that deadline the cluster is gone, and
+the next round starts covering only the indexes that never landed.
+
+The record is written before the submission rather than after on purpose. A driver that
+dies in between leaves a record for a cluster that never ran, costing the next driver one
+barrier timeout; the other order leaves a live cluster nothing mentions, which is exactly
+the collision. One wasted wait beats one refused submission and a stage of duplicated
+reads.
+
+The round budget is counted across drivers, not per driver — otherwise each resume would
+hand the stage a fresh budget and the cap would mean nothing.
+
 ### Artifact-is-completion, and a driver with no state
 
 Nothing the driver holds survives its own process, because nothing needs to. Position in

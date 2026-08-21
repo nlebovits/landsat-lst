@@ -160,6 +160,30 @@ def shard_log_key(root: str, stage: str, index: int, attempt: int) -> str:
     return f"{root}/state/{stage}.{index:04d}.{attempt}.log"
 
 
+def stage_submission_key(root: str, stage: str, submission_round: int) -> str:
+    """One driver's record that it started this stage, and when.
+
+    The only thing that tells a *second* driver that a stage is already in
+    flight. Without it, a resume that arrives while the first driver's shards
+    are still booting sees zero artifacts, concludes nothing has started, and
+    submits a duplicate array -- which Coiled refuses outright when the cluster
+    name collides, and which would otherwise pay twice for the same blocks.
+
+    Deliberately not a Coiled API call: the bucket is the only thing both
+    drivers and every test can read.
+    """
+    return f"{root}/state/{stage}.submission.{submission_round:03d}.json"
+
+
+def stage_submission_prefix(root: str, stage: str) -> str:
+    """Every submission record one stage has accumulated, across drivers.
+
+    ``{stage}.submission.`` cannot collide with a shard's own artifacts: those
+    carry a four-digit index where this carries the literal word.
+    """
+    return f"{root}/state/{stage}.submission."
+
+
 def shard_attempt_prefix(root: str, stage: str, index: int) -> str:
     """Everything one shard of one stage has published across its attempts.
 

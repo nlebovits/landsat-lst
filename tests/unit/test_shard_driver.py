@@ -27,7 +27,10 @@ from tests.unit.shard_fixtures import (
     RUN_ID,
     TILE,
     FakeFleet,
+    LandsOnPoll,
     make_plan,
+    publish_plan,
+    record_in_flight,
 )
 
 pytestmark = pytest.mark.unit
@@ -151,9 +154,9 @@ class TestResubmission:
 class TestResume:
     """A killed driver picks up from the bucket, not from anything it held."""
 
-    def test_a_run_with_no_plan_cannot_be_resumed(self, storage):
+    def test_a_run_with_no_plan_cannot_be_resumed(self, storage, plan):
         with pytest.raises(FileNotFoundError, match="nothing to resume"):
-            resume_tile(RUN_ID, TILE, storage=storage)
+            resume_tile(RUN_ID, TILE, storage=storage, submit=FakeFleet(storage, plan))
 
     @pytest.mark.parametrize(
         ("done_through", "expected_stages"),
@@ -216,6 +219,187 @@ class TestSummary:
             "composite",
             "export",
         }
+
+
+class TestStorageBackend:
+    """The driver and its shards must read and write one namespace.
+
+    The acceptance run for S30W065 did not: the default local backend had the
+    driver listing a directory on the laptop while the VMs -- which inherit
+    ``LST_STORAGE_BACKEND=s3`` from ``_worker_environ`` -- published to the
+    bucket. ``plan.json`` landed within 3.5 minutes and the resolve barrier
+    never closed. A barrier that cannot see its artifacts fails as a hang,
+    which is the most expensive shape a failure can take.
+    """
+
+    def test_a_local_backend_is_refused_before_anything_is_submitted(self, storage, job):
+        from landsat_lst.shard_driver import ShardBackendMismatch
+
+        with pytest.raises(ShardBackendMismatch) as excinfo:
+            drive_tile(job, run_id=RUN_ID, storage=storage)
+
+        message = str(excinfo.value)
+        assert "storage_backend" in message
+        assert "LST_STORAGE_BACKEND=s3" in message
+        # Nothing was written, so nothing was started.
+        assert storage.read_text(shards.plan_key(shards.shard_root(RUN_ID, TILE))) is None
+
+    def test_resume_refuses_the_same_way(self, storage, plan):
+        from landsat_lst.shard_driver import ShardBackendMismatch
+
+        publish_plan(storage, plan)
+
+        with pytest.raises(ShardBackendMismatch):
+            resume_tile(RUN_ID, TILE, storage=storage)
+
+    def test_an_injected_submitter_is_driving_something_local_on_purpose(
+        self, storage, plan, job, fast_barriers
+    ):
+        """Which is every test here, and must stay allowed."""
+        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=FakeFleet(storage, plan))
+
+        assert summary.completed
+
+
+class TestClusterNames:
+    """A round that reuses a name collides with a cluster still in flight."""
+
+    def test_each_round_gets_its_own_name(self, storage, plan, job, fast_barriers):
+        """Observed verbatim: ``Unable to add batch jobs to existing cluster
+        'lst-shard-S30W065-2021-2025-20260821T194111Z-S30W065-climato'`` -- no
+        round marker, and truncated mid-stage so appending one would have been
+        eaten.
+        """
+        fleet = FakeFleet(storage, plan, never={("climatology", 1)}, heal=True)
+
+        drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet)
+
+        climatology = [
+            name
+            for (stage, _), name in zip(fleet.calls, fleet.names, strict=True)
+            if stage == "climatology"
+        ]
+        assert climatology == sorted(set(climatology))
+        assert len(climatology) == 2
+        assert climatology[0].endswith("-r1")
+        assert climatology[1].endswith("-r2")
+
+    def test_the_name_stays_well_inside_the_length_limit(self):
+        """The run id is hashed rather than spelled: it already holds the tile."""
+        from landsat_lst.batch import stage_cluster_name
+
+        name = stage_cluster_name(
+            "shard-S30W065-2021-2025-20260821T194111Z", "S30W065", "climatology", 2
+        )
+
+        assert name.endswith("-r2")
+        assert len(name) < 45
+
+
+class TestInFlightAdoption:
+    """A stage somebody else started is watched, never restarted.
+
+    The artifacts cannot tell "still booting" from "nobody started this" --
+    shards publish nothing until they finish -- so a submission record, written
+    before the submission, is what distinguishes them.
+    """
+
+    def test_a_fresh_submission_record_is_adopted_rather_than_resubmitted(
+        self, storage, plan, monkeypatch
+    ):
+        from landsat_lst.config import settings
+
+        monkeypatch.setattr(settings, "shard_barrier_timeout_s", 300)
+        monkeypatch.setattr(settings, "shard_driver_poll_s", 0.001)
+        publish_plan(storage, plan)
+        record_in_flight(storage, plan, "climatology", [0, 1])
+
+        watching = LandsOnPoll(storage, plan, "climatology", after=3)
+        fleet = FakeFleet(storage, plan)
+        summary = resume_tile(RUN_ID, TILE, storage=watching, submit=fleet)
+
+        assert "climatology" not in fleet.stages
+        assert summary.completed
+        climatology = next(s for s in summary.stages if s.stage == "climatology")
+        assert climatology.submissions == 0
+        assert climatology.adopted == 1
+
+    def test_a_second_driver_submits_nothing_while_round_one_is_fresh(
+        self, storage, plan, monkeypatch
+    ):
+        """The collision, as a regression test.
+
+        Driver one's climatology cluster is still in flight and its shards have
+        published nothing. Driver two must not start a second array under the
+        same name -- which is what Coiled refused, and what would have paid for
+        the same blocks twice if it had not.
+        """
+        from landsat_lst.config import settings
+
+        monkeypatch.setattr(settings, "shard_barrier_timeout_s", 300)
+        monkeypatch.setattr(settings, "shard_driver_poll_s", 0.001)
+        publish_plan(storage, plan)
+        record_in_flight(storage, plan, "climatology", [0, 1], age_s=5.0)
+
+        watching = LandsOnPoll(storage, plan, "climatology", after=4)
+        fleet = FakeFleet(storage, plan)
+        resume_tile(RUN_ID, TILE, storage=watching, submit=fleet)
+
+        assert [stage for stage, _ in fleet.calls if stage == "climatology"] == []
+        assert watching.polls > 1, "it must actually have watched, not just skipped the stage"
+
+    def test_after_the_deadline_only_the_missing_indexes_go_again(
+        self, storage, plan, fast_barriers
+    ):
+        """A stale record is a cluster that is gone, so the stage restarts --
+        under a *new* round, and covering only what never landed.
+        """
+        publish_plan(storage, plan)
+        seed = FakeFleet(storage, plan)
+        seed(stage="climatology", run_id=RUN_ID, tile=TILE, indexes=[0])  # round 1 landed one
+        record_in_flight(storage, plan, "climatology", [0, 1], age_s=10_000.0)
+
+        fleet = FakeFleet(storage, plan)
+        summary = resume_tile(RUN_ID, TILE, storage=storage, submit=fleet)
+
+        assert [indexes for stage, indexes in fleet.calls if stage == "climatology"] == [[1]]
+        assert fleet.names[fleet.stages.index("climatology")].endswith("-r2")
+        assert summary.completed
+
+    def test_the_round_budget_is_the_stage_not_the_driver(self, storage, plan, fast_barriers):
+        """Otherwise every resume would grant the stage a fresh budget."""
+        publish_plan(storage, plan)
+        for round_no in (1, 2):
+            record_in_flight(
+                storage, plan, "climatology", [0, 1], round_no=round_no, age_s=10_000.0
+            )
+
+        fleet = FakeFleet(storage, plan)
+        with pytest.raises(ShardStageFailed, match="climatology"):
+            resume_tile(RUN_ID, TILE, storage=storage, submit=fleet)
+
+        assert fleet.calls == []
+
+    def test_a_submission_record_is_published_before_the_submission(
+        self, storage, plan, job, fast_barriers
+    ):
+        """A driver that dies mid-submit must leave the record, not the orphan.
+
+        The other order leaves a live cluster nothing mentions, which is
+        precisely the collision.
+        """
+        root = shards.shard_root(RUN_ID, TILE)
+        seen: list[bool] = []
+
+        class _Watcher(FakeFleet):
+            def __call__(self, **kwargs):
+                key = shards.stage_submission_key(root, kwargs["stage"], kwargs["submission_round"])
+                seen.append(self.storage.read_text(key) is not None)
+                return super().__call__(**kwargs)
+
+        drive_tile(job, run_id=RUN_ID, storage=storage, submit=_Watcher(storage, plan))
+
+        assert seen and all(seen)
 
 
 def _indexes(plan, stage: str) -> list[int]:

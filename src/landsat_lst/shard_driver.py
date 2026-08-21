@@ -30,6 +30,7 @@ There is no on-Coiled driver here: that needs a token that outlives the run.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -39,9 +40,9 @@ from typing import TYPE_CHECKING
 import structlog
 
 from landsat_lst import shard_tasks, shards
-from landsat_lst.batch import submit_shard_stage
+from landsat_lst.batch import stage_cluster_name, submit_shard_stage
 from landsat_lst.config import settings
-from landsat_lst.storage import PRODUCTS, get_storage
+from landsat_lst.storage import PRODUCTS, S3Storage, get_storage
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -54,6 +55,15 @@ log = structlog.get_logger()
 #: Signature of the stage submitter, so a test can pass one that writes the
 #: artifacts synchronously instead of starting a cluster.
 Submitter = Callable[..., object]
+
+
+class ShardBackendMismatch(RuntimeError):
+    """The driver would poll one storage while its VMs wrote another.
+
+    Not a warning and not an override. Silently switching the backend under a
+    caller who asked for local storage would put COGs somewhere they did not
+    ask for; polling on regardless is what actually happened, and it is worse.
+    """
 
 
 class ShardStageFailed(RuntimeError):
@@ -80,6 +90,9 @@ class StageOutcome:
     already_done: int
     submissions: int
     wall_s: float
+    #: Rounds this driver watched instead of starting, because another driver's
+    #: submission record for the stage was still fresh.
+    adopted: int = 0
     cluster_ids: list[int | None] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -88,6 +101,7 @@ class StageOutcome:
             "shards": self.shards,
             "already_done": self.already_done,
             "submissions": self.submissions,
+            "adopted": self.adopted,
             "wall_s": round(self.wall_s, 1),
             "cluster_ids": self.cluster_ids,
         }
@@ -122,6 +136,48 @@ class TileRunSummary:
             "resubmissions": self.resubmissions,
             "stages": [stage.as_dict() for stage in self.stages],
         }
+
+
+def require_shared_storage(storage: StorageBackend, submit: Submitter | None) -> None:
+    """Refuse to drive Coiled work against storage the VMs cannot see.
+
+    The barrier's whole premise is that the driver and the shards read and
+    write **one** namespace. Run with the default ``storage_backend=local`` and
+    they do not: the shards inherit ``LST_STORAGE_BACKEND=s3`` from
+    ``_worker_environ`` and publish to the bucket, while the driver lists a
+    directory on the laptop that nothing will ever write to. Observed on
+    ``S30W065`` -- ``plan.json`` was on S3 within 3.5 minutes and the resolve
+    barrier still never closed, because the driver was looking somewhere else
+    entirely. A barrier that cannot see its artifacts fails as a hang, which is
+    the most expensive shape a failure can take.
+
+    Checked only when the driver would actually start Coiled work. A caller
+    that injects its own submitter -- every test in this repo -- is driving
+    something local on purpose, and both halves then share ``LocalStorage``.
+
+    Args:
+        storage: The backend the driver will poll.
+        submit: The submitter it will use. ``None`` means the default, so a
+            caller that wants to check *before* it has built anything (the CLI,
+            which must not print a resume hint for a run it cannot start) can
+            pass nothing.
+
+    Raises:
+        ShardBackendMismatch: If Coiled work is about to be submitted against
+            a non-S3 backend.
+    """
+    coiled_bound = submit is None or submit is submit_shard_stage
+    if not coiled_bound or isinstance(storage, S3Storage):
+        return
+
+    msg = (
+        f"the shard driver submits Coiled work, whose VMs always write S3, but "
+        f"settings.storage_backend is {settings.storage_backend!r} -- the driver "
+        f"would poll {type(storage).__name__} for artifacts that land in the "
+        "bucket, and every stage barrier would hang. Re-run with "
+        "LST_STORAGE_BACKEND=s3 (and LST_S3_BUCKET set)."
+    )
+    raise ShardBackendMismatch(msg)
 
 
 def shard_run_id(job: ProcessingJob) -> str:
@@ -177,22 +233,137 @@ def _missing(storage: StorageBackend, prefix: str, expected: dict[int, list[str]
     return sorted(i for i, keys in expected.items() if not all(k in present for k in keys))
 
 
+def _submission_records(storage: StorageBackend, root: str, stage: str) -> list[dict]:
+    """Every driver's record of having started this stage, oldest round first.
+
+    Best-effort, like everything else that only exists to be read: a listing or
+    a body that cannot be parsed yields no record, and the caller then behaves
+    as it did before this existed -- it submits. Failing a tile because a
+    bookkeeping object was unreadable would be worse than the duplicate
+    submission the object exists to prevent.
+    """
+    out: list[dict] = []
+    try:
+        keys = sorted(storage.list_prefix(shards.stage_submission_prefix(root, stage)))
+    except Exception as e:
+        log.warning("shard_submission_listing_failed", root=root, stage=stage, error=str(e))
+        return out
+
+    for key in keys:
+        try:
+            raw = storage.read_text(key)
+            if raw is not None:
+                out.append(json.loads(raw))
+        except (ValueError, TypeError) as e:
+            log.warning("shard_submission_malformed", key=key, error=str(e))
+    return sorted(out, key=lambda record: int(record.get("round", 0)))
+
+
+def _record_submission(
+    storage: StorageBackend,
+    root: str,
+    stage: str,
+    *,
+    submission_round: int,
+    indexes: Sequence[int],
+    run_id: str,
+    tile: str,
+    cluster_name: str,
+    cluster_id: int | None = None,
+) -> None:
+    """Publish the fact that this stage was started, before it is started.
+
+    Written *before* the submission, not after. A driver that dies between the
+    two leaves a record for a cluster that never ran, which costs the next
+    driver one barrier timeout of waiting; a driver that died the other way
+    round would leave a live cluster no record mentions, and the next driver
+    would collide with it -- which is the failure this whole mechanism exists
+    to remove. One wasted wait beats one refused submission and a stage's worth
+    of duplicated reads.
+    """
+    payload = {
+        "run_id": run_id,
+        "tile": tile,
+        "stage": stage,
+        "round": submission_round,
+        "indexes": list(indexes),
+        "cluster_name": cluster_name,
+        "cluster_id": cluster_id,
+        # Wall clock, not monotonic: the reader is a different process, often
+        # on a different machine.
+        "submitted_at": time.time(),
+        "submitted_at_iso": datetime.now(tz=UTC).isoformat(),
+    }
+    try:
+        storage.write_text(
+            shards.stage_submission_key(root, stage, submission_round),
+            json.dumps(payload, indent=2),
+        )
+    except Exception as e:  # pragma: no cover - instrumentation never fails a stage
+        log.warning("shard_submission_record_failed", stage=stage, error=str(e))
+
+
+def _watch(
+    *,
+    storage: StorageBackend,
+    prefix: str,
+    expected: dict[int, list[str]],
+    deadline: float,
+    run_id: str,
+    tile: str,
+    stage: str,
+) -> list[int]:
+    """Poll until every artifact has landed or the wall-clock deadline passes.
+
+    Returns what is still missing, which is empty exactly when the stage is
+    done. Checks before it sleeps, so a stage that finished while the caller
+    was deciding costs no poll interval.
+    """
+    while True:
+        missing = _missing(storage, prefix, expected)
+        if not missing:
+            return missing
+        if time.time() >= deadline:
+            log.warning(
+                "shard_stage_barrier_expired",
+                run_id=run_id,
+                tile=tile,
+                stage=stage,
+                missing=len(missing),
+            )
+            return missing
+        time.sleep(settings.shard_driver_poll_s)
+
+
 def _await_stage(
     *,
     stage: str,
     run_id: str,
     tile: str,
+    root: str,
     storage: StorageBackend,
     prefix: str,
     expected: dict[int, list[str]],
     submit: Submitter,
     job: ProcessingJob | None = None,
 ) -> StageOutcome:
-    """Submit whatever is missing, poll until it lands, resubmit once, then fail.
+    """Get this stage finished: adopt what is running, start what is not.
 
-    Checks before it submits and before it sleeps, so a stage whose artifacts
-    are all present costs one listing and starts no cluster -- which is what
-    makes a resumed tile skip the stages it already paid for.
+    Three states, distinguished by one listing and one small record:
+
+    - Every artifact present. Return, having started nothing. This is what
+      makes a resumed tile skip the stages it already paid for.
+    - Artifacts missing, but a submission record younger than
+      ``shard_barrier_timeout_s`` exists. Somebody's cluster is still in
+      flight, so **watch it**. A second driver that submitted here instead
+      would be refused by Coiled outright (the cluster name is already taken)
+      and, if it were not, would pay a second time for the same blocks. Shards
+      still booting publish nothing, so the artifacts alone cannot tell this
+      state from the next one.
+    - Artifacts missing and no fresh record. Start a new round covering only
+      the missing indexes, bounded by ``shard_barrier_rounds`` counted across
+      *all* drivers rather than per driver -- otherwise each resume would grant
+      the stage a fresh budget.
     """
     started = time.monotonic()
     outcome = StageOutcome(
@@ -202,39 +373,98 @@ def _await_stage(
         submissions=0,
         wall_s=0.0,
     )
+    timeout = settings.shard_barrier_timeout_s
 
-    for _round in range(settings.shard_barrier_rounds):
+    # Bounded so the loop cannot spin on a clock that moves backwards: every
+    # pass either finishes, adopts once, or burns one of the stage's rounds.
+    for _pass in range(2 * settings.shard_barrier_rounds + 2):
         missing = _missing(storage, prefix, expected)
         if not missing:
             break
 
-        submission = submit(stage=stage, run_id=run_id, tile=tile, indexes=missing, job=job)
+        records = _submission_records(storage, root, stage)
+        latest = records[-1] if records else None
+
+        if latest is not None and time.time() < float(latest["submitted_at"]) + timeout:
+            outcome.adopted += 1
+            log.info(
+                "shard_stage_adopted",
+                run_id=run_id,
+                tile=tile,
+                stage=stage,
+                round=latest.get("round"),
+                cluster_name=latest.get("cluster_name"),
+                missing=len(missing),
+            )
+            missing = _watch(
+                storage=storage,
+                prefix=prefix,
+                expected=expected,
+                deadline=float(latest["submitted_at"]) + timeout,
+                run_id=run_id,
+                tile=tile,
+                stage=stage,
+            )
+            if not missing:
+                break
+            continue
+
+        next_round = int(latest["round"]) + 1 if latest else 1
+        if next_round > settings.shard_barrier_rounds:
+            break
+
+        cluster_name = stage_cluster_name(run_id, tile, stage, next_round)
+        _record_submission(
+            storage,
+            root,
+            stage,
+            submission_round=next_round,
+            indexes=missing,
+            run_id=run_id,
+            tile=tile,
+            cluster_name=cluster_name,
+        )
+        submission = submit(
+            stage=stage,
+            run_id=run_id,
+            tile=tile,
+            indexes=missing,
+            job=job,
+            submission_round=next_round,
+        )
         outcome.submissions += 1
-        outcome.cluster_ids.append(getattr(submission, "cluster_id", None))
+        cluster_id = getattr(submission, "cluster_id", None)
+        outcome.cluster_ids.append(cluster_id)
+        _record_submission(
+            storage,
+            root,
+            stage,
+            submission_round=next_round,
+            indexes=missing,
+            run_id=run_id,
+            tile=tile,
+            cluster_name=getattr(submission, "name", cluster_name),
+            cluster_id=cluster_id,
+        )
         log.info(
             "shard_stage_open",
             run_id=run_id,
             tile=tile,
             stage=stage,
             submitted=len(missing),
-            submission=outcome.submissions,
+            round=next_round,
+            cluster_name=cluster_name,
         )
 
-        deadline = time.monotonic() + settings.shard_barrier_timeout_s
-        while True:
-            missing = _missing(storage, prefix, expected)
-            if not missing:
-                break
-            if time.monotonic() >= deadline:
-                log.warning(
-                    "shard_stage_barrier_expired",
-                    run_id=run_id,
-                    tile=tile,
-                    stage=stage,
-                    missing=len(missing),
-                )
-                break
-            time.sleep(settings.shard_driver_poll_s)
+        missing = _watch(
+            storage=storage,
+            prefix=prefix,
+            expected=expected,
+            deadline=time.time() + timeout,
+            run_id=run_id,
+            tile=tile,
+            stage=stage,
+        )
         if not missing:
             break
 
@@ -261,6 +491,7 @@ def _await_single(
     stage: str,
     run_id: str,
     tile: str,
+    root: str,
     storage: StorageBackend,
     prefix: str,
     keys: Sequence[str],
@@ -272,6 +503,7 @@ def _await_single(
         stage=stage,
         run_id=run_id,
         tile=tile,
+        root=root,
         storage=storage,
         prefix=prefix,
         expected={0: list(keys)},
@@ -311,11 +543,14 @@ def drive_tile(
         The :class:`TileRunSummary`.
 
     Raises:
+        ShardBackendMismatch: If the configured backend is not S3 while Coiled
+            work is about to be submitted.
         ShardStageFailed: If a stage exhausted its submissions with shards
             still missing.
     """
     storage = storage or get_storage()
     submit = submit or submit_shard_stage
+    require_shared_storage(storage, submit)
     run_id = run_id or shard_run_id(job)
     return _drive(
         run_id=run_id,
@@ -342,10 +577,13 @@ def resume_tile(
     set that might differ from the first.
 
     Raises:
+        ShardBackendMismatch: If the configured backend is not S3 while Coiled
+            work is about to be submitted.
         FileNotFoundError: If the run published no plan for this tile.
     """
     storage = storage or get_storage()
     submit = submit or submit_shard_stage
+    require_shared_storage(storage, submit)
     root = shards.shard_root(run_id, tile)
 
     if storage.read_text(shards.plan_key(root)) is None:
@@ -375,6 +613,7 @@ def _drive(
             stage="resolve",
             run_id=run_id,
             tile=tile,
+            root=root,
             storage=storage,
             prefix=f"{root}/",
             keys=[shards.plan_key(root), shards.items_key(root)],
@@ -406,6 +645,7 @@ def _drive(
                 stage=stage,
                 run_id=run_id,
                 tile=tile,
+                root=root,
                 storage=storage,
                 prefix=prefix,
                 expected=_expected_keys(plan, stage, root),
@@ -432,6 +672,7 @@ def _drive(
             stage="composite",
             run_id=run_id,
             tile=tile,
+            root=root,
             storage=storage,
             prefix=f"{root}/composite/",
             expected=_expected_keys(plan, "composite", root),
@@ -444,6 +685,7 @@ def _drive(
             stage="export",
             run_id=run_id,
             tile=tile,
+            root=root,
             storage=storage,
             prefix=storage.cog_key(plan.window, tile, PRODUCTS[0]).rsplit("/", 1)[0] + "/",
             keys=[storage.cog_key(plan.window, tile, product) for product in PRODUCTS],

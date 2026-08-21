@@ -1027,6 +1027,42 @@ class TestSubmitShardStage:
         assert fake_coiled["vm_type"] == settings.coiled_vm_types
         assert "disk_size" not in fake_coiled
 
+    def test_the_cluster_name_carries_the_round(self, fake_coiled):
+        """Coiled refuses a name that matches a running cluster, and a resumed
+        driver resubmitting a stage whose first cluster is still in flight hits
+        exactly that.
+        """
+        from landsat_lst.batch import submit_shard_stage
+
+        submit_shard_stage(
+            stage="climatology", run_id="r1", tile="N40W075", indexes=[1], submission_round=2
+        )
+
+        assert fake_coiled["name"].endswith("-r2")
+        assert fake_coiled["tag"]["round"] == "2"
+
+    def test_two_rounds_of_one_stage_never_share_a_name(self):
+        from landsat_lst.batch import stage_cluster_name
+
+        args = ("shard-S30W065-2021-2025-20260821T194111Z", "S30W065", "climatology")
+
+        assert stage_cluster_name(*args, 1) != stage_cluster_name(*args, 2)
+
+    def test_the_name_survives_truncation(self):
+        """The observed collision was already cut mid-stage at 60 characters,
+        so a round marker appended to that shape would have been eaten. The run
+        id is hashed instead -- it already holds the tile and the window.
+        """
+        from landsat_lst.batch import _CLUSTER_NAME_MAX, stage_cluster_name
+
+        name = stage_cluster_name(
+            "shard-S30W065-2021-2025-20260821T194111Z", "S30W065", "climatology", 3
+        )
+
+        assert len(name) < _CLUSTER_NAME_MAX
+        assert name.endswith("-r3")
+        assert "S30W065" in name
+
     def test_an_unknown_stage_is_refused(self, fake_coiled):
         from landsat_lst.batch import submit_shard_stage
 

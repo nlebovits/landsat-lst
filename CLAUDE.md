@@ -552,10 +552,23 @@ Rules worth keeping:
 - **The driver holds no state a crash could lose.** Its shell must stay open while the
   tile runs, because it is the thing sequencing stages; it must never be the thing
   remembering them. `resume_tile` reconstructs the position from one listing.
+- **The driver requires `LST_STORAGE_BACKEND=s3`, and refuses rather than overriding.**
+  Coiled VMs always write S3 (`_worker_environ`), so a driver on the default local backend
+  polls a directory nothing will ever write to. `S30W065` on 2026-08-21: `plan.json` was on
+  S3 in 3.5 minutes and the resolve barrier never closed. A barrier that cannot see its
+  artifacts fails as a *hang*, the most expensive shape a failure takes.
+- **A stage already in flight is adopted, never restarted.** Shards publish nothing until
+  they finish, so artifacts cannot tell "still booting" from "not started". The driver
+  writes `state/{stage}.submission.{round}.json` **before** it submits; a record younger
+  than `shard_barrier_timeout_s` means watch, do not submit. Resuming into a live stage
+  used to collide: `Unable to add batch jobs to existing cluster '...-climato'`. Cluster
+  names now carry the round (`stage_cluster_name`, run id hashed so truncation cannot eat
+  the marker).
 - **Failure is bounded.** On barrier expiry the driver resubmits *only the missing
-  indexes*, at most `shard_barrier_rounds` submissions per stage, then fails naming the
-  keys. A fleet that resent the whole stage would also finish, which is why the test
-  asserts on which indexes the second call carried.
+  indexes*, at most `shard_barrier_rounds` submissions per stage **counted across
+  drivers**, then fails naming the keys. Per-driver counting would hand every resume a
+  fresh budget. A fleet that resent the whole stage would also finish, which is why the
+  test asserts on which indexes the second call carried.
 - **Row bands only, never column bands.** `odc-stac` derives its `solar_day` shift from
   the geobox centroid longitude, so two column bands can group the same items onto
   different time axes and the tile-wide offsets would stop lining up.

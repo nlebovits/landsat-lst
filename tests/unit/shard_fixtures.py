@@ -12,7 +12,9 @@ task writes.
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
+from typing import ClassVar
 
 import numpy as np
 import pandas as pd
@@ -161,16 +163,27 @@ class FakeFleet:
         #: submission -- a preempted VM rather than a broken one.
         self.heal = heal
         self.calls: list[tuple[str, list[int]]] = []
+        #: Every cluster name this fleet was asked to start, in order. A round
+        #: that reused a previous round's name is what Coiled refuses outright.
+        self.names: list[str] = []
 
-    def __call__(self, *, stage, run_id, tile, indexes, job=None):
+    def __call__(self, *, stage, run_id, tile, indexes, job=None, submission_round=1):
+        from landsat_lst.batch import stage_cluster_name
+
         self.calls.append((stage, list(indexes)))
+        self.names.append(stage_cluster_name(run_id, tile, stage, submission_round))
         for index in indexes:
             if (stage, index) in self.never:
                 if self.heal:
                     self.never.discard((stage, index))
                 continue
             self._write(stage, index)
-        return SimpleNamespace(cluster_id=len(self.calls), job_id=1)
+        return SimpleNamespace(
+            cluster_id=len(self.calls),
+            job_id=1,
+            name=self.names[-1],
+            submission_round=submission_round,
+        )
 
     @property
     def stages(self) -> list[str]:
@@ -192,6 +205,17 @@ class FakeFleet:
         for key in _expected_keys(self.plan, stage, self.root)[index]:
             self.storage.write_text(key, "")
 
+    def all_indexes(self, stage: str) -> list[int]:
+        """Every shard index this stage has, from the plan."""
+        counts = {
+            "resolve": 1,
+            "climatology": self.plan.ref_shards,
+            "offsets": self.plan.scene_shards,
+            "composite": len(self.plan.bands),
+            "export": 1,
+        }
+        return list(range(counts[stage]))
+
     def _write_partial(self, index: int) -> None:
         """A real partial, so the driver's in-process merge has something to merge."""
         from landsat_lst.shard_tasks import offsets_group
@@ -206,3 +230,83 @@ class FakeFleet:
         self.storage.write_text(
             shards.scene_partial_key(self.root, start, stop), json.dumps(payload)
         )
+
+
+def record_in_flight(
+    storage, plan, stage, indexes, *, round_no: int = 1, age_s: float = 0.0, run_id: str = RUN_ID
+) -> str:
+    """Publish a submission record, as a driver does just before it submits.
+
+    ``age_s`` backdates it: a record older than ``shard_barrier_timeout_s``
+    describes a cluster whose barrier has expired, and a fresh one describes
+    shards that may still be booting -- the state the artifacts alone cannot
+    distinguish from "nobody has started this".
+    """
+    root = shards.shard_root(run_id, plan.tile)
+    storage.write_text(
+        shards.stage_submission_key(root, stage, round_no),
+        json.dumps(
+            {
+                "run_id": run_id,
+                "tile": plan.tile,
+                "stage": stage,
+                "round": round_no,
+                "indexes": list(indexes),
+                "cluster_name": f"lst-fake-{stage}-r{round_no}",
+                "cluster_id": 1,
+                "submitted_at": time.time() - age_s,
+            }
+        ),
+    )
+    return root
+
+
+class LandsOnPoll:
+    """A backend whose Nth listing is when somebody else's shards finish.
+
+    The in-flight case cannot be tested by waiting it out: a driver that adopts
+    a fresh submission watches until that round's deadline, and a deadline
+    short enough for a test would not be fresh. So the artifacts arrive *during*
+    the watch, which is exactly what an adopting driver is waiting for -- and
+    what the driver in the observed failure never got to see, because it
+    submitted instead and Coiled refused the duplicate cluster name.
+    """
+
+    #: Where each stage's artifacts are listed from. Only listings of *this*
+    #: prefix are counted, so the trigger cannot drift when an earlier stage
+    #: adds or drops a listing.
+    PREFIXES: ClassVar[dict[str, str]] = {
+        "climatology": "offsets/ref/",
+        "offsets": "offsets/scene/",
+        "composite": "composite/",
+    }
+
+    def __init__(self, storage, plan, stage, *, after: int = 2, run_id: str = RUN_ID) -> None:
+        self._storage = storage
+        self._plan = plan
+        self._stage = stage
+        self._after = after
+        self._run_id = run_id
+        self._landed = False
+        self._watched = f"{shards.shard_root(run_id, plan.tile)}/{self.PREFIXES[stage]}"
+        #: Listings of the watched prefix, so a test can show the watch polled.
+        self.polls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._storage, name)
+
+    def list_prefix(self, prefix):
+        if prefix != self._watched:
+            return self._storage.list_prefix(prefix)
+
+        self.polls += 1
+        if self.polls >= self._after and not self._landed:
+            self._landed = True
+            fleet = FakeFleet(self._storage, self._plan, run_id=self._run_id)
+            fleet(
+                stage=self._stage,
+                run_id=self._run_id,
+                tile=self._plan.tile,
+                indexes=fleet.all_indexes(self._stage),
+            )
+        return self._storage.list_prefix(prefix)

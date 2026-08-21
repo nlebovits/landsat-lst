@@ -1840,16 +1840,29 @@ def shard_process(
     ``landsat-lst shard resume <run-id> <tile>`` picks up wherever the bucket
     says the run got to.
     """
-    from landsat_lst.shard_driver import ShardStageFailed, drive_tile, shard_run_id
+    from landsat_lst.shard_driver import (
+        ShardBackendMismatch,
+        ShardStageFailed,
+        drive_tile,
+        require_shared_storage,
+        shard_run_id,
+    )
+    from landsat_lst.storage import get_storage
 
     job = _shard_job(tile, year, end_year, max_scenes)
+    # Before the run id is printed: a driver that cannot see its shards' output
+    # has not started a run, and printing a resume hint for it would be a lie.
+    try:
+        require_shared_storage(get_storage(), None)
+    except ShardBackendMismatch as e:
+        raise click.ClickException(str(e)) from e
     run_id = run_id or shard_run_id(job)
     console.print(f"[bold]Sharding {tile}[/bold] {job.window_label}  run-id [cyan]{run_id}[/cyan]")
     console.print(f"  resume with: landsat-lst shard resume {run_id} {tile}")
 
     try:
         summary = drive_tile(job, run_id=run_id)
-    except ShardStageFailed as e:
+    except (ShardStageFailed, ShardBackendMismatch) as e:
         raise click.ClickException(str(e)) from e
 
     _print_shard_summary(summary)
@@ -1860,12 +1873,12 @@ def shard_process(
 @click.argument("tile")
 def shard_resume(run_id: str, tile: str) -> None:
     """Continue a killed driver's run, reading its position out of the bucket."""
-    from landsat_lst.shard_driver import ShardStageFailed, resume_tile
+    from landsat_lst.shard_driver import ShardBackendMismatch, ShardStageFailed, resume_tile
 
     console.print(f"[bold]Resuming {tile}[/bold] in run [cyan]{run_id}[/cyan]")
     try:
         summary = resume_tile(run_id, tile)
-    except ShardStageFailed as e:
+    except (ShardStageFailed, ShardBackendMismatch) as e:
         raise click.ClickException(str(e)) from e
 
     _print_shard_summary(summary)
