@@ -7,13 +7,20 @@ exclude open ocean while erring on the side of inclusion for any potentially
 inhabited or administered areas. See docs/findings-land-mask-buffer.md.
 """
 
-from pathlib import Path
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import geopandas as gpd
 import numpy as np
 import rasterio.features
 import xarray as xr
 from shapely.geometry import box
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from odc.geo.geobox import GeoBox
 
 NATURAL_EARTH_URL = "https://naciscdn.org/naturalearth/10m/physical/ne_10m_land.zip"
 COASTAL_BUFFER_METERS = 25_000  # 25km buffer for coastal features
@@ -117,6 +124,53 @@ def get_land_mask_for_bbox(
         dtype=np.uint8,
     )
 
+    return mask.astype(bool)
+
+
+def get_land_mask_for_geobox(
+    geobox: GeoBox,
+    land_polygons: gpd.GeoDataFrame,
+) -> np.ndarray:
+    """Create a land mask on a geobox's own grid, exactly.
+
+    The transform comes from ``geobox.transform``, not from
+    ``rasterio.transform.from_bounds``. They agree to about fifteen digits and
+    that is not enough: ``from_bounds`` divides the span by the pixel count, so
+    a five-degree tile gets a pixel size of ``5/18000`` rather than the grid's
+    ``1/3600``, and a row band cut out of that tile gets ``(rows/3600)/rows``.
+    Those differ in the last bits, which is enough to move a polygon edge
+    across a pixel centre and flip a pixel between a band's mask and the
+    corresponding rows of the tile's. A shard's mask has to be the *slice* of
+    the tile's mask, not a very good approximation of it -- otherwise the
+    seams between bands carry a one-pixel land/ocean disagreement that no
+    downstream check looks for. The geobox transform is the grid's own affine
+    and slices exactly, because ``geobox[a:b, :]`` only moves its origin.
+
+    Args:
+        geobox: The ``odc.geo.geobox.GeoBox`` the data was loaded on. Imported
+            for typing only: the rasterization itself needs nothing from
+            ``odc.geo`` beyond the affine and the bounds.
+        land_polygons: GeoDataFrame of land polygons in EPSG:4326.
+
+    Returns:
+        Boolean numpy array where True indicates land, shaped like the geobox.
+    """
+    height, width = int(geobox.shape[0]), int(geobox.shape[1])
+    transform = geobox.transform
+    left, bottom, right, top = (float(v) for v in geobox.boundingbox)
+
+    clipped = land_polygons.clip(box(left, bottom, right, top))
+    if clipped.empty:
+        return np.zeros((height, width), dtype=bool)
+
+    mask = rasterio.features.rasterize(
+        clipped.geometry.values,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        default_value=1,
+        dtype=np.uint8,
+    )
     return mask.astype(bool)
 
 
