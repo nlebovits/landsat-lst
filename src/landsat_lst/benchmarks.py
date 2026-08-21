@@ -180,6 +180,22 @@ import json, os, resource, time
 import dask
 import numpy as np
 
+
+def _peak_mb():
+    # Linux does not reset ru_maxrss across execve, so a child forked from a
+    # fat parent (pytest after the integration tier sits near 2.6 GB) reports
+    # the parent's high-water mark -- byte-identical across children and flat
+    # in every geometry. VmHWM comes from the fresh mm the exec created and
+    # is the child's own truth; getrusage stays as the no-procfs fallback.
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
 scenes = int(os.environ["LSTB_SCENES"])
 side = int(os.environ["LSTB_SIDE"])
 chunk = int(os.environ["LSTB_CHUNK"])
@@ -263,7 +279,7 @@ if graph in ("export", "export_separate"):
         scenes=scenes, chunk_size=chunk, threads=threads, height=side, width=side
     )
     print(json.dumps({
-        "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+        "peak_rss_mb": _peak_mb(),
         "wall_s": time.monotonic() - t0,
         "offset_tasks": 0,
         "composite_tasks": 0,
@@ -311,7 +327,7 @@ floor = predict_peak(
 )
 
 print(json.dumps({
-    "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+    "peak_rss_mb": _peak_mb(),
     "wall_s": time.monotonic() - t0,
     "offset_tasks": offset_tasks,
     "composite_tasks": composite_tasks,

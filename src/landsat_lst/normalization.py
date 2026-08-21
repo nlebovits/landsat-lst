@@ -80,16 +80,16 @@ def _read_values(da: xr.DataArray, dtype: np.dtype) -> np.ndarray:
 def _unit_workers(unit_bytes: int) -> int:
     """How many work units may run concurrently.
 
-    The configured worker count is also the memory bound: each worker holds at
-    most one unit resident, so in-flight memory is ``workers x unit_bytes``.
-    When a unit is larger than the phase-A budget (phase B's batch over a
-    native-resolution footprint can be), the count shrinks so the total stays
-    inside ``destripe_unit_memory_gb x configured`` -- the same envelope the
-    serial form promised, multiplied by the parallelism it never used.
+    Each worker holds at most one unit resident, so in-flight memory is
+    ``workers x unit_bytes``, and the count is clamped so that product stays
+    inside ``destripe_total_memory_gb`` -- a fixed aggregate bound, not a
+    per-unit one, because unit sizes span 3.2 GB (a phase-B batch) to
+    12.3 GB (a chunk-1024 phase-A block) and multiplying a per-unit budget
+    by the worker count would let the large units overrun the VM.
     """
     configured = settings.destripe_unit_workers or min(8, os.cpu_count() or 8)
-    envelope = int(settings.destripe_unit_memory_gb * configured * 1024**3)
-    return max(1, min(configured, envelope // max(unit_bytes, 1)))
+    total = int(settings.destripe_total_memory_gb * 1024**3)
+    return max(1, min(configured, total // max(unit_bytes, 1)))
 
 
 def _spatial_dims(lst: xr.DataArray) -> list[str]:

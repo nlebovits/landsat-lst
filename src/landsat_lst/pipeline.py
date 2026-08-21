@@ -214,7 +214,11 @@ def load_scenes(
     Returns:
         Dataset with thermal and QA bands.
     """
-    csize = settings.load_chunk_size
+    # A coarse load (factor > 1) is the offset pass, which has no rechunk
+    # term and takes the probe-measured larger request size; the native load
+    # feeds the composite, whose single-time-chunk rechunk caps it at 512.
+    # See the two fields' docstrings in config.py.
+    csize = settings.load_chunk_size_offsets if resolution_factor > 1 else settings.load_chunk_size
 
     # Averaging only helps the thermal band, and only when coarsening. qa_pixel
     # is a bitfield and must be sampled, never interpolated -- averaging bit
