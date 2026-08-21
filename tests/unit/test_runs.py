@@ -178,6 +178,64 @@ class TestLegacyRuns:
         assert art.legacy_progress == "_runs/r/N40W075.progress.json"
 
 
+class TestShardKeysAreNotRunKeys:
+    """Stage 3's intermediates must be invisible to every run reader.
+
+    ``classify`` files a key by the suffix of its *basename*, so a shard object
+    named ``plan.json`` or ``ref.0003.2.json`` would land here as a tile called
+    ``plan`` or ``ref`` if it ever reached this function -- a phantom row in
+    ``watch``, exactly the failure this module was written to end. The defence
+    is structural rather than a filter: shard keys live under a different
+    top-level prefix, so no listing of the run prefix can contain one.
+    """
+
+    def test_the_two_prefixes_are_disjoint(self):
+        from landsat_lst.shards import SHARD_PREFIX, shard_root
+        from landsat_lst.storage import RUN_RECORD_PREFIX
+
+        assert SHARD_PREFIX != RUN_RECORD_PREFIX
+        assert not SHARD_PREFIX.startswith(RUN_RECORD_PREFIX)
+        assert not shard_root("r", "N40W075").startswith(f"{RUN_RECORD_PREFIX}/")
+
+    def test_a_run_listing_cannot_contain_a_shard_key(self):
+        """What ``watch`` and ``reconcile`` actually pass in: one prefix's keys."""
+        from landsat_lst.shards import band_key, plan_key, shard_root, shard_state_key
+        from landsat_lst.storage import RUN_RECORD_PREFIX
+
+        root = shard_root("r", "N40W075")
+        shard_keys = [
+            plan_key(root),
+            shard_state_key(root, "ref", 3, 2),
+            band_key(root, "lst_p95", 0),
+        ]
+        run_prefix = f"{RUN_RECORD_PREFIX}/r/"
+
+        assert [k for k in shard_keys if k.startswith(run_prefix)] == []
+
+    def test_shard_keys_classify_as_nothing(self):
+        """Belt and braces: even handed the keys directly, nothing is a tile.
+
+        The band and ref keys end in ``.tif`` and ``.npy``, which match none of
+        the four shapes. ``plan.json`` and the state objects only stay out
+        because of the prefix, so this asserts the filtered listing -- the
+        thing a reader is ever given.
+        """
+        from landsat_lst.shards import band_key, ref_block_key, scene_partial_key, shard_root
+        from landsat_lst.storage import RUN_RECORD_PREFIX
+
+        root = shard_root("r", "N40W075")
+        run_prefix = f"{RUN_RECORD_PREFIX}/r/"
+        listing = _listing(
+            band_key(root, "lst_p95", 0),
+            ref_block_key(root, 12),
+            scene_partial_key(root, 0, 120),
+        )
+        under_run = {k: v for k, v in listing.items() if k.startswith(run_prefix)}
+
+        assert under_run == {}
+        assert classify(under_run) == {}
+
+
 class TestArtifactPrefix:
     def test_selects_one_tile(self):
         assert tile_artifact_prefix("r", "N40W075") == "_runs/r/N40W075."
