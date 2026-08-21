@@ -207,13 +207,25 @@ class Settings(BaseSettings):
         "Set False to run the graph form, which is retained as the equivalence oracle.",
     )
     destripe_unit_memory_gb: float = Field(
-        default=4.0,
+        default=13.0,
         ge=0.25,
         description="Resident budget for one phase-A spatial block. The block edge is "
         "chosen as the largest power of two whose stack (edge^2 * scenes * 4 bytes) "
         "fits, so unit memory stays flat as the window grows rather than scaling with "
         "it. Raising this enlarges the I/O unit and cuts the number of COG opens; it "
-        "does not change any value.",
+        "does not change any value. 13.0 admits a 1024 block edge at the 2,930-scene "
+        "window (1024^2 * 2930 * 4 B = 12.3 GB), which load_chunk_size_offsets=1024 "
+        "requires (_io_block_edge never goes below the spatial chunk edge). The "
+        "aggregate in-flight bound lives in destripe_total_memory_gb, not here.",
+    )
+    destripe_total_memory_gb: float = Field(
+        default=32.0,
+        ge=1.0,
+        description="Total in-flight budget across concurrent work units: the unit "
+        "worker count is clamped to total // unit_bytes. At production offset "
+        "geometry (12.3 GB units) that is 2 concurrent units; phase B's 3.2 GB "
+        "batches get 8. Sized to leave the 3.9 GB climatology, the process "
+        "baseline, and headroom on a 64 GiB VM.",
     )
     destripe_compute_panel: int = Field(
         default=256,
@@ -250,17 +262,31 @@ class Settings(BaseSettings):
     )
 
     load_chunk_size: int = Field(
-        default=256,
-        description="Spatial (lat/lon) chunk size for odc-stac scene loading. "
-        "256, not 512, because 512 provably cannot finish a production tile. "
-        "Measured on a production-type VM at 4096 squared px "
-        "(`landsat-lst benchmark`): at 800 scenes, chunk 512 with 4 threads was "
-        "SIGKILLed on 64 GiB while chunk 256 with 1 thread peaked at 16.2 GB. "
-        "Across 50-400 scenes the cut is 3.1x to 4.1x, roughly ten times what "
-        "the static floor predicts, because the unmodelled memory scales with "
-        "threads * chunk**2 too. Costs ~23% more tasks and, on real data with "
-        "real range requests, measured 2.9x slower at this size (see 7fda25c). "
-        "See docs/findings-memory-model.md.",
+        default=512,
+        description="Spatial (lat/lon) chunk size for odc-stac scene loading on "
+        "the native/composite path. Chunk size sets bytes per S3 range request, "
+        "and the 2026-08-21 concurrency-ladder probe (results/probe/, scripts/"
+        "probe_io_ladder.py) found request size is THE throughput lever: chunk "
+        "256 was flat at 12-24 MB/s across every thread count while 512 read "
+        "70-85 MB/s warm. The old 256 default rested on the fused offset "
+        "graph's threads*chunk**2*scenes memory term, which ADR-015's bounded "
+        "units removed; the composite's own ceiling is the single-time-chunk "
+        "rechunk, whose per-task working set is chunk**2 * scenes * 4 B -- "
+        "3.1 GB at 512 over 2,930 scenes, and an infeasible 12.3 GB at 1024, "
+        "which is why the composite stops at 512 while the offset pass "
+        "(load_chunk_size_offsets) goes to 1024.",
+    )
+
+    load_chunk_size_offsets: int = Field(
+        default=1024,
+        description="Spatial chunk size for the coarse offset-pass load "
+        "(resolution_factor > 1). Probe-measured 2026-08-21: (8 threads, "
+        "chunk 1024) read 158.4 MB/s at 3.0 cores against 70-85 MB/s at 512 "
+        "and 12-24 MB/s at the old 256 -- request size, not concurrency, is "
+        "the lever, and the offset pass has no rechunk term to cap it. A 1024 "
+        "chunk obliges _io_block_edge to a >= 1024 block edge (~12.3 GB per "
+        "unit at 2,930 scenes), which destripe_unit_memory_gb accommodates "
+        "and destripe_total_memory_gb bounds in aggregate.",
     )
 
     dask_max_threads: int | None = Field(
@@ -285,25 +311,23 @@ class Settings(BaseSettings):
         description="Concurrent bounded work units (phase-A blocks, phase-B "
         "scene batches). 0 means auto: min(8, CPU count). Each worker holds at "
         "most one unit resident, so this is also the memory bound -- in-flight "
-        "bytes stay within destripe_unit_memory_gb x workers, and phase B "
-        "shrinks the count when its batch spans a native-resolution footprint. "
+        "bytes stay within destripe_total_memory_gb, and the count shrinks "
+        "when units are large (a 12.3 GB offset block at chunk 1024 admits 2). "
         "The serial form this replaces ran 324 independent blocks one at a "
         "time on ~1 core of 8; the loop, not the estimator, was the offset "
         "pass's wall clock (2026-08-21 investigation).",
     )
     destripe_io_threads: int = Field(
-        default=32,
+        default=8,
         ge=1,
         description="Threads in the shared pool that executes unit reads "
-        "(dask threaded scheduler, pool= override). This is the number of "
-        "concurrent S3 range requests the offset pass can hold in flight, "
-        "which is a latency lever, not a CPU one: at the previous effective "
-        "concurrency of 4, a VM used ~1% of its NIC and ~1.2 of 8 cores while "
-        "~84% of wall clock was request latency (batch4/scale, 2026-08). "
-        "Threads here spend their time in GIL-released GDAL reads, so the "
-        "count may exceed CPUs by a wide margin. Tune with the Stage-2 "
-        "concurrency-ladder probe before raising past ~128: the S3 side has "
-        "per-prefix request-rate ceilings.",
+        "(dask threaded scheduler, pool= override). The 2026-08-21 "
+        "concurrency-ladder probe overturned the raise-concurrency hypothesis: "
+        "throughput fell monotonically with MORE threads at every chunk size "
+        "(8 > 16 > 32 > 64 > 128), and the winning arm was 8 threads at chunk "
+        "1024 (158.4 MB/s, 3.0 cores, zero S3 throttling). Request size, not "
+        "request count, amortizes latency on this path. Do not raise this "
+        "without re-running scripts/probe_io_ladder.py.",
     )
     dask_workers: int = Field(
         default=8,

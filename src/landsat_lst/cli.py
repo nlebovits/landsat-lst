@@ -962,6 +962,15 @@ def _print_fetched_sweep(payload: dict, run_id: str) -> None:
             f"\n  At {report['target_scenes']:,} scenes this geometry projects to "
             f"{report['projected_peak_mb'] / 1024:.1f} GB, against a 64 GiB VM."
         )
+
+    # The requirement this whole tier serves: what does a production tile
+    # cost in wall clock and VM-hours, at the probe-measured rates.
+    from landsat_lst.projection import tile_projection
+
+    console.print("\n[bold]Production-tile projection[/bold]")
+    for line in tile_projection().summary_lines():
+        console.print(f"  {line}")
+
     console.print("\n  [dim]Write the outcome into docs/findings-memory-model.md.[/dim]")
 
 

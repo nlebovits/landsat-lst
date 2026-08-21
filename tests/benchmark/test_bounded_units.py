@@ -86,9 +86,23 @@ _MEMORY_CHILD = """
                 "longitude": np.linspace(-75, -70, {grid})}},
     )
     off, nval = offsets_as_units(lst)
+
+    def _peak_mb():
+        # Linux keeps ru_maxrss across execve, so a child forked from a fat
+        # pytest parent inherits its high-water mark. VmHWM belongs to the
+        # exec'd process's own mm; getrusage is the no-procfs fallback.
+        try:
+            with open("/proc/self/status") as fh:
+                for line in fh:
+                    if line.startswith("VmHWM:"):
+                        return int(line.split()[1]) / 1024
+        except OSError:
+            pass
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
     print(json.dumps({{
         "scenes": n,
-        "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+        "peak_rss_mb": _peak_mb(),
         "n_offsets": int(np.isfinite(np.asarray(off.values)).sum()),
         "n_valid_total": int(np.asarray(nval.values).sum()),
     }}))
