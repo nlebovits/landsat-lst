@@ -48,13 +48,13 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from landsat_lst import pricing, runs
+from landsat_lst import pricing, runs, shards
 from landsat_lst.config import settings
 from landsat_lst.job import JobResult, _split_completed, _worker_environ
 from landsat_lst.storage import S3Storage, get_storage
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
     from landsat_lst.models import ProcessingJob
@@ -407,6 +407,166 @@ def submit_batch(
     path = submission_path(run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(submission.to_dict(), indent=2))
+    return submission
+
+
+@dataclass(frozen=True)
+class StageSubmission:
+    """What one ``submit_shard_stage`` call handed to Coiled.
+
+    Not persisted, unlike :class:`BatchSubmission`. A sharded tile's driver is
+    the thing that outlives a stage, and everything it needs to resume is
+    derivable from the shard prefix in the bucket; a submission record would be
+    a second answer to "which shards are done" that could disagree with the
+    only one that counts. See ADR-016.
+    """
+
+    stage: str
+    tile: str
+    indexes: list[int]
+    cluster_id: int | None
+    job_id: int | None
+    command: str
+
+
+def _shard_task_command(
+    *,
+    stage: str,
+    run_id: str,
+    tile: str,
+    job: ProcessingJob | None = None,
+) -> str:
+    """The shell script one VM runs for one shard.
+
+    The same shape ``_task_command`` uses, for the same reasons: ``python -m``
+    rather than the console script, a ``#!`` script rather than a command
+    string, and the task input read from the environment by bash on the VM
+    rather than by the submitting shell. ``COILED_BATCH_TASK_INPUT`` rather
+    than ``COILED_ARRAY_TASK_ID``, which is identical on every retry (issue
+    #66) -- here the index selects which slice of the tile the task owns, so an
+    index that meant something else on a retry would recompute the wrong slab.
+
+    ``resolve`` additionally carries the window, because it is the one stage
+    that runs before a plan exists to read the window from. Every field the job
+    carries has to be restated, ``--max-scenes`` included: a missing one
+    silently reverts to a default and resolves a different scene set.
+    """
+    parts = ["python", "-m", "landsat_lst.cli", "shard", stage, "--run-id", run_id, "--tile", tile]
+    if job is not None:
+        parts += ["--year", str(job.year)]
+        if job.end_year is not None:
+            parts += ["--end-year", str(job.end_year)]
+        if job.max_scenes is not None:
+            parts += ["--max-scenes", str(job.max_scenes)]
+    quoted = shlex.join(parts)
+    return f'#!/bin/bash\n{quoted} --index "${TASK_INPUT_VAR}"\n'
+
+
+def submit_shard_stage(
+    *,
+    stage: str,
+    run_id: str,
+    tile: str,
+    indexes: Sequence[int],
+    job: ProcessingJob | None = None,
+) -> StageSubmission:
+    """Start one stage's shards as a Coiled Batch array, and return.
+
+    One array per stage rather than one graph for the tile: ``coiled.batch_run``
+    has no dependency mechanism, so the ordering between stages is the driver's
+    poll loop and not anything Coiled knows about (ADR-016).
+
+    ``max_workers`` is the shard count rather than
+    ``settings.coiled_max_workers``. That setting is the cost ceiling on a
+    700-tile fleet, where queueing is the point; here the whole reason to shard
+    is that the pieces run at once, and a stage held to four VMs would take the
+    wall clock straight back to the single-VM figure.
+
+    Per-stage overrides, and only these:
+
+    - ``composite`` runs on :attr:`~landsat_lst.config.Settings.shard_composite_vm_type`
+      and carries ``LST_LOAD_CHUNK_SIZE``, because it is the native read.
+    - ``export`` asks for :attr:`~landsat_lst.config.Settings.shard_export_disk_gb`
+      of scratch: it holds every band slab, a full-tile intermediate, and the
+      COG being translated out of it, all at once.
+
+    Args:
+        stage: One of :data:`landsat_lst.shards.STAGES`.
+        run_id: Run token, which names the shard prefix.
+        tile: Tile these shards belong to.
+        indexes: Which shards to start. A resubmission passes only the missing
+            ones.
+        job: Required by ``resolve``; unused otherwise.
+
+    Returns:
+        The :class:`StageSubmission`, with the cluster it started.
+
+    Raises:
+        ImportError: If Coiled is not installed.
+        ValueError: If ``indexes`` is empty or ``stage`` is unknown.
+    """
+    try:
+        import coiled  # noqa: PLC0415
+    except ImportError as e:
+        msg = "Coiled is required for distributed execution. Install with: pip install coiled"
+        raise ImportError(msg) from e
+
+    if stage not in shards.STAGES:
+        msg = f"unknown shard stage {stage!r}; expected one of {shards.STAGES}"
+        raise ValueError(msg)
+    if not indexes:
+        msg = f"no shards to submit for stage {stage!r}"
+        raise ValueError(msg)
+
+    command = _shard_task_command(stage=stage, run_id=run_id, tile=tile, job=job)
+    environ = _worker_environ()
+
+    kwargs: dict[str, Any] = {
+        "command": command,
+        "name": f"lst-{run_id}-{tile}-{stage}"[:60],
+        "region": settings.coiled_region,
+        "vm_type": settings.coiled_vm_types,
+        "spot_policy": settings.coiled_spot_policy,
+        "max_workers": len(indexes),
+        "max_retries": settings.coiled_retries,
+        "job_timeout": settings.coiled_job_timeout,
+        "map_over_values": [str(i) for i in indexes],
+        "env": environ,
+        "tag": {"project": "landsat-lst", "run_id": run_id, "tile": tile, "stage": stage},
+        "forward_aws_credentials": False,
+    }
+
+    if stage == "composite":
+        kwargs["vm_type"] = [settings.shard_composite_vm_type]
+        kwargs["env"] = {**environ, "LST_LOAD_CHUNK_SIZE": str(settings.shard_composite_chunk)}
+    elif stage == "export":
+        kwargs["disk_size"] = settings.shard_export_disk_gb
+
+    log.info(
+        "shard_stage_submit",
+        run_id=run_id,
+        tile=tile,
+        stage=stage,
+        shards=len(indexes),
+        vm_type=kwargs["vm_type"],
+    )
+    result = coiled.batch_run(**kwargs)
+    submission = StageSubmission(
+        stage=stage,
+        tile=tile,
+        indexes=list(indexes),
+        cluster_id=result.get("cluster_id"),
+        job_id=result.get("job_id"),
+        command=command,
+    )
+    log.info(
+        "shard_stage_submitted",
+        run_id=run_id,
+        tile=tile,
+        stage=stage,
+        cluster_id=submission.cluster_id,
+        job_id=submission.job_id,
+    )
     return submission
 
 

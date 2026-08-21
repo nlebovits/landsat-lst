@@ -214,6 +214,21 @@ class StorageBackend(ABC):
         """
 
     @abstractmethod
+    def download(self, key: str, local: Path) -> bool:
+        """Fetch ``key`` to ``local``, returning whether it existed.
+
+        The binary counterpart of :meth:`read_text`, and the inverse of
+        :meth:`upload`. A sharded tile needs it twice: the phase-B shards
+        reassemble the climatology from ``.npy`` blocks, and the export-merge
+        stitches per-band GeoTIFFs. Neither is text and neither fits in a
+        heartbeat-sized object, so ``read_text`` cannot serve them.
+
+        A missing key returns ``False`` rather than raising, for the reason
+        :meth:`read_text` documents: a shard that never published is an
+        ordinary outcome the caller decides about.
+        """
+
+    @abstractmethod
     def list_prefix(self, prefix: str) -> dict[str, datetime]:
         """Every key under ``prefix``, mapped to when it was last written.
 
@@ -284,6 +299,14 @@ class LocalStorage(StorageBackend):
     def read_text(self, key: str) -> str | None:
         path = self.output_dir / key
         return path.read_text() if path.is_file() else None
+
+    def download(self, key: str, local: Path) -> bool:
+        path = self.output_dir / key
+        if not path.is_file():
+            return False
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(path.read_bytes())
+        return True
 
     def list_prefix(self, prefix: str) -> dict[str, datetime]:
         """Every key under ``prefix``, mapped to when it was last written.
@@ -382,6 +405,18 @@ class S3Storage(StorageBackend):
                 return None
             raise
         return response["Body"].read().decode()
+
+    def download(self, key: str, local: Path) -> bool:
+        from botocore.exceptions import ClientError  # noqa: PLC0415
+
+        local.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.client.download_file(self.bucket, self._full_key(key), str(local))
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                return False
+            raise
+        return True
 
     def list_prefix(self, prefix: str) -> dict[str, datetime]:
         full = self._full_key(prefix)

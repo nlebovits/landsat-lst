@@ -927,3 +927,115 @@ def test_credentials_are_resolved_only_when_a_cluster_starts(
     submit_batch(_jobs("N40W075"), storage=storage, run_id="r")
 
     environ.assert_not_called()
+
+
+class TestShardStageCommand:
+    """The command a shard task runs, which is the whole contract with its VM."""
+
+    def test_the_index_is_the_task_input(self):
+        from landsat_lst.batch import _shard_task_command
+
+        command = _shard_task_command(stage="composite", run_id="r1", tile="N40W075")
+
+        assert command == (
+            "#!/bin/bash\n"
+            "python -m landsat_lst.cli shard composite --run-id r1 --tile N40W075 "
+            '--index "$COILED_BATCH_TASK_INPUT"\n'
+        )
+
+    def test_not_the_array_task_id(self):
+        """``COILED_ARRAY_TASK_ID`` is identical on every retry (issue #66).
+
+        Here the index selects which slice of the tile the task owns, so an
+        index that meant something else on a retry would recompute the wrong
+        slab into the right key.
+        """
+        from landsat_lst.batch import _shard_task_command
+
+        command = _shard_task_command(stage="offsets", run_id="r1", tile="N40W075")
+
+        assert "COILED_ARRAY_TASK_ID" not in command
+
+    def test_resolve_carries_the_window_because_no_plan_exists_yet(self):
+        from landsat_lst.batch import _shard_task_command
+
+        job = _jobs("N40W075")[0]
+        command = _shard_task_command(stage="resolve", run_id="r1", tile="N40W075", job=job)
+
+        assert "--year 2021 --end-year 2025" in command
+
+    def test_a_sampled_window_restates_max_scenes(self):
+        """A missing --max-scenes resolves a different scene set entirely."""
+        from landsat_lst.batch import _shard_task_command
+        from landsat_lst.models import ProcessingJob
+
+        job = ProcessingJob(
+            tile=parse_tile_name("N40W075"), year=2021, end_year=2025, max_scenes=300
+        )
+        command = _shard_task_command(stage="resolve", run_id="r1", tile="N40W075", job=job)
+
+        assert "--max-scenes 300" in command
+
+
+class TestSubmitShardStage:
+    """One array per stage, because batch_run has no dependency mechanism."""
+
+    def test_pins_the_knobs_and_maps_over_indexes(self, fake_coiled):
+        from landsat_lst.batch import submit_shard_stage
+
+        submission = submit_shard_stage(
+            stage="climatology", run_id="r1", tile="N40W075", indexes=[0, 2, 5]
+        )
+
+        assert fake_coiled["map_over_values"] == ["0", "2", "5"]
+        assert fake_coiled["region"] == settings.coiled_region
+        assert fake_coiled["tag"]["stage"] == "climatology"
+        assert submission.cluster_id == 4242
+
+    def test_the_fleet_width_is_the_shard_count_not_the_tile_cost_cap(self, fake_coiled):
+        """``coiled_max_workers`` bounds a 700-tile fleet, where queueing is the
+        point. Here the whole reason to shard is that the pieces run at once.
+        """
+        from landsat_lst.batch import submit_shard_stage
+
+        submit_shard_stage(stage="offsets", run_id="r1", tile="N40W075", indexes=list(range(9)))
+
+        assert fake_coiled["max_workers"] == 9
+        assert settings.coiled_max_workers < 9
+
+    def test_the_composite_stage_takes_its_own_vm_and_chunk(self, fake_coiled):
+        from landsat_lst.batch import submit_shard_stage
+
+        submit_shard_stage(stage="composite", run_id="r1", tile="N40W075", indexes=[0, 1])
+
+        assert fake_coiled["vm_type"] == [settings.shard_composite_vm_type]
+        assert fake_coiled["env"]["LST_LOAD_CHUNK_SIZE"] == str(settings.shard_composite_chunk)
+
+    def test_the_export_stage_asks_for_scratch_disk(self, fake_coiled):
+        """It holds every band slab, a full-tile intermediate, and a COG at once."""
+        from landsat_lst.batch import submit_shard_stage
+
+        submit_shard_stage(stage="export", run_id="r1", tile="N40W075", indexes=[0])
+
+        assert fake_coiled["disk_size"] == settings.shard_export_disk_gb
+
+    def test_the_offset_stages_keep_the_default_vm_preference(self, fake_coiled):
+        from landsat_lst.batch import submit_shard_stage
+
+        submit_shard_stage(stage="climatology", run_id="r1", tile="N40W075", indexes=[0])
+
+        assert fake_coiled["vm_type"] == settings.coiled_vm_types
+        assert "disk_size" not in fake_coiled
+
+    def test_an_unknown_stage_is_refused(self, fake_coiled):
+        from landsat_lst.batch import submit_shard_stage
+
+        with pytest.raises(ValueError, match="unknown shard stage"):
+            submit_shard_stage(stage="polish", run_id="r1", tile="N40W075", indexes=[0])
+
+    def test_an_empty_submission_is_refused(self, fake_coiled):
+        """The driver skips a finished stage rather than submitting nothing."""
+        from landsat_lst.batch import submit_shard_stage
+
+        with pytest.raises(ValueError, match="no shards to submit"):
+            submit_shard_stage(stage="climatology", run_id="r1", tile="N40W075", indexes=[])

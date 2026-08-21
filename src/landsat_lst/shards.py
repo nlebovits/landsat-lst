@@ -40,10 +40,21 @@ import hashlib
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import structlog
+
 from landsat_lst.config import settings
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from landsat_lst.storage import StorageBackend
+
+log = structlog.get_logger()
+
+#: The stages one tile runs through, in the only order they can run in. Named
+#: here rather than in the driver so a shard task, a submission, and a key all
+#: spell a stage the same way.
+STAGES: tuple[str, ...] = ("resolve", "climatology", "offsets", "composite", "export")
 
 #: Prefix for per-shard intermediates. A sibling of the collection directories
 #: and deliberately **disjoint** from :data:`landsat_lst.storage.RUN_RECORD_PREFIX`:
@@ -147,6 +158,86 @@ def shard_state_key(root: str, stage: str, index: int, attempt: int) -> str:
 def shard_log_key(root: str, stage: str, index: int, attempt: int) -> str:
     """One shard's stdout and stderr, beside its state object."""
     return f"{root}/state/{stage}.{index:04d}.{attempt}.log"
+
+
+def shard_attempt_prefix(root: str, stage: str, index: int) -> str:
+    """Everything one shard of one stage has published across its attempts.
+
+    The trailing dot is load-bearing for the same reason it is in
+    ``runs.tile_artifact_prefix``: without it, shard 1 would collect shard 10's
+    artifacts.
+    """
+    return f"{root}/state/{stage}.{index:04d}."
+
+
+def resolve_shard_attempt(storage: StorageBackend, root: str, stage: str, index: int) -> int:
+    """The number this shard should key its artifacts under.
+
+    One more than the highest attempt that already left one, counting state
+    objects *and* logs, because a VM preempted before it published state still
+    uploaded a log on the way out. The same reasoning as
+    ``runs.resolve_attempt``, over this module's key grammar rather than that
+    one's; the two grammars are deliberately disjoint (see :data:`SHARD_PREFIX`)
+    so neither module's classifier can be handed the other's keys.
+
+    Resolve it **once per process**. Asking twice would number the log higher
+    than the state object, since the log uploads last.
+
+    A listing that fails returns 1: instrumentation never fails a shard.
+    """
+    prefix = shard_attempt_prefix(root, stage, index)
+    try:
+        listed = storage.list_prefix(prefix)
+    except Exception as e:
+        log.warning(
+            "shard_attempt_listing_failed", root=root, stage=stage, index=index, error=str(e)
+        )
+        return 1
+
+    highest = 0
+    for key in listed:
+        token = key[len(prefix) :].split(".")[0]
+        if token.isdigit():
+            highest = max(highest, int(token))
+    return highest + 1
+
+
+def stage_shard_counts(*, blocks: int, scene_batches: int, block_rows: int) -> tuple[int, int, int]:
+    """How wide each stage's fleet is, given what there is to divide.
+
+    Configuration wins where it is set. Where it is 0 the width comes from
+    :func:`landsat_lst.projection.tile_projection`, which turns the probe's
+    measured per-VM rates into the VM count that fits a phase inside its share
+    of the sixty-minute tile. That is a projection, not a measurement, and it is
+    the same projection ``landsat-lst plan`` prints -- the point is that the
+    fleet is priced before it is started, never discovered from a run.
+
+    Every width is clamped to the work available. A shard with no block is a VM
+    that boots, reads a plan, finds nothing to do, and bills a minute.
+
+    Args:
+        blocks: Phase-A climatology blocks in the tile.
+        scene_batches: Phase-B scene ranges in the window.
+        block_rows: Whole COG block rows in the output grid, which bounds the
+            number of row bands :func:`band_edges` can cut.
+
+    Returns:
+        ``(ref_shards, scene_shards, band_shards)``, each at least 1.
+    """
+    from landsat_lst.projection import tile_projection  # noqa: PLC0415
+
+    projected = tile_projection()
+    auto_offsets = max(1, round(projected.n_vms_offsets))
+    auto_composite = max(1, round(projected.n_vms_composite))
+
+    def _pick(configured: int, auto: int, available: int) -> int:
+        return max(1, min(configured or auto, available))
+
+    return (
+        _pick(settings.shard_climatology_vms, auto_offsets, blocks),
+        _pick(settings.shard_offset_vms, auto_offsets, scene_batches),
+        _pick(settings.shard_composite_vms, auto_composite, block_rows),
+    )
 
 
 def block_spans(shape: tuple[int, int], block: int) -> list[Span]:

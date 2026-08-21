@@ -393,6 +393,87 @@ class Settings(BaseSettings):
         "forwarded to Coiled workers for S3 writes.",
     )
 
+    # Sharded tile execution (ADR-016). One tile across many VMs, sequenced by a
+    # local driver that polls S3 between stages. Coiled Batch has no dependency
+    # mechanism, so every knob here is either a fleet width or a barrier bound.
+    shard_climatology_vms: int = Field(
+        default=0,
+        ge=0,
+        description="Processes the phase-A climatology is split across. 0 means "
+        "auto, from landsat_lst.projection.tile_projection: the coarse pass "
+        "divided by the offset phase's minute budget. Clamped to the number of "
+        "blocks the tile actually has, since a shard with no block is a VM that "
+        "boots to do nothing.",
+    )
+    shard_offset_vms: int = Field(
+        default=0,
+        ge=0,
+        description="Processes the phase-B per-scene offsets are split across. "
+        "0 means auto, as shard_climatology_vms. Clamped to the number of scene "
+        "batches, which is what bounds it on a short window.",
+    )
+    shard_composite_vms: int = Field(
+        default=0,
+        ge=0,
+        description="Row bands the native composite is split across. 0 means "
+        "auto, from the composite phase's minute budget in "
+        "landsat_lst.projection. Clamped to the number of whole COG block rows "
+        "in the tile: a band must start on a block row for the merge to stay a "
+        "windowed copy (landsat_lst.shards.band_edges).",
+    )
+    shard_composite_vm_type: str = Field(
+        default="m6i.4xlarge",
+        description="VM type for composite shards. The composite is the "
+        "native-resolution read and wants cores against a 16-thread load; the "
+        "offset stages keep the default preference list. Named as one type "
+        "rather than a list so the chunk this stage runs at "
+        "(shard_composite_chunk) describes a known core count.",
+    )
+    shard_composite_chunk: int = Field(
+        default=1024,
+        ge=64,
+        description="Spatial chunk edge a composite shard loads at, overriding "
+        "load_chunk_size. A whole-tile composite stops at 512 because the "
+        "single-time-chunk rechunk holds chunk^2 * scenes * 4 B (3.1 GB at 512 "
+        "over 2,930 scenes, 12.3 GB at 1024). A row band holds a fraction of "
+        "the rows, so the same per-task working set buys the larger request the "
+        "2026-08-21 probe measured as THE throughput lever. Applied by every "
+        "shard process AND by the planner, so the plan digest -- which covers "
+        "load_chunk_size -- agrees across all of them.",
+    )
+    shard_export_disk_gb: int = Field(
+        default=100,
+        ge=1,
+        description="Scratch disk for the export-merge VM. It downloads every "
+        "row band of both products, merges each into a full-tile intermediate, "
+        "and runs cog_translate over it, so three full-tile rasters are on "
+        "disk at once. The default VM disk does not hold them.",
+    )
+    shard_driver_poll_s: float = Field(
+        default=20.0,
+        gt=0,
+        description="Seconds between the driver's storage listings while a "
+        "stage barrier is open. One listing of the tile's shard prefix per "
+        "poll, which is how the driver learns a shard finished: Coiled Batch "
+        "has no dependency mechanism and an exit code is not completion.",
+    )
+    shard_barrier_timeout_s: int = Field(
+        default=7200,
+        ge=0,
+        description="How long one stage may run before the driver gives up "
+        "waiting and resubmits whichever shard indexes are still missing. Two "
+        "hours covers a phase that projects to well under one, with room for a "
+        "spot replacement to boot and redo a shard.",
+    )
+    shard_barrier_rounds: int = Field(
+        default=2,
+        ge=1,
+        description="Submissions per stage, including the first. The second is "
+        "the resubmission of only the missing indexes; after that the tile "
+        "fails, naming the keys that never appeared. Unbounded retries would "
+        "bill all night against a shard that is failing deterministically.",
+    )
+
     # Live observability for batch tiles. A batch task is a plain process that
     # never registers with dask, so the cluster dashboard reports nothing about
     # it and its stdout stays on the VM until it exits. These knobs drive the
