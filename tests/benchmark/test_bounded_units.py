@@ -64,6 +64,13 @@ _MEMORY_CHILD = """
     settings.destripe_bounded_units = True
     settings.destripe_unit_memory_gb = {budget}
     settings.destripe_compute_panel = 128
+    settings.destripe_unit_workers = {workers}
+    # Pinned like num_workers above: the guard measures what a unit holds,
+    # not the read pool's in-flight chunk set. At the production default (32)
+    # the pool's per-task overhead rides the ratio up to ~1.33 at this toy
+    # geometry -- against the band, run-to-run flaky, and not the property
+    # under test.
+    settings.destripe_io_threads = 2
     from landsat_lst.normalization import offsets_as_units
 
     n = {scenes}
@@ -88,8 +95,18 @@ _MEMORY_CHILD = """
 """
 
 
-def _peak_for(scenes: int) -> dict:
-    return _run(_MEMORY_CHILD.format(scenes=scenes, grid=GRID, budget=BLOCK_BUDGET_GB))
+#: Same doubling, with the unit pool at its default width. In-flight memory is
+#: workers x unit rather than 1 x unit, and a unit's bytes grow with the
+#: window (the block edge only shrinks at the budget boundary), so the slope
+#: is legitimately steeper than the one-worker case. The band still catches a
+#: worker holding the window, which doubles the whole curve.
+PARALLEL_MEMORY_BAND = 1.6
+
+
+def _peak_for(scenes: int, workers: int = 1) -> dict:
+    return _run(
+        _MEMORY_CHILD.format(scenes=scenes, grid=GRID, budget=BLOCK_BUDGET_GB, workers=workers)
+    )
 
 
 def test_peak_memory_does_not_grow_with_the_window():
@@ -97,7 +114,9 @@ def test_peak_memory_does_not_grow_with_the_window():
 
     The graph form this replaced held a plateau independent of scene count only
     because it had already materialized the stack; growth here would mean a
-    work unit is holding the window rather than a block of it.
+    work unit is holding the window rather than a block of it. Pinned at one
+    unit worker so the guard isolates the per-unit property; the parallel
+    envelope has its own guard below.
     """
     small, large = _peak_for(24), _peak_for(48)
     ratio = large["peak_rss_mb"] / small["peak_rss_mb"]
@@ -108,6 +127,27 @@ def test_peak_memory_does_not_grow_with_the_window():
         f"Check normalization._io_block_edge and offsets_by_scene."
     )
     # Both runs must have produced a real answer, or the ratio is meaningless.
+    assert small["n_offsets"] == 24
+    assert large["n_offsets"] == 48
+
+
+def test_parallel_units_keep_the_memory_envelope():
+    """The unit pool multiplies in-flight units, never what a unit holds.
+
+    With eight workers, in-flight memory is eight units, and each unit's bytes
+    scale with the window until the block edge shrinks at the budget boundary.
+    That gives a steeper-but-bounded doubling curve. A regression where a
+    *worker* holds the window (the pre-C1 failure mode, reintroduced through
+    the pool) doubles the whole curve and blows the band.
+    """
+    small, large = _peak_for(24, workers=8), _peak_for(48, workers=8)
+    ratio = large["peak_rss_mb"] / small["peak_rss_mb"]
+    assert ratio <= PARALLEL_MEMORY_BAND, (
+        f"peak RSS grew {ratio:.2f}x when the window doubled at 8 unit "
+        f"workers ({small['peak_rss_mb']:.0f} -> {large['peak_rss_mb']:.0f} MB, "
+        f"band {PARALLEL_MEMORY_BAND}). A worker is holding the window, not "
+        f"one unit. Check normalization._unit_workers and _read_values."
+    )
     assert small["n_offsets"] == 24
     assert large["n_offsets"] == 48
 

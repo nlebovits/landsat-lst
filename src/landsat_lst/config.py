@@ -264,21 +264,46 @@ class Settings(BaseSettings):
     )
 
     dask_max_threads: int | None = Field(
-        default=4,
-        description="Cap on dask's threaded scheduler for one tile. Was 1, for the "
-        "fused offset graph: that graph made the threaded scheduler hold one chunk "
-        "per thread across the whole time axis, so peak memory ran to roughly "
-        "threads * chunk_size**2 * scenes * 4 bytes -- ~49 GB on a 16-vCPU VM at "
-        "chunk 512 over 2,930 scenes, and a tile at 4 threads was OOMing. "
-        "ADR-015's bounded work units removed that term: each block read is a "
-        "graph over one block, so a thread costs one chunk (~2.6 MB) rather than "
-        "one time series. Measured 2026-08-16 on r6i.2xlarge at production "
-        "geometry, 40 scenes, four arms: peak RSS 14.60 / 14.66 / 14.15 / 14.25 GB "
-        "at 1 / 2 / 4 / 8 threads -- flat within 3.6%, no trend -- while wall time "
-        "went 1776 / 1377 / 1235 / 1445 s. 4 is the optimum; 8 is slower than 4 "
-        "and burns 46% more CPU, because past 4 the threads contend rather than "
-        "overlap. Every arm returned identical offsets. Raising this above 4 "
-        "costs time, not just memory. See docs/findings-memory-model.md.",
+        default=None,
+        description="Cap on dask's threaded scheduler for one tile; None uses "
+        "dask's default (the VM's CPU count). Was 1 for the fused offset graph "
+        "(one time series per thread, ~49 GB at 16 threads), then 4 from a "
+        "2026-08-16 sweep (1776 / 1377 / 1235 / 1445 s at 1 / 2 / 4 / 8 "
+        "threads, RSS flat within 3.6%). That sweep measured the wrong thing: "
+        "its hot kernels were np.nanquantile's per-pixel apply_along_axis loop "
+        "and np.nanmedian's masked-array small path, both of which hold the "
+        "GIL, so past 4 threads contended rather than overlapped. Both kernels "
+        "were replaced 2026-08-21 with GIL-releasing sort kernels "
+        "(landsat_lst.kernels), which removes the curve's cause. Never "
+        "re-calibrate this on a GIL-bound kernel. Unit-read concurrency is a "
+        "separate knob (destripe_io_threads); this one governs composite and "
+        "export graphs.",
+    )
+    destripe_unit_workers: int = Field(
+        default=0,
+        ge=0,
+        description="Concurrent bounded work units (phase-A blocks, phase-B "
+        "scene batches). 0 means auto: min(8, CPU count). Each worker holds at "
+        "most one unit resident, so this is also the memory bound -- in-flight "
+        "bytes stay within destripe_unit_memory_gb x workers, and phase B "
+        "shrinks the count when its batch spans a native-resolution footprint. "
+        "The serial form this replaces ran 324 independent blocks one at a "
+        "time on ~1 core of 8; the loop, not the estimator, was the offset "
+        "pass's wall clock (2026-08-21 investigation).",
+    )
+    destripe_io_threads: int = Field(
+        default=32,
+        ge=1,
+        description="Threads in the shared pool that executes unit reads "
+        "(dask threaded scheduler, pool= override). This is the number of "
+        "concurrent S3 range requests the offset pass can hold in flight, "
+        "which is a latency lever, not a CPU one: at the previous effective "
+        "concurrency of 4, a VM used ~1% of its NIC and ~1.2 of 8 cores while "
+        "~84% of wall clock was request latency (batch4/scale, 2026-08). "
+        "Threads here spend their time in GIL-released GDAL reads, so the "
+        "count may exceed CPUs by a wide margin. Tune with the Stage-2 "
+        "concurrency-ladder probe before raising past ~128: the S3 side has "
+        "per-prefix request-rate ceilings.",
     )
     dask_workers: int = Field(
         default=8,

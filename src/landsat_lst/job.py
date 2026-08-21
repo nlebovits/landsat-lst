@@ -327,7 +327,11 @@ def _thread_cap():
 
     Applied around the whole tile rather than at each compute, because both
     hour-scale graphs -- the offset estimation and the COG write -- are subject
-    to it and neither is reached from here directly.
+    to it and neither is reached from here directly. The default is now None
+    (dask's own CPU-count pool): the old cap of 4 was calibrated against
+    GIL-bound kernels that landsat_lst.kernels has since replaced. Unit reads
+    in the offset pass run on their own pool (settings.destripe_io_threads)
+    either way.
     """
     if settings.dask_max_threads is None:
         return nullcontext()

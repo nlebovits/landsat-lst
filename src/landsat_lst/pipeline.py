@@ -17,6 +17,7 @@ from urllib3.util.retry import Retry
 
 from landsat_lst.config import settings
 from landsat_lst.encoding import LST_MIN_TRUSTED_C
+from landsat_lst.kernels import nanquantile_last
 from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
 from landsat_lst.normalization import (
     offset_diagnostics,
@@ -108,6 +109,14 @@ def _configure_requester_pays() -> None:
     """
     os.environ.setdefault("AWS_REQUEST_PAYER", "requester")
     os.environ.setdefault("GDAL_HTTP_UNSAFESSL", "NO")
+    # Same cloud defaults the Planetary Computer path already sets
+    # (azure_auth.py). Measured effect on AWS is within run-to-run noise
+    # (the 2026-08 A/B's every arm matched its baseline_repeat), so this is
+    # hygiene, not a speedup: it pins sane open/read behavior for the
+    # request concurrency the unit reads now run at.
+    from odc.stac import configure_rio  # noqa: PLC0415
+
+    configure_rio(cloud_defaults=True)
 
 
 def _sample_scenes(items: list, max_scenes: int) -> list:
@@ -406,6 +415,12 @@ def compute_annual_composite(
                 min_offset_samples=settings.destripe_min_offset_samples,
                 offset_source=source,
                 cache=offset_cache,
+                # The mask on whichever grid the offsets are estimated on, so
+                # phase A can skip blocks that hold no land at all. On a
+                # coastal tile most blocks are ocean; the skip is free work
+                # reduction and value-identical (an all-NaN block's medians
+                # are NaN either way).
+                land_mask=offset_land_mask if source is not None else land_mask,
             )
         diagnostics = offset_diagnostics(offset, keep)
         log.info("destripe_offsets_degC", **diagnostics)
@@ -454,7 +469,25 @@ def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
     # Total valid obs per pixel (across the whole window) gates the P95 fill.
     total_valid = valid_mask.sum(dim="time")
 
-    lst_p95 = lst.quantile(0.95, dim="time", skipna=True).drop_vars("quantile")
+    # Vectorized sort-based P95 instead of ``lst.quantile``. On the production
+    # window xarray's path lands in ``np.nanquantile``'s per-pixel
+    # ``apply_along_axis`` loop: dask's own vectorized escape hatch
+    # (``_custom_nanquantile``) bails back to numpy above 1,000 elements on
+    # the reduced axis, and the window holds ~2,930 scenes. That loop holds
+    # the GIL, which is why 4 threads measured 1.06x one thread here.
+    # ``kernels.nanquantile_last`` is one GIL-releasing ``np.sort`` and
+    # reproduces the shipped values bit for bit after the float32 cast below
+    # (pinned by tests/unit/test_kernels.py). apply_ufunc moves time to the
+    # last axis per block; the single-chunk time rechunk above guarantees the
+    # core dimension is whole.
+    lst_p95 = xr.apply_ufunc(
+        nanquantile_last,
+        lst,
+        input_core_dims=[["time"]],
+        kwargs={"q": 0.95},
+        dask="parallelized",
+        output_dtypes=[np.float64],
+    )
     lst_p95 = lst_p95.where(total_valid > 0, settings.nodata)
 
     # Guard against a pixel that has observations yet still produces a P95 on
