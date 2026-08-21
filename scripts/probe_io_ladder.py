@@ -92,24 +92,23 @@ def collect(cluster_id: int) -> list[dict]:
 
 
 def project(rows: list[dict]) -> dict:
-    ok = [r for r in rows if "decoded_mb_s" in r]
+    # Arm 0 is the warmup by convention (ladder v2): it absorbs first-run
+    # warming (v1's control ran 1.81x its first arm) and is excluded from
+    # both the best-rate pick and the drift check.
+    ok = [r for r in rows if "decoded_mb_s" in r and r.get("arm") != 0]
     if not ok:
         return {"verdict": "no data"}
     best = max(ok, key=lambda r: r["decoded_mb_s"])
     rate = best["decoded_mb_s"] * 1e6
-    first = next((r for r in ok if r["arm"] == 0), None)
-    control = (
-        next(
-            (
-                r
-                for r in reversed(ok)
-                if r["arm"] != 0
-                and (r["io_threads"], r["chunk"]) == (first["io_threads"], first["chunk"])
-            ),
-            None,
-        )
-        if first
-        else None
+    control = ok[-1]
+    first = next(
+        (
+            r
+            for r in ok
+            if r is not control
+            and (r["io_threads"], r["chunk"]) == (control["io_threads"], control["chunk"])
+        ),
+        None,
     )
     drift = (
         round(control["decoded_mb_s"] / first["decoded_mb_s"], 3)

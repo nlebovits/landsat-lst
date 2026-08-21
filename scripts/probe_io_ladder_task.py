@@ -32,17 +32,25 @@ TILE = os.environ.get("PROBE_TILE", "N40W075")
 SCENES_PER_ARM = int(os.environ.get("PROBE_SCENES_PER_ARM", "24"))
 FACTOR = int(os.environ.get("PROBE_FACTOR", "2"))
 
-#: (io_threads, chunk) per arm; the first repeats at the end as the control.
+#: (io_threads, chunk) per arm; arm 0 is a discardable warmup, the last arm
+#: is a warm control. History: v1 (cluster 1944816) showed request size
+#: dominates -- 55.8 MB/s at (32, 512) against a flat 12-24 MB/s across the
+#: whole thread column at chunk 256 -- with a 1.81x first-run warming drift.
+#: v2 (cluster 1944879) walked the request axis up: (16, 1024) = 155.8 MB/s
+#: at 3.9 cores, and throughput fell monotonically with MORE threads at
+#: every chunk (16 > 32 > 64 > 128). v3 asks the two questions that size
+#: Stage 3: does 8 beat 16, and what are the warm rates for the two shapes
+#: production can actually run -- chunk 1024 for the offset pass (a 1024
+#: block edge costs ~12.3 GB per unit, so ~4 workers on 64 GiB) and chunk
+#: 512 for the composite (the single-time-chunk rechunk makes a 1024^2 task
+#: hold 12.3 GB, which caps the composite at 512).
 ARMS: list[tuple[int, int]] = [
-    (4, 256),  # today's effective concurrency -- the baseline
-    (16, 256),
-    (32, 256),
-    (64, 256),
-    (128, 256),
-    (256, 256),
-    (32, 512),
-    (128, 512),
-    (4, 256),  # control: first arm again, last
+    (16, 1024),  # warmup -- discard; absorbs first-run warming
+    (8, 1024),
+    (16, 1024),
+    (8, 512),
+    (16, 512),
+    (16, 1024),  # control: warm repeat of the reference arm
 ]
 
 _CHILD = """
