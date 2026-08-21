@@ -24,7 +24,10 @@ issue #46 and ADR-007.
 
 from __future__ import annotations
 
+import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
 import dask
@@ -32,6 +35,7 @@ import numpy as np
 import xarray as xr
 
 from landsat_lst.config import settings
+from landsat_lst.kernels import sort_median_axis0
 from landsat_lst.profiling import PROFILE_DESTRIPE_OFFSETS, profile_compute
 from landsat_lst.progress import GraphProgress, report_phase, timed_section
 
@@ -39,6 +43,53 @@ if TYPE_CHECKING:
     from landsat_lst.offsets import OffsetCache
 
 _TIME_DIM = "time"
+
+# One shared executor for every unit read in the process. dask's threaded
+# scheduler accepts it via ``pool=`` and just submits into it, so concurrent
+# ``get`` calls from several unit workers share one bounded set of I/O
+# threads. Without it, each non-main thread that computes a graph gets its
+# own per-thread pool (dask.threaded keys pools by thread), and the in-flight
+# request count multiplies uncontrolled. The pool is I/O-sized, not CPU-sized:
+# these threads spend their time in GIL-released S3 reads, and the number of
+# them is the number of concurrent range requests -- the lever the 2026-08
+# investigation found capped at 4 while the VM used ~1% of its NIC.
+_io_pool_lock = threading.Lock()
+_io_pool: ThreadPoolExecutor | None = None
+
+
+def _read_pool() -> ThreadPoolExecutor:
+    global _io_pool  # noqa: PLW0603
+    with _io_pool_lock:
+        if _io_pool is None or _io_pool._max_workers != settings.destripe_io_threads:
+            _io_pool = ThreadPoolExecutor(
+                max_workers=settings.destripe_io_threads,
+                thread_name_prefix="lst-unit-io",
+            )
+        return _io_pool
+
+
+def _read_values(da: xr.DataArray, dtype: np.dtype) -> np.ndarray:
+    """Materialize one unit's slice, routing dask reads through the I/O pool."""
+    data = da.data
+    if dask.is_dask_collection(data):
+        (arr,) = dask.compute(data, scheduler="threads", pool=_read_pool())
+        return np.asarray(arr, dtype=dtype)
+    return np.asarray(da.values, dtype=dtype)
+
+
+def _unit_workers(unit_bytes: int) -> int:
+    """How many work units may run concurrently.
+
+    The configured worker count is also the memory bound: each worker holds at
+    most one unit resident, so in-flight memory is ``workers x unit_bytes``.
+    When a unit is larger than the phase-A budget (phase B's batch over a
+    native-resolution footprint can be), the count shrinks so the total stays
+    inside ``destripe_unit_memory_gb x configured`` -- the same envelope the
+    serial form promised, multiplied by the parallelism it never used.
+    """
+    configured = settings.destripe_unit_workers or min(8, os.cpu_count() or 8)
+    envelope = int(settings.destripe_unit_memory_gb * configured * 1024**3)
+    return max(1, min(configured, envelope // max(unit_bytes, 1)))
 
 
 def _spatial_dims(lst: xr.DataArray) -> list[str]:
@@ -188,11 +239,14 @@ def _scene_batches(lst: xr.DataArray, batch: int) -> list[tuple[int, int]]:
 def _panel_median(panel: np.ndarray) -> np.ndarray:
     """Per-pixel median over time for one panel, NaNs skipped.
 
-    ``np.nanmedian`` over axis 0 rather than anything cleverer, because E1
-    established bit-exactness against the shipped graph with exactly this call
-    and a faster kernel would have to re-earn that.
+    ``kernels.sort_median_axis0`` rather than ``np.nanmedian``: below 600
+    scenes per month numpy takes its masked-array path, measured at 2.43 s
+    per 256-square panel, and it holds the GIL. The sort kernel is pure C,
+    releases the GIL, and ``tests/unit/test_kernels.py`` pins bit-exactness
+    against ``np.nanmedian`` on both numpy paths -- the same standard E1
+    established for the unit form, re-earned by the replacement kernel.
     """
-    return np.nanmedian(panel, axis=0)
+    return sort_median_axis0(panel)
 
 
 def climatology_by_blocks(
@@ -200,8 +254,9 @@ def climatology_by_blocks(
     *,
     block: int | None = None,
     panel: int | None = None,
+    land_mask: xr.DataArray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Phase A: the 12-month per-pixel climatology, one spatial block at a time.
+    """Phase A: the 12-month per-pixel climatology, blocks run concurrently.
 
     Sharded over space, which is the axis the per-pixel median is parallel in.
     Each block is read with one small dask graph and reduced in memory, so the
@@ -211,11 +266,23 @@ def climatology_by_blocks(
     cache, and E3 measured 256 running 1.8x faster than any larger panel while
     producing an identical checksum.
 
+    Blocks write disjoint slices of ``ref`` and the loop body carries no
+    state, so they run in a thread pool. Reads release the GIL in GDAL and
+    the median kernel releases it in ``np.sort``, so threads overlap both
+    I/O and compute; in-flight memory is bounded at one block per worker
+    (see :func:`_unit_workers`). The serial form ran the same 324 blocks one
+    at a time on ~1 core of 8 -- that loop, not the estimator, was the
+    offset pass's wall clock.
+
     Args:
         lst: Land-masked, QA-masked stack in Celsius.
         block: I/O block edge. Defaults to the largest power of two fitting
             ``settings.destripe_unit_memory_gb``.
         panel: Compute panel edge. Defaults to ``settings.destripe_compute_panel``.
+        land_mask: Optional boolean mask on ``lst``'s spatial grid. A block
+            with no land pixel is filled with NaN and never read: its every
+            panel median would be a median of an all-NaN stack, which is NaN,
+            so the skip is value-identical and the tests hold it to that.
 
     Returns:
         ``(ref, months)`` where ``ref`` is ``(n_months, y, x)`` float32 and
@@ -233,33 +300,53 @@ def climatology_by_blocks(
     dtype = np.dtype(lst.dtype)
     scene_months = lst[_TIME_DIM].dt.month.values.astype(np.int16)
     uniq = np.unique(scene_months)
+    month_sel = [scene_months == month for month in uniq]
     ref = np.empty((uniq.size, height, width), dtype=dtype)
 
-    y_starts = range(0, height, block)
-    x_starts = range(0, width, block)
-    total = len(list(y_starts)) * len(list(x_starts))
-    done = 0
-    for y0 in range(0, height, block):
-        y1 = min(y0 + block, height)
-        for x0 in range(0, width, block):
-            x1 = min(x0 + block, width)
-            # One bounded graph per block. Everything after this is numpy.
-            data = np.asarray(
-                lst.isel({y_dim: slice(y0, y1), x_dim: slice(x0, x1)}).values,
-                dtype=dtype,
+    mask = None
+    if land_mask is not None:
+        mask = np.asarray(land_mask.values, dtype=bool)
+        if mask.shape != (height, width):
+            raise ValueError(
+                f"land_mask shape {mask.shape} does not match the stack's "
+                f"spatial grid {(height, width)}; the mask must be on the "
+                "same grid offsets are estimated on"
             )
-            for py in range(0, y1 - y0, panel):
-                py1 = min(py + panel, y1 - y0)
-                for px in range(0, x1 - x0, panel):
-                    px1 = min(px + panel, x1 - x0)
-                    tile = data[:, py:py1, px:px1]
-                    for i, month in enumerate(uniq):
-                        ref[i, y0 + py : y0 + py1, x0 + px : x0 + px1] = _panel_median(
-                            tile[scene_months == month]
-                        )
-            del data
-            done += 1
-            report_phase("destripe_climatology", blocks_done=done, blocks_total=total)
+
+    spans = [
+        (y0, min(y0 + block, height), x0, min(x0 + block, width))
+        for y0 in range(0, height, block)
+        for x0 in range(0, width, block)
+    ]
+    total = len(spans)
+    n_scenes = int(lst.sizes[_TIME_DIM])
+
+    def _one_block(span: tuple[int, int, int, int]) -> None:
+        y0, y1, x0, x1 = span
+        if mask is not None and not mask[y0:y1, x0:x1].any():
+            ref[:, y0:y1, x0:x1] = np.nan
+            return
+        # One bounded graph per block. Everything after this is numpy.
+        data = _read_values(lst.isel({y_dim: slice(y0, y1), x_dim: slice(x0, x1)}), dtype)
+        for py in range(0, y1 - y0, panel):
+            py1 = min(py + panel, y1 - y0)
+            for px in range(0, x1 - x0, panel):
+                px1 = min(px + panel, x1 - x0)
+                tile = data[:, py:py1, px:px1]
+                for i, sel in enumerate(month_sel):
+                    ref[i, y0 + py : y0 + py1, x0 + px : x0 + px1] = _panel_median(tile[sel])
+        del data
+
+    workers = _unit_workers(block * block * n_scenes * dtype.itemsize)
+    done = 0
+    progress = threading.Lock()
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_one_block, span) for span in spans]
+        for fut in as_completed(futures):
+            fut.result()
+            with progress:
+                done += 1
+                report_phase("destripe_climatology", blocks_done=done, blocks_total=total)
     return ref, uniq
 
 
@@ -292,20 +379,46 @@ def offsets_by_scene(
     scene_months = lst[_TIME_DIM].dt.month.values.astype(np.int16)
     plane = {int(m): i for i, m in enumerate(months)}
     n_scenes = int(lst.sizes[_TIME_DIM])
+    y_dim, x_dim = _spatial_dims(lst)
+    footprint = int(lst.sizes[y_dim]) * int(lst.sizes[x_dim])
 
     dtype = np.dtype(ref.dtype)
     offset = np.empty(n_scenes, dtype=dtype)
     n_valid = np.empty(n_scenes, dtype=np.int64)
 
-    for start, stop in _scene_batches(lst, batch):
-        chunk = np.asarray(lst.isel({_TIME_DIM: slice(start, stop)}).values, dtype=dtype)
+    batches = _scene_batches(lst, batch)
+
+    def _one_batch(span: tuple[int, int]) -> int:
+        start, stop = span
+        chunk = _read_values(lst.isel({_TIME_DIM: slice(start, stop)}), dtype)
         for j in range(stop - start):
             scene = chunk[j]
             anomaly = scene - ref[plane[int(scene_months[start + j])]]
             offset[start + j] = np.nanmedian(anomaly)
             n_valid[start + j] = int(np.isfinite(scene).sum())
         del chunk
-        report_phase("destripe_offsets", scenes_done=stop, scenes_total=n_scenes)
+        return stop - start
+
+    # Batches write disjoint slices of ``offset``/``n_valid`` and share only
+    # the read-only climatology, so they run in the same bounded pool shape
+    # as phase A. The unit here spans the full footprint, so on a
+    # native-resolution stack _unit_workers shrinks the count to keep
+    # in-flight memory inside the phase-A envelope.
+    max_batch = max((stop - start) for start, stop in batches)
+    workers = _unit_workers(footprint * max_batch * dtype.itemsize)
+    scenes_done = 0
+    progress = threading.Lock()
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_one_batch, span) for span in batches]
+        for fut in as_completed(futures):
+            n_done = fut.result()
+            with progress:
+                scenes_done += n_done
+                report_phase(
+                    "destripe_offsets",
+                    scenes_done=scenes_done,
+                    scenes_total=n_scenes,
+                )
 
     coord = {_TIME_DIM: lst[_TIME_DIM]}
     return (
@@ -314,7 +427,9 @@ def offsets_by_scene(
     )
 
 
-def offsets_as_units(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
+def offsets_as_units(
+    lst: xr.DataArray, *, land_mask: xr.DataArray | None = None
+) -> tuple[xr.DataArray, xr.DataArray]:
     """The two phases, run back to back. Bit-exact against :func:`offset_graph`.
 
     Equivalence is not assumed. E1 ran both forms over a real 300-scene fixture
@@ -324,7 +439,7 @@ def offsets_as_units(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
     a regression fails in CI rather than in a five-hour tile.
     """
     with timed_section("destripe_climatology"):
-        ref, months = climatology_by_blocks(lst)
+        ref, months = climatology_by_blocks(lst, land_mask=land_mask)
     try:
         with timed_section("destripe_offsets"):
             return offsets_by_scene(lst, ref, months)
@@ -333,7 +448,10 @@ def offsets_as_units(lst: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray]:
 
 
 def scene_offsets(
-    lst: xr.DataArray, *, cache: OffsetCache | None = None
+    lst: xr.DataArray,
+    *,
+    cache: OffsetCache | None = None,
+    land_mask: xr.DataArray | None = None,
 ) -> tuple[xr.DataArray, xr.DataArray]:
     """Estimate one scalar offset per scene, plus each scene's valid-pixel count.
 
@@ -347,6 +465,10 @@ def scene_offsets(
         cache: Optional :class:`~landsat_lst.offsets.OffsetCache`. A hit returns
             immediately; a miss computes and then writes. The cache never
             raises, so passing one cannot fail a tile that would have succeeded.
+        land_mask: Optional boolean mask on ``lst``'s grid, forwarded to the
+            unit form so phase A can skip blocks with no land pixel. Purely a
+            work-skip: it never changes a value, so it does not enter the
+            cache digest. The graph form ignores it.
 
     Returns:
         ``(offset, n_valid)``, both indexed on time and eagerly evaluated.
@@ -369,7 +491,7 @@ def scene_offsets(
         # against. Each phase publishes its own unit counts instead, which is
         # the more useful number anyway -- "block 44 of 81" localizes a stall
         # where a task fraction over a fused graph never could.
-        offset, n_valid = offsets_as_units(lst)
+        offset, n_valid = offsets_as_units(lst, land_mask=land_mask)
     else:
         # Both reductions read the same stack, so they are computed together:
         # two `.compute()` calls would walk it twice, and on a 5-year tile that
@@ -433,6 +555,7 @@ def seasonal_debias(
     min_offset_samples: int = 0,
     offset_source: xr.DataArray | None = None,
     cache: OffsetCache | None = None,
+    land_mask: xr.DataArray | None = None,
 ) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
     """De-bias each scene against a per-pixel monthly climatology.
 
@@ -463,6 +586,10 @@ def seasonal_debias(
             the cache returns, so sweeping a cap costs one lookup per candidate
             instead of one 27-minute pass. This is the whole point of caching
             here rather than caching ``debiased``.
+        land_mask: Optional boolean mask on the grid offsets are estimated on
+            (``offset_source``'s grid when given, else ``lst``'s). Lets the
+            unit form skip phase-A blocks with no land pixel. A work-skip
+            only; values are identical with or without it.
 
     Returns:
         ``(debiased, offset, keep)``. ``debiased`` covers only the surviving
@@ -483,7 +610,7 @@ def seasonal_debias(
         )
         raise ValueError(msg)
 
-    offset, n_valid = scene_offsets(source, cache=cache)
+    offset, n_valid = scene_offsets(source, cache=cache, land_mask=land_mask)
 
     # The sparse guard is stated on whichever grid the offset was estimated on,
     # because that is the grid the median actually rests on. See
