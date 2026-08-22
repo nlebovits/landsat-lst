@@ -18,14 +18,18 @@ the gap with NaN would turn a lost shard into a silently thinner composite.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 
 from landsat_lst import shard_tasks, shards
 from landsat_lst.config import settings
 from landsat_lst.models import ProcessingJob
+from landsat_lst.offsets import _times_iso
 from landsat_lst.shard_tasks import (
     _offset_key,
     _time_coord,
@@ -47,7 +51,9 @@ from tests.unit.shard_fixtures import (
     TILE,
     WINDOW,
     FakeFleet,
+    make_items,
     make_plan,
+    publish_legacy_plan,
     publish_plan,
     write_offset_cache,
 )
@@ -102,6 +108,12 @@ class _PeerArrivesDuringTheWait:
                 self.landed = True
                 run_climatology_shard(RUN_ID, self._plan.tile, 1, storage=self._storage)
         return self._storage.list_prefix(prefix)
+
+
+def _iso(stamps: list[str]) -> list[str]:
+    """Spell a list of timestamps exactly as a plan stores them."""
+    coord = SimpleNamespace(values=pd.to_datetime(stamps).values)
+    return [str(stamp) for stamp in _times_iso(coord)]
 
 
 def _record_phases(monkeypatch) -> list[str]:
@@ -512,6 +524,161 @@ class TestOffsetRecordWait:
         monkeypatch.setattr(storage, "read_text", read_text)
 
         assert run_composite_shard(RUN_ID, TILE, 0, storage=storage)
+
+
+class TestLegacyPlanStamps:
+    """A plan written before the nanosecond fix truncated its own time axis.
+
+    The record-side fix was not enough. ``_time_coord`` rebuilds the offset axis
+    from ``plan.scene_times``, so a legacy plan hands the join a
+    second-precision axis and the composite fails exactly as it did before --
+    which is what the packing probe hit on every arm, and what the S30W065
+    acceptance rerun would hit again, because a resume reads the legacy plan
+    rather than writing a new one.
+
+    The items were never truncated: the loss happened on the way *into* the
+    plan. That asymmetry is what makes recovery possible, and verifiable.
+    """
+
+    def test_the_axis_is_recovered_from_the_items(self, storage, plan):
+        publish_legacy_plan(storage, plan)
+
+        ctx = load_context(RUN_ID, TILE, storage=storage)
+
+        assert ctx.plan.scene_times == plan.scene_times
+        assert all("." in stamp for stamp in ctx.plan.scene_times)
+
+    def test_the_recovered_axis_joins_against_a_full_precision_stack(
+        self, storage, plan, monkeypatch
+    ):
+        """The probe's exact failure, end to end.
+
+        Before the recovery this raised ``lst carries a time step the offsets
+        do not ... ("not all values found in index 'time'")`` from
+        ``keep.sel({time: lst.time})`` -- once per composite shard, on every arm.
+        """
+        publish_legacy_plan(storage, plan)
+        _stub_native_load(monkeypatch, plan)
+        write_offset_cache(storage, plan)
+
+        written = run_composite_shard(RUN_ID, TILE, 0, storage=storage)
+
+        assert written
+
+    def test_the_digest_does_not_move(self, storage, plan):
+        """It covers the scene ids and the settings, never the stamps.
+
+        Which is what lets a legacy plan verify against a current process at
+        all -- and why the recovery needs no re-signing.
+        """
+        root = publish_legacy_plan(storage, plan)
+        stored = json.loads(storage.read_text(shards.plan_key(root)))["digest"]
+
+        ctx = load_context(RUN_ID, TILE, storage=storage)
+
+        assert ctx.plan.digest == stored
+
+    def test_an_ambiguous_truncation_is_a_hard_error(self, storage):
+        """Two *time steps* inside one second: the stored axis fits two real ones.
+
+        Nothing in the items can decide which, so this is a refusal rather than
+        a reading -- the same rule ``offsets._truncation_of`` follows.
+        """
+        crowded = replace(
+            make_plan(),
+            scene_times=_iso(
+                [
+                    "2021-07-04T13:45:12.100000",
+                    "2021-07-04T13:45:12.900000",
+                    "2021-09-03T13:45:13.482915",
+                    "2021-11-03T13:45:14.482915",
+                ]
+            ),
+        )
+        publish_legacy_plan(storage, crowded)
+
+        with pytest.raises(ValueError, match="truncates ambiguously"):
+            load_context(RUN_ID, TILE, storage=storage)
+
+    def test_extra_items_sharing_a_second_do_not_block_recovery(self, storage, plan):
+        """Which is the ordinary case, not an exotic one.
+
+        ``items.json`` holds one entry per scene and the axis one per solar-day
+        group, so adjacent WRS rows of a single overpass land seconds -- often
+        the same second -- apart. The group's timestamp is the earliest of
+        them, because odc-stac sorts each group by ``nominal_datetime`` and
+        takes the first.
+        """
+        items = make_items(plan)
+        neighbour = json.loads(json.dumps(items[0]))
+        neighbour["id"] = "scene-0-row-next"
+        first = pd.Timestamp(plan.scene_times[0])
+        neighbour["properties"]["datetime"] = (
+            first + pd.Timedelta(microseconds=250_000)
+        ).isoformat() + "Z"
+        publish_legacy_plan(storage, plan, items=[*items, neighbour])
+
+        ctx = load_context(RUN_ID, TILE, storage=storage)
+
+        assert ctx.plan.scene_times == plan.scene_times
+
+    def test_a_stamp_no_item_matches_is_a_hard_error(self, storage, plan):
+        """The plan and the item list disagree; guessing would invent an axis."""
+        wrong = make_items(plan)
+        wrong[0]["properties"]["datetime"] = "2019-01-01T00:00:00.123456Z"
+        publish_legacy_plan(storage, plan, items=wrong)
+
+        with pytest.raises(ValueError, match=r"no item in items\.json matches"):
+            load_context(RUN_ID, TILE, storage=storage)
+
+    def test_a_current_plan_is_left_alone(self, storage, plan, published, monkeypatch):
+        """The upgrade path must not touch a plan that never lost anything."""
+        from landsat_lst import shard_tasks as tasks
+
+        def explode(*args, **kwargs):
+            raise AssertionError("a full-precision plan needs no recovery")
+
+        monkeypatch.setattr(tasks, "_item_time_values", explode)
+
+        assert load_context(RUN_ID, TILE, storage=storage).plan.scene_times == plan.scene_times
+
+    def test_the_fused_offsets_stage_runs_against_a_legacy_plan(self, storage, plan, monkeypatch):
+        """The resume case: S30W065 comes back to a plan it did not just write."""
+        publish_legacy_plan(storage, plan)
+        _stub_coarse_load(monkeypatch, plan)
+        monkeypatch.setattr(settings, "shard_unit_poll_s", 0.001)
+        monkeypatch.setattr(settings, "shard_block_wait_s", 5)
+        for index in range(plan.ref_shards):
+            run_climatology_shard(RUN_ID, TILE, index, storage=storage)
+
+        key = run_offsets_stage(RUN_ID, TILE, 0, storage=storage)
+
+        assert key is not None
+        partial = json.loads(storage.read_text(key))
+        assert all("." in stamp for stamp in partial["times"])
+
+    def test_the_merge_of_legacy_partials_lands_on_the_recovered_axis(self, storage, plan):
+        """Old partials carry old stamps; the merge already tolerates that."""
+        publish_legacy_plan(storage, plan)
+        root = shards.shard_root(RUN_ID, TILE)
+        for index in range(plan.scene_shards):
+            group = offsets_group(plan, index)
+            start, stop = group[0][0], group[-1][1]
+            storage.write_text(
+                shards.scene_partial_key(root, start, stop),
+                json.dumps(
+                    {
+                        "times": [s.split(".")[0] for s in plan.scene_times[start:stop]],
+                        "offset": [0.25] * (stop - start),
+                        "n_valid": [1000] * (stop - start),
+                    }
+                ),
+            )
+
+        key = merge_offsets(RUN_ID, TILE, storage=storage)
+
+        record = json.loads(storage.read_text(key.storage_key))
+        assert record["times"] == plan.scene_times
 
 
 class TestAttemptNumbers:

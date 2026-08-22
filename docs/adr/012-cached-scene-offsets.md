@@ -126,6 +126,28 @@ the repo used whole-second timestamps, so no test could distinguish a serializer
 truncated from one that did not. Fixtures whose offsets round-trip through JSON now carry
 sub-second components.
 
+**The records were only half of it.** A sharded tile freezes its time axis in
+`plan.scene_times` too, and `shard_tasks._time_coord` rebuilds the offset axis from *that*.
+A plan written before the fix therefore hands the join a truncated axis whatever the record
+says — which is why the packing probe failed every arm after the record fix landed, and why
+the S30W065 rerun would have failed again: a resume reads the legacy plan rather than
+writing a new one.
+
+`load_context` recovers the lost fraction from `items.json`, which was never truncated: the
+loss happened on the way *into* the plan. Two properties make the recovery a derivation
+rather than a guess. `odc-stac` sets each group's coordinate to
+`group[0].nominal_datetime`, so the value is always some item's timestamp. And several
+items inside one second is the *ordinary* case, not an exotic one — `items.json` holds one
+entry per scene where the axis holds one per solar-day group, and adjacent WRS rows of one
+overpass are seconds apart — but items within a second are necessarily the same date and so
+the same group, whose representative is the earliest of them, because `odc-stac` sorts each
+group by `nominal_datetime` before taking the first. Taking the minimum is exact.
+
+What remains a hard error is ambiguity nothing can resolve: two entries in the *stored axis*
+truncating to the same second, or a stamp no item matches at all. The digest is unaffected,
+because it covers the scene ids and the settings and never the stamps — which is precisely
+what lets a legacy plan verify against a current process.
+
 **A sampled window cannot validate a rejection fraction.** 93 of 300 sampled scenes survived
 de-striping, a 69% rejection rate against 21.8% measured at Pergamino. Spreading 300 scenes
 across five years leaves each calendar month roughly 25 scenes to build its climatology
