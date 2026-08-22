@@ -368,6 +368,20 @@ class Settings(BaseSettings):
         description="Instance purchase strategy. Spot preemption is safe: "
         "tile writes are idempotent via the two-asset existence check.",
     )
+    shard_spot_policy: Literal["on-demand", "spot", "spot_with_fallback"] = Field(
+        default="spot",
+        description="Purchase strategy for shard-stage clusters, deliberately "
+        "stricter than coiled_spot_policy: no per-VM on-demand fallback. The "
+        "700-tile build's budget holds only at spot prices (measured-count "
+        "projection 2026-08-22: $1.9-4.7k spot against $6.2k on-demand, gates "
+        "<$3k target / $5k ceiling), and spot_with_fallback would let a "
+        "capacity shortfall silently convert the run to the on-demand figure. "
+        "Under 'spot' a shortfall surfaces as missing shards instead, which "
+        "the driver's bounded resubmission rounds retry and then FAIL loudly. "
+        "Preemption stays safe: shard outputs are idempotent by key. Raise to "
+        "spot_with_fallback only as an explicit per-run decision with the "
+        "exposure priced first.",
+    )
     coiled_max_workers: int = Field(
         default=4,
         description="Ceiling on VMs running batch tasks at once. Coiled gives "

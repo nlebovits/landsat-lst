@@ -559,7 +559,11 @@ def submit_shard_stage(
         "name": name,
         "region": settings.coiled_region,
         "vm_type": settings.coiled_vm_types,
-        "spot_policy": settings.coiled_spot_policy,
+        # Stricter than the tile fleet's policy on purpose: see
+        # shard_spot_policy's docstring -- a silent per-VM fallback to
+        # on-demand is the one failure mode that converts a spot-priced
+        # build into the on-demand bill without anyone deciding it.
+        "spot_policy": settings.shard_spot_policy,
         "max_workers": len(indexes),
         "max_retries": settings.coiled_retries,
         "job_timeout": settings.coiled_job_timeout,

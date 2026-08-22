@@ -1003,6 +1003,22 @@ class TestSubmitShardStage:
         assert fake_coiled["max_workers"] == 9
         assert settings.coiled_max_workers < 9
 
+    def test_shard_stages_never_fall_back_to_on_demand_silently(self, fake_coiled):
+        """The budget holds only at spot prices ($1.9-4.7k spot vs $6.2k
+        on-demand at measured counts). ``spot_with_fallback`` would let a
+        capacity shortfall convert the build to the on-demand bill with
+        nobody deciding it; under ``spot`` the shortfall surfaces as missing
+        shards, which the driver's bounded rounds retry and then fail loudly.
+        """
+        from landsat_lst.batch import submit_shard_stage
+
+        submit_shard_stage(stage="offsets", run_id="r1", tile="N40W075", indexes=[0])
+
+        assert fake_coiled["spot_policy"] == settings.shard_spot_policy
+        assert settings.shard_spot_policy == "spot"
+        # The tile fleet keeps its own policy; only shard stages tighten.
+        assert settings.coiled_spot_policy == "spot_with_fallback"
+
     def test_the_composite_stage_takes_its_own_vm_and_chunk(self, fake_coiled):
         from landsat_lst.batch import submit_shard_stage
 
