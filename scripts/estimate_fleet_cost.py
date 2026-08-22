@@ -84,7 +84,6 @@ def main() -> int:
     from landsat_lst.job import generate_jobs  # noqa: PLC0415
     from landsat_lst.projection import (  # noqa: PLC0415
         SPOT_FACTOR_RANGE,
-        VM_HOURLY_ON_DEMAND,
         tile_projection,
     )
 
@@ -92,11 +91,22 @@ def main() -> int:
     tiles = [j.tile for j in jobs]
     fractions = land_fractions(tiles)
 
+    # Measured per-tile counts when the sweep has run
+    # (scripts/count_scenes_per_tile.py); the latitude interpolation is the
+    # fallback and is known bad per-tile (S30W065: predicted ~2,900,
+    # measured 4,403).
+    counts_path = HERE.parent / "results" / "probe" / "scene_counts.json"
+    measured: dict[str, int] = {}
+    if counts_path.exists():
+        measured = {k: v for k, v in json.loads(counts_path.read_text()).items() if v > 0}
+        print(f"using measured scene counts for {len(measured)} tiles")
+
     rows = []
     for tile in tiles:
         _w, s, _e, n = tile.bbox
         lat_c = (s + n) / 2
-        p = tile_projection(scenes=scenes_for(lat_c), land_fraction=fractions[tile.name])
+        n_scenes = measured.get(tile.name) or scenes_for(lat_c)
+        p = tile_projection(scenes=n_scenes, land_fraction=fractions[tile.name])
         rows.append(
             {
                 "tile": tile.name,
@@ -112,7 +122,8 @@ def main() -> int:
         )
 
     total_vm_h = sum(r["vm_hours"] for r in rows)
-    total_od = total_vm_h * VM_HOURLY_ON_DEMAND
+    # Per-tile costs already price each phase at its own VM type.
+    total_od = sum(r["cost_on_demand"] for r in rows)
     spot_lo = total_od * SPOT_FACTOR_RANGE[0]
     spot_hi = total_od * SPOT_FACTOR_RANGE[1]
     worst = max(rows, key=lambda r: r["vm_hours"])

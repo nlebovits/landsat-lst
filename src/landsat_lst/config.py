@@ -444,15 +444,20 @@ class Settings(BaseSettings):
         "(shard_composite_chunk) describes a known core count.",
     )
     shard_composite_chunk: int = Field(
-        default=1024,
+        default=512,
         ge=64,
         description="Spatial chunk edge a composite shard loads at, overriding "
-        "load_chunk_size. A whole-tile composite stops at 512 because the "
-        "single-time-chunk rechunk holds chunk^2 * scenes * 4 B (3.1 GB at 512 "
-        "over 2,930 scenes, 12.3 GB at 1024). A row band holds a fraction of "
-        "the rows, so the same per-task working set buys the larger request the "
-        "2026-08-21 probe measured as THE throughput lever. Applied by every "
-        "shard process AND by the planner, so the plan digest -- which covers "
+        "load_chunk_size. 512, not 1024: the old 1024 rationale assumed a row "
+        "band's time axis shrinks with its rows, and it does not -- odc-stac "
+        "prunes chunk reads spatially but never thins the time axis, and ~90% "
+        "of solar-day groups touch every band (measured on S30W065's 1,031 "
+        "steps). At 1024 the rechunk task holds 4.32 GB and 16 threads want "
+        "69 GB on a 64 GiB VM. The 2026-08-22 packing probe measured the real "
+        "composite at chunk 512: ~34 GB peak VmHWM per shard, 45.5 MB/s "
+        "decoded, 44% headroom on m6i.4xlarge -- and showed a second shard "
+        "OOMs, which is also why intra-VM packing was rejected "
+        "(results/probe/composite_packing.json). Applied by every shard "
+        "process AND by the planner, so the plan digest -- which covers "
         "load_chunk_size -- agrees across all of them.",
     )
     shard_export_disk_gb: int = Field(

@@ -41,7 +41,7 @@ from landsat_lst.config import settings
 #:   sharded land-tile run calibrates it.
 PROBE_AS_OF = "2026-08-21"
 R_OFFSETS_MB_S = 140.0  # r6i.2xlarge, chunk 1024, 8 io threads; ladder v3
-R_COMPOSITE_MB_S = 150.0  # m6i.4xlarge, native, chunk 1024; land-discounted
+R_COMPOSITE_MB_S = 45.5  # m6i.4xlarge, native chunk 512; packing probe, real composite
 
 #: Phase budgets inside the 60-minute tile (the rest is setup + export).
 OFFSET_BUDGET_MIN = 15.0
@@ -133,9 +133,17 @@ def tile_projection(
         n_vms_offsets=round(n_off, 1),
         n_vms_composite=round(n_comp, 1),
         meets_60min_single_vm=(off_h + comp_h) <= 1.0,
-        cost_on_demand_usd=round(vm_hours * VM_HOURLY_ON_DEMAND, 2),
+        # Each phase at its own VM price: offsets on r6i.2xlarge, composite
+        # on m6i.4xlarge (the frozen Stage-3 fleet).
+        cost_on_demand_usd=round(off_h * VM_HOURLY_ON_DEMAND + comp_h * VM_HOURLY_COMPOSITE, 2),
         cost_spot_usd_range=(
-            round(vm_hours * VM_HOURLY_ON_DEMAND * SPOT_FACTOR_RANGE[0], 2),
-            round(vm_hours * VM_HOURLY_ON_DEMAND * SPOT_FACTOR_RANGE[1], 2),
+            round(
+                (off_h * VM_HOURLY_ON_DEMAND + comp_h * VM_HOURLY_COMPOSITE) * SPOT_FACTOR_RANGE[0],
+                2,
+            ),
+            round(
+                (off_h * VM_HOURLY_ON_DEMAND + comp_h * VM_HOURLY_COMPOSITE) * SPOT_FACTOR_RANGE[1],
+                2,
+            ),
         ),
     )
