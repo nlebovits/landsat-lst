@@ -160,6 +160,7 @@ class FakeFleet:
         run_id: str = RUN_ID,
         never: set | None = None,
         heal: bool = False,
+        claims_export: bool = True,
     ) -> None:
         self.storage = storage
         self.plan = plan
@@ -175,12 +176,23 @@ class FakeFleet:
         #: Every cluster name this fleet was asked to start, in order. A round
         #: that reused a previous round's name is what Coiled refuses outright.
         self.names: list[str] = []
+        #: Scene partials present at each call, to pin the overlap's ordering.
+        self.partials_at_call: list[int] = []
+        #: Whether a composite worker claims the export once every band exists,
+        #: as :func:`landsat_lst.shard_tasks.claim_export` does. ``False`` plays
+        #: the VM that was preempted between claiming and running.
+        self.claims_export = claims_export
 
-    def __call__(self, *, stage, run_id, tile, indexes, job=None, submission_round=1):
+    def __call__(self, *, stage, run_id, tile, indexes, job=None, units=None, submission_round=1):
         from landsat_lst.batch import stage_cluster_name
 
         self.calls.append((stage, list(indexes)))
         self.names.append(stage_cluster_name(run_id, tile, stage, submission_round))
+        # How much of phase B existed when this fleet was asked for. The overlap
+        # is only worth anything if the composite starts *before* the offsets
+        # stage finishes, and a fleet that started after would still produce a
+        # correct tile -- so the ordering has to be recorded, not inferred.
+        self.partials_at_call.append(len(self.storage.list_prefix(f"{self.root}/offsets/scene/")))
         for index in indexes:
             if (stage, index) in self.never:
                 if self.heal:
@@ -203,16 +215,46 @@ class FakeFleet:
             publish_plan(self.storage, self.plan, run_id=self.run_id)
             return
         if stage == "export":
-            for product in PRODUCTS:
-                self.storage.write_text(
-                    self.storage.cog_key(self.plan.window, self.plan.tile, product), "tif"
-                )
+            self._write_cogs()
             return
         if stage == "offsets":
-            self._write_partial(index)
+            # Fused: shard 0 resolves before anyone reduces anything, every
+            # shard publishes its blocks, and then its scene partial.
+            publish_plan(self.storage, self.plan, run_id=self.run_id)
+            if index < self.plan.ref_shards:
+                for key in _expected_keys(self.plan, "climatology", self.root)[index]:
+                    self.storage.write_text(key, "")
+            if index < self.plan.scene_shards:
+                self._write_partial(index)
             return
+
         for key in _expected_keys(self.plan, stage, self.root)[index]:
             self.storage.write_text(key, "")
+
+        if stage == "composite" and self.claims_export:
+            self._maybe_claim_export()
+
+    def _write_cogs(self) -> None:
+        for product in PRODUCTS:
+            self.storage.write_text(
+                self.storage.cog_key(self.plan.window, self.plan.tile, product), "tif"
+            )
+
+    def _maybe_claim_export(self) -> None:
+        """What ``claim_export`` does: the last band written runs the export."""
+        present = set(self.storage.list_prefix(f"{self.root}/composite/"))
+        wanted = {
+            key
+            for index in range(len(self.plan.bands))
+            for key in _expected_keys(self.plan, "composite", self.root)[index]
+        }
+        if wanted - present:
+            return
+        claim = shards.export_claim_key(self.root)
+        if self.storage.read_text(claim) is not None:
+            return
+        self.storage.write_text(claim, json.dumps({"tile": self.plan.tile}))
+        self._write_cogs()
 
     def all_indexes(self, stage: str) -> list[int]:
         """Every shard index this stage has, from the plan."""
@@ -288,16 +330,38 @@ class LandsOnPoll:
         "climatology": "offsets/ref/",
         "offsets": "offsets/scene/",
         "composite": "composite/",
+        # The export's artifacts are the COGs, which live outside the shard
+        # prefix entirely -- completion is the canonical key, unchanged.
+        "export": None,  # type: ignore[dict-item]
     }
 
-    def __init__(self, storage, plan, stage, *, after: int = 2, run_id: str = RUN_ID) -> None:
+    def __init__(
+        self,
+        storage,
+        plan,
+        stage,
+        *,
+        after: int = 2,
+        when=None,
+        run_id: str = RUN_ID,
+    ) -> None:
         self._storage = storage
         self._plan = plan
         self._stage = stage
         self._after = after
+        #: Land on a *condition* rather than a poll count. Counting polls is
+        #: brittle once several helpers list the same prefix; a condition says
+        #: what the test means -- "this stage finishes only after that happened"
+        #: -- and makes the run deadlock if it never does.
+        self._when = when
         self._run_id = run_id
         self._landed = False
-        self._watched = f"{shards.shard_root(run_id, plan.tile)}/{self.PREFIXES[stage]}"
+        suffix = self.PREFIXES[stage]
+        self._watched = (
+            storage.cog_key(plan.window, plan.tile, PRODUCTS[0]).rsplit("/", 1)[0] + "/"
+            if suffix is None
+            else f"{shards.shard_root(run_id, plan.tile)}/{suffix}"
+        )
         #: Listings of the watched prefix, so a test can show the watch polled.
         self.polls = 0
 
@@ -309,7 +373,8 @@ class LandsOnPoll:
             return self._storage.list_prefix(prefix)
 
         self.polls += 1
-        if self.polls >= self._after and not self._landed:
+        ready = self._when() if self._when is not None else self.polls >= self._after
+        if ready and not self._landed:
             self._landed = True
             fleet = FakeFleet(self._storage, self._plan, run_id=self._run_id)
             fleet(

@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -144,12 +145,14 @@ class ShardContext:
         plan: shards.TilePlan,
         items: list,
         job: ProcessingJob,
+        run_id: str,
         root: str,
         storage: StorageBackend,
     ) -> None:
         self.plan = plan
         self.items = items
         self.job = job
+        self.run_id = run_id
         self.root = root
         self.storage = storage
 
@@ -191,6 +194,7 @@ def load_context(run_id: str, tile: str, *, storage: StorageBackend | None = Non
         plan=plan,
         items=items_from_dicts(json.loads(raw_items)),
         job=job_for_window(tile, plan.window),
+        run_id=run_id,
         root=root,
         storage=storage,
     )
@@ -201,10 +205,47 @@ def load_context(run_id: str, tile: str, *, storage: StorageBackend | None = Non
 # --------------------------------------------------------------------------
 
 
+def wait_for_key(
+    storage: StorageBackend,
+    key: str,
+    *,
+    timeout_s: float,
+    what: str,
+    poll_s: float | None = None,
+) -> bool:
+    """Poll for one object, in a process that is already booted.
+
+    The consolidation's whole premise: a booted VM waiting is cheap, and a
+    fleet booting again is not. Offsets-side shards computed ~6 minutes each
+    while their stages held fleets ~30, so every wait here replaces a boot.
+
+    Bounded, and loud when it expires. An unbounded wait would turn a stage
+    whose predecessor died into a fleet idling until ``coiled_job_timeout`` --
+    the same "fails as a hang" shape the backend mismatch had.
+
+    Returns:
+        Whether the key appeared before the deadline.
+    """
+    poll = settings.shard_unit_poll_s if poll_s is None else poll_s
+    deadline = time.time() + timeout_s
+    waited = 0.0
+    while True:
+        if storage.read_text(key) is not None:
+            if waited:
+                log.info("shard_wait_satisfied", what=what, key=key, waited_s=round(waited, 1))
+            return True
+        if time.time() >= deadline:
+            log.warning("shard_wait_expired", what=what, key=key, timeout_s=timeout_s)
+            return False
+        time.sleep(poll)
+        waited += poll
+
+
 def resolve_tile_plan(
     job: ProcessingJob,
     run_id: str,
     *,
+    units: int | None = None,
     storage: StorageBackend | None = None,
 ) -> shards.TilePlan:
     """Query the catalog once for the whole tile and freeze where it is cut.
@@ -271,6 +312,9 @@ def resolve_tile_plan(
         blocks=len(blocks),
         scene_batches=len(scene_batches),
         block_rows=native_shape[0] // settings.cog_blocksize,
+        # The offsets-side widths are the fused fleet's width, which the driver
+        # fixed before this plan existed. See stage_shard_counts.
+        units=units,
     )
 
     from landsat_lst.offsets import _times_iso  # noqa: PLC0415
@@ -351,6 +395,7 @@ def run_climatology_shard(
     index: int,
     *,
     storage: StorageBackend | None = None,
+    ctx: ShardContext | None = None,
 ) -> list[str]:
     """Reduce this shard's blocks of the 12-month climatology and publish them.
 
@@ -364,7 +409,7 @@ def run_climatology_shard(
     Returns:
         The keys written, which is empty when they all already existed.
     """
-    ctx = load_context(run_id, tile, storage=storage)
+    ctx = ctx or load_context(run_id, tile, storage=storage)
     start, group = climatology_group(ctx.plan, index)
 
     wanted = {}
@@ -474,6 +519,7 @@ def run_offsets_shard(
     index: int,
     *,
     storage: StorageBackend | None = None,
+    ctx: ShardContext | None = None,
 ) -> str | None:
     """Estimate this shard's scenes' offsets against the assembled climatology.
 
@@ -484,7 +530,7 @@ def run_offsets_shard(
     Returns:
         The key written, or ``None`` when it already existed.
     """
-    ctx = load_context(run_id, tile, storage=storage)
+    ctx = ctx or load_context(run_id, tile, storage=storage)
     group = offsets_group(ctx.plan, index)
     key = shards.scene_partial_key(ctx.root, group[0][0], group[-1][1])
 
@@ -505,6 +551,165 @@ def run_offsets_shard(
     ctx.storage.write_text(key, json.dumps(partial_payload(offset, n_valid)))
     log.info("shard_done", stage="offsets", tile=tile, index=index, scenes=scenes, key=key)
     return key
+
+
+def _block_keys(plan: shards.TilePlan, root: str) -> list[str]:
+    """Every phase-A artifact the tile expects, land block or ocean marker."""
+    return [
+        shards.ref_block_key(root, i) if has_land else shards.ref_marker_key(root, i)
+        for i, has_land in enumerate(plan.block_has_land)
+    ]
+
+
+def wait_for_blocks(ctx: ShardContext, *, timeout_s: float | None = None) -> bool:
+    """Poll until every peer's climatology block has landed.
+
+    The in-process phase-A barrier. Phase B measures each scene against the
+    *whole* climatology, so it cannot start on a partial one -- but the process
+    holding that requirement is already booted, and a second fleet exists only
+    to re-establish that fact. Waiting here costs time; a separate stage costs
+    time *and* a boot per shard.
+
+    One listing per poll rather than one read per block: a production tile has
+    324 of these.
+
+    Returns:
+        Whether every block appeared before the deadline.
+    """
+    limit = settings.shard_block_wait_s if timeout_s is None else timeout_s
+    wanted = set(_block_keys(ctx.plan, ctx.root))
+    deadline = time.time() + limit
+    while True:
+        present = ctx.keys("offsets/ref/")
+        missing = wanted - present
+        report_phase(
+            "shard_barrier_wait",
+            blocks_done=len(wanted) - len(missing),
+            blocks_total=len(wanted),
+        )
+        if not missing:
+            return True
+        if time.time() >= deadline:
+            log.warning(
+                "shard_block_barrier_expired",
+                tile=ctx.tile,
+                missing=len(missing),
+                total=len(wanted),
+                first=sorted(missing)[0],
+            )
+            return False
+        time.sleep(settings.shard_unit_poll_s)
+
+
+def run_offsets_stage(
+    run_id: str,
+    tile: str,
+    index: int,
+    *,
+    job: ProcessingJob | None = None,
+    units: int | None = None,
+    storage: StorageBackend | None = None,
+) -> str | None:
+    """The whole offsets side of a tile, on one VM, in one boot.
+
+    Resolve, climatology, phase-A barrier, per-scene offsets -- four things
+    that used to be three fleets and are now four sub-phases of one task. The
+    measurement that forced it: an offsets-side shard computed for about six
+    minutes while its stage held a fleet for about thirty. Boots and queueing
+    dominated, and every barrier between those stages was paid for twice, once
+    in the driver's poll and once in the next fleet's boot.
+
+    What each shard does, by index:
+
+    - **Shard 0 resolves.** It runs the one STAC query and publishes
+      ``items.json`` and ``plan.json``. Exactly one process may do this: two
+      would resolve two scene sets from a live catalog and the tile would be
+      assembled from both.
+    - **Every shard waits for that plan**, bounded. This is the barrier that
+      used to be a whole stage boundary.
+    - **Every shard reduces its climatology blocks**, then waits at the
+      in-process phase-A barrier for its peers'.
+    - **Every shard estimates its scenes' offsets.**
+
+    A shard whose index falls past a phase's clamped shard count has nothing to
+    do in that phase and says so rather than failing: the fleet's width is
+    fixed before the plan exists, so it can exceed the work the tile holds.
+
+    Every sub-phase still checks its own outputs first, so a retried fused task
+    skips what it already finished -- the resolve is a plan read, the blocks it
+    published are skipped, and it goes straight back to where it died.
+
+    Returns:
+        The scene-partial key this shard wrote, or ``None`` when it had none to
+        write or it already existed.
+
+    Raises:
+        RuntimeError: If the plan or the phase-A barrier never arrives.
+    """
+    storage = storage or get_storage()
+    root = shards.shard_root(run_id, tile)
+
+    # Only when there is no plan yet. A retry of shard 0, and every shard of a
+    # resumed run, finds one already there and must not need the job to reach
+    # its own work -- a resume rebuilds the tile from the plan precisely so it
+    # never resolves a second scene set.
+    if index == 0 and storage.read_text(shards.plan_key(root)) is None:
+        if job is None:
+            msg = (
+                f"no plan for {tile} and no job to resolve one from; shard 0 of the "
+                "offsets stage carries the window, and this invocation did not"
+            )
+            raise ValueError(msg)
+        with timed_section("shard_resolve"):
+            resolve_tile_plan(job, run_id, units=units, storage=storage)
+
+    with timed_section("shard_plan_wait"):
+        if not wait_for_key(
+            storage,
+            shards.plan_key(root),
+            timeout_s=settings.shard_plan_wait_s,
+            what="tile plan",
+        ):
+            msg = (
+                f"no plan for {tile} at {shards.plan_key(root)} after "
+                f"{settings.shard_plan_wait_s}s; shard 0 never published one"
+            )
+            raise RuntimeError(msg)
+
+    ctx = load_context(run_id, tile, storage=storage)
+
+    if index < ctx.plan.ref_shards:
+        run_climatology_shard(run_id, tile, index, storage=storage, ctx=ctx)
+    else:
+        log.info(
+            "shard_phase_skipped",
+            stage="climatology",
+            tile=tile,
+            index=index,
+            shards=ctx.plan.ref_shards,
+            note="fleet is wider than the work",
+        )
+
+    with timed_section("shard_barrier_wait"):
+        if not wait_for_blocks(ctx):
+            msg = (
+                f"the phase-A climatology for {tile} is incomplete after "
+                f"{settings.shard_block_wait_s}s; a peer never published its blocks"
+            )
+            raise RuntimeError(msg)
+
+    if index >= ctx.plan.scene_shards:
+        log.info(
+            "shard_phase_skipped",
+            stage="offsets",
+            tile=tile,
+            index=index,
+            shards=ctx.plan.scene_shards,
+            note="fleet is wider than the work",
+        )
+        return None
+
+    return run_offsets_shard(run_id, tile, index, storage=storage, ctx=ctx)
 
 
 def merge_offsets(
@@ -576,13 +781,35 @@ def _tile_offsets(ctx: ShardContext) -> tuple[xr.DataArray, xr.DataArray]:
     reading on a thinned axis would miss and silently re-estimate per band --
     a different reference climatology and a seam at every boundary.
     ``debias_with_offsets`` then joins the estimate to the band by coordinate.
+
+    **Waits rather than refuses.** The driver starts the composite fleet while
+    phase B is still running (``shard_composite_overlap``), precisely so these
+    VMs boot on somebody else's time. A shard that refused on arrival would
+    burn the boot the overlap exists to save, so it polls to
+    ``shard_offsets_record_wait_s`` instead -- and then fails loudly, because
+    waiting forever is the hang shape this project keeps paying for.
     """
-    cache = OffsetCache(storage=ctx.storage, key=_offset_key(ctx.plan))
+    key = _offset_key(ctx.plan)
+    with timed_section("shard_offsets_wait"):
+        found = wait_for_key(
+            ctx.storage,
+            key.storage_key,
+            timeout_s=settings.shard_offsets_record_wait_s,
+            what="merged offsets",
+        )
+    if not found:
+        msg = (
+            f"no merged offsets for {ctx.tile} at {key.storage_key} after "
+            f"{settings.shard_offsets_record_wait_s}s; the offsets stage never merged"
+        )
+        raise FileNotFoundError(msg)
+
+    cache = OffsetCache(storage=ctx.storage, key=key)
     hit = cache.read(_time_coord(ctx.plan))
     if hit is None:
         msg = (
-            f"no merged offsets for {ctx.tile} at {_offset_key(ctx.plan).storage_key}; "
-            "the offsets stage has not been merged"
+            f"the merged offsets for {ctx.tile} at {key.storage_key} do not cover "
+            "the planned time axis"
         )
         raise FileNotFoundError(msg)
     return hit
@@ -665,7 +892,70 @@ def run_composite_shard(
         shutil.rmtree(scratch, ignore_errors=True)
 
     log.info("shard_done", stage="composite", tile=tile, index=index, rows=(start, stop))
+
+    claim_export(ctx, index)
     return list(keys.values())
+
+
+def claim_export(ctx: ShardContext, index: int) -> bool:
+    """Run the export here if this worker wrote the last band.
+
+    The export is one task at the end of a wide stage. Submitting it as its own
+    fleet costs a whole VM boot -- and a queue wait, and a plan read -- to do a
+    merge that the worker which just finished the last band is already booted
+    and warm for.
+
+    **The claim is not a lock.** The export is idempotent at the canonical COG
+    keys, so two workers racing produce the same two objects: a lost race costs
+    duplicated work, never a corrupted tile. That is why this is a plain write
+    with no compare-and-set. S3 offers none, and synthesizing one out of
+    listings would add a failure mode to save a few minutes of one VM. The
+    claim makes duplication rare; the driver's fallback covers a claim that is
+    written and never executed, because the claiming VM was preempted.
+
+    Never fails the shard. Its bands are already published, which is what the
+    shard was for; an export that does not happen here happens in the fallback.
+
+    Returns:
+        Whether this worker ran the export.
+    """
+    try:
+        bands = {
+            shards.band_key(ctx.root, product, i)
+            for product in PRODUCTS
+            for i in range(len(ctx.plan.bands))
+        }
+        if bands - ctx.keys("composite/"):
+            return False
+
+        claim = shards.export_claim_key(ctx.root)
+        if ctx.storage.read_text(claim) is not None:
+            log.info("shard_export_already_claimed", tile=ctx.tile, index=index)
+            return False
+
+        ctx.storage.write_text(
+            claim,
+            json.dumps(
+                {
+                    "tile": ctx.tile,
+                    "claimed_by_band": index,
+                    "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+            ),
+        )
+        log.info("shard_export_claimed", tile=ctx.tile, index=index)
+    except Exception as e:  # pragma: no cover - claiming never fails a shard
+        log.warning("shard_export_claim_failed", tile=ctx.tile, index=index, error=str(e))
+        return False
+
+    try:
+        run_export_merge(ctx.run_id, ctx.tile, storage=ctx.storage)
+    except Exception as e:
+        # The driver's fallback exists for exactly this. Failing the shard now
+        # would also fail its bands, which are already in the bucket and fine.
+        log.warning("shard_export_failed", tile=ctx.tile, index=index, error=str(e))
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -802,6 +1092,7 @@ def run_shard(
     index: int,
     *,
     job: ProcessingJob | None = None,
+    units: int | None = None,
     storage: StorageBackend | None = None,
 ) -> Any:
     """Run one shard as a batch task, with its log and its heartbeat.
@@ -822,8 +1113,11 @@ def run_shard(
         index: Which shard of the stage. Always 0 for ``resolve`` and
             ``export``, which are single tasks; passed anyway so every stage has
             one command shape.
-        job: The job to resolve, required by ``resolve`` and unused elsewhere
-            (every other stage reads the window from the plan).
+        job: The job to resolve. Required by ``resolve`` and by shard 0 of the
+            fused ``offsets`` stage, which resolves before it reduces; unused
+            elsewhere, since every other stage reads the window from the plan.
+        units: The fused offsets fleet's width, which the plan is cut to. Only
+            the shard that writes the plan reads it.
         storage: Backend. Defaults to the configured one.
 
     Returns:
@@ -859,7 +1153,7 @@ def run_shard(
             )
         )
         report_phase(f"shard_{stage}")
-        return _dispatch(stage, run_id, tile, index, job=job, storage=storage)
+        return _dispatch(stage, run_id, tile, index, job=job, units=units, storage=storage)
 
 
 def _heartbeat_job(storage: StorageBackend, root: str, tile: str) -> ProcessingJob:
@@ -891,17 +1185,20 @@ def _dispatch(
     index: int,
     *,
     job: ProcessingJob | None,
+    units: int | None,
     storage: StorageBackend | None,
 ) -> Any:
     if stage == "resolve":
         if job is None:
             msg = "the resolve stage needs the job it is resolving"
             raise ValueError(msg)
-        return resolve_tile_plan(job, run_id, storage=storage)
+        return resolve_tile_plan(job, run_id, units=units, storage=storage)
     if stage == "climatology":
         return run_climatology_shard(run_id, tile, index, storage=storage)
     if stage == "offsets":
-        return run_offsets_shard(run_id, tile, index, storage=storage)
+        # Fused: resolve (shard 0), climatology, phase-A barrier, offsets. One
+        # fleet, one boot. See run_offsets_stage.
+        return run_offsets_stage(run_id, tile, index, job=job, units=units, storage=storage)
     if stage == "composite":
         return run_composite_shard(run_id, tile, index, storage=storage)
     if stage == "export":

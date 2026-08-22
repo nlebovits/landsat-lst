@@ -1911,6 +1911,12 @@ def _shard_stage_command(stage: str, needs_job: bool = False):
     def decorator(func):
         func = click.option("--index", type=int, default=0, help="Which shard of this stage")(func)
         if needs_job:
+            func = click.option(
+                "--units",
+                type=int,
+                default=None,
+                help="Fused offsets fleet width the plan is cut to",
+            )(func)
             func = click.option("--max-scenes", type=int, default=None)(func)
             func = click.option("--end-year", type=int, default=None)(func)
             func = click.option("-y", "--year", type=int, default=None)(func)
@@ -1929,13 +1935,14 @@ def shard_resolve(
     year: int | None,
     end_year: int | None,
     max_scenes: int | None,
+    units: int | None,
     index: int,
 ) -> None:
     """Query the catalog once and freeze where this tile is cut."""
     from landsat_lst.shard_tasks import run_shard
 
     job = _shard_job(tile, year, end_year, max_scenes)
-    plan = run_shard("resolve", run_id, tile, index, job=job)
+    plan = run_shard("resolve", run_id, tile, index, job=job, units=units)
     console.print(
         f"planned {tile}: {len(plan.scene_ids)} scenes, {len(plan.blocks)} blocks, "
         f"{plan.ref_shards}/{plan.scene_shards}/{len(plan.bands)} shards, digest {plan.digest}"
@@ -1951,13 +1958,29 @@ def shard_climatology(*, run_id: str, tile: str, index: int) -> None:
     console.print(f"{tile} climatology shard {index}: {len(written)} block(s)")
 
 
-@_shard_stage_command("offsets")
-def shard_offsets(*, run_id: str, tile: str, index: int) -> None:
-    """Estimate this shard's scenes' offsets against the merged climatology."""
+@_shard_stage_command("offsets", needs_job=True)
+def shard_offsets(
+    *,
+    run_id: str,
+    tile: str,
+    year: int | None,
+    end_year: int | None,
+    max_scenes: int | None,
+    units: int | None,
+    index: int,
+) -> None:
+    """The whole offsets side of a tile: resolve, climatology, barrier, offsets.
+
+    One fleet, one boot. Shard 0 resolves; every shard then waits for that plan,
+    reduces its climatology blocks, waits at the in-process phase-A barrier, and
+    estimates its scenes' offsets. The window arguments are needed only by shard
+    0, and reach every shard because one command shape is cheaper than two.
+    """
     from landsat_lst.shard_tasks import run_shard
 
-    key = run_shard("offsets", run_id, tile, index)
-    console.print(f"{tile} offsets shard {index}: {key or 'already published'}")
+    job = _shard_job(tile, year, end_year, max_scenes)
+    key = run_shard("offsets", run_id, tile, index, job=job, units=units)
+    console.print(f"{tile} offsets shard {index}: {key or 'nothing to publish'}")
 
 
 @_shard_stage_command("composite")

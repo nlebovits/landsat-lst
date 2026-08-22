@@ -29,7 +29,17 @@ def _restore_shard_settings():
 
 @pytest.fixture
 def fast_barriers(monkeypatch):
-    """No sleeping and no waiting: a fake fleet finishes before the first poll."""
+    """No sleeping and no waiting: a fake fleet finishes before the first poll.
+
+    ``shard_offset_vms`` is pinned to the fused fleet width the shard fixtures'
+    plan is cut for. The driver fixes that width before any plan exists, so a
+    fleet wider than the fixture would ask for shard indexes the plan has no
+    work for -- which is legal in production (those shards skip) and only
+    confusing in a test.
+    """
     monkeypatch.setattr(settings, "shard_barrier_timeout_s", 0)
     monkeypatch.setattr(settings, "shard_driver_poll_s", 0.001)
     monkeypatch.setattr(settings, "shard_barrier_rounds", 2)
+    monkeypatch.setattr(settings, "shard_unit_poll_s", 0.001)
+    monkeypatch.setattr(settings, "shard_offset_vms", 2)
+    monkeypatch.setattr(settings, "shard_export_claim_fallback_s", 0)
