@@ -637,3 +637,122 @@ class TestSampledRunsProfileThemselves:
         self._run(runner, "--max-scenes", "300")
 
         assert profile_off.profile_dask_cache is False
+
+
+@pytest.fixture
+def s3_backend(monkeypatch):
+    """The only backend the driver will submit Coiled work against."""
+    from landsat_lst.config import settings
+
+    monkeypatch.setattr(settings, "storage_backend", "s3")
+
+
+class TestShardGroup:
+    """The two commands a person runs, and the five a VM runs."""
+
+    def test_every_stage_is_reachable(self, runner):
+        from landsat_lst.shards import STAGES
+
+        result = runner.invoke(main, ["shard", "--help"])
+
+        assert result.exit_code == 0
+        for stage in (*STAGES, "process", "resume"):
+            assert stage in result.output
+
+    def test_a_local_backend_fails_before_a_run_id_is_printed(self, runner, monkeypatch):
+        """The acceptance run printed one and then hung: the driver polled the
+        laptop while the VMs wrote S3. A resume hint for a run that never
+        started is worse than no output at all.
+        """
+        from landsat_lst.config import settings
+
+        monkeypatch.setattr(settings, "storage_backend", "local")
+
+        result = runner.invoke(main, ["shard", "process", "--tile", "N40W075"])
+
+        assert result.exit_code != 0
+        assert "LST_STORAGE_BACKEND=s3" in result.output
+        assert "shard resume" not in result.output
+
+    def test_process_prints_the_resume_line_before_it_starts(self, runner, s3_backend):
+        """The run id is the only thing a resume needs, so it is printed first.
+
+        A driver killed mid-run is ordinary; a driver whose run id was never
+        shown leaves a bucket full of shards nothing can pick up.
+        """
+        summary = _shard_summary()
+        with patch("landsat_lst.shard_driver.drive_tile", return_value=summary) as drive:
+            result = runner.invoke(main, ["shard", "process", "--tile", "N40W075"])
+
+        assert result.exit_code == 0
+        assert "shard resume" in result.output
+        assert drive.call_args.kwargs["run_id"] in result.output
+
+    def test_a_stage_that_never_finished_fails_the_command(self, runner, s3_backend):
+        from landsat_lst.shard_driver import ShardStageFailed
+
+        with patch(
+            "landsat_lst.shard_driver.drive_tile",
+            side_effect=ShardStageFailed("composite", ["_shards/r/N40W075/composite/x.tif"]),
+        ):
+            result = runner.invoke(main, ["shard", "process", "--tile", "N40W075"])
+
+        assert result.exit_code != 0
+        assert "composite" in result.output
+
+    def test_resume_takes_a_run_id_and_a_tile_and_nothing_else(self, runner):
+        summary = _shard_summary()
+        with patch("landsat_lst.shard_driver.resume_tile", return_value=summary) as resume:
+            result = runner.invoke(main, ["shard", "resume", "run-7", "N40W075"])
+
+        assert result.exit_code == 0
+        assert resume.call_args.args == ("run-7", "N40W075")
+
+    def test_a_stage_subcommand_forwards_its_index(self, runner):
+        with patch("landsat_lst.shard_tasks.run_shard", return_value=[]) as run_shard:
+            result = runner.invoke(
+                main,
+                ["shard", "composite", "--run-id", "r", "--tile", "N40W075", "--index", "3"],
+            )
+
+        assert result.exit_code == 0
+        assert run_shard.call_args.args == ("composite", "r", "N40W075", 3)
+
+    def test_resolve_forwards_the_window_it_was_given(self, runner):
+        from landsat_lst.shards import TilePlan
+
+        plan = TilePlan(
+            tile="N40W075",
+            window="2024",
+            scene_ids=["a"],
+            scene_times=["2024-07-04T00:00:00"],
+            offset_factor=2,
+            coarse_shape=(8, 8),
+            native_shape=(1024, 1024),
+            block_edge=4,
+            blocks=[(0, 4, 0, 4)],
+            block_has_land=[True],
+            scene_batches=[(0, 1)],
+            bands=[(0, 1024)],
+        )
+        with patch("landsat_lst.shard_tasks.run_shard", return_value=plan) as run_shard:
+            result = runner.invoke(
+                main,
+                ["shard", "resolve", "--run-id", "r", "--tile", "N40W075", "--year", "2024"],
+            )
+
+        assert result.exit_code == 0
+        assert run_shard.call_args.kwargs["job"].year == 2024
+        assert run_shard.call_args.kwargs["job"].end_year is None
+
+
+def _shard_summary():
+    from landsat_lst.shard_driver import StageOutcome, TileRunSummary
+
+    return TileRunSummary(
+        run_id="run-7",
+        tile="N40W075",
+        window="2021-2025",
+        stages=[StageOutcome("resolve", 1, 0, 1, 3.0)],
+        completed=True,
+    )

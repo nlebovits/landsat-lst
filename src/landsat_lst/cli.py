@@ -1801,5 +1801,182 @@ def catalog_publish(path: Path, remote: str, dry_run: bool, profile: str | None)
     console.print(f"  Bytes:    {summary.uploaded_bytes}")
 
 
+@main.group("shard")
+def shard() -> None:
+    """One tile across many VMs: the local driver, and the shard tasks it starts.
+
+    ``process`` and ``resume`` are the two a person runs. The five stage
+    subcommands are what a Coiled Batch task runs on a VM; they take a shard
+    index and are not meant to be typed, though running one by hand is a
+    legitimate way to reproduce a failed shard.
+    """
+
+
+def _shard_job(tile: str, year: int | None, end_year: int | None, max_scenes: int | None):
+    """One job, through the same window defaulting every other command uses."""
+    jobs = _build_jobs(year, end_year, (tile,), max_scenes)
+    return jobs[0]
+
+
+@shard.command("process")
+@click.option("-t", "--tile", required=True, help="Tile to build, e.g. N40W075")
+@click.option("-y", "--year", type=int, default=None, help="Start year; omit for the window")
+@click.option("--end-year", type=int, default=None, help="End year (inclusive)")
+@click.option("--max-scenes", type=int, default=None, help="Sample at most N scenes")
+@click.option("--run-id", default=None, help="Run token; generated when omitted")
+def shard_process(
+    *,
+    tile: str,
+    year: int | None,
+    end_year: int | None,
+    max_scenes: int | None,
+    run_id: str | None,
+) -> None:
+    """Build one tile as a fleet of shards, driven from this shell.
+
+    This shell has to stay open, unlike ``process --distributed``: it is the
+    thing sequencing the stages, because Coiled Batch has no dependency
+    mechanism. It holds no state, though -- print the run id and
+    ``landsat-lst shard resume <run-id> <tile>`` picks up wherever the bucket
+    says the run got to.
+    """
+    from landsat_lst.shard_driver import (
+        ShardBackendMismatch,
+        ShardStageFailed,
+        drive_tile,
+        require_shared_storage,
+        shard_run_id,
+    )
+    from landsat_lst.storage import get_storage
+
+    job = _shard_job(tile, year, end_year, max_scenes)
+    # Before the run id is printed: a driver that cannot see its shards' output
+    # has not started a run, and printing a resume hint for it would be a lie.
+    try:
+        require_shared_storage(get_storage(), None)
+    except ShardBackendMismatch as e:
+        raise click.ClickException(str(e)) from e
+    run_id = run_id or shard_run_id(job)
+    console.print(f"[bold]Sharding {tile}[/bold] {job.window_label}  run-id [cyan]{run_id}[/cyan]")
+    console.print(f"  resume with: landsat-lst shard resume {run_id} {tile}")
+
+    try:
+        summary = drive_tile(job, run_id=run_id)
+    except (ShardStageFailed, ShardBackendMismatch) as e:
+        raise click.ClickException(str(e)) from e
+
+    _print_shard_summary(summary)
+
+
+@shard.command("resume")
+@click.argument("run_id")
+@click.argument("tile")
+def shard_resume(run_id: str, tile: str) -> None:
+    """Continue a killed driver's run, reading its position out of the bucket."""
+    from landsat_lst.shard_driver import ShardBackendMismatch, ShardStageFailed, resume_tile
+
+    console.print(f"[bold]Resuming {tile}[/bold] in run [cyan]{run_id}[/cyan]")
+    try:
+        summary = resume_tile(run_id, tile)
+    except (ShardStageFailed, ShardBackendMismatch) as e:
+        raise click.ClickException(str(e)) from e
+
+    _print_shard_summary(summary)
+
+
+def _print_shard_summary(summary) -> None:
+    from rich.table import Table
+
+    table = Table(title=f"{summary.tile} {summary.window}")
+    for column in ("stage", "shards", "skipped", "submits", "wall (s)"):
+        table.add_column(column, justify="right" if column != "stage" else "left")
+    for stage in summary.stages:
+        table.add_row(
+            stage.stage,
+            str(stage.shards),
+            str(stage.already_done),
+            str(stage.submissions),
+            f"{stage.wall_s:.0f}",
+        )
+    console.print(table)
+    verdict = "[green]complete[/green]" if summary.completed else "[red]incomplete[/red]"
+    console.print(
+        f"  {verdict}  {summary.wall_s / 60:.0f} min, {summary.resubmissions} resubmission(s)"
+    )
+
+
+def _shard_stage_command(stage: str, needs_job: bool = False):
+    """Register one stage subcommand: the thing a batch task actually runs."""
+
+    def decorator(func):
+        func = click.option("--index", type=int, default=0, help="Which shard of this stage")(func)
+        if needs_job:
+            func = click.option("--max-scenes", type=int, default=None)(func)
+            func = click.option("--end-year", type=int, default=None)(func)
+            func = click.option("-y", "--year", type=int, default=None)(func)
+        func = click.option("-t", "--tile", required=True, help="Tile this shard belongs to")(func)
+        func = click.option("--run-id", required=True, help="Run token")(func)
+        return shard.command(stage)(func)
+
+    return decorator
+
+
+@_shard_stage_command("resolve", needs_job=True)
+def shard_resolve(
+    *,
+    run_id: str,
+    tile: str,
+    year: int | None,
+    end_year: int | None,
+    max_scenes: int | None,
+    index: int,
+) -> None:
+    """Query the catalog once and freeze where this tile is cut."""
+    from landsat_lst.shard_tasks import run_shard
+
+    job = _shard_job(tile, year, end_year, max_scenes)
+    plan = run_shard("resolve", run_id, tile, index, job=job)
+    console.print(
+        f"planned {tile}: {len(plan.scene_ids)} scenes, {len(plan.blocks)} blocks, "
+        f"{plan.ref_shards}/{plan.scene_shards}/{len(plan.bands)} shards, digest {plan.digest}"
+    )
+
+
+@_shard_stage_command("climatology")
+def shard_climatology(*, run_id: str, tile: str, index: int) -> None:
+    """Reduce this shard's blocks of the 12-month climatology."""
+    from landsat_lst.shard_tasks import run_shard
+
+    written = run_shard("climatology", run_id, tile, index)
+    console.print(f"{tile} climatology shard {index}: {len(written)} block(s)")
+
+
+@_shard_stage_command("offsets")
+def shard_offsets(*, run_id: str, tile: str, index: int) -> None:
+    """Estimate this shard's scenes' offsets against the merged climatology."""
+    from landsat_lst.shard_tasks import run_shard
+
+    key = run_shard("offsets", run_id, tile, index)
+    console.print(f"{tile} offsets shard {index}: {key or 'already published'}")
+
+
+@_shard_stage_command("composite")
+def shard_composite(*, run_id: str, tile: str, index: int) -> None:
+    """Composite one row band and publish both products' slabs."""
+    from landsat_lst.shard_tasks import run_shard
+
+    written = run_shard("composite", run_id, tile, index)
+    console.print(f"{tile} composite band {index}: {len(written)} slab(s)")
+
+
+@_shard_stage_command("export")
+def shard_export(*, run_id: str, tile: str, index: int) -> None:
+    """Stitch the row bands into the tile's two COGs."""
+    from landsat_lst.shard_tasks import run_shard
+
+    written = run_shard("export", run_id, tile, index)
+    console.print(f"{tile} export: {len(written)} COG(s)")
+
+
 if __name__ == "__main__":
     main()

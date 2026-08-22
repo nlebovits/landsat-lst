@@ -696,6 +696,68 @@ class TestGraphState:
             assert heartbeat.payload()["graph_state"] == "idle"
 
 
+class TestKeyOverride:
+    """A process that is not one whole tile must not write under ``_runs/``.
+
+    ``runs.classify`` reads every key under the run prefix as a tile attempt,
+    and a tile's shards all share one tile name -- filed there, seven shards
+    would appear in a manifest as seven attempts of the same tile and ``watch``
+    would subtract them from its pending count. ``capture_task_log`` already
+    takes a key for exactly this; the heartbeat needed the same.
+    """
+
+    def test_the_state_object_goes_where_it_is_told(self, tmp_path):
+        from landsat_lst.progress import TileHeartbeat
+
+        storage = LocalStorage(output_dir=tmp_path)
+        beat = TileHeartbeat(
+            run_id="r", job=JOB, storage=storage, key="_shards/r/N40W075/state/offsets.0002.1.json"
+        )
+
+        beat.write()
+
+        assert beat.key == "_shards/r/N40W075/state/offsets.0002.1.json"
+        assert json.loads(storage.read_text(beat.key))["tile"] == TILE
+        assert storage.read_text(storage.run_record_key("r", TILE, 1)) is None
+
+    def test_an_overridden_key_writes_no_settled_pointer(self, tmp_path):
+        """For a shard, completion is the artifact, never a state object."""
+        from landsat_lst.progress import TileHeartbeat
+
+        storage = LocalStorage(output_dir=tmp_path)
+        beat = TileHeartbeat(run_id="r", job=JOB, storage=storage, key="_shards/r/x.json")
+
+        beat.write_pointer()
+
+        assert beat.pointer_key is None
+        assert storage.read_text(storage.run_record_key("r", TILE)) is None
+
+    def test_a_named_pointer_is_still_written(self, tmp_path):
+        from landsat_lst.progress import TileHeartbeat
+
+        storage = LocalStorage(output_dir=tmp_path)
+        beat = TileHeartbeat(
+            run_id="r",
+            job=JOB,
+            storage=storage,
+            key="_shards/r/x.1.json",
+            pointer_key="_shards/r/x.json",
+        )
+
+        beat.write_pointer()
+
+        assert json.loads(storage.read_text("_shards/r/x.json"))["tile"] == TILE
+
+    def test_the_default_keys_are_unchanged(self, tmp_path):
+        from landsat_lst.progress import TileHeartbeat
+
+        storage = LocalStorage(output_dir=tmp_path)
+        beat = TileHeartbeat(run_id="r", job=JOB, storage=storage, attempt=2)
+
+        assert beat.key == storage.run_record_key("r", TILE, 2)
+        assert beat.pointer_key == storage.run_record_key("r", TILE)
+
+
 class TestTimedSection:
     """The wrapper that lights up stretches running no dask graph."""
 

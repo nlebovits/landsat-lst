@@ -171,6 +171,8 @@ class TileHeartbeat:
         storage: StorageBackend,
         attempt: int = 1,
         interval_s: float | None = None,
+        key: str | None = None,
+        pointer_key: str | None = None,
     ) -> None:
         self.run_id = run_id
         self.job = job
@@ -179,8 +181,17 @@ class TileHeartbeat:
         self.attempt = attempt
         self.storage = storage
         self.interval_s = settings.heartbeat_interval_s if interval_s is None else interval_s
-        self.key = storage.run_record_key(run_id, self.tile, attempt)
-        self.pointer_key = storage.run_record_key(run_id, self.tile)
+        # Overridable for the same reason ``capture_task_log(key=...)`` is: a
+        # process that is not one whole tile must not write under ``_runs/``,
+        # where ``runs.classify`` would read it as a tile attempt and put it in
+        # a manifest. A shard of a tile is such a process -- seven of them share
+        # one tile name -- and it owns its own key grammar
+        # (:mod:`landsat_lst.shards`), which it passes in here. A caller that
+        # overrides ``key`` and not ``pointer_key`` gets no pointer at all
+        # rather than one aimed at the tile's settled-state key.
+        default_pointer = None if key is not None else storage.run_record_key(run_id, self.tile)
+        self.key = key if key is not None else storage.run_record_key(run_id, self.tile, attempt)
+        self.pointer_key = pointer_key if pointer_key is not None else default_pointer
 
         # The tile's outcome, folded in by :meth:`set_result` and published by
         # the terminal beat. Holding it here rather than writing it to a second
@@ -362,7 +373,13 @@ class TileHeartbeat:
         Written once, at the terminal boundary, and never from the beat loop. A
         pointer refreshed every minute would double the run's PUT bill to buy a
         key that is already published under its own name.
+
+        A caller that overrode ``key`` without naming a ``pointer_key`` has no
+        settled-state key, and this is then a no-op: for a shard, completion is
+        the artifact in the bucket, never a state object.
         """
+        if self.pointer_key is None:
+            return
         payload = self.payload()
         try:
             self.storage.write_text(self.pointer_key, json.dumps(payload, indent=2))

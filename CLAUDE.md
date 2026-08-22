@@ -521,8 +521,69 @@ Rules worth keeping:
 - **`notnull` and `isfinite` diverge on ±inf.** The graph form counts `n_valid` with the
   first, the unit form with the second. `convert_to_celsius`'s clamp makes this unreachable
   today. It is latent, not fixed.
-- **There is no intra-tile checkpoint.** A failure costs the whole tile, and a tile is
-  hours. Checkpointing `ref` after phase A would halve the worst case; it is not built.
+- **There is no intra-tile checkpoint** *inside one process*. Sharding is the checkpoint
+  that was never built: see below.
+
+---
+
+## One tile across many VMs — S3 barriers, never a Coiled DAG
+
+A tile does not fit in an hour on one VM and never will: `projection.tile_projection`
+prices a 2,930-scene tile at ~950 GB read twice plus a 3.8 TB native pass, from *measured*
+rates. So a tile is cut into stages, each stage into shards, and the stages are sequenced
+by a **local driver polling S3**. See [ADR-016](docs/adr/016-sharded-tile-execution.md).
+
+```bash
+landsat-lst shard process --tile N40W075     # drives the whole tile; prints a run id
+landsat-lst shard resume <run-id> N40W075    # continues a killed driver, from the bucket
+landsat-lst shard composite --run-id <id> --tile N40W075 --index 3   # what a VM runs
+```
+
+Rules worth keeping:
+
+- **A shard is complete when its artifact is listed.** Never an exit code, never a state
+  object — the same rule tile completion already follows, one level down. The key is a
+  pure function of the shard index (`shards.py` owns the grammar), which is what makes a
+  resubmission safe: the driver cannot tell a slow shard from a dead one, so every shard
+  checks its own output first and exits if it is there.
+- **`coiled.batch_run` has no dependency mechanism.** One array per stage, and the
+  ordering between them is the poll loop. Do not reach for a cluster: ADR-010 records
+  three runs killed by exactly that in one day.
+- **The driver holds no state a crash could lose.** Its shell must stay open while the
+  tile runs, because it is the thing sequencing stages; it must never be the thing
+  remembering them. `resume_tile` reconstructs the position from one listing.
+- **The driver requires `LST_STORAGE_BACKEND=s3`, and refuses rather than overriding.**
+  Coiled VMs always write S3 (`_worker_environ`), so a driver on the default local backend
+  polls a directory nothing will ever write to. `S30W065` on 2026-08-21: `plan.json` was on
+  S3 in 3.5 minutes and the resolve barrier never closed. A barrier that cannot see its
+  artifacts fails as a *hang*, the most expensive shape a failure takes.
+- **A stage already in flight is adopted, never restarted.** Shards publish nothing until
+  they finish, so artifacts cannot tell "still booting" from "not started". The driver
+  writes `state/{stage}.submission.{round}.json` **before** it submits; a record younger
+  than `shard_barrier_timeout_s` means watch, do not submit. Resuming into a live stage
+  used to collide: `Unable to add batch jobs to existing cluster '...-climato'`. Cluster
+  names now carry the round (`stage_cluster_name`, run id hashed so truncation cannot eat
+  the marker).
+- **Failure is bounded.** On barrier expiry the driver resubmits *only the missing
+  indexes*, at most `shard_barrier_rounds` submissions per stage **counted across
+  drivers**, then fails naming the keys. Per-driver counting would hand every resume a
+  fresh budget. A fleet that resent the whole stage would also finish, which is why the
+  test asserts on which indexes the second call carried.
+- **Row bands only, never column bands.** `odc-stac` derives its `solar_day` shift from
+  the geobox centroid longitude, so two column bands can group the same items onto
+  different time axes and the tile-wide offsets would stop lining up.
+- **The merge runs in the driver and writes the ordinary ADR-012 record** at the canonical
+  `_offsets/` key. That is the seam: every band reads the same estimate back, and because
+  only the estimate is cached, rejection is applied tile-wide and identically.
+- **Shard objects live under `_shards/`, never `_runs/`.** `runs.classify` reads every key
+  under the run prefix as a tile attempt, and seven shards share one tile name.
+  `TileHeartbeat(key=...)` mirrors `capture_task_log(key=...)` for this.
+- **`shard_composite_chunk` (1024) is applied by every shard process *and by the
+  planner*.** The plan digest covers `load_chunk_size`; setting it only in the composite
+  shard would make that shard refuse a plan its own planner had cut.
+- **Fleet widths come from `projection.tile_projection` when the `shard_*_vms` settings
+  are 0**, clamped to the work available. A shard with no block is a VM that boots to bill
+  a minute.
 
 ---
 
