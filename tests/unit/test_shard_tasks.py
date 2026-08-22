@@ -374,6 +374,21 @@ def test_the_time_coordinate_round_trips_through_the_plan(plan):
     assert [str(s) for s in _times_iso(_time_coord(plan))] == plan.scene_times
 
 
+def test_the_plan_keeps_the_sub_second_component_of_every_stamp(plan):
+    """Which is where S30W065 died.
+
+    The plan froze the axis at second precision, ``_time_coord`` rebuilt a
+    truncated axis from it, and every composite shard then failed to join that
+    estimate onto a stack loaded at full precision:
+    ``lst carries a time step the offsets do not``. Real solar-day stamps have
+    sub-second components; the synthetic fixtures did not, so nothing here
+    could see it.
+    """
+    assert all("." in stamp for stamp in plan.scene_times)
+    rebuilt = np.asarray(_time_coord(plan).values)
+    assert (rebuilt.astype("datetime64[ns]") != rebuilt.astype("datetime64[s]")).any()
+
+
 def test_the_offset_key_is_the_one_a_whole_tile_would_write(plan):
     from landsat_lst.offsets import OffsetKey
 

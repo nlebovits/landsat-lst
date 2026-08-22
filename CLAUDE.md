@@ -320,6 +320,16 @@ Rules worth keeping:
   leaves the record alone (validating the estimator). The second skips the read and still
   writes (rebuilding an estimate whose inputs did not change). `--force` on `composite` and
   `process` is unrelated: it is about the output COGs.
+- **Time stamps are load-bearing, and serialized at nanoseconds.** `debias_with_offsets`
+  joins offsets to a stack **by coordinate value**, so a stamp that does not round-trip
+  exactly is a stamp the join cannot find. `_times_iso` wrote seconds; real Landsat
+  solar-day stamps carry sub-second components, so a rebuilt axis was a *different* axis
+  and every composite shard of S30W065 died with `lst carries a time step the offsets do
+  not`. Positional alignment used to hide it, and every synthetic fixture used whole
+  seconds. **Any fixture whose offsets round-trip through JSON must use sub-second
+  times.** Records written at second precision are still read, via an unambiguous
+  truncated match (duplicates in the truncated axis are a miss, never a guess); the values
+  never changed, so `ALGORITHM_VERSION` is unchanged.
 - **A sampled window cannot check a rejection fraction.** 300 scenes over five years leaves
   each month ~25 scenes for its climatology instead of 244, and the noisy reference inflates
   offsets: 69% rejected on the sample against 21.8% at Pergamino.

@@ -35,7 +35,7 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import structlog
@@ -44,7 +44,7 @@ import xarray as xr
 from landsat_lst.config import settings
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
     from landsat_lst.storage import StorageBackend
 
@@ -79,9 +79,49 @@ def _finite_or_none(values: Iterable[float]) -> list[float | None]:
     return [None if not math.isfinite(v) else float(v) for v in values]
 
 
-def _times_iso(time_coord: xr.DataArray) -> list[str]:
-    """The time coordinate as ISO strings, for an exact equality check on read."""
-    return [np.datetime_as_string(t, unit="s") for t in np.asarray(time_coord.values)]
+#: Precision every writer serializes the time axis at. Nanoseconds, because
+#: that is what the loaded axis carries and the stamps are now load-bearing:
+#: ``normalization.debias_with_offsets`` joins offsets to a stack **by
+#: coordinate value**, so a stamp that does not round-trip exactly is a stamp
+#: the join cannot find.
+TIME_UNIT: Literal["ns"] = "ns"
+
+#: What records written before that fix carry. Real Landsat solar-day
+#: timestamps have sub-second components, so a second-precision stamp is a
+#: *truncation* of the axis rather than a spelling of it. Read support for this
+#: is permanent, not a migration window: the records are valid answers and cost
+#: half an hour of compute each.
+LEGACY_TIME_UNIT: Literal["s"] = "s"
+
+
+def _times_iso(time_coord: xr.DataArray, *, unit: Literal["ns", "s"] = TIME_UNIT) -> list[str]:
+    """The time coordinate as ISO strings, at ``unit`` precision.
+
+    ``str`` rather than ``np.str_``: these are compared against values that
+    have been through JSON, and the two types compare equal but do not print
+    equal in a failure message.
+    """
+    return [str(np.datetime_as_string(t, unit=unit)) for t in np.asarray(time_coord.values)]
+
+
+def _truncation_of(stored: Sequence[str], time_coord: xr.DataArray) -> bool:
+    """Whether ``stored`` is this axis, written at the old second precision.
+
+    Accepted only when the truncation is **1:1 and order-preserving**: the
+    second-precision rendering of the live axis must equal the stored list
+    element for element, and must itself hold no duplicates. Two distinct
+    nanosecond stamps that collapse onto one second would make the record
+    consistent with more than one axis, and a record that might belong to a
+    different scene set is a record to recompute rather than to guess at.
+
+    Positional equality of the two lists *is* the order-preserving 1:1 check,
+    given the no-duplicates test: a bijection between two equal sequences that
+    preserves order is the identity.
+    """
+    truncated = _times_iso(time_coord, unit=LEGACY_TIME_UNIT)
+    if len(truncated) != len(stored) or len(set(truncated)) != len(truncated):
+        return False
+    return list(stored) == truncated
 
 
 @dataclass(frozen=True)
@@ -237,22 +277,37 @@ class OffsetCache:
             self.last_read_hit = False
             return None
 
+        precision = "exact"
         if stored_times != _times_iso(time_coord):
-            log.warning(
-                "offset_cache_time_mismatch",
+            if not _truncation_of(stored_times, time_coord):
+                log.warning(
+                    "offset_cache_time_mismatch",
+                    key=self.key.storage_key,
+                    stored=len(stored_times),
+                    live=int(time_coord.size),
+                    note="key is under-specified; recomputing",
+                )
+                self.last_read_hit = False
+                return None
+            # A record written before the axis was serialized at nanoseconds.
+            # The values are the same values -- the offsets never depended on
+            # how their timestamps were spelled -- so it is a hit, and the
+            # arrays come back on the *loaded* axis at full precision, which is
+            # the axis `debias_with_offsets` will join against.
+            precision = LEGACY_TIME_UNIT
+            log.info(
+                "offset_cache_legacy_precision",
                 key=self.key.storage_key,
-                stored=len(stored_times),
-                live=int(time_coord.size),
-                note="key is under-specified; recomputing",
+                scenes=len(stored_times),
+                note="stored at second precision; matched by truncation",
             )
-            self.last_read_hit = False
-            return None
 
         log.info(
             "offset_cache_hit",
             key=self.key.storage_key,
             scenes=len(stored_times),
             saved_s=record.get("duration_s"),
+            precision=precision,
         )
         self.last_read_hit = True
         coords = {"time": time_coord}
@@ -349,6 +404,18 @@ def merge_scene_partials(
         msg = "the time axis holds duplicate timestamps; partials cannot be joined on it"
         raise ValueError(msg)
 
+    # A partial written before the axis was serialized at nanoseconds carries a
+    # truncated stamp, which the exact map cannot find. Same rule as
+    # `OffsetCache.read`: accepted only where the truncation is unambiguous, so
+    # a stage half-finished under the old spelling can still be merged rather
+    # than repeated. Built once, and only if it is needed.
+    truncated = _times_iso(time_coord, unit=LEGACY_TIME_UNIT)
+    legacy_position: dict[str, int] = (
+        {stamp: i for i, stamp in enumerate(truncated)}
+        if len(set(truncated)) == len(truncated)
+        else {}
+    )
+
     offset = np.full(len(wanted), np.nan, dtype=dtype)
     n_valid = np.zeros(len(wanted), dtype="int64")
     filled = [False] * len(wanted)
@@ -365,6 +432,8 @@ def merge_scene_partials(
             raise ValueError(msg)
         for stamp, value, count in zip(times, offsets, counts, strict=True):
             i = position.get(stamp)
+            if i is None:
+                i = legacy_position.get(stamp)
             if i is None:
                 msg = (
                     f"partial covers {stamp}, which is not on the planned time "

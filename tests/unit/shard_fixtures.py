@@ -37,13 +37,22 @@ COARSE = (8, 8)
 BLOCK = 4
 
 
+def scene_time_values(n: int = SCENES) -> np.ndarray:
+    """A frozen time axis with real sub-second components.
+
+    Landsat solar-day stamps carry them, and every stamp here round-trips
+    through JSON before a coordinate join reads it back. Whole seconds made the
+    serializer's truncation invisible to every test in this repo while the
+    composite failed on every shard of S30W065.
+    """
+    base = pd.date_range("2021-07-04T13:45:12", periods=n, freq="61D")
+    return (base + pd.to_timedelta(482_915 + 137 * np.arange(n), unit="us")).values
+
+
 def scene_times(n: int = SCENES) -> list[str]:
-    """A frozen time axis, spelled exactly as the offset records spell it."""
-    times = pd.date_range("2021-07-04", periods=n, freq="61D").values
-    coord = SimpleNamespace(values=times)
-    # ``np.datetime_as_string`` yields ``np.str_``; the plan's own round trip
-    # through JSON does this cast, so the fixture does it up front.
-    return [str(stamp) for stamp in _times_iso(coord)]  # type: ignore[arg-type]
+    """That axis, spelled exactly as the offset records spell it."""
+    coord = SimpleNamespace(values=scene_time_values(n))
+    return _times_iso(coord)  # type: ignore[arg-type]
 
 
 def make_plan(*, ref_shards: int = 2, scene_shards: int = 2, band_shards: int = 2):
