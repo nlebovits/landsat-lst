@@ -44,7 +44,9 @@ FACTOR = int(os.environ.get("PROBE_FACTOR", "2"))
 #: block edge costs ~12.3 GB per unit, so ~4 workers on 64 GiB) and chunk
 #: 512 for the composite (the single-time-chunk rechunk makes a 1024^2 task
 #: hold 12.3 GB, which caps the composite at 512).
-ARMS: list[tuple[int, int]] = [
+#: Overridable via PROBE_ARMS ("io:chunk,io:chunk,..."), so a variant probe
+#: (native factor, other VM type) reuses this harness without editing it.
+_DEFAULT_ARMS: list[tuple[int, int]] = [
     (16, 1024),  # warmup -- discard; absorbs first-run warming
     (8, 1024),
     (16, 1024),
@@ -52,6 +54,13 @@ ARMS: list[tuple[int, int]] = [
     (16, 512),
     (16, 1024),  # control: warm repeat of the reference arm
 ]
+
+
+def _parse_arms(spec: str) -> list[tuple[int, int]]:
+    return [(int(io), int(chunk)) for io, chunk in (arm.split(":") for arm in spec.split(","))]
+
+
+ARMS = _parse_arms(os.environ["PROBE_ARMS"]) if os.environ.get("PROBE_ARMS") else _DEFAULT_ARMS
 
 _CHILD = """
     import json, resource, sys, time
@@ -73,7 +82,11 @@ _CHILD = """
     import dask
     import numpy as np
     from landsat_lst.config import settings
+    # Both fields, because load_scenes reads load_chunk_size_offsets for a
+    # coarse (factor > 1) load and load_chunk_size for a native one; the
+    # arm's chunk must apply whichever path the factor takes.
     settings.load_chunk_size = chunk
+    settings.load_chunk_size_offsets = chunk
     from landsat_lst.models import ProcessingJob
     from landsat_lst.pipeline import load_scenes, query_stac
     from landsat_lst.progress import silence_sections

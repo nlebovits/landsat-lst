@@ -148,9 +148,31 @@ def main() -> int:
         metavar="CLUSTER_ID",
         help="skip submission; summarize an existing cluster's log",
     )
+    ap.add_argument(
+        "--vm-type",
+        default=None,
+        help="Coiled VM type override (e.g. m6i.4xlarge); default: settings",
+    )
+    ap.add_argument(
+        "--factor",
+        type=int,
+        default=2,
+        help="resolution factor: 2 = coarse/offset shape, 1 = native/composite",
+    )
+    ap.add_argument("--scenes-per-arm", type=int, default=24)
+    ap.add_argument(
+        "--arms",
+        default=None,
+        help='override arm list as "io:chunk,io:chunk,..." (first = warmup)',
+    )
+    ap.add_argument(
+        "--out",
+        default="io_ladder.json",
+        help="result filename under results/probe/",
+    )
     args = ap.parse_args()
 
-    out_path = HERE.parent / "results" / "probe" / "io_ladder.json"
+    out_path = HERE.parent / "results" / "probe" / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.dry_run:
@@ -178,17 +200,24 @@ def main() -> int:
         from landsat_lst.job import _worker_environ  # noqa: PLC0415
 
         run_id = f"ioladder-{datetime.now(tz=UTC):%Y%m%dT%H%M%SZ}"
+        env = {
+            **_worker_environ(),
+            "PROBE_FACTOR": str(args.factor),
+            "PROBE_SCENES_PER_ARM": str(args.scenes_per_arm),
+        }
+        if args.arms:
+            env["PROBE_ARMS"] = args.arms
         res = coiled.batch_run(
             command=command(),
             name=f"lst-{run_id}",
             region=settings.coiled_region,
-            vm_type=settings.coiled_vm_types,
+            vm_type=[args.vm_type] if args.vm_type else settings.coiled_vm_types,
             spot_policy=settings.coiled_spot_policy,
             max_workers=1,
             ntasks=1,
             max_retries=0,
             job_timeout=JOB_TIMEOUT,
-            env=_worker_environ(),
+            env=env,
             tag={"project": "landsat-lst", "run_id": run_id, "kind": "probe"},
             forward_aws_credentials=False,
         )
