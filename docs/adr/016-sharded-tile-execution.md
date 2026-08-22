@@ -159,6 +159,89 @@ request the probe measured as *the* throughput lever. Because the plan digest co
 process **and in the planner**, so all of them hash the same number; setting it only in
 the composite shard would make that shard refuse a plan its own planner had cut.
 
+## Consolidation: one fleet per side, not one per phase
+
+**Amendment, 2026-08-22.** The first working acceptance run measured the thing the design
+had assumed away. Offsets-side shards **computed for about six minutes each while their
+stages held fleets for about thirty**. The work was fine; the lifecycle was the cost. Every
+stage boundary was being paid for twice — once as the driver's poll, and again as a whole
+fleet's boot and queue wait — and the offsets side had three of them.
+
+Nothing about the estimator, the work-unit bodies, the artifact keys, or any equivalence
+guarantee changes below. This is lifecycles only.
+
+### The offsets side is one task type
+
+`resolve`, `climatology`, and `offsets` became sub-phases of one task
+(`shard_tasks.run_offsets_stage`) rather than three fleets:
+
+- **Shard 0 resolves** — and only when no plan exists yet, so a retry, and every shard of a
+  resumed run, reaches its own work without needing the window. Exactly one process may
+  resolve; two would query a live catalog twice and assemble the tile from two scene sets.
+- **Every shard waits for that plan**, bounded by `shard_plan_wait_s`.
+- **Every shard reduces its climatology blocks**, then waits at an **in-process phase-A
+  barrier** for its peers'. Phase B measures each scene against the *whole* climatology, so
+  this barrier is not negotiable — but the process that needs it is already booted, and a
+  second fleet existed only to re-establish that fact.
+- **Every shard estimates its scenes' offsets.**
+
+The sub-phase bodies are reused verbatim. `run_climatology_shard` and `run_offsets_shard`
+gained an optional `ctx=` so the fused task loads the plan once, and nothing else moved. Each
+sub-phase still checks its own outputs first, so a retried fused task walks back to where it
+died: the resolve is a plan read, the blocks it published are skipped, and it resumes at the
+barrier.
+
+One consequence worth stating plainly. The fused fleet's **width has to be fixed before the
+plan exists**, because shard 0 of that fleet is what writes the plan. `shards.offsets_fleet_units`
+decides it, and it travels to the planner as `--units` so the plan is cut to the fleet that
+will run it. Re-deriving it on the VM would let the two disagree, and the symptom would be a
+stage waiting forever for a partial nobody was asked to write. A shard whose index falls past
+a clamped count skips that phase and says so.
+
+### The composite fleet boots on the offsets stage's time
+
+The driver starts it from **inside** the offsets barrier, as soon as phase B is demonstrably
+producing (`shard_composite_overlap`, default: the first partial). Evidence, not a timer —
+a partial means the stage is running and producing, which is what separates overlapping from
+gambling a fleet's boot on a stage that may be about to fail.
+
+That start goes through `ensure_started`, so the ordinary composite barrier afterwards sees a
+fresh submission record and **adopts** it. The same machinery that stops two drivers colliding
+turns out to be exactly what an early start needs.
+
+A composite shard that arrives before the merge now **waits** for the offset record
+(`shard_offsets_record_wait_s`) instead of refusing. Refusing would burn the boot the overlap
+exists to save.
+
+### The export is claimed, not submitted
+
+The export is one task at the end of a wide stage. After writing its bands, each composite
+shard checks whether every band now exists; the one that finds them all writes
+`state/export.claim.json` and runs the export itself, already booted and warm.
+
+**The claim is not a lock, and first-writer-wins is not needed.** The export is idempotent at
+the canonical COG keys, so two workers racing produce the same two objects: a lost race costs
+duplicated work, never a corrupted tile. That is why it is a plain write with no
+compare-and-set — S3 offers none, and synthesizing one out of listings would add a failure
+mode to save a few minutes of one VM. The claim makes duplication rare; it does not make it
+impossible, and it does not need to.
+
+The driver keeps a belt: if the COGs are still absent `shard_export_claim_fallback_s` after
+every band exists, it submits the old export stage. That covers the claim that is written and
+never executed, because the claiming VM was preempted in between.
+
+### What did not change
+
+Barrier and round semantics, the round budget counted across drivers, the submission records,
+the cluster naming, `shard_spot_policy`, every S3 key, and every equivalence test. Tile
+completion is still both COGs at the canonical keys.
+
+Observability was extended rather than trimmed: the fused task reports `shard_resolve`,
+`shard_plan_wait`, `shard_barrier_wait`, and the estimator's own phases separately, and the
+composite reports `shard_offsets_wait`. Time spent waiting at an in-process barrier is now the
+majority of what a consolidated run can waste, so it has to be attributable — otherwise the
+next round of tuning is guesswork again.
+
 ## The three latent defects the seams pass fixed
 
 Stage 3's first PR opened five narrow seams in existing code. Three of them closed

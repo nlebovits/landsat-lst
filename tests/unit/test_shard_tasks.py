@@ -23,12 +23,13 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from landsat_lst import shards
+from landsat_lst import shard_tasks, shards
 from landsat_lst.config import settings
 from landsat_lst.models import ProcessingJob
 from landsat_lst.shard_tasks import (
     _offset_key,
     _time_coord,
+    claim_export,
     climatology_group,
     job_for_window,
     load_context,
@@ -36,6 +37,7 @@ from landsat_lst.shard_tasks import (
     offsets_group,
     run_climatology_shard,
     run_composite_shard,
+    run_offsets_stage,
 )
 from landsat_lst.storage import PRODUCTS, LocalStorage
 from landsat_lst.tiling import parse_tile_name
@@ -66,6 +68,62 @@ def plan():
 @pytest.fixture
 def published(storage, plan):
     return publish_plan(storage, plan)
+
+
+@pytest.fixture
+def job():
+    return ProcessingJob(tile=parse_tile_name(TILE), year=2021, end_year=2025)
+
+
+class _PeerArrivesDuringTheWait:
+    """A backend whose Nth block listing is when the peer shard finishes.
+
+    Concurrency without threads. Running two fused tasks in real threads
+    deadlocks against the estimator's own bounded pools, and the thing under
+    test is not the pools -- it is whether this shard proceeds before its
+    peer's blocks exist.
+    """
+
+    def __init__(self, storage, plan, *, after: int = 2) -> None:
+        self._storage = storage
+        self._plan = plan
+        self._after = after
+        self._polls = 0
+        self.landed = False
+
+    def __getattr__(self, name):
+        return getattr(self._storage, name)
+
+    def list_prefix(self, prefix: str):
+        root = shards.shard_root(RUN_ID, self._plan.tile)
+        if prefix == f"{root}/offsets/ref/":
+            self._polls += 1
+            if self._polls >= self._after and not self.landed:
+                self.landed = True
+                run_climatology_shard(RUN_ID, self._plan.tile, 1, storage=self._storage)
+        return self._storage.list_prefix(prefix)
+
+
+def _record_phases(monkeypatch) -> list[str]:
+    """Every phase the fused task reports, in order.
+
+    The sub-phases are the point of the consolidation's observability clause:
+    an acceptance run has to be able to attribute wall clock to resolve, to the
+    climatology, to the barrier wait, and to the offsets separately, or the
+    next round of tuning is guesswork again.
+    """
+    seen: list[str] = []
+    import landsat_lst.progress as progress_module
+
+    real = progress_module.report_phase
+
+    def record(phase: str, **counts) -> None:
+        seen.append(phase)
+        real(phase, **counts)
+
+    monkeypatch.setattr("landsat_lst.shard_tasks.report_phase", record)
+    monkeypatch.setattr(progress_module, "report_phase", record)
+    return seen
 
 
 class TestWindowLabels:
@@ -241,14 +299,219 @@ class TestCompositeShard:
 
         assert run_composite_shard(RUN_ID, TILE, 0, storage=storage) == []
 
-    def test_it_refuses_to_composite_without_merged_offsets(
+    # A composite shard without merged offsets now *waits* rather than refusing
+    # -- its VM was started early on purpose. See TestOffsetRecordWait.
+
+
+class TestFusedOffsetsStage:
+    """Four sub-phases, one boot.
+
+    A shard computed for about six minutes while its stage held a fleet for
+    about thirty: boots and queueing dominated, so the boundaries between
+    resolve, climatology, and offsets became in-process waits. The order still
+    matters -- phase B measures scenes against the *whole* climatology -- and so
+    does skipping what a retry already finished, since the barrier resubmits
+    indexes that may merely be slow.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _quick_polls(self, monkeypatch):
+        monkeypatch.setattr(settings, "shard_unit_poll_s", 0.001)
+        monkeypatch.setattr(settings, "shard_plan_wait_s", 1)
+        monkeypatch.setattr(settings, "shard_block_wait_s", 1)
+
+    def test_one_shard_runs_every_sub_phase_in_order(self, storage, plan, monkeypatch, job):
+        """Resolve, then its own blocks, then the barrier, then its scenes.
+
+        The peer's blocks are pre-published, so this shard's barrier clears
+        immediately; what the barrier does when they are *not* there is the
+        next test.
+        """
+        _stub_coarse_load(monkeypatch, plan)
+        root = shards.shard_root(RUN_ID, TILE)
+
+        def resolve(*_args, **_kwargs):
+            """Shard 0's resolve, plus the peer that would be running alongside."""
+            publish_plan(storage, plan)
+            run_climatology_shard(RUN_ID, TILE, 1, storage=storage)
+
+        monkeypatch.setattr(shard_tasks, "resolve_tile_plan", resolve)
+
+        seen = _record_phases(monkeypatch)
+        key = run_offsets_stage(RUN_ID, TILE, 0, job=job, storage=storage)
+
+        assert seen.index("shard_resolve") < seen.index("shard_plan_wait")
+        assert seen.index("shard_plan_wait") < seen.index("shard_barrier_wait")
+        assert seen.index("shard_barrier_wait") < seen.index("destripe_offsets")
+        assert key is not None
+        assert len(storage.list_prefix(f"{root}/offsets/ref/")) == len(plan.blocks)
+
+    def test_no_offset_is_estimated_until_the_whole_climatology_exists(
         self, storage, plan, published, monkeypatch
     ):
-        """Estimating per band instead would seam the tile at every boundary."""
-        _stub_native_load(monkeypatch, plan)
+        """Phase B measures each scene against the *whole* climatology.
 
-        with pytest.raises(FileNotFoundError, match="no merged offsets"):
+        The peer arrives mid-wait, which is what a fleet looks like from inside
+        one shard. Without the barrier this shard would estimate against a half
+        -built reference and the spy would see two blocks rather than four --
+        an answer that is wrong and that nothing downstream inspects.
+        """
+        _stub_coarse_load(monkeypatch, plan)
+        monkeypatch.setattr(settings, "shard_block_wait_s", 30)
+        root = shards.shard_root(RUN_ID, TILE)
+        blocks_when_estimated: list[int] = []
+
+        peer = _PeerArrivesDuringTheWait(storage, plan, after=2)
+        real = shard_tasks.run_offsets_shard
+
+        def spy(*args, **kwargs):
+            blocks_when_estimated.append(len(storage.list_prefix(f"{root}/offsets/ref/")))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(shard_tasks, "run_offsets_shard", spy)
+
+        run_offsets_stage(RUN_ID, TILE, 0, storage=peer)
+
+        assert peer.landed, "the barrier must have actually waited"
+        assert blocks_when_estimated == [len(plan.blocks)]
+
+    def test_a_shard_that_is_not_zero_waits_for_the_plan(self, storage, plan, monkeypatch):
+        """And fails loudly rather than hanging when shard 0 never publishes."""
+        _stub_coarse_load(monkeypatch, plan)
+
+        with pytest.raises(RuntimeError, match="never published"):
+            run_offsets_stage(RUN_ID, TILE, 1, storage=storage)
+
+    def test_shard_zero_without_a_plan_or_a_job_says_so(self, storage, plan, monkeypatch):
+        _stub_coarse_load(monkeypatch, plan)
+
+        with pytest.raises(ValueError, match="no job to resolve one from"):
+            run_offsets_stage(RUN_ID, TILE, 0, storage=storage)
+
+    def test_shard_zero_does_not_re_resolve_a_plan_that_exists(
+        self, storage, plan, published, monkeypatch
+    ):
+        """Which is what makes a retry, and every shard of a resume, work."""
+        _stub_coarse_load(monkeypatch, plan)
+        run_climatology_shard(RUN_ID, TILE, 1, storage=storage)
+
+        def explode(*args, **kwargs):
+            raise AssertionError("a second resolve would query a live catalog again")
+
+        monkeypatch.setattr(shard_tasks, "resolve_tile_plan", explode)
+
+        assert run_offsets_stage(RUN_ID, TILE, 0, storage=storage) is not None
+
+    def test_phase_b_waits_for_every_peers_blocks(self, storage, plan, published, monkeypatch):
+        """A scene's offset is measured against the *whole* climatology.
+
+        Shard 1 publishes only its own blocks, so the barrier must not clear.
+        """
+        _stub_coarse_load(monkeypatch, plan)
+
+        with pytest.raises(RuntimeError, match="phase-A climatology"):
+            run_offsets_stage(RUN_ID, TILE, 1, storage=storage)
+
+        root = shards.shard_root(RUN_ID, TILE)
+        assert storage.list_prefix(f"{root}/offsets/scene/") == {}
+
+    def test_a_retry_skips_the_sub_phases_it_already_finished(
+        self, storage, plan, published, monkeypatch
+    ):
+        """The driver resubmits indexes that may still be running."""
+        _stub_coarse_load(monkeypatch, plan)
+        for index in range(plan.ref_shards):
+            run_climatology_shard(RUN_ID, TILE, index, storage=storage)
+        for index in range(plan.scene_shards):
+            run_offsets_stage(RUN_ID, TILE, index, storage=storage)
+
+        def explode(*args, **kwargs):
+            raise AssertionError("a retried fused task must not recompute finished work")
+
+        monkeypatch.setattr("landsat_lst.pipeline.load_scenes", explode)
+
+        assert run_offsets_stage(RUN_ID, TILE, 0, storage=storage) is None
+
+    def test_a_shard_past_the_work_skips_its_phases(self, storage, plan, published, monkeypatch):
+        """The fleet's width is fixed before the plan exists, so it can exceed it."""
+        _stub_coarse_load(monkeypatch, plan)
+        for index in range(plan.ref_shards):
+            run_climatology_shard(RUN_ID, TILE, index, storage=storage)
+
+        assert run_offsets_stage(RUN_ID, TILE, plan.scene_shards + 3, storage=storage) is None
+
+
+class TestExportClaim:
+    """The last band written runs the export, rather than a fleet booting to."""
+
+    def test_the_last_band_claims_and_runs_it(self, storage, plan, published, monkeypatch):
+        _stub_native_load(monkeypatch, plan)
+        write_offset_cache(storage, plan)
+
+        for index in range(len(plan.bands)):
+            run_composite_shard(RUN_ID, TILE, index, storage=storage)
+
+        root = shards.shard_root(RUN_ID, TILE)
+        assert storage.read_text(shards.export_claim_key(root)) is not None
+        assert storage.cog_exists(plan.window, TILE)
+
+    def test_an_earlier_band_claims_nothing(self, storage, plan, published, monkeypatch):
+        from landsat_lst.shard_tasks import load_context
+
+        _stub_native_load(monkeypatch, plan)
+        write_offset_cache(storage, plan)
+
+        run_composite_shard(RUN_ID, TILE, 0, storage=storage)
+
+        root = shards.shard_root(RUN_ID, TILE)
+        assert storage.read_text(shards.export_claim_key(root)) is None
+        assert not storage.cog_exists(plan.window, TILE)
+        assert claim_export(load_context(RUN_ID, TILE, storage=storage), 0) is False
+
+    def test_a_second_claimant_does_not_run_it_again(self, storage, plan, published, monkeypatch):
+        """Wasted work, never corruption -- which is why this is a note, not a lock."""
+        from landsat_lst.shard_tasks import load_context
+
+        _stub_native_load(monkeypatch, plan)
+        write_offset_cache(storage, plan)
+        for index in range(len(plan.bands)):
+            run_composite_shard(RUN_ID, TILE, index, storage=storage)
+
+        ctx = load_context(RUN_ID, TILE, storage=storage)
+
+        assert claim_export(ctx, 0) is False
+
+
+class TestOffsetRecordWait:
+    """A composite shard boots early on purpose, so it waits rather than refusing."""
+
+    def test_it_polls_for_the_merged_record(self, storage, plan, published, monkeypatch):
+        _stub_native_load(monkeypatch, plan)
+        monkeypatch.setattr(settings, "shard_unit_poll_s", 0.001)
+        monkeypatch.setattr(settings, "shard_offsets_record_wait_s", 1)
+
+        with pytest.raises(FileNotFoundError, match="never merged"):
             run_composite_shard(RUN_ID, TILE, 0, storage=storage)
+
+    def test_a_record_that_arrives_during_the_wait_is_used(
+        self, storage, plan, published, monkeypatch
+    ):
+        _stub_native_load(monkeypatch, plan)
+        monkeypatch.setattr(settings, "shard_unit_poll_s", 0.001)
+        monkeypatch.setattr(settings, "shard_offsets_record_wait_s", 5)
+
+        calls = {"n": 0}
+        real = storage.read_text
+
+        def read_text(key: str):
+            calls["n"] += 1
+            if calls["n"] > 3 and "_offsets/" in key and real(key) is None:
+                write_offset_cache(storage, plan)
+            return real(key)
+
+        monkeypatch.setattr(storage, "read_text", read_text)
+
+        assert run_composite_shard(RUN_ID, TILE, 0, storage=storage)
 
 
 class TestAttemptNumbers:
@@ -331,13 +594,25 @@ def _dataset(shape: tuple[int, int], times) -> xr.Dataset:
     )
 
 
-def _stub_loader(monkeypatch, plan, shape: tuple[int, int]):
-    """Replace the scene load and the land mask with arrays of a known shape."""
+def _stub_loader(monkeypatch, plan, shape: tuple[int, int], *, follow_geobox: bool = True):
+    """Replace the scene load and the land mask with arrays of a known shape.
+
+    ``follow_geobox`` is how the composite path gets a *band's* shape from the
+    row-sliced geobox it was handed. The coarse path must not follow it: the
+    real offsets geobox is the production 9,000 squared grid, and the fixture
+    plan's blocks and ``coarse_shape`` describe an 8 squared one. Letting the
+    two disagree gave the phase-B reduction a 9,000 squared scene and an 8
+    squared climatology, which broadcast rather than failing anywhere useful.
+    """
     times = np.array(plan.scene_times, dtype="datetime64[ns]")
 
     def load_scenes(items, bbox, **kwargs):
         geobox = kwargs.get("geobox")
-        size = (int(geobox.shape[0]), int(geobox.shape[1])) if geobox is not None else shape
+        size = (
+            (int(geobox.shape[0]), int(geobox.shape[1]))
+            if follow_geobox and geobox is not None
+            else shape
+        )
         return _dataset(size, times)
 
     def build_land_mask(geobox, latitude, longitude):
@@ -353,7 +628,7 @@ def _stub_loader(monkeypatch, plan, shape: tuple[int, int]):
 
 
 def _stub_coarse_load(monkeypatch, plan):
-    _stub_loader(monkeypatch, plan, COARSE)
+    _stub_loader(monkeypatch, plan, COARSE, follow_geobox=False)
     # The fixture's blocks are 4 px, far below the chunk edge ``_io_block_edge``
     # would insist on, so the block edge comes from the plan either way.
     monkeypatch.setattr(settings, "destripe_compute_panel", 2)

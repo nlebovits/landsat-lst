@@ -4,9 +4,18 @@
 and tells you nothing about when they finish that is worth acting on. The exit
 code it records is the tee wrapper's, task stdout never reaches ``coiled logs``,
 and a task can exit non-zero after its artifact landed. So the ordering between
-stages -- resolve, then the climatology, then the per-scene offsets, then the
-composite bands, then the export -- is a poll loop here, and the only question
-it ever asks is whether a key exists.
+stages is a poll loop here, and the only question it ever asks is whether a key
+exists.
+
+**Two fleets, not five.** The offsets side is one fused task type: shard 0
+resolves, every shard waits for that plan, reduces its climatology blocks,
+waits at an in-process phase-A barrier, and estimates its scenes' offsets. An
+offsets-side shard computed for about six minutes while its stage held a fleet
+for about thirty, so the boundaries between those phases are now waits inside a
+booted process rather than boots of new ones. The composite fleet starts from
+inside the offsets barrier, as soon as phase B is demonstrably producing, and
+the export is claimed by whichever composite worker writes the last band --
+leaving the driver a fallback rather than a submission. See ADR-016.
 
 **Completion is bytes in the bucket.** A shard is done when its artifact is
 listed, never when a task exits, and the artifact key is a pure function of the
@@ -35,6 +44,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from math import ceil
 from typing import TYPE_CHECKING
 
 import structlog
@@ -93,6 +103,12 @@ class StageOutcome:
     #: Rounds this driver watched instead of starting, because another driver's
     #: submission record for the stage was still fresh.
     adopted: int = 0
+    #: Highest round this stage reached, across every driver and including the
+    #: round started outside the barrier (the fused fleet, and the composite
+    #: fleet's overlapped start). ``submissions`` counts only what *this*
+    #: driver sent, which is why the two differ and why the retry accounting
+    #: reads this one.
+    rounds: int = 0
     cluster_ids: list[int | None] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -102,6 +118,7 @@ class StageOutcome:
             "already_done": self.already_done,
             "submissions": self.submissions,
             "adopted": self.adopted,
+            "rounds": self.rounds,
             "wall_s": round(self.wall_s, 1),
             "cluster_ids": self.cluster_ids,
         }
@@ -123,8 +140,14 @@ class TileRunSummary:
 
     @property
     def resubmissions(self) -> int:
-        """Extra submissions beyond the first for each stage that ran."""
-        return sum(max(0, stage.submissions - 1) for stage in self.stages)
+        """Rounds beyond the first, for each stage that ran.
+
+        Counted from ``rounds`` rather than ``submissions``: a stage's first
+        round is started outside its barrier now (the fused fleet before the
+        plan exists, the composite fleet from inside the offsets barrier), so
+        this driver's own submission count is one short of the stage's history.
+        """
+        return sum(max(0, stage.rounds - 1) for stage in self.stages)
 
     def as_dict(self) -> dict:
         return {
@@ -312,17 +335,30 @@ def _watch(
     run_id: str,
     tile: str,
     stage: str,
+    on_poll: Callable[[], None] | None = None,
 ) -> list[int]:
     """Poll until every artifact has landed or the wall-clock deadline passes.
 
     Returns what is still missing, which is empty exactly when the stage is
     done. Checks before it sleeps, so a stage that finished while the caller
     was deciding costs no poll interval.
+
+    ``on_poll`` runs after each check. It is how the *next* stage gets started
+    while this one is still going: the offsets barrier calls a hook that starts
+    the composite fleet as soon as phase B is demonstrably producing, so those
+    VMs boot on time this stage was going to spend anyway. Best-effort -- an
+    overlap that fails to start is a slower tile, not a broken one, and it must
+    never take down the barrier it is riding on.
     """
     while True:
         missing = _missing(storage, prefix, expected)
         if not missing:
             return missing
+        if on_poll is not None:
+            try:
+                on_poll()
+            except Exception as e:
+                log.warning("shard_overlap_hook_failed", run_id=run_id, stage=stage, error=str(e))
         if time.time() >= deadline:
             log.warning(
                 "shard_stage_barrier_expired",
@@ -333,6 +369,108 @@ def _watch(
             )
             return missing
         time.sleep(settings.shard_driver_poll_s)
+
+
+def _start_round(
+    *,
+    stage: str,
+    run_id: str,
+    tile: str,
+    root: str,
+    storage: StorageBackend,
+    indexes: Sequence[int],
+    submission_round: int,
+    submit: Submitter,
+    job: ProcessingJob | None = None,
+    units: int | None = None,
+) -> int | None:
+    """Record the submission, then make it. Returns the cluster id, if any."""
+    cluster_name = stage_cluster_name(run_id, tile, stage, submission_round)
+    _record_submission(
+        storage,
+        root,
+        stage,
+        submission_round=submission_round,
+        indexes=indexes,
+        run_id=run_id,
+        tile=tile,
+        cluster_name=cluster_name,
+    )
+    submission = submit(
+        stage=stage,
+        run_id=run_id,
+        tile=tile,
+        indexes=indexes,
+        job=job,
+        units=units,
+        submission_round=submission_round,
+    )
+    cluster_id = getattr(submission, "cluster_id", None)
+    _record_submission(
+        storage,
+        root,
+        stage,
+        submission_round=submission_round,
+        indexes=indexes,
+        run_id=run_id,
+        tile=tile,
+        cluster_name=getattr(submission, "name", cluster_name),
+        cluster_id=cluster_id,
+    )
+    log.info(
+        "shard_stage_open",
+        run_id=run_id,
+        tile=tile,
+        stage=stage,
+        submitted=len(indexes),
+        round=submission_round,
+        cluster_name=cluster_name,
+    )
+    return cluster_id
+
+
+def ensure_started(
+    *,
+    stage: str,
+    run_id: str,
+    tile: str,
+    root: str,
+    storage: StorageBackend,
+    indexes: Sequence[int],
+    submit: Submitter,
+    job: ProcessingJob | None = None,
+    units: int | None = None,
+) -> bool:
+    """Start a stage's first round unless somebody already has. No waiting.
+
+    Two callers need to start a fleet without then blocking on it. The fused
+    offsets stage is started *before* its expected artifacts are even knowable
+    (they come from a plan its own shard 0 writes), and the composite fleet is
+    started mid-way through the offsets barrier so its boot overlaps that
+    stage's tail. Both then fall through to the ordinary
+    :func:`_await_stage`, which sees the fresh submission record and **adopts**
+    it rather than submitting again -- the same machinery that keeps two
+    drivers from colliding.
+
+    Returns:
+        Whether this call started anything.
+    """
+    records = _submission_records(storage, root, stage)
+    if records:
+        return False
+    _start_round(
+        stage=stage,
+        run_id=run_id,
+        tile=tile,
+        root=root,
+        storage=storage,
+        indexes=indexes,
+        submission_round=1,
+        submit=submit,
+        job=job,
+        units=units,
+    )
+    return True
 
 
 def _await_stage(
@@ -346,6 +484,8 @@ def _await_stage(
     expected: dict[int, list[str]],
     submit: Submitter,
     job: ProcessingJob | None = None,
+    units: int | None = None,
+    on_poll: Callable[[], None] | None = None,
 ) -> StageOutcome:
     """Get this stage finished: adopt what is running, start what is not.
 
@@ -404,6 +544,7 @@ def _await_stage(
                 run_id=run_id,
                 tile=tile,
                 stage=stage,
+                on_poll=on_poll,
             )
             if not missing:
                 break
@@ -413,48 +554,20 @@ def _await_stage(
         if next_round > settings.shard_barrier_rounds:
             break
 
-        cluster_name = stage_cluster_name(run_id, tile, stage, next_round)
-        _record_submission(
-            storage,
-            root,
-            stage,
-            submission_round=next_round,
-            indexes=missing,
-            run_id=run_id,
-            tile=tile,
-            cluster_name=cluster_name,
-        )
-        submission = submit(
+        cluster_id = _start_round(
             stage=stage,
             run_id=run_id,
             tile=tile,
+            root=root,
+            storage=storage,
             indexes=missing,
-            job=job,
             submission_round=next_round,
+            submit=submit,
+            job=job,
+            units=units,
         )
         outcome.submissions += 1
-        cluster_id = getattr(submission, "cluster_id", None)
         outcome.cluster_ids.append(cluster_id)
-        _record_submission(
-            storage,
-            root,
-            stage,
-            submission_round=next_round,
-            indexes=missing,
-            run_id=run_id,
-            tile=tile,
-            cluster_name=getattr(submission, "name", cluster_name),
-            cluster_id=cluster_id,
-        )
-        log.info(
-            "shard_stage_open",
-            run_id=run_id,
-            tile=tile,
-            stage=stage,
-            submitted=len(missing),
-            round=next_round,
-            cluster_name=cluster_name,
-        )
 
         missing = _watch(
             storage=storage,
@@ -464,10 +577,13 @@ def _await_stage(
             run_id=run_id,
             tile=tile,
             stage=stage,
+            on_poll=on_poll,
         )
         if not missing:
             break
 
+    records = _submission_records(storage, root, stage)
+    outcome.rounds = int(records[-1]["round"]) if records else 0
     missing = _missing(storage, prefix, expected)
     outcome.wall_s = time.monotonic() - started
     if missing:
@@ -509,6 +625,118 @@ def _await_single(
         expected={0: list(keys)},
         submit=submit,
         job=job,
+    )
+
+
+def _read_plan(
+    run_id: str, tile: str, root: str, storage: StorageBackend
+) -> shards.TilePlan | None:
+    """The plan if shard 0 has already published it, else ``None``."""
+    if storage.read_text(shards.plan_key(root)) is None:
+        return None
+    return shard_tasks.load_context(run_id, tile, storage=storage).plan
+
+
+def _wait_for_plan(run_id: str, tile: str, root: str, storage: StorageBackend) -> shards.TilePlan:
+    """Wait for shard 0 of the fused fleet to publish the plan.
+
+    The driver cannot know what the offsets stage's artifacts are called until
+    this exists -- the scene ranges come from the plan -- so this is the one
+    barrier it takes before it has an expected-key map. Bounded by
+    ``shard_plan_wait_s`` plus the fleet's own boot allowance, and loud on
+    expiry: a plan that never arrives means shard 0 died, and waiting on it
+    forever is the hang shape this project keeps paying for.
+
+    Raises:
+        ShardStageFailed: If no plan appears in time.
+    """
+    deadline = time.time() + settings.shard_plan_wait_s + settings.shard_barrier_timeout_s
+    while True:
+        if storage.read_text(shards.plan_key(root)) is not None:
+            return shard_tasks.load_context(run_id, tile, storage=storage).plan
+        if time.time() >= deadline:
+            raise ShardStageFailed("offsets", [shards.plan_key(root)])
+        time.sleep(settings.shard_driver_poll_s)
+
+
+def _overlap_ready(storage: StorageBackend, root: str, plan: shards.TilePlan) -> bool:
+    """Whether phase B has produced enough to justify booting the composite.
+
+    The trigger is *evidence*, not a timer: at least one scene partial means
+    the offsets stage is running and producing, which is what separates
+    overlapping from gambling a fleet's worth of boot on a stage that may be
+    about to fail. ``shard_composite_overlap`` raises the bar to a fraction of
+    the partials; 1.0 turns the overlap off entirely.
+    """
+    present = set(storage.list_prefix(f"{root}/offsets/scene/"))
+    done = sum(
+        1
+        for index in range(plan.scene_shards)
+        if all(k in present for k in _expected_keys(plan, "offsets", root)[index])
+    )
+    if done == 0:
+        return False
+    needed = max(1, ceil(settings.shard_composite_overlap * plan.scene_shards))
+    return done >= needed
+
+
+def _await_export(
+    *,
+    run_id: str,
+    tile: str,
+    root: str,
+    storage: StorageBackend,
+    plan: shards.TilePlan,
+    submit: Submitter,
+) -> StageOutcome:
+    """Wait for a composite worker to run the export; submit one only if none does.
+
+    The last composite worker to write a band claims the export and runs it
+    there, which saves a whole VM boot and a queue wait for a merge whose
+    inputs that worker just produced. So the driver's first move is to wait, not
+    to submit.
+
+    The fallback is for the claim that is written and never executed -- the
+    claiming VM preempted between the two. After
+    ``shard_export_claim_fallback_s`` with the bands all present and no COGs,
+    the driver submits the export stage exactly as it always did.
+    """
+    started = time.monotonic()
+    cog_keys = [storage.cog_key(plan.window, tile, product) for product in PRODUCTS]
+    prefix = cog_keys[0].rsplit("/", 1)[0] + "/"
+    expected = {0: cog_keys}
+
+    deadline = time.time() + settings.shard_export_claim_fallback_s
+    while _missing(storage, prefix, expected):
+        if time.time() >= deadline:
+            log.warning(
+                "shard_export_claim_unfulfilled",
+                run_id=run_id,
+                tile=tile,
+                waited_s=settings.shard_export_claim_fallback_s,
+                note="submitting the export stage",
+            )
+            outcome = _await_single(
+                stage="export",
+                run_id=run_id,
+                tile=tile,
+                root=root,
+                storage=storage,
+                prefix=prefix,
+                keys=cog_keys,
+                submit=submit,
+            )
+            outcome.wall_s += time.monotonic() - started
+            return outcome
+        time.sleep(settings.shard_driver_poll_s)
+
+    log.info("shard_export_claimed_by_worker", run_id=run_id, tile=tile)
+    return StageOutcome(
+        stage="export",
+        shards=1,
+        already_done=1,
+        submissions=0,
+        wall_s=time.monotonic() - started,
     )
 
 
@@ -604,56 +832,97 @@ def _drive(
     storage: StorageBackend,
     submit: Submitter,
 ) -> TileRunSummary:
-    """The stage sequence, shared by a fresh run and a resumed one."""
+    """The stage sequence, shared by a fresh run and a resumed one.
+
+    Two fleets, not five. The offsets side -- resolve, climatology, phase-A
+    barrier, per-scene offsets -- is one fused task type
+    (:func:`landsat_lst.shard_tasks.run_offsets_stage`), because an offsets-side
+    shard computed for about six minutes while its stage held a fleet for about
+    thirty: boots and queueing dominated. The composite fleet starts while that
+    one is still finishing, and the export is claimed by whichever composite
+    worker writes the last band. See ADR-016.
+    """
     root = shards.shard_root(run_id, tile)
     summary = TileRunSummary(run_id=run_id, tile=tile, window=job.window_label if job else "")
 
-    summary.stages.append(
-        _await_single(
-            stage="resolve",
+    # The fused fleet's width has to be settled before the plan exists, because
+    # shard 0 of this very fleet is what writes the plan. It travels with the
+    # task command so the planner cuts the plan to the fleet that will run it.
+    units = shards.offsets_fleet_units()
+    plan = _read_plan(run_id, tile, root, storage)
+
+    # Start the fused fleet only when there is offsets work left. A resumed run
+    # whose offsets finished has a plan and every partial, and must start
+    # nothing -- which is the whole point of resuming.
+    if plan is None or _missing(
+        storage, f"{root}/offsets/scene/", _expected_keys(plan, "offsets", root)
+    ):
+        ensure_started(
+            stage="offsets",
             run_id=run_id,
             tile=tile,
             root=root,
             storage=storage,
-            prefix=f"{root}/",
-            keys=[shards.plan_key(root), shards.items_key(root)],
+            indexes=list(range(units)),
             submit=submit,
             job=job,
+            units=units,
         )
-    )
 
-    ctx = shard_tasks.load_context(run_id, tile, storage=storage)
-    plan = ctx.plan
+    if plan is None:
+        plan = _wait_for_plan(run_id, tile, root, storage)
     summary.window = plan.window
     log.info(
         "shard_plan_read",
         run_id=run_id,
         tile=tile,
         scenes=len(plan.scene_ids),
+        units=units,
         ref_shards=plan.ref_shards,
         scene_shards=plan.scene_shards,
         band_shards=len(plan.bands),
         digest=plan.digest,
     )
 
-    for stage, prefix in (
-        ("climatology", f"{root}/offsets/ref/"),
-        ("offsets", f"{root}/offsets/scene/"),
-    ):
-        summary.stages.append(
-            _await_stage(
-                stage=stage,
-                run_id=run_id,
-                tile=tile,
-                root=root,
-                storage=storage,
-                prefix=prefix,
-                expected=_expected_keys(plan, stage, root),
-                submit=submit,
-            )
-        )
+    # Started from inside the offsets barrier, the moment phase B is
+    # demonstrably producing. Guarded by a flag rather than by the submission
+    # record alone so the driver does not list on every poll.
+    composite_started = False
 
-    # In the driver, not on a VM: a kilobyte of JSON in, 600 floats out.
+    def _overlap() -> None:
+        nonlocal composite_started
+        if composite_started or not _overlap_ready(storage, root, plan):
+            return
+        composite_started = ensure_started(
+            stage="composite",
+            run_id=run_id,
+            tile=tile,
+            root=root,
+            storage=storage,
+            indexes=list(range(len(plan.bands))),
+            submit=submit,
+        )
+        if composite_started:
+            log.info("shard_composite_overlapped", run_id=run_id, tile=tile, bands=len(plan.bands))
+
+    summary.stages.append(
+        _await_stage(
+            stage="offsets",
+            run_id=run_id,
+            tile=tile,
+            root=root,
+            storage=storage,
+            prefix=f"{root}/offsets/scene/",
+            expected=_expected_keys(plan, "offsets", root),
+            submit=submit,
+            job=job,
+            units=units,
+            on_poll=_overlap,
+        )
+    )
+
+    # In the driver, not on a VM: a kilobyte of JSON in, 600 floats out. The
+    # composite shards are already booting and polling for exactly this record.
     merged = time.monotonic()
     key = shard_tasks.merge_offsets(run_id, tile, storage=storage)
     summary.stages.append(
@@ -681,14 +950,12 @@ def _drive(
     )
 
     summary.stages.append(
-        _await_single(
-            stage="export",
+        _await_export(
             run_id=run_id,
             tile=tile,
             root=root,
             storage=storage,
-            prefix=storage.cog_key(plan.window, tile, PRODUCTS[0]).rsplit("/", 1)[0] + "/",
-            keys=[storage.cog_key(plan.window, tile, product) for product in PRODUCTS],
+            plan=plan,
             submit=submit,
         )
     )

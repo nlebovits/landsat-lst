@@ -551,6 +551,26 @@ landsat-lst shard composite --run-id <id> --tile N40W075 --index 3   # what a VM
 
 Rules worth keeping:
 
+- **Two fleets per tile, not five.** Offsets-side shards computed ~6 min each while their
+  stages held fleets ~30: boots and queueing dominated. `resolve`, `climatology`, and
+  `offsets` are now sub-phases of one fused task (`run_offsets_stage`) — shard 0 resolves
+  (only if no plan exists), everyone waits for the plan, reduces its blocks, waits at an
+  **in-process** phase-A barrier, then estimates. The work-unit bodies are unchanged and
+  reused; only the wrappers moved.
+- **The fused fleet's width is fixed before the plan exists**, because shard 0 writes the
+  plan. `shards.offsets_fleet_units` decides it and `--units` carries it to the planner.
+  Never re-derive it on the VM: a disagreement means the stage waits forever for a partial
+  nobody owns.
+- **The composite fleet starts from inside the offsets barrier** once phase B is producing
+  (`shard_composite_overlap`, default: first partial). Evidence, not a timer. It goes
+  through `ensure_started`, so the later composite barrier *adopts* it. A composite shard
+  therefore **waits** for the merged offset record rather than refusing — refusing would
+  burn the boot the overlap saves.
+- **The export is claimed by the composite worker that writes the last band**, not
+  submitted as a fleet. The claim key is not a lock and does not need to be: the export is
+  idempotent at the canonical COG keys, so a lost race is waste, not corruption. The driver
+  submits the old export stage only if the COGs are still absent
+  `shard_export_claim_fallback_s` after every band exists (the claiming VM was preempted).
 - **A shard is complete when its artifact is listed.** Never an exit code, never a state
   object — the same rule tile completion already follows, one level down. The key is a
   pure function of the shard index (`shards.py` owns the grammar), which is what makes a

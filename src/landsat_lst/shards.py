@@ -160,6 +160,24 @@ def shard_log_key(root: str, stage: str, index: int, attempt: int) -> str:
     return f"{root}/state/{stage}.{index:04d}.{attempt}.log"
 
 
+def export_claim_key(root: str) -> str:
+    """One composite shard's claim on running the export itself.
+
+    The export is a single task at the end of a wide stage, and submitting it
+    as its own fleet costs a whole VM boot to do a merge that the last
+    composite worker is already booted for. So that worker claims it.
+
+    **This is not a lock, and first-writer-wins is not needed.** The export is
+    idempotent at the canonical COG keys: two workers running it concurrently
+    produce the same two objects, so a lost race costs duplicated work, never a
+    corrupted tile. The claim exists to make that duplication rare, not
+    impossible, which is why it is a plain write with no compare-and-set --
+    S3 offers none, and building one out of listings would add a failure mode
+    to save a few minutes of one VM.
+    """
+    return f"{root}/state/export.claim.json"
+
+
 def stage_submission_key(root: str, stage: str, submission_round: int) -> str:
     """One driver's record that it started this stage, and when.
 
@@ -226,7 +244,9 @@ def resolve_shard_attempt(storage: StorageBackend, root: str, stage: str, index:
     return highest + 1
 
 
-def stage_shard_counts(*, blocks: int, scene_batches: int, block_rows: int) -> tuple[int, int, int]:
+def stage_shard_counts(
+    *, blocks: int, scene_batches: int, block_rows: int, units: int | None = None
+) -> tuple[int, int, int]:
     """How wide each stage's fleet is, given what there is to divide.
 
     Configuration wins where it is set. Where it is 0 the width comes from
@@ -244,6 +264,15 @@ def stage_shard_counts(*, blocks: int, scene_batches: int, block_rows: int) -> t
         scene_batches: Phase-B scene ranges in the window.
         block_rows: Whole COG block rows in the output grid, which bounds the
             number of row bands :func:`band_edges` can cut.
+        units: The fused offsets fleet's width, which the driver fixed *before*
+            this plan existed -- it had to, since it starts that fleet and only
+            then does shard 0 write the plan. Both offsets-side counts follow
+            it (still clamped to the work available), so shard *i* of the fleet
+            owns group *i* of each phase. A shard whose index falls past a
+            clamped count simply has nothing to do in that phase. Ignoring this
+            and re-deriving the width here would let the two processes disagree
+            about how many partials the tile expects, and the stage would wait
+            forever for one nobody was asked to write.
 
     Returns:
         ``(ref_shards, scene_shards, band_shards)``, each at least 1.
@@ -258,10 +287,26 @@ def stage_shard_counts(*, blocks: int, scene_batches: int, block_rows: int) -> t
         return max(1, min(configured or auto, available))
 
     return (
-        _pick(settings.shard_climatology_vms, auto_offsets, blocks),
-        _pick(settings.shard_offset_vms, auto_offsets, scene_batches),
+        _pick(units or settings.shard_climatology_vms, auto_offsets, blocks),
+        _pick(units or settings.shard_offset_vms, auto_offsets, scene_batches),
         _pick(settings.shard_composite_vms, auto_composite, block_rows),
     )
+
+
+def offsets_fleet_units() -> int:
+    """How wide the fused offsets fleet is, decided without a plan.
+
+    The driver starts that fleet before any plan exists, so this cannot depend
+    on the tile's geometry. It is passed to the planner (``--units``) rather
+    than recomputed there: two processes deriving one number from settings that
+    drifted apart would each be internally consistent and jointly wrong, and
+    the symptom would be a stage waiting forever for a partial nobody owns.
+    """
+    from landsat_lst.projection import tile_projection  # noqa: PLC0415
+
+    if settings.shard_offset_vms:
+        return settings.shard_offset_vms
+    return max(1, round(tile_projection().n_vms_offsets))
 
 
 def block_spans(shape: tuple[int, int], block: int) -> list[Span]:

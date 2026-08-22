@@ -463,6 +463,7 @@ def _shard_task_command(
     run_id: str,
     tile: str,
     job: ProcessingJob | None = None,
+    units: int | None = None,
 ) -> str:
     """The shell script one VM runs for one shard.
 
@@ -474,10 +475,13 @@ def _shard_task_command(
     #66) -- here the index selects which slice of the tile the task owns, so an
     index that meant something else on a retry would recompute the wrong slab.
 
-    ``resolve`` additionally carries the window, because it is the one stage
-    that runs before a plan exists to read the window from. Every field the job
-    carries has to be restated, ``--max-scenes`` included: a missing one
-    silently reverts to a default and resolves a different scene set.
+    ``resolve`` and the fused ``offsets`` stage additionally carry the window,
+    because shard 0 of each runs before a plan exists to read the window from.
+    Every field the job carries has to be restated, ``--max-scenes`` included:
+    a missing one silently reverts to a default and resolves a different scene
+    set. They also carry ``--units``, the fleet width the plan is cut to, which
+    the driver fixed before this plan existed and must not be re-derived on the
+    VM (see :func:`landsat_lst.shards.offsets_fleet_units`).
     """
     parts = ["python", "-m", "landsat_lst.cli", "shard", stage, "--run-id", run_id, "--tile", tile]
     if job is not None:
@@ -486,6 +490,8 @@ def _shard_task_command(
             parts += ["--end-year", str(job.end_year)]
         if job.max_scenes is not None:
             parts += ["--max-scenes", str(job.max_scenes)]
+    if units is not None:
+        parts += ["--units", str(units)]
     quoted = shlex.join(parts)
     return f'#!/bin/bash\n{quoted} --index "${TASK_INPUT_VAR}"\n'
 
@@ -497,6 +503,7 @@ def submit_shard_stage(
     tile: str,
     indexes: Sequence[int],
     job: ProcessingJob | None = None,
+    units: int | None = None,
     submission_round: int = 1,
 ) -> StageSubmission:
     """Start one stage's shards as a Coiled Batch array, and return.
@@ -525,7 +532,10 @@ def submit_shard_stage(
         tile: Tile these shards belong to.
         indexes: Which shards to start. A resubmission passes only the missing
             ones.
-        job: Required by ``resolve``; unused otherwise.
+        job: Required by ``resolve`` and by the fused ``offsets`` stage, whose
+            shard 0 resolves; unused otherwise.
+        units: The fused offsets fleet's width, forwarded to the planner so the
+            plan is cut to the fleet that will run it.
         submission_round: Which attempt at this stage this is, counting from 1.
             It names the cluster, so a resubmission cannot collide with a
             previous round whose cluster is still in flight.
@@ -550,7 +560,7 @@ def submit_shard_stage(
         msg = f"no shards to submit for stage {stage!r}"
         raise ValueError(msg)
 
-    command = _shard_task_command(stage=stage, run_id=run_id, tile=tile, job=job)
+    command = _shard_task_command(stage=stage, run_id=run_id, tile=tile, job=job, units=units)
     environ = _worker_environ()
     name = stage_cluster_name(run_id, tile, stage, submission_round)
 

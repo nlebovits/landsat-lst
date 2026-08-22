@@ -479,6 +479,63 @@ class Settings(BaseSettings):
         "hours covers a phase that projects to well under one, with room for a "
         "spot replacement to boot and redo a shard.",
     )
+    # Consolidation (ADR-016, "One fleet per side"). Boots and queueing, not
+    # compute: offsets-side shards computed ~6 minutes each while their stages
+    # held fleets ~30. These knobs bound the waits that replace those boots.
+    shard_unit_poll_s: float = Field(
+        default=10.0,
+        gt=0,
+        description="Seconds between S3 listings *inside* a task, while it "
+        "waits at an in-process barrier: for the plan shard 0 writes, for the "
+        "phase-A blocks its peers write, or for the merged offset record. "
+        "Faster than the driver's poll because these waits are minutes rather "
+        "than hours and the listings are small.",
+    )
+    shard_plan_wait_s: int = Field(
+        default=1800,
+        ge=0,
+        description="How long a fused offsets task waits for shard 0 to "
+        "publish plan.json before failing. Shard 0 runs one STAC query and "
+        "builds two lazy graphs, which is minutes; the ceiling is generous "
+        "because the alternative to waiting is a whole fleet's boot.",
+    )
+    shard_block_wait_s: int = Field(
+        default=5400,
+        ge=0,
+        description="How long a fused offsets task waits at the in-process "
+        "phase-A barrier for every peer's climatology blocks. Phase B cannot "
+        "start without the whole climatology, and waiting in a booted process "
+        "costs nothing but time already paid for.",
+    )
+    shard_offsets_record_wait_s: int = Field(
+        default=5400,
+        ge=0,
+        description="How long a composite shard waits for the merged offset "
+        "record before failing. Composite VMs are started while phase B is "
+        "still running (shard_composite_overlap), so an early boot must wait "
+        "rather than refuse -- a refusal here would burn the boot the overlap "
+        "exists to save.",
+    )
+    shard_composite_overlap: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of phase-B partials that must exist before the "
+        "driver starts the composite fleet, overlapping its boot with the tail "
+        "of the offsets stage. 0.0 means the first partial: proof the offsets "
+        "stage is producing, which is what distinguishes overlap from "
+        "gambling. 1.0 disables the overlap (composite starts only once phase "
+        "B is complete).",
+    )
+    shard_export_claim_fallback_s: int = Field(
+        default=900,
+        ge=0,
+        description="How long the driver waits for the COGs after every band "
+        "slab exists before submitting the export stage itself. A composite "
+        "shard claims the export once it writes the last band, which saves a "
+        "whole VM boot; this is the belt for a claim that is never executed "
+        "because the claiming VM was preempted.",
+    )
     shard_barrier_rounds: int = Field(
         default=2,
         ge=1,
