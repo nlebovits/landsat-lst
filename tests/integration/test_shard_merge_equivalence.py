@@ -89,7 +89,13 @@ def _dataset(
     offset path interacts with.
     """
     rng = np.random.default_rng(seed)
-    times = pd.date_range("2021-01-05", periods=scenes, freq="34D").values
+    # Sub-second components, because real solar-day stamps have them and every
+    # offset here round-trips through JSON before a coordinate join reads it
+    # back. On whole seconds this whole file passed while the composite failed
+    # on every shard of S30W065: the serializer truncated the axis and the join
+    # could not find a single stamp.
+    base = pd.date_range("2021-01-05T13:52:07", periods=scenes, freq="34D")
+    times = (base + pd.to_timedelta(482_915 + 137 * np.arange(scenes), unit="us")).values
     doy = pd.DatetimeIndex(times).dayofyear.values.astype("float64")
 
     celsius = 25.0 + 12.0 * np.sin(2 * np.pi * (doy - 15) / 365)

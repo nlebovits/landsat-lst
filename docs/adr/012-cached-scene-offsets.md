@@ -103,6 +103,29 @@ to on and the batch task forwards it.
 Local `write_text` became atomic (temp file plus `os.replace`). S3 gives that for free, and
 a truncated offset record that parses as far as it goes would be worse than no record.
 
+**The stored time axis is serialized at nanosecond precision, and that is not cosmetic.**
+The record was written with `np.datetime_as_string(..., unit="s")`, which is a *truncation*
+of a real Landsat solar-day stamp rather than a spelling of it. That was harmless while
+offsets were aligned to a stack by position. ADR-016 made the stamps load-bearing —
+`debias_with_offsets` joins by coordinate value, because a row band's stack can lose a time
+step and index alignment would then apply scene *k*'s offset to scene *k+1* — and an axis
+rebuilt from truncated stamps is a different axis. Every composite shard of S30W065 failed
+with `lst carries a time step the offsets do not ... ("not all values found in index
+'time'")`.
+
+Records written at the old precision are still read. Where the second-precision rendering
+of the live axis matches the stored list element for element **and holds no duplicates**,
+the record is accepted and returned on the loaded axis at full precision. A duplicate means
+the record is consistent with more than one axis, and that is a miss: recompute rather than
+serve numbers that might belong to a different scene set. Support for this is permanent
+rather than a migration window — the records are correct answers that cost half an hour of
+compute each — and `ALGORITHM_VERSION` is **not** bumped, because no value ever changed.
+
+The reason this survived so long is a testing one worth keeping: every synthetic fixture in
+the repo used whole-second timestamps, so no test could distinguish a serializer that
+truncated from one that did not. Fixtures whose offsets round-trip through JSON now carry
+sub-second components.
+
 **A sampled window cannot validate a rejection fraction.** 93 of 300 sampled scenes survived
 de-striping, a 69% rejection rate against 21.8% measured at Pergamino. Spreading 300 scenes
 across five years leaves each calendar month roughly 25 scenes to build its climatology

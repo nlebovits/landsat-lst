@@ -34,9 +34,19 @@ def _times(years=(2021, 2022, 2023, 2024, 2025), per_month=2) -> np.ndarray:
     Window length matters to the estimator. Each month's reference is a median
     over ``len(years) * per_month`` samples, and a scene's own bias leaks into
     its own reference, so a short window attenuates the recovered offset.
+
+    **Sub-second stamps, deliberately.** Real Landsat solar-day timestamps carry
+    them, and the offsets are joined to a stack by coordinate *value*. A
+    whole-second fixture cannot see a serializer that truncates the axis: the
+    cache round-tripped, the join found every stamp, and the composite still
+    failed on every shard of S30W065 against real data.
     """
     days = [5, 20][:per_month]
-    stamps = [f"{y}-{m:02d}-{d:02d}" for y in years for m in range(1, 13) for d in days]
+    dates = [(y, m, d) for y in years for m in range(1, 13) for d in days]
+    stamps = [
+        f"{y}-{m:02d}-{d:02d}T14:07:{i % 60:02d}.{(123_456 + 977 * i) % 1_000_000:06d}"
+        for i, (y, m, d) in enumerate(dates)
+    ]
     return pd.to_datetime(stamps).values
 
 
