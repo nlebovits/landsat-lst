@@ -31,17 +31,26 @@ from dataclasses import dataclass
 from landsat_lst.config import settings
 
 #: Measured per-VM rates and their provenance. Update only from a probe run.
+#: The frozen Stage-3 planning numbers, deliberately conservative:
+#: - Offsets: v3 measured 158.4 at (8, 1024) warm, 120-134 at (16, 1024);
+#:   140 planned.
+#: - Composite: the m6i.4xlarge native probe (composite_rate_m6i4xl.json)
+#:   measured 210-386 MB/s decoded at chunk 1024 -- but on a 4.4%-land tile
+#:   whose ocean nodata deflates ~8x on the wire. A full-land tile
+#:   compresses ~1.64x (U4), so 150 is the planning rate until the first
+#:   sharded land-tile run calibrates it.
 PROBE_AS_OF = "2026-08-21"
-R_OFFSETS_MB_S = 155.0  # chunk 1024, 8 io threads; probe v2/v3
-R_COMPOSITE_MB_S = 75.0  # chunk 512, 16 threads; probe v2/v3
+R_OFFSETS_MB_S = 140.0  # r6i.2xlarge, chunk 1024, 8 io threads; ladder v3
+R_COMPOSITE_MB_S = 150.0  # m6i.4xlarge, native, chunk 1024; land-discounted
 
 #: Phase budgets inside the 60-minute tile (the rest is setup + export).
 OFFSET_BUDGET_MIN = 15.0
 COMPOSITE_BUDGET_MIN = 38.0
 
-#: r6i.2xlarge on-demand; spot spans 0.30-0.75 of it (pricing.json discipline:
-#: a range, never a scalar).
-VM_HOURLY_ON_DEMAND = 0.504
+#: On-demand hourly per phase VM type; spot spans 0.30-0.75 of it
+#: (pricing.json discipline: a range, never a scalar).
+VM_HOURLY_ON_DEMAND = 0.504  # r6i.2xlarge -- offsets stage
+VM_HOURLY_COMPOSITE = 0.768  # m6i.4xlarge -- composite stage
 SPOT_FACTOR_RANGE = (0.30, 0.75)
 
 
