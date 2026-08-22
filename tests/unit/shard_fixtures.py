@@ -102,6 +102,25 @@ def make_items(plan) -> list[dict]:
     return out
 
 
+def publish_legacy_plan(storage, plan, *, run_id: str = RUN_ID, items=None) -> str:
+    """A plan as the pre-2026-08-22 planner wrote it: stamps at second precision.
+
+    The items keep their full precision, because they always did -- the
+    truncation happened in ``_times_iso`` on the way into the plan, not in the
+    catalog. That asymmetry is the whole of the bug and the whole of the
+    recovery, so a fixture that truncated both would prove nothing.
+    """
+    from landsat_lst.shard_tasks import apply_shard_settings
+
+    apply_shard_settings()
+    root = shards.shard_root(run_id, plan.tile)
+    payload = plan.to_dict()
+    payload["scene_times"] = [stamp.split(".")[0] for stamp in plan.scene_times]
+    storage.write_text(shards.items_key(root), json.dumps(items or make_items(plan)))
+    storage.write_text(shards.plan_key(root), json.dumps(payload, indent=2))
+    return root
+
+
 def publish_plan(storage, plan, *, run_id: str = RUN_ID) -> str:
     """Write the plan and its items, as the resolve stage would.
 

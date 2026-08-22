@@ -330,6 +330,17 @@ Rules worth keeping:
   times.** Records written at second precision are still read, via an unambiguous
   truncated match (duplicates in the truncated axis are a miss, never a guess); the values
   never changed, so `ALGORITHM_VERSION` is unchanged.
+- **Legacy *plans* needed the same treatment, and the record fix alone did not
+  reach them.** `plan.scene_times` written before 2026-08-22 are second-precision;
+  `shard_tasks._time_coord` rebuilds the offset axis from them, so a resumed run
+  hands the join a truncated axis and fails identically. `load_context` recovers the
+  fraction from `items.json` (`upgrade_legacy_scene_times`). Note `items.json` holds
+  one entry per **scene** and the axis one per **solar-day group**, so several items
+  inside one second is ordinary: the group's stamp is the *earliest* of them, because
+  odc-stac sorts each group by `nominal_datetime` and takes `group[0]`. Two entries in
+  the *stored axis* truncating to one second is the ambiguity that has no answer, and
+  that is a hard error. The plan digest covers scene ids and settings, never the
+  stamps, so the upgrade cannot move it.
 - **A sampled window cannot check a rejection fraction.** 300 scenes over five years leaves
   each month ~25 scenes for its climatology instead of 244, and the noisy reference inflates
   offsets: 69% rejected on the sample against 21.8% at Pergamino.

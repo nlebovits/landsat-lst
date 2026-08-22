@@ -41,6 +41,7 @@ import shutil
 import tempfile
 import time
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -49,7 +50,7 @@ import pandas as pd
 import structlog
 import xarray as xr
 
-from landsat_lst import shards
+from landsat_lst import offsets, shards
 from landsat_lst.config import settings
 from landsat_lst.logging_config import configure_logging
 from landsat_lst.models import ProcessingJob
@@ -165,12 +166,129 @@ class ShardContext:
         return set(self.storage.list_prefix(f"{self.root}/{prefix}"))
 
 
+def _item_time_values(items: list) -> list[np.datetime64]:
+    """Every item's nominal timestamp, naive UTC, as ``odc-stac`` resolves it.
+
+    ``odc-stac`` sets each group's time coordinate to
+    ``group[0].nominal_datetime.replace(tzinfo=None)``, and a group's
+    representative is always *some* item -- so whatever the solar-day grouping
+    decided, the value it chose is in this list. That is what makes recovering
+    a truncated axis possible without re-implementing the grouping, which is
+    version-coupled and which nothing here would notice getting wrong.
+
+    ``nominal_datetime`` falls back to ``start_datetime`` and then
+    ``end_datetime``; this mirrors that order.
+    """
+    values: list[np.datetime64] = []
+    for item in items:
+        stamp = getattr(item, "datetime", None)
+        if stamp is None:
+            props = getattr(item, "properties", {}) or {}
+            raw = props.get("start_datetime") or props.get("end_datetime")
+            if raw is None:
+                continue
+            stamp = raw
+        moment = pd.Timestamp(stamp)
+        if moment.tzinfo is not None:
+            moment = moment.tz_convert("UTC").tz_localize(None)
+        values.append(np.datetime64(moment.to_datetime64()))
+    return values
+
+
+def upgrade_legacy_scene_times(plan: shards.TilePlan, items: list) -> shards.TilePlan:
+    """Restore the sub-second component a pre-2026-08-22 planner truncated away.
+
+    Plans written before the nanosecond fix froze ``scene_times`` at second
+    precision. :func:`_time_coord` rebuilds the offset axis from those strings,
+    and a composite shard then joins it against a stack loaded at full
+    precision -- which raises exactly the error the record-side fix was supposed
+    to have ended. The S30W065 plan is one of these, and a resumed run reads it
+    rather than writing a new one, so the record fix alone left the whole chain
+    blocked.
+
+    The recovery is derived, not guessed, and the derivation is exact for a
+    reason worth writing down. ``items.json`` holds one entry per *scene* while
+    the axis holds one per *solar-day group*, so several items routinely fall
+    inside one second -- adjacent WRS rows of one overpass are seconds apart.
+    Where they do, the group's representative is the **earliest** of them:
+    ``odc-stac`` sorts each group by ``(group_key, nominal_datetime, id)`` and
+    takes ``group[0]``. Items within one second are necessarily on the same
+    date and therefore in the same solar-day group, so the earliest candidate
+    in a second *is* that group's timestamp. Taking the minimum is a proof, not
+    a preference.
+
+    What stays a hard error is ambiguity the items cannot resolve: two entries
+    in the stored axis that truncate to the same second. The plan then fits
+    more than one real axis, and there is nothing to read it from -- the same
+    discipline as :func:`landsat_lst.offsets._truncation_of`, which treats an
+    ambiguous truncation as a miss rather than a reading. So is a stamp no item
+    matches at all, which means the plan and the item list disagree.
+
+    The digest is untouched, and cannot move: it covers the scene *ids* and the
+    settings, never the stamps (see :meth:`landsat_lst.shards.TilePlan.digest`).
+    A legacy plan therefore still verifies against a current process.
+
+    Args:
+        plan: The plan as stored.
+        items: The tile's resolved STAC items, from ``items.json``.
+
+    Returns:
+        The plan unchanged when its stamps already carry a fraction, else a
+        copy whose ``scene_times`` are full precision.
+
+    Raises:
+        ValueError: If two entries in the stored axis truncate to the same
+            second, or if a stored stamp matches no item at all.
+    """
+    stored = list(plan.scene_times)
+    if not stored or any("." in stamp for stamp in stored):
+        return plan
+    if len(set(stored)) != len(stored):
+        duplicate = next(s for s in stored if stored.count(s) > 1)
+        msg = (
+            f"the plan for {plan.tile} truncates ambiguously at {duplicate}: two of "
+            "its time steps fall inside that second, so the stored axis fits more "
+            "than one real one. Re-plan the tile rather than guessing which."
+        )
+        raise ValueError(msg)
+
+    candidates: dict[str, set[np.datetime64]] = {}
+    for value in _item_time_values(items):
+        second = str(np.datetime_as_string(value, unit=offsets.LEGACY_TIME_UNIT))
+        candidates.setdefault(second, set()).add(value)
+
+    upgraded: list[np.datetime64] = []
+    for stamp in stored:
+        matches = candidates.get(stamp, set())
+        if not matches:
+            msg = (
+                f"the plan for {plan.tile} carries {stamp}, which no item in "
+                "items.json matches; the plan and the item list disagree"
+            )
+            raise ValueError(msg)
+        # The earliest, which is the group's representative -- see the note
+        # above on why several items inside one second are ordinary and why
+        # ``min`` is exact rather than a preference.
+        upgraded.append(min(matches))
+
+    times = xr.DataArray(np.array(upgraded, dtype="datetime64[ns]"), dims=["time"])
+    log.info(
+        "offset_plan_legacy_precision",
+        tile=plan.tile,
+        window=plan.window,
+        scenes=len(stored),
+        note="plan stamps stored at second precision; recovered from items.json",
+    )
+    return replace(plan, scene_times=offsets._times_iso(times))
+
+
 def load_context(run_id: str, tile: str, *, storage: StorageBackend | None = None) -> ShardContext:
     """Read the plan and the frozen item list, refusing a plan cut elsewhere.
 
     Raises:
         FileNotFoundError: If the planner has not run for this tile.
-        ValueError: If the plan was cut under a different configuration.
+        ValueError: If the plan was cut under a different configuration, or if
+            a legacy plan's truncated time axis cannot be recovered.
     """
     apply_shard_settings()
     storage = storage or get_storage()
@@ -190,9 +308,13 @@ def load_context(run_id: str, tile: str, *, storage: StorageBackend | None = Non
     # Raises on digest drift. Not caught: a shard that computed against
     # different settings would merge into a tile nothing inspects.
     plan = shards.TilePlan.from_dict(json.loads(raw_plan))
+    items = items_from_dicts(json.loads(raw_items))
+    # After the digest check, and with the items in hand: a plan written before
+    # the nanosecond fix carries a truncated time axis that no join can match.
+    plan = upgrade_legacy_scene_times(plan, items)
     return ShardContext(
         plan=plan,
-        items=items_from_dicts(json.loads(raw_items)),
+        items=items,
         job=job_for_window(tile, plan.window),
         run_id=run_id,
         root=root,
