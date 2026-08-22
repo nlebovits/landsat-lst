@@ -186,13 +186,30 @@ class OffsetCache:
         #: not timing one.
         self.last_read_hit: bool | None = None
 
-    def read(self, time_coord: xr.DataArray) -> tuple[xr.DataArray, xr.DataArray] | None:
+    def read(
+        self, time_coord: xr.DataArray, *, dtype: Any = np.float32
+    ) -> tuple[xr.DataArray, xr.DataArray] | None:
         """The cached ``(offset, n_valid)`` for this stack, or ``None``.
 
         The stored time coordinate is compared against ``time_coord`` before the
         arrays are handed back. The digest should already have guaranteed the
         match, so a mismatch here means the key is under-specified rather than
         that the cache is cold, and it is logged as the defect it is.
+
+        Args:
+            time_coord: The stack's time axis, checked against the record's.
+            dtype: Element type for the returned offsets. The default matches
+                what the estimator produces. It used to rebuild them as
+                float64, and since ``debiased = lst - offset`` takes the wider
+                type, a warm cache silently promoted the entire composite -- a
+                doubling of every intermediate the P95 holds, decided by
+                nothing but whether a lookup hit. The stored JSON is unchanged
+                by this, so no ``ALGORITHM_VERSION`` bump: the numbers on disk
+                are the same numbers, read back at the width they were computed
+                at.
+
+        Returns:
+            ``(offset, n_valid)``, or ``None`` on any miss.
         """
         if not (self.enabled and self.read_enabled):
             self.last_read_hit = False
@@ -240,7 +257,7 @@ class OffsetCache:
         self.last_read_hit = True
         coords = {"time": time_coord}
         return (
-            xr.DataArray(np.array(offset_values, dtype="float64"), dims=["time"], coords=coords),
+            xr.DataArray(np.array(offset_values, dtype=dtype), dims=["time"], coords=coords),
             xr.DataArray(np.array(n_valid_values, dtype="int64"), dims=["time"], coords=coords),
         )
 
@@ -278,6 +295,102 @@ class OffsetCache:
             )
         except Exception as e:
             log.warning("offset_cache_write_failed", key=self.key.storage_key, error=str(e))
+
+
+def partial_payload(offset: xr.DataArray, n_valid: xr.DataArray) -> dict[str, Any]:
+    """One phase-B shard's answer, in the shape :func:`merge_scene_partials` reads.
+
+    The same three fields the cache record carries, and written by the same two
+    helpers, so a partial and a full record cannot disagree about how a NaN or
+    a timestamp is spelled.
+    """
+    return {
+        "times": _times_iso(offset.time),
+        "offset": _finite_or_none(np.asarray(offset.values, dtype="float64")),
+        "n_valid": [int(v) for v in np.asarray(n_valid.values)],
+    }
+
+
+def merge_scene_partials(
+    partials: Iterable[dict[str, Any]],
+    time_coord: xr.DataArray,
+    *,
+    dtype: Any = np.float32,
+) -> tuple[xr.DataArray, xr.DataArray]:
+    """Assemble whole ``(offset, n_valid)`` arrays from per-range partials.
+
+    Joined on the time coordinate rather than on the ranges in the keys. The
+    ranges are positions in one process's scene list, and a merge that trusted
+    them would produce a plausible answer from partials computed against two
+    different scene lists -- the failure mode the plan's digest exists to make
+    impossible and this check exists to catch if it happens anyway.
+
+    Coverage is verified against a frozen axis rather than inferred from what
+    arrived. A missing shard is the ordinary failure here (a preempted VM
+    writes nothing), and a merge that quietly emitted NaN for its scenes would
+    turn a lost shard into a silently thinner composite instead of an error.
+
+    Args:
+        partials: Records as :func:`partial_payload` builds them.
+        time_coord: The tile's full time axis, as the plan froze it.
+        dtype: Element type for the assembled offsets. Defaults to the
+            estimator's own, for the reason :meth:`OffsetCache.read` documents.
+
+    Returns:
+        ``(offset, n_valid)`` on ``time_coord``, in its order.
+
+    Raises:
+        ValueError: If any scene is missing, claimed twice, or unknown, or if a
+            record's three fields disagree in length.
+    """
+    wanted = _times_iso(time_coord)
+    position = {stamp: i for i, stamp in enumerate(wanted)}
+    if len(position) != len(wanted):
+        msg = "the time axis holds duplicate timestamps; partials cannot be joined on it"
+        raise ValueError(msg)
+
+    offset = np.full(len(wanted), np.nan, dtype=dtype)
+    n_valid = np.zeros(len(wanted), dtype="int64")
+    filled = [False] * len(wanted)
+
+    for record in partials:
+        times = list(record["times"])
+        offsets = list(record["offset"])
+        counts = list(record["n_valid"])
+        if not (len(times) == len(offsets) == len(counts)):
+            msg = (
+                f"partial covering {times[:1]}..{times[-1:]} is inconsistent: "
+                f"{len(times)} times, {len(offsets)} offsets, {len(counts)} counts"
+            )
+            raise ValueError(msg)
+        for stamp, value, count in zip(times, offsets, counts, strict=True):
+            i = position.get(stamp)
+            if i is None:
+                msg = (
+                    f"partial covers {stamp}, which is not on the planned time "
+                    "axis; the partials were computed against a different scene set"
+                )
+                raise ValueError(msg)
+            if filled[i]:
+                msg = f"two partials both claim {stamp}; the ranges overlap"
+                raise ValueError(msg)
+            offset[i] = np.nan if value is None else float(value)
+            n_valid[i] = int(count)
+            filled[i] = True
+
+    missing = [stamp for stamp, done in zip(wanted, filled, strict=True) if not done]
+    if missing:
+        msg = (
+            f"{len(missing)} of {len(wanted)} scenes have no partial "
+            f"(first {missing[0]}); a phase-B shard did not publish"
+        )
+        raise ValueError(msg)
+
+    coords = {"time": time_coord}
+    return (
+        xr.DataArray(offset, dims=["time"], coords=coords),
+        xr.DataArray(n_valid, dims=["time"], coords=coords),
+    )
 
 
 def cache_for_items(

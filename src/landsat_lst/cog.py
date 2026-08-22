@@ -74,6 +74,7 @@ import numpy as np
 import rasterio
 import rioxarray  # noqa: F401 - needed for .rio accessor
 import structlog
+from rasterio.windows import Window
 from rio_cogeo.cogeo import cog_translate, cog_validate
 from rio_cogeo.profiles import cog_profiles
 
@@ -148,7 +149,7 @@ def _write_intermediate(da: xr.DataArray, src_tif: Path, *, compute: bool = True
     )
 
 
-def _write_intermediates(pairs: Sequence[tuple[xr.DataArray, Path]]) -> None:
+def write_intermediates(pairs: Sequence[tuple[xr.DataArray, Path]]) -> None:
     """Write every ``(array, path)`` pair, sharing one pass over their sources.
 
     The arrays here descend from a common stack, so their graphs share source
@@ -315,7 +316,7 @@ def _to_cog(src_tif: Path, cog_path: Path, *, nodata: float | None) -> None:
 
 
 @dataclass(frozen=True)
-class _Product:
+class Product:
     """One COG to write: the array, its nodata, and how to finish the raster."""
 
     da: xr.DataArray
@@ -328,7 +329,7 @@ class _Product:
     describe: Callable[[rasterio.io.DatasetWriter], None]
 
 
-def _lst_product(native: xr.Dataset, cog_path: Path) -> _Product:
+def lst_product(native: xr.Dataset, cog_path: Path) -> Product:
     """Describe the single-band ``lst_p95`` COG (uint16 DN with scale/offset)."""
 
     def describe(src: rasterio.io.DatasetWriter) -> None:
@@ -336,7 +337,7 @@ def _lst_product(native: xr.Dataset, cog_path: Path) -> _Product:
         src.scales = (LST_SCALE,)
         src.offsets = (LST_OFFSET,)
 
-    return _Product(
+    return Product(
         da=_prep(native["lst_p95"]).rio.write_nodata(LST_FILL_VALUE),
         nodata=LST_FILL_VALUE,
         cog_path=cog_path,
@@ -346,7 +347,7 @@ def _lst_product(native: xr.Dataset, cog_path: Path) -> _Product:
     )
 
 
-def _qa_product(native: xr.Dataset, cog_path: Path) -> _Product:
+def qa_product(native: xr.Dataset, cog_path: Path) -> Product:
     """Describe the 12-band ``qa_count`` COG (uint8, one band per calendar month)."""
     qa = _prep(native["qa_count"])
     if "month" in qa.dims:
@@ -359,7 +360,7 @@ def _qa_product(native: xr.Dataset, cog_path: Path) -> _Product:
 
     # No nodata anywhere on this product: 0 observations is data, not absence of
     # data, and it has to stay visible for gap diagnosis.
-    return _Product(
+    return Product(
         da=qa,
         nodata=None,
         cog_path=cog_path,
@@ -369,7 +370,7 @@ def _qa_product(native: xr.Dataset, cog_path: Path) -> _Product:
     )
 
 
-def _export(native: xr.Dataset, products: Sequence[_Product]) -> None:
+def _export(native: xr.Dataset, products: Sequence[Product]) -> None:
     """Write every product, sharing one pass over the sources they have in common.
 
     All the intermediates are written first, in one compute, and only then
@@ -380,15 +381,119 @@ def _export(native: xr.Dataset, products: Sequence[_Product]) -> None:
     """
     with ExitStack() as stack:
         scratch = [stack.enter_context(_scratch_tif(p.scratch_prefix)) for p in products]
-        _write_intermediates([(p.da, tif) for p, tif in zip(products, scratch, strict=True)])
+        write_intermediates([(p.da, tif) for p, tif in zip(products, scratch, strict=True)])
         for product, src_tif in zip(products, scratch, strict=True):
-            with rasterio.open(src_tif, "r+") as src:
-                product.describe(src)
-                src.update_tags(**_dataset_tags(native.attrs))
-                histogram = _embed_statistics(src, product.nodata, coverage=product.coverage)
-            if histogram is not None:
-                _log_coverage(native.attrs, histogram)
-            _to_cog(src_tif, product.cog_path, nodata=product.nodata)
+            finish_product(src_tif, product, native.attrs)
+
+
+def finish_product(src_tif: Path, product: Product, attrs: Mapping[str, Any]) -> Path:
+    """Turn one written intermediate into its finished COG.
+
+    Split out of :func:`_export` so that a merge step can run it over an
+    intermediate it assembled from row bands rather than one it computed. The
+    tail is identical either way, and it has to be: the band descriptions, the
+    scale/offset pair, and the exact ``STATISTICS_*`` moments are what a
+    sharded tile has to match a single-VM one on, and a second implementation
+    of this sequence would drift on one of them without failing anything.
+
+    Args:
+        src_tif: A written plain GeoTIFF, opened here in ``r+``.
+        product: What it is and how to finish it.
+        attrs: Dataset attrs to stamp on as TIFF tags.
+
+    Returns:
+        The COG path written.
+    """
+    with rasterio.open(src_tif, "r+") as src:
+        product.describe(src)
+        src.update_tags(**_dataset_tags(attrs))
+        histogram = _embed_statistics(src, product.nodata, coverage=product.coverage)
+    if histogram is not None:
+        _log_coverage(attrs, histogram)
+    _to_cog(src_tif, product.cog_path, nodata=product.nodata)
+    return product.cog_path
+
+
+def merge_bands(
+    band_paths: Sequence[Path],
+    dst_tif: Path,
+    band_windows: Sequence[tuple[int, int]],
+) -> Path:
+    """Stack per-band GeoTIFFs into one full-tile intermediate, window by window.
+
+    Each band file holds the same columns and a contiguous run of the output's
+    rows. The copy walks the *source's* block windows and writes each one at
+    its destination row offset, so nothing larger than a block is resident and
+    the tile is assembled from a stream rather than a concatenation. Band
+    boundaries are multiples of the block height
+    (:func:`landsat_lst.shards.band_edges`), which is what makes every write
+    land on a destination block edge instead of forcing GDAL into a
+    read-modify-write of a straddling block.
+
+    The result is a **plain tiled GeoTIFF, never a COG**. Overviews belong to
+    the assembled tile: a pyramid built per band would resample across a
+    boundary the output does not have, and the merged file exists precisely so
+    :func:`finish_product` can build one pyramid over the whole thing. The
+    profile matches ``_write_intermediate``'s so the finished COG's blocking is
+    the same whichever way the tile was produced.
+
+    Args:
+        band_paths: One GeoTIFF per row band, in band order.
+        dst_tif: Destination intermediate.
+        band_windows: ``(row_start, row_stop)`` for each band, in the same
+            order. The last stop is the output height.
+
+    Returns:
+        ``dst_tif``.
+
+    Raises:
+        ValueError: If the bands disagree in width, band count, or dtype, or if
+            a band's height does not match the window it claims.
+    """
+    if len(band_paths) != len(band_windows):
+        msg = f"{len(band_paths)} bands but {len(band_windows)} windows"
+        raise ValueError(msg)
+
+    with rasterio.open(band_paths[0]) as first:
+        profile = dict(first.profile)
+        reference = (first.width, first.count, first.dtypes[0])
+
+    profile.update(
+        height=band_windows[-1][1],
+        tiled=True,
+        blockxsize=_BLOCKSIZE,
+        blockysize=_BLOCKSIZE,
+        compress="deflate",
+    )
+
+    dst_tif.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(dst_tif, "w", **profile) as dst:
+        for path, (row_start, row_stop) in zip(band_paths, band_windows, strict=True):
+            with rasterio.open(path) as src:
+                if (src.width, src.count, src.dtypes[0]) != reference:
+                    msg = (
+                        f"{path.name} does not match band 0: "
+                        f"{(src.width, src.count, src.dtypes[0])} vs {reference}"
+                    )
+                    raise ValueError(msg)
+                if src.height != row_stop - row_start:
+                    msg = (
+                        f"{path.name} is {src.height} rows but claims rows "
+                        f"[{row_start}, {row_stop})"
+                    )
+                    raise ValueError(msg)
+                for _, window in src.block_windows(1):
+                    dst.write(
+                        src.read(window=window),
+                        window=Window.from_slices(
+                            (
+                                window.row_off + row_start,
+                                window.row_off + row_start + window.height,
+                            ),
+                            (window.col_off, window.col_off + window.width),
+                        ),
+                    )
+    return dst_tif
 
 
 def _log_coverage(attrs: Mapping[str, Any], histogram: np.ndarray) -> None:
@@ -410,13 +515,13 @@ def _log_coverage(attrs: Mapping[str, Any], histogram: np.ndarray) -> None:
 
 def export_lst_cog(native: xr.Dataset, cog_path: Path) -> Path:
     """Write the single-band ``lst_p95`` COG (uint16 DN with scale/offset)."""
-    _export(native, [_lst_product(native, cog_path)])
+    _export(native, [lst_product(native, cog_path)])
     return cog_path
 
 
 def export_qa_cog(native: xr.Dataset, cog_path: Path) -> Path:
     """Write the 12-band ``qa_count`` COG (uint8, one band per calendar month)."""
-    _export(native, [_qa_product(native, cog_path)])
+    _export(native, [qa_product(native, cog_path)])
     return cog_path
 
 
@@ -439,5 +544,5 @@ def cog_export(native: xr.Dataset, lst_cog: Path, qa_cog: Path) -> tuple[Path, P
     Returns:
         ``(lst_cog, qa_cog)`` paths written.
     """
-    _export(native, [_lst_product(native, lst_cog), _qa_product(native, qa_cog)])
+    _export(native, [lst_product(native, lst_cog), qa_product(native, qa_cog)])
     return lst_cog, qa_cog

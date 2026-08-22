@@ -18,8 +18,9 @@ from urllib3.util.retry import Retry
 from landsat_lst.config import settings
 from landsat_lst.encoding import LST_MIN_TRUSTED_C
 from landsat_lst.kernels import nanquantile_last
-from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
+from landsat_lst.masks import get_land_mask_for_geobox, load_land_polygons
 from landsat_lst.normalization import (
+    debias_with_offsets,
     offset_diagnostics,
     rejection_floor,
     scene_keep_mask,
@@ -33,6 +34,8 @@ from landsat_lst.tiling import geobox_for_bbox
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from odc.geo.geobox import GeoBox
 
     from landsat_lst.models import ProcessingJob
     from landsat_lst.storage import StorageBackend
@@ -182,6 +185,58 @@ def query_stac(job: ProcessingJob) -> list:
     return list(search.items())
 
 
+def resolve_items(job: ProcessingJob) -> list:
+    """The scene set one job runs over: query, then sample if asked.
+
+    Every entry point into the tile path used to open with these seven lines,
+    and a sharded tile needs them exactly once for the whole tile rather than
+    once per shard. Two shards resolving their own scene set from a live
+    catalog can disagree -- STAC is not frozen, and ``_sample_scenes`` is only
+    deterministic given identical input -- and a tile assembled from two scene
+    sets is striped in a way no downstream check inspects.
+
+    Args:
+        job: Tile and window to resolve.
+
+    Returns:
+        The STAC items to load, sampled when ``job.max_scenes`` is set.
+
+    Raises:
+        ValueError: If the query returned nothing.
+    """
+    with timed_section("stac_query"):
+        items = query_stac(job)
+
+    if not items:
+        msg = f"No scenes found for {job.tile.name} in {job.window_label}"
+        raise ValueError(msg)
+
+    if job.max_scenes is not None:
+        items = _sample_scenes(items, job.max_scenes)
+
+    return items
+
+
+def items_to_dicts(items: list) -> list[dict]:
+    """Serialize resolved STAC items for a shard to read back.
+
+    Whole items rather than the ids alone: a shard has to *load* these, which
+    needs the asset hrefs and the properties ``odc-stac`` groups on, and
+    re-fetching them by id would put the catalog back in the per-shard path
+    that :func:`resolve_items` exists to keep it out of. (``fixture.py`` stores
+    only ids because a fixture's pixels are already on disk and the ids are
+    there for attribution.)
+    """
+    return [item.to_dict() for item in items]
+
+
+def items_from_dicts(payload: list[dict]) -> list:
+    """Rebuild items serialized by :func:`items_to_dicts`."""
+    import pystac  # noqa: PLC0415
+
+    return [pystac.Item.from_dict(entry) for entry in payload]
+
+
 def load_scenes(
     items: list,
     bbox: tuple[float, float, float, float],
@@ -189,6 +244,7 @@ def load_scenes(
     *,
     fail_on_error: bool = True,
     resolution_factor: int = 1,
+    geobox: GeoBox | None = None,
 ) -> xr.Dataset:
     """Load Landsat scenes as an xarray Dataset.
 
@@ -210,6 +266,14 @@ def load_scenes(
             ``factor**2`` fewer bytes. Use powers of two to land on a stored
             level. Intended for per-scene statistics that need no spatial
             detail; never for the composite itself.
+        geobox: Load onto this grid instead of the whole ``bbox``. Used by a
+            row-band shard, which loads a slice of the tile's geobox: slicing
+            the tile's grid rather than deriving one from the band's own bounds
+            is what keeps the band's pixels *the tile's* pixels (ADR-008), and
+            ``bbox`` is then unused. Row slices only -- a column slice moves
+            the geobox centroid longitude, which is what ``odc-stac`` derives
+            its ``solar_day`` shift from, so two column bands can group the
+            same items onto different time axes. See :mod:`landsat_lst.shards`.
 
     Returns:
         Dataset with thermal and QA bands.
@@ -236,7 +300,7 @@ def load_scenes(
     return stac_load(
         items,
         bands=["lwir11", "qa_pixel"],
-        geobox=geobox_for_bbox(bbox, resolution_factor),
+        geobox=geobox if geobox is not None else geobox_for_bbox(bbox, resolution_factor),
         chunks={"time": TIME_CHUNK, "latitude": csize, "longitude": csize},
         groupby="solar_day",
         patch_url=patch_url,
@@ -310,26 +374,25 @@ def scene_cloud_cover(
 
 
 def _build_land_mask(
-    bbox: tuple[float, float, float, float],
+    geobox: GeoBox,
     latitude: xr.DataArray,
     longitude: xr.DataArray,
 ) -> xr.DataArray:
     """Rasterize the Natural Earth land mask onto a grid's exact coordinates.
 
-    ``target_shape`` comes from the loaded array rather than from the bbox, so
-    the mask matches whatever grid the caller actually has, including the
-    zoomed-out grid used for offset estimation.
+    Rasterized against the geobox's own affine rather than against a transform
+    rebuilt from its bounds. The two agree to about fifteen digits, which is
+    not enough: a row band's mask has to be the exact slice of the tile's mask
+    or the seam between two bands carries a one-pixel land/ocean disagreement,
+    and offsets estimated over land would then be estimated over a slightly
+    different set of pixels per band. See
+    :func:`landsat_lst.masks.get_land_mask_for_geobox`.
 
     Both rasterio and odc-stac use north-down (descending latitude), so the
     rasterized array needs no flip.
     """
     land_polygons = load_land_polygons()
-    land_mask = get_land_mask_for_bbox(
-        bbox,
-        settings.resolution,
-        land_polygons,
-        target_shape=(len(latitude), len(longitude)),
-    )
+    land_mask = get_land_mask_for_geobox(geobox, land_polygons)
     return xr.DataArray(
         land_mask,
         dims=["latitude", "longitude"],
@@ -344,6 +407,7 @@ def compute_annual_composite(
     offset_source: xr.Dataset | None = None,
     offset_land_mask: xr.DataArray | None = None,
     offset_cache: OffsetCache | None = None,
+    offsets: tuple[xr.DataArray, xr.DataArray] | None = None,
 ) -> xr.Dataset:
     """Compute an LST P95 composite with a per-month observation count.
 
@@ -379,6 +443,17 @@ def compute_annual_composite(
             replaces the tile's longest compute with a kilobyte read. Only the
             estimate is cached, never the rejection, so a cap sweep re-reads one
             record per candidate. See issue #77 item 2.
+        offsets: A ready ``(offset, n_valid)`` pair, which skips estimation
+            entirely -- ``offset_source``, ``offset_land_mask``, and
+            ``offset_cache`` are then all unused, since there is nothing left
+            to estimate or to cache. This is the seam a row-band shard runs
+            through: the offsets are estimated once for the whole tile and
+            every band applies *the same* scalars, which is what makes the
+            bands concatenate into the tile's composite. Estimating per band
+            would give each band its own reference climatology and its own
+            correction, i.e. a horizontal seam at every band boundary. The
+            pair must be aligned by time coordinate, not position; see
+            :func:`~landsat_lst.normalization.debias_with_offsets`.
 
     Returns:
         Dataset with ``lst_p95`` ``(latitude, longitude)`` and ``qa_count``
@@ -396,7 +471,25 @@ def compute_annual_composite(
         lst = lst.where(land_mask)
 
     scenes_kept = None
-    if settings.destripe:
+    if settings.destripe and offsets is not None:
+        # A shard's path: the estimate arrived with the job, so all that is
+        # left is rejection and subtraction. The floor follows the grid the
+        # estimate was made on, which the configured factor names -- the same
+        # rule the estimating path applies, read from the setting rather than
+        # from the presence of a coarse stack this process never loaded.
+        with timed_section("destriping"):
+            lst, offset, keep = debias_with_offsets(
+                lst,
+                *offsets,
+                max_offset_c=settings.destripe_max_offset_c,
+                min_scene_pixels=settings.destripe_min_scene_pixels,
+                min_offset_samples=settings.destripe_min_offset_samples,
+                offset_source_given=settings.destripe_offset_resolution_factor > 1,
+            )
+        diagnostics = offset_diagnostics(offset, keep)
+        log.info("destripe_offsets_degC", **diagnostics)
+        scenes_kept = int(diagnostics["n_kept"])
+    elif settings.destripe:
         # The offset is one scalar per scene, so it can be estimated from a
         # coarse stack read off the source COGs' overviews. That cuts bytes
         # read, which post-load subsampling cannot do: dask must materialize a
@@ -576,13 +669,7 @@ def compute_tile_offsets(
     """
     started = time.monotonic()
 
-    with timed_section("stac_query"):
-        items = query_stac(job)
-    if not items:
-        msg = f"No scenes found for {job.tile.name} in {job.window_label}"
-        raise ValueError(msg)
-    if job.max_scenes is not None:
-        items = _sample_scenes(items, job.max_scenes)
+    items = resolve_items(job)
 
     factor = settings.destripe_offset_resolution_factor
     cache = cache_for_items(
@@ -597,16 +684,17 @@ def compute_tile_offsets(
 
     report_phase("loading", scenes_found=len(items))
     patch_url = _patch_url_for(items)
+    coarse_geobox = geobox_for_bbox(job.tile.bbox, factor)
     source = load_scenes(
         items,
         job.tile.bbox,
         patch_url=patch_url,
         fail_on_error=False,
-        resolution_factor=factor,
+        geobox=coarse_geobox,
     )
 
     with timed_section("land_mask"):
-        land = _build_land_mask(job.tile.bbox, source.latitude, source.longitude)
+        land = _build_land_mask(coarse_geobox, source.latitude, source.longitude)
 
     lst = convert_to_celsius(apply_qa_mask(source)["lwir11"]).where(land)
 
@@ -656,19 +744,12 @@ def process_tile(
         Dataset with the LST P95 composite (``lst_p95``) and per-month
         ``qa_count`` for the job's window.
     """
-    with timed_section("stac_query"):
-        items = query_stac(job)
-
-    if not items:
-        msg = f"No scenes found for {job.tile.name} in {job.year}"
-        raise ValueError(msg)
-
-    if job.max_scenes is not None:
-        items = _sample_scenes(items, job.max_scenes)
+    items = resolve_items(job)
 
     report_phase("loading", scenes_found=len(items))
 
     patch_url = _patch_url_for(items)
+    native_geobox = geobox_for_bbox(job.tile.bbox)
 
     # A 5-year window pulls ~1900 scenes, so at least one transient read failure
     # is near-certain. Fill that scene with nodata rather than aborting the load;
@@ -676,7 +757,9 @@ def process_tile(
     # the full stack. The coverage line the exporter logs is what makes this
     # safe: it is where a run that filled wholesale rather than occasionally
     # shows up. See `cog._log_coverage`.
-    data = load_scenes(items, job.tile.bbox, patch_url=patch_url, fail_on_error=False)
+    data = load_scenes(
+        items, job.tile.bbox, patch_url=patch_url, fail_on_error=False, geobox=native_geobox
+    )
 
     # Built before the composite so de-striping estimates each scene's offset
     # over land only. Ocean is thermally stable and would damp the estimate on
@@ -684,7 +767,7 @@ def process_tile(
     # dask graph and is not free, so it gets its own phase rather than hiding
     # inside `loading`.
     with timed_section("land_mask"):
-        land_mask_da = _build_land_mask(job.tile.bbox, data.latitude, data.longitude)
+        land_mask_da = _build_land_mask(native_geobox, data.latitude, data.longitude)
 
     # A coarse second load for the de-striping offsets. Reading from the source
     # overviews costs ~factor**2 fewer bytes than a second native-resolution
@@ -697,17 +780,18 @@ def process_tile(
         # over every scene in the window, and sitting untimed between two
         # `land_mask` sections it billed its minutes to the mask and published
         # the same phase name twice with a silence in the middle.
+        coarse_geobox = geobox_for_bbox(job.tile.bbox, factor)
         with timed_section("offset_load", scenes_found=len(items)):
             offset_source = load_scenes(
                 items,
                 job.tile.bbox,
                 patch_url=patch_url,
                 fail_on_error=False,
-                resolution_factor=factor,
+                geobox=coarse_geobox,
             )
         with timed_section("land_mask"):
             offset_land_mask = _build_land_mask(
-                job.tile.bbox, offset_source.latitude, offset_source.longitude
+                coarse_geobox, offset_source.latitude, offset_source.longitude
             )
 
     composite = compute_annual_composite(
