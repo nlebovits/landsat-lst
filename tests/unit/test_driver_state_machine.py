@@ -598,10 +598,13 @@ class TestPreflightCredits:
         import landsat_lst.shard_driver as driver
 
         monkeypatch.setattr(settings, "ack_quota", False)
-        # The backend guard runs first and has its own tests; standing the
-        # fleet where the real submitter stands trips it too, and it is not
-        # what this scenario is about.
+        # The backend guard and the identity check both run before the credit
+        # gate, and standing the fleet where the real submitter stands trips
+        # both. Neither is what this scenario is about, and the identity one
+        # would reach a real STS call -- passing on a laptop with a session and
+        # refusing on a credential-less CI runner.
         monkeypatch.setattr(driver, "require_shared_storage", _allow_any_backend)
+        monkeypatch.setattr(quota, "preflight_identity", _healthy_identity)
         fleet = ScriptedFleet(storage, plan, clock=clock)
 
         def broke() -> quota.CreditBalance:
@@ -762,6 +765,26 @@ class TestIdentityPreflight:
 
         assert quota.preflight_identity(caller=lambda: {"Arn": arn}) == arn
 
+    def test_an_injected_submitter_skips_the_identity_check(
+        self, storage, plan, job, clock, monkeypatch
+    ):
+        """The same exemption the backend guard and the credit gate already take.
+
+        A caller that injects its own submitter starts no clusters and writes
+        nowhere but a temporary directory, so it needs no AWS session -- and if
+        it did, every scenario in this file would pass on a laptop with an SSO
+        session and refuse on a credential-less runner. It is pinned here
+        because the rule is easy to break by moving one line.
+        """
+
+        def explode(**_kwargs) -> str:
+            raise AssertionError("a locally-driven run must not call STS")
+
+        monkeypatch.setattr(quota, "preflight_identity", explode)
+        fleet = ScriptedFleet(storage, plan, clock=clock)
+
+        assert _drive(job, storage, fleet, clock).completed
+
     def test_identity_is_checked_before_credits(self, storage, plan, job, clock, monkeypatch):
         """A session that cannot call STS cannot read a Coiled balance either."""
         import landsat_lst.shard_driver as driver
@@ -886,6 +909,16 @@ def test_the_whole_state_machine_suite_runs_without_real_waiting():
 
     assert clock.elapsed == 7200
     assert time.monotonic() - started < 1.0
+
+
+def _healthy_identity(**_kwargs) -> str:
+    """A logged-in session, for scenarios that are not about being logged in.
+
+    Any test that reaches the real ``preflight_identity`` passes on a laptop
+    with an SSO session and refuses on a credential-less CI runner. That is not
+    a test; it is a reading of the machine it ran on.
+    """
+    return "arn:aws:sts::123456789012:assumed-role/test/runner"
 
 
 def _named_error(name: str, message: str) -> Exception:

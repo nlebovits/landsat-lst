@@ -679,6 +679,26 @@ Rules worth keeping:
   (ADR-008).
 - `--timeout` lives in the CI workflow, never in `pyproject.toml`: a local debugging
   session must not be killed mid-breakpoint.
+- **Local-green is not evidence for anything that touches a preflight or a control
+  plane.** A test that reaches `quota.preflight_identity`, `read_balance`, or a real
+  `coiled`/`boto3` call passes on a laptop with a live session and fails on a
+  credential-less runner — it reads the machine, not the code. This has escaped twice
+  (`coiled.get_billing_activity` via a default bound at definition; STS via the CLI's
+  pre-run-id path). Two rules: a caller injecting its own submitter is exempt from all
+  three gates (backend, identity, credits), and anything else must stub them. Validate
+  with a credential-less run before pushing:
+
+  ```bash
+  FAKEHOME=$(mktemp -d)
+  env HOME="$FAKEHOME" AWS_ACCESS_KEY_ID= AWS_SECRET_ACCESS_KEY= \
+      AWS_PROFILE= COILED_TOKEN= \
+      .venv/bin/python -m pytest tests/unit -n auto -q
+  ```
+
+  An *empty* `AWS_PROFILE` is a profile named `""` to botocore, which raises
+  `ProfileNotFound` from inside rasterio's AWS plumbing and takes down tests that only
+  wanted to write a GeoTIFF. `tests/conftest.py` normalises it away so the run proves
+  credential-lessness rather than botocore's opinion of empty strings.
 
 - Unit tests: `uv run pytest tests/unit/`
 - Integration tests: `uv run pytest tests/integration/`
