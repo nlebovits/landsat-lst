@@ -114,8 +114,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --frozen
 
+      - name: Runner telemetry (diagnostic, remove after CI stall is found)
+        run: free -m && nproc && df -h /tmp | tail -1
       - name: Run unit tests
-        run: uv run pytest tests/unit -v --cov=src/landsat_lst --cov-report=xml -n auto
+        run: >
+          uv run --with pytest-timeout pytest tests/unit -v
+          --cov=src/landsat_lst --cov-report=xml -n auto
+          --timeout=120 --timeout-method=thread
 
       - name: Upload coverage
         if: matrix.python-version == '3.11'
