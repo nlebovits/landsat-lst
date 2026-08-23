@@ -1824,6 +1824,11 @@ def _shard_job(tile: str, year: int | None, end_year: int | None, max_scenes: in
 @click.option("--end-year", type=int, default=None, help="End year (inclusive)")
 @click.option("--max-scenes", type=int, default=None, help="Sample at most N scenes")
 @click.option("--run-id", default=None, help="Run token; generated when omitted")
+@click.option(
+    "--ack-quota",
+    is_flag=True,
+    help="Proceed when the Coiled credit balance cannot be read, on your own check",
+)
 def shard_process(
     *,
     tile: str,
@@ -1831,6 +1836,7 @@ def shard_process(
     end_year: int | None,
     max_scenes: int | None,
     run_id: str | None,
+    ack_quota: bool,
 ) -> None:
     """Build one tile as a fleet of shards, driven from this shell.
 
@@ -1840,6 +1846,8 @@ def shard_process(
     ``landsat-lst shard resume <run-id> <tile>`` picks up wherever the bucket
     says the run got to.
     """
+    from landsat_lst import quota
+    from landsat_lst.config import settings
     from landsat_lst.shard_driver import (
         ShardBackendMismatch,
         ShardStageFailed,
@@ -1850,12 +1858,22 @@ def shard_process(
     from landsat_lst.storage import get_storage
 
     job = _shard_job(tile, year, end_year, max_scenes)
-    # Before the run id is printed: a driver that cannot see its shards' output
-    # has not started a run, and printing a resume hint for it would be a lie.
+    # Before the run id is printed: a driver that cannot see its shards' output,
+    # or that cannot pay for them, has not started a run -- and printing a
+    # resume hint for it would be a lie.
+    if ack_quota:
+        settings.ack_quota = True
     try:
         require_shared_storage(get_storage(), None)
-    except ShardBackendMismatch as e:
+        estimate = quota.estimate_run_credits()
+        balance = quota.preflight_credits(estimate)
+    except (ShardBackendMismatch, quota.QuotaRefused) as e:
         raise click.ClickException(str(e)) from e
+    console.print(
+        f"  credits: ~{estimate:.0f} needed, "
+        f"{'unknown' if balance.remaining is None else f'{balance.remaining:.0f}'} "
+        f"remaining ({balance.source})"
+    )
     run_id = run_id or shard_run_id(job)
     console.print(f"[bold]Sharding {tile}[/bold] {job.window_label}  run-id [cyan]{run_id}[/cyan]")
     console.print(f"  resume with: landsat-lst shard resume {run_id} {tile}")
@@ -1871,14 +1889,23 @@ def shard_process(
 @shard.command("resume")
 @click.argument("run_id")
 @click.argument("tile")
-def shard_resume(run_id: str, tile: str) -> None:
+@click.option(
+    "--ack-quota",
+    is_flag=True,
+    help="Proceed when the Coiled credit balance cannot be read, on your own check",
+)
+def shard_resume(run_id: str, tile: str, ack_quota: bool) -> None:
     """Continue a killed driver's run, reading its position out of the bucket."""
+    from landsat_lst import quota
+    from landsat_lst.config import settings
     from landsat_lst.shard_driver import ShardBackendMismatch, ShardStageFailed, resume_tile
 
+    if ack_quota:
+        settings.ack_quota = True
     console.print(f"[bold]Resuming {tile}[/bold] in run [cyan]{run_id}[/cyan]")
     try:
         summary = resume_tile(run_id, tile)
-    except (ShardStageFailed, ShardBackendMismatch) as e:
+    except (ShardStageFailed, ShardBackendMismatch, quota.QuotaRefused) as e:
         raise click.ClickException(str(e)) from e
 
     _print_shard_summary(summary)

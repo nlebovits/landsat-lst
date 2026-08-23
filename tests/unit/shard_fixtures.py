@@ -102,6 +102,38 @@ def make_items(plan) -> list[dict]:
     return out
 
 
+def stub_tile_geoboxes(monkeypatch, plan) -> None:
+    """Make the shard tasks derive *toy* grids instead of production ones.
+
+    The fixture plan is deliberately tiny -- 1,024 squared native, four scenes --
+    but nothing in the tasks reads its shape to build a grid. They call
+    ``geobox_for_bbox(job.tile.bbox)``, which resolves the real tile name to the
+    real global grid: **18,000 columns**. So a "toy" composite test was
+    computing float64 quantile and rechunk intermediates over 18,000-wide
+    bands, and a "toy" export was merging 512 x 18,000 rasters.
+
+    Measured before this: ``TestCompositeShard`` peaked at 3.18 GB,
+    ``TestExportClaim`` at 3.60 GB, ``TestLegacyPlanStamps`` at 3.15 GB. Three
+    such families colocated on one xdist worker exceed a 7 GB CI runner, and
+    which families colocate is decided by the test count -- so adding tests
+    anywhere could OOM a worker that had been green by distribution luck.
+
+    The production derivation is untouched and must stay that way: a band's
+    pixels have to be *the tile's* pixels, cut from the global grid (ADR-008).
+    This replaces only what the tasks see, with a grid over the same bbox at
+    the plan's own shape, so every assertion holds against narrower arrays.
+    """
+    from odc.geo.geobox import GeoBox
+
+    from landsat_lst import shard_tasks
+
+    def geobox_for_bbox(bbox, resolution_factor: int = 1):
+        shape = plan.coarse_shape if resolution_factor > 1 else plan.native_shape
+        return GeoBox.from_bbox(tuple(bbox), crs="EPSG:4326", shape=shape)
+
+    monkeypatch.setattr(shard_tasks, "geobox_for_bbox", geobox_for_bbox)
+
+
 def publish_legacy_plan(storage, plan, *, run_id: str = RUN_ID, items=None) -> str:
     """A plan as the pre-2026-08-22 planner wrote it: stamps at second precision.
 

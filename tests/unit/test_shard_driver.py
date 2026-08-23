@@ -70,7 +70,7 @@ class TestHappyPath:
     ):
         fleet = FakeFleet(storage, plan)
 
-        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet)
+        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet, cluster_probe=None)
 
         assert fleet.stages == STAGE_ORDER
         assert summary.completed
@@ -93,7 +93,9 @@ class TestHappyPath:
         """
         from landsat_lst.shard_tasks import _offset_key
 
-        drive_tile(job, run_id=RUN_ID, storage=storage, submit=FakeFleet(storage, plan))
+        drive_tile(
+            job, run_id=RUN_ID, storage=storage, submit=FakeFleet(storage, plan), cluster_probe=None
+        )
 
         record = storage.read_text(_offset_key(plan).storage_key)
         assert record is not None
@@ -102,7 +104,7 @@ class TestHappyPath:
     def test_every_shard_index_is_submitted_exactly_once(self, storage, plan, job, fast_barriers):
         fleet = FakeFleet(storage, plan)
 
-        drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet)
+        drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet, cluster_probe=None)
 
         by_stage = dict(fleet.calls)
         assert by_stage["offsets"] == [0, 1]
@@ -122,7 +124,7 @@ class TestResubmission:
         """
         fleet = FakeFleet(storage, plan, never={("offsets", 1)}, heal=True)
 
-        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet)
+        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet, cluster_probe=None)
 
         offsets = [indexes for stage, indexes in fleet.calls if stage == "offsets"]
         assert offsets == [[0, 1], [1]]
@@ -136,7 +138,7 @@ class TestResubmission:
         fleet = FakeFleet(storage, plan, never={("composite", 1)})
 
         with pytest.raises(ShardStageFailed) as excinfo:
-            drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet)
+            drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet, cluster_probe=None)
 
         error = excinfo.value
         assert error.stage == "composite"
@@ -156,7 +158,7 @@ class TestResubmission:
         fleet = FakeFleet(storage, plan, never={("composite", 0)})
 
         with pytest.raises(ShardStageFailed):
-            drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet)
+            drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet, cluster_probe=None)
 
         assert len([c for c in fleet.calls if c[0] == "composite"]) == 3
 
@@ -166,7 +168,9 @@ class TestResume:
 
     def test_a_run_with_no_plan_cannot_be_resumed(self, storage, plan):
         with pytest.raises(FileNotFoundError, match="nothing to resume"):
-            resume_tile(RUN_ID, TILE, storage=storage, submit=FakeFleet(storage, plan))
+            resume_tile(
+                RUN_ID, TILE, storage=storage, submit=FakeFleet(storage, plan), cluster_probe=None
+            )
 
     @pytest.mark.parametrize(
         ("done_through", "expected_stages"),
@@ -191,7 +195,7 @@ class TestResume:
             seed(stage=stage, run_id=RUN_ID, tile=TILE, indexes=_indexes(plan, stage))
 
         fleet = FakeFleet(storage, plan)
-        summary = resume_tile(RUN_ID, TILE, storage=storage, submit=fleet)
+        summary = resume_tile(RUN_ID, TILE, storage=storage, submit=fleet, cluster_probe=None)
 
         assert fleet.stages == expected_stages
         assert summary.completed
@@ -204,7 +208,9 @@ class TestResume:
         for stage in ("resolve", "offsets"):
             seed(stage=stage, run_id=RUN_ID, tile=TILE, indexes=_indexes(plan, stage))
 
-        summary = resume_tile(RUN_ID, TILE, storage=storage, submit=FakeFleet(storage, plan))
+        summary = resume_tile(
+            RUN_ID, TILE, storage=storage, submit=FakeFleet(storage, plan), cluster_probe=None
+        )
 
         offsets = next(s for s in summary.stages if s.stage == "offsets")
         assert offsets.submissions == 0
@@ -215,7 +221,9 @@ class TestSummary:
     def test_the_summary_round_trips_to_json_safe_primitives(
         self, storage, plan, job, fast_barriers
     ):
-        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=FakeFleet(storage, plan))
+        summary = drive_tile(
+            job, run_id=RUN_ID, storage=storage, submit=FakeFleet(storage, plan), cluster_probe=None
+        )
 
         payload = summary.as_dict()
         assert payload["tile"] == TILE
@@ -263,7 +271,9 @@ class TestStorageBackend:
         self, storage, plan, job, fast_barriers
     ):
         """Which is every test here, and must stay allowed."""
-        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=FakeFleet(storage, plan))
+        summary = drive_tile(
+            job, run_id=RUN_ID, storage=storage, submit=FakeFleet(storage, plan), cluster_probe=None
+        )
 
         assert summary.completed
 
@@ -279,7 +289,7 @@ class TestClusterNames:
         """
         fleet = FakeFleet(storage, plan, never={("offsets", 1)}, heal=True)
 
-        drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet)
+        drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet, cluster_probe=None)
 
         offsets = [
             name
@@ -323,7 +333,7 @@ class TestInFlightAdoption:
 
         watching = LandsOnPoll(storage, plan, "offsets", after=4)
         fleet = FakeFleet(storage, plan)
-        summary = resume_tile(RUN_ID, TILE, storage=watching, submit=fleet)
+        summary = resume_tile(RUN_ID, TILE, storage=watching, submit=fleet, cluster_probe=None)
 
         assert "offsets" not in fleet.stages
         assert summary.completed
@@ -350,7 +360,7 @@ class TestInFlightAdoption:
 
         watching = LandsOnPoll(storage, plan, "offsets", after=4)
         fleet = FakeFleet(storage, plan)
-        resume_tile(RUN_ID, TILE, storage=watching, submit=fleet)
+        resume_tile(RUN_ID, TILE, storage=watching, submit=fleet, cluster_probe=None)
 
         assert [stage for stage, _ in fleet.calls if stage == "offsets"] == []
         assert watching.polls > 1, "it must actually have watched, not just skipped the stage"
@@ -367,7 +377,7 @@ class TestInFlightAdoption:
         record_in_flight(storage, plan, "offsets", [0, 1], age_s=10_000.0)
 
         fleet = FakeFleet(storage, plan)
-        summary = resume_tile(RUN_ID, TILE, storage=storage, submit=fleet)
+        summary = resume_tile(RUN_ID, TILE, storage=storage, submit=fleet, cluster_probe=None)
 
         assert [indexes for stage, indexes in fleet.calls if stage == "offsets"] == [[1]]
         assert fleet.names[fleet.stages.index("offsets")].endswith("-r2")
@@ -381,7 +391,7 @@ class TestInFlightAdoption:
 
         fleet = FakeFleet(storage, plan)
         with pytest.raises(ShardStageFailed, match="offsets"):
-            resume_tile(RUN_ID, TILE, storage=storage, submit=fleet)
+            resume_tile(RUN_ID, TILE, storage=storage, submit=fleet, cluster_probe=None)
 
         assert fleet.calls == []
 
@@ -438,7 +448,7 @@ class TestCompositeOverlap:
         fleet = FakeFleet(storage, plan)
         watching = LandsOnPoll(storage, plan, "offsets", when=lambda: "composite" in fleet.stages)
 
-        summary = resume_tile(RUN_ID, TILE, storage=watching, submit=fleet)
+        summary = resume_tile(RUN_ID, TILE, storage=watching, submit=fleet, cluster_probe=None)
 
         composite_at = fleet.stages.index("composite")
         assert fleet.partials_at_call[composite_at] < plan.scene_shards
@@ -472,7 +482,7 @@ class TestExportClaim:
     def test_a_claimed_export_costs_no_submission(self, storage, plan, job, fast_barriers):
         fleet = FakeFleet(storage, plan)
 
-        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet)
+        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet, cluster_probe=None)
 
         assert "export" not in fleet.stages
         assert storage.read_text(shards.export_claim_key(shards.shard_root(RUN_ID, TILE)))
@@ -486,7 +496,7 @@ class TestExportClaim:
         """The claiming VM was preempted between writing the claim and running it."""
         fleet = FakeFleet(storage, plan, claims_export=False)
 
-        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet)
+        summary = drive_tile(job, run_id=RUN_ID, storage=storage, submit=fleet, cluster_probe=None)
 
         assert "export" in fleet.stages
         assert summary.completed
@@ -502,8 +512,16 @@ class TestExportClaim:
         watching = LandsOnPoll(storage, plan, "export", after=3)
         fleet = FakeFleet(storage, plan)
 
+        from landsat_lst.shard_driver import Clock
+
         outcome = _await_export(
-            run_id=RUN_ID, tile=TILE, root=root, storage=watching, plan=plan, submit=fleet
+            run_id=RUN_ID,
+            tile=TILE,
+            root=root,
+            storage=watching,
+            plan=plan,
+            submit=fleet,
+            clock=Clock(),
         )
 
         assert fleet.calls == []

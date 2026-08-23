@@ -641,10 +641,19 @@ class TestSampledRunsProfileThemselves:
 
 @pytest.fixture
 def s3_backend(monkeypatch):
-    """The only backend the driver will submit Coiled work against."""
+    """The only backend the driver will submit Coiled work against.
+
+    Also stubs the credit preflight, which runs before the run id is printed
+    and must never reach a control plane from a unit test. The refusal paths
+    have their own scenarios in tests/unit/test_driver_state_machine.py.
+    """
+    from landsat_lst import quota
     from landsat_lst.config import settings
 
     monkeypatch.setattr(settings, "storage_backend", "s3")
+    monkeypatch.setattr(
+        quota, "read_balance", lambda: quota.CreditBalance(remaining=10_000.0, source="test")
+    )
 
 
 class TestShardGroup:
