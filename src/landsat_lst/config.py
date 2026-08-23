@@ -512,13 +512,14 @@ class Settings(BaseSettings):
         "cannot become slower than the run it precedes.",
     )
     coiled_credit_safety: float = Field(
-        default=1.5,
+        default=2.0,
         ge=1.0,
         description="Headroom a run must have beyond its credit estimate. The "
-        "estimate is built on an assumed credits-per-VM-hour whose interval "
-        "the billing events do not state, so it is uncertain in both "
-        "directions; being killed mid-stage costs the whole tile, while "
-        "refusing costs a re-check.",
+        "estimate is priced per vCPU-hour, calibrated on the S30W065 run that "
+        "billed 268.11 credits; the per-cluster rates spread 0.6-1.25 because "
+        "a fleet's VMs do not boot or finish together. 2.0 carries that band's "
+        "width. Being killed mid-stage costs the whole tile, while refusing "
+        "costs a re-check.",
     )
     ack_quota: bool = Field(
         default=False,

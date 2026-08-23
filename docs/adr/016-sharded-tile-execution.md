@@ -312,6 +312,37 @@ event amounts on the assumption that one event is roughly one VM-hour, which the
 stream does not state. **A preflight pass means "not obviously unaffordable", never a
 promise.**
 
+### The credit model, calibrated against an invoice
+
+**Amendment, 2026-08-23.** The first run that could check the estimate billed **268.11
+credits** against an estimate of 75. The model was per *VM*-hour; Coiled bills per
+*vCPU*-hour, so it could not see that a 16-vCPU composite VM costs twice an 8-vCPU offsets
+VM for the same wall clock — and being 3.6x low is the direction that lets an unaffordable
+run start.
+
+`estimate = Σ over stages (fleet_size × vcpus × per-VM wall hours) × CREDITS_PER_VCPU_HOUR`.
+Wall hours are *per VM* because that is what a fleet bills: every VM pays its own boot and
+then its share of the stage's work. The per-cluster rates from that run were 1.09, 1.24,
+and 0.62–0.99; the spread is staggered VM lifetimes rather than a different rate, since a
+fleet's VMs do not boot or finish together. 1.0 sits inside the band and prices the run's
+own shape ~19% high — pinned from both sides by a regression test that takes the billed
+fleet shape as its input.
+
+`settings.coiled_credit_safety` rises to 2.0 to carry the band's width. The estimate
+itself stays raw so it remains comparable to an invoice.
+
+### Identity, before credits, before anything
+
+An AWS SSO session expires within hours, which is less than a tile takes. Three times the
+driver spent a STAC query, a plan, and a fleet's boot before discovering that nothing it
+wrote could reach S3. `quota.preflight_identity` calls STS with a 5-second timeout and no
+retries — an expired token does not un-expire — and refuses with the exact command,
+reading `AWS_PROFILE` for the profile and falling back to the configured one.
+
+It runs *first*, before the credit check, because a session that cannot call STS cannot
+read a Coiled balance either, and "log in again" is a better message than "the balance
+could not be read".
+
 ### A clock seam, and what it bought
 
 Every wait, poll, deadline, and backoff goes through an injectable `Clock`. That is not

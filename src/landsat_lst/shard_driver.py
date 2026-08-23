@@ -345,22 +345,33 @@ def require_shared_storage(storage: StorageBackend, submit: Submitter | None) ->
 
 
 def _preflight(submit: Submitter, balance_source: Callable[[], quota.CreditBalance] | None) -> None:
-    """State zero: nothing is submitted until the workspace can pay for it.
+    """State zero: two gates, before a single cluster is created.
 
-    A quota is knowable before a cluster is created, and on 2026-08-22 it cost
-    a night to learn it afterwards -- once as an empty ``ServerError`` on a
-    create, once as a healthy fleet killed mid-stage. The estimate comes from
-    the same budget model the deadlines do, so it moves with the geometry.
+    **Identity, then credits.** An AWS SSO session expires within hours, which
+    is less than a tile takes, and this has bitten three times: the driver
+    spends its whole startup -- a STAC query, a plan, a fleet's boot -- before
+    discovering that nothing it writes can reach S3. It also has to come first,
+    because a session that cannot call STS cannot read a Coiled balance either,
+    and "log in again" is a better message than "the balance could not be
+    read".
+
+    Then the quota. That one is knowable before a cluster is created too, and
+    on 2026-08-22 it cost a night to learn afterwards -- once as an empty
+    ``ServerError`` on a create, once as a healthy fleet killed mid-stage. The
+    estimate comes from the same budget model the deadlines do, so it moves
+    with the geometry.
 
     Skipped when the caller injected its own submitter: such a run starts no
-    clusters and spends no credits.
+    clusters, spends no credits, and writes nowhere but a temporary directory.
 
     Raises:
+        IdentityRefused: If AWS credentials are missing or expired.
         QuotaRefused: If the workspace cannot afford the run, or if the balance
             could not be read and nobody acknowledged a manual check.
     """
     if submit is not submit_shard_stage:
         return
+    quota.preflight_identity()
     estimate = quota.estimate_run_credits()
     balance = quota.preflight_credits(estimate, balance_source=balance_source)
     log.info(

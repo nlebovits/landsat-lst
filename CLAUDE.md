@@ -605,11 +605,24 @@ Rules worth keeping:
   used to collide: `Unable to add batch jobs to existing cluster '...-climato'`. Cluster
   names now carry the round (`stage_cluster_name`, run id hashed so truncation cannot eat
   the marker).
-- **Nothing submits before the credit quota is checked.** `quota.preflight_credits` is
-  state zero, and it refuses rather than guessing. A workspace at its quota gets its
-  healthy fleet killed mid-stage (2026-08-22, 400 credits) and its cluster creates
-  rejected with an *empty* `ServerError`. The estimate comes from the budget model;
-  `--ack-quota` is the escape when no balance can be read.
+- **Two gates before anything submits, in this order: identity, then credits.**
+  `quota.preflight_identity` calls STS with a 5s timeout and refuses on an expired or
+  missing session, naming `aws sso login --profile <profile>`. The SSO session expires
+  within hours — less than a tile — and this has bitten three times, each time after the
+  driver had already spent a STAC query, a plan, and a fleet's boot. It runs first because
+  a session that cannot call STS cannot read a Coiled balance either.
+  `quota.preflight_credits` then refuses rather than guessing: a workspace at its quota
+  gets its healthy fleet killed mid-stage (2026-08-22, 400 credits) and its cluster
+  creates rejected with an *empty* `ServerError`. `--ack-quota` is the escape when no
+  balance can be read.
+- **Credits are billed per vCPU-hour, not per VM-hour.** S30W065 billed **268.11** where
+  the old per-VM-hour model said 75 — 3.6x low, the direction that lets an unaffordable
+  run start, because it could not see that a 16-vCPU composite VM costs twice an 8-vCPU
+  offsets VM for the same wall clock. `CREDITS_PER_VCPU_HOUR = 1.0` sits inside the
+  observed 0.6–1.25 band (the spread is staggered VM lifetimes, not a different rate) and
+  prices that run's shape ~19% **high**, which is the safe direction. `projection.vcpus`
+  holds the lookup beside the hourly prices and parses AWS's size grammar for anything
+  untabulated — a type priced as one core would understate a fleet 8x.
 - **Deadlines are derived, never typed.** `landsat_lst.budgets` computes each stage's
   deadline from bytes over measured rates, per shard, times `shard_budget_safety`.
   `shard_barrier_timeout_s` is now an explicit override defaulting to `None`. The

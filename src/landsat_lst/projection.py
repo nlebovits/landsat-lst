@@ -53,6 +53,47 @@ VM_HOURLY_ON_DEMAND = 0.504  # r6i.2xlarge -- offsets stage
 VM_HOURLY_COMPOSITE = 0.768  # m6i.4xlarge -- composite stage
 SPOT_FACTOR_RANGE = (0.30, 0.75)
 
+#: vCPUs per configured VM type. Beside the hourly prices because they are the
+#: same kind of fact about the same machines, and because Coiled bills credits
+#: per *vCPU-hour* rather than per VM-hour -- so a fleet of 16-vCPU composite
+#: VMs costs twice what the same count of 8-vCPU offsets VMs does for the same
+#: wall clock. See :mod:`landsat_lst.quota`.
+VM_VCPUS: dict[str, int] = {
+    "r6i.xlarge": 4,
+    "r6i.2xlarge": 8,
+    "m6i.2xlarge": 8,
+    "m6i.4xlarge": 16,
+}
+
+
+def vcpus(vm_type: str) -> int:
+    """vCPUs for an EC2 instance type, from the table or from its name.
+
+    The table covers what this project configures. The fallback parses AWS's
+    own size grammar (``large`` = 2, ``xlarge`` = 4, ``Nxlarge`` = 4N) so a VM
+    type someone sets tomorrow is priced rather than silently treated as one
+    core -- which would under-estimate a fleet's credits by 8x and let an
+    unaffordable run start.
+
+    Returns:
+        vCPU count, defaulting to the 8 of the primary type when the name
+        parses as nothing recognizable.
+    """
+    known = VM_VCPUS.get(vm_type)
+    if known is not None:
+        return known
+
+    size = vm_type.rsplit(".", 1)[-1]
+    if size == "large":
+        return 2
+    if size == "xlarge":
+        return 4
+    if size.endswith("xlarge"):
+        multiple = size[: -len("xlarge")]
+        if multiple.isdigit():
+            return 4 * int(multiple)
+    return VM_VCPUS["r6i.2xlarge"]
+
 
 @dataclass(frozen=True)
 class TileProjection:

@@ -1865,9 +1865,12 @@ def shard_process(
         settings.ack_quota = True
     try:
         require_shared_storage(get_storage(), None)
+        # Identity before credits: a session that cannot call STS cannot read a
+        # Coiled balance either, and "log in again" beats "balance unreadable".
+        quota.preflight_identity()
         estimate = quota.estimate_run_credits()
         balance = quota.preflight_credits(estimate)
-    except (ShardBackendMismatch, quota.QuotaRefused) as e:
+    except (ShardBackendMismatch, quota.IdentityRefused, quota.QuotaRefused) as e:
         raise click.ClickException(str(e)) from e
     console.print(
         f"  credits: ~{estimate:.0f} needed, "
@@ -1905,7 +1908,12 @@ def shard_resume(run_id: str, tile: str, ack_quota: bool) -> None:
     console.print(f"[bold]Resuming {tile}[/bold] in run [cyan]{run_id}[/cyan]")
     try:
         summary = resume_tile(run_id, tile)
-    except (ShardStageFailed, ShardBackendMismatch, quota.QuotaRefused) as e:
+    except (
+        ShardStageFailed,
+        ShardBackendMismatch,
+        quota.IdentityRefused,
+        quota.QuotaRefused,
+    ) as e:
         raise click.ClickException(str(e)) from e
 
     _print_shard_summary(summary)
