@@ -162,6 +162,20 @@ class ShardFleetKilled(RuntimeError):
         super().__init__(f"stage {stage!r} cluster stopped: {reason}")
 
 
+def _coiled_credentials_present() -> bool:
+    """Whether a coiled token is configured, without touching the network."""
+    import os  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    if os.environ.get("COILED_TOKEN") or os.environ.get("DASK_COILED__TOKEN"):
+        return True
+    import dask.config  # noqa: PLC0415
+
+    if dask.config.get("coiled.token", None):
+        return True
+    return (Path.home() / ".config" / "dask" / "coiled.yaml").is_file()
+
+
 def coiled_cluster_probe(cluster_id: object) -> tuple[str, str] | None:
     """One cluster's state and the reason it is in it, from Coiled.
 
@@ -171,6 +185,14 @@ def coiled_cluster_probe(cluster_id: object) -> tuple[str, str] | None:
     without a control plane.
     """
     if cluster_id is None:
+        return None
+    if not _coiled_credentials_present():
+        # Without a token the coiled client BLOCKS on its interactive auth
+        # flow rather than raising -- the except below never fires. On a
+        # token-less CI runner that block ate pytest-timeout's full 300 s and
+        # took the xdist worker down with it (2026-08-23). Probing is
+        # best-effort; no token means no answer, immediately.
+        log.warning("shard_cluster_probe_skipped", reason="no coiled credentials")
         return None
     try:
         import coiled  # noqa: PLC0415
