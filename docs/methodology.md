@@ -130,6 +130,31 @@ most noticeable in parts of southern Africa, including the Durban region. See
 
 A pixel with `qa_count == 0` inside the land mask is unambiguously a gap rather than ocean.
 
+## ASTER GED emissivity-gap mask
+
+The ASTER coverage gaps above do worse than leave holes. USGS *interpolates* GED emissivity over
+cells with no observations, and a per-pixel verification on tile S30W065 (2026-08-23) showed the
+consequence: the gap cores produce Surface Temperature fill (the missing blobs), while the
+contaminated fringe around them produces spurious 70-78 C retrievals that a P95 composite then
+promotes to the output. These are emissivity artifacts, not measurements of heat.
+
+The composite therefore masks every pixel whose ~1 km ASTER GED v3 (AG100) cell has
+`NumObs == 0`, plus a one-cell (~1 km) buffer for the interpolated fringe. On S30W065 this
+removes 0.863% of valid pixels and 92.45% of the >= 70 C artifact tail (2,793 pixels down
+to 211), and annotates 99.9% of the missing blobs. The known residue -- 211 hot pixels sitting
+on cells with 1-3 ASTER observations -- is deliberately not chased: extending the rule to
+`NumObs <= 2` removes it completely but costs 11.4% of valid pixels, which fails the dataset's
+guiding principle of honest omission at a defensible price.
+
+The mask applies to the temperature band only, in the same output-side position as the land
+mask. The observation counts are not masked: zero-or-more observations over a gap cell is still
+data, and the count layer remains the evidence behind every value. Nor does the mask enter the
+scene-normalization estimator -- a per-scene offset is a median over a whole scene's land pixels
+and does not care about 0.86% of them, and keeping the mask out of the estimator keeps every
+cached offset estimate valid. See
+[findings-aster-ged-gaps.md](findings-aster-ged-gaps.md), the 2026-08-23 verification
+(`results/ged-mask-check/`), and `src/landsat_lst/ged.py`.
+
 ## Spatial extent
 
 To reduce storage requirements and focus on the regions where the dataset is most relevant for

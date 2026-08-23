@@ -17,6 +17,7 @@ from urllib3.util.retry import Retry
 
 from landsat_lst.config import settings
 from landsat_lst.encoding import LST_MIN_TRUSTED_C
+from landsat_lst.ged import gap_mask_for_geobox
 from landsat_lst.kernels import nanquantile_last
 from landsat_lst.masks import get_land_mask_for_geobox, load_land_polygons
 from landsat_lst.normalization import (
@@ -395,6 +396,28 @@ def _build_land_mask(
     land_mask = get_land_mask_for_geobox(geobox, land_polygons)
     return xr.DataArray(
         land_mask,
+        dims=["latitude", "longitude"],
+        coords={"latitude": latitude, "longitude": longitude},
+    )
+
+
+def _build_ged_gap_mask(
+    geobox: GeoBox,
+    latitude: xr.DataArray,
+    longitude: xr.DataArray,
+) -> xr.DataArray:
+    """Build the ASTER GED emissivity-gap mask on the grid's exact coordinates.
+
+    True where a pixel must be dropped from the LST output: its ~1 km GED
+    cell has NumObs == 0, or sits within ``settings.ged_gap_buffer_cells`` of
+    one. Applied to the composite *output* only, mirroring the land mask's
+    output-side application -- never to offset estimation, and never to
+    ``qa_count``. See :mod:`landsat_lst.ged` and
+    docs/findings-aster-ged-gaps.md.
+    """
+    gap = gap_mask_for_geobox(geobox)
+    return xr.DataArray(
+        gap,
         dims=["latitude", "longitude"],
         coords={"latitude": latitude, "longitude": longitude},
     )
@@ -821,6 +844,17 @@ def process_tile(
     # Zero out ocean in the per-month counts too (broadcasts over the month dim);
     # keeps qa_count uint8 and makes ocean compress away.
     composite["qa_count"] = composite["qa_count"].where(land_mask_da, 0).astype(np.uint8)
+
+    # ASTER GED emissivity-gap mask, output-side like the land mask and only
+    # on the LST band: qa_count keeps counting over gap cells because zero-or-
+    # more observations there is still the evidence layer, and the offsets
+    # above were deliberately estimated without this mask (a per-scene median
+    # over a whole tile does not care about 0.86% of pixels, and keeping the
+    # mask out of the estimator keeps every cached offset record valid).
+    if settings.ged_gap_mask:
+        with timed_section("ged_gap_mask"):
+            gap_mask_da = _build_ged_gap_mask(native_geobox, data.latitude, data.longitude)
+        composite["lst_p95"] = composite["lst_p95"].where(~gap_mask_da)
 
     composite.attrs["tile"] = job.tile.name
     composite.attrs["year"] = job.year

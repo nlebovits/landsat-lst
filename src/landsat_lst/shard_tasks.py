@@ -961,6 +961,7 @@ def run_composite_shard(
     from landsat_lst.cog import lst_product, qa_product, write_intermediates  # noqa: PLC0415
     from landsat_lst.job import _encode_native  # noqa: PLC0415
     from landsat_lst.pipeline import (  # noqa: PLC0415
+        _build_ged_gap_mask,
         _build_land_mask,
         _patch_url_for,
         compute_annual_composite,
@@ -993,6 +994,14 @@ def run_composite_shard(
     # them would differ from the whole tile exactly along its own rows.
     composite["lst_p95"] = composite["lst_p95"].where(land)
     composite["qa_count"] = composite["qa_count"].where(land, 0).astype(np.uint8)
+    # The GED gap mask a whole tile applies, on the band's slice of the tile's
+    # grid -- gap_mask_for_geobox reads the geobox's own affine, so a band's
+    # mask is the exact slice of the tile's and the seams stay invisible
+    # (ADR-008). LST only; qa_count stays the evidence layer.
+    if settings.ged_gap_mask:
+        with timed_section("ged_gap_mask"):
+            gap = _build_ged_gap_mask(geobox, data.latitude, data.longitude)
+        composite["lst_p95"] = composite["lst_p95"].where(~gap)
     composite.attrs.update(_tile_attrs(ctx.plan))
 
     native = _encode_native(composite)
