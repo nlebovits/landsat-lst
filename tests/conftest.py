@@ -1,5 +1,6 @@
 """Shared test fixtures."""
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +8,24 @@ import pytest
 import xarray as xr
 
 from landsat_lst.models import ProcessingJob, TileId
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _drop_empty_aws_profile() -> None:
+    """An empty ``AWS_PROFILE`` is an unset one, whatever botocore thinks.
+
+    ``AWS_PROFILE=`` selects a profile *named* the empty string, and botocore
+    raises ``ProfileNotFound: The config profile () could not be found`` for it
+    -- from deep inside rasterio's AWS plumbing, so it takes down tests that
+    only wanted to write a GeoTIFF. A shell doing ``export AWS_PROFILE=$UNSET``
+    produces exactly this, and so does the credential-less CI simulation.
+
+    Normalising it here keeps that simulation meaningful: it should prove the
+    suite runs without credentials, not that botocore dislikes an empty string.
+    """
+    for name in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE"):
+        if os.environ.get(name) == "":
+            del os.environ[name]
 
 
 @pytest.fixture

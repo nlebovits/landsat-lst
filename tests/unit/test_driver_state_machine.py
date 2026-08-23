@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import time
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -597,10 +598,13 @@ class TestPreflightCredits:
         import landsat_lst.shard_driver as driver
 
         monkeypatch.setattr(settings, "ack_quota", False)
-        # The backend guard runs first and has its own tests; standing the
-        # fleet where the real submitter stands trips it too, and it is not
-        # what this scenario is about.
+        # The backend guard and the identity check both run before the credit
+        # gate, and standing the fleet where the real submitter stands trips
+        # both. Neither is what this scenario is about, and the identity one
+        # would reach a real STS call -- passing on a laptop with a session and
+        # refusing on a credential-less CI runner.
         monkeypatch.setattr(driver, "require_shared_storage", _allow_any_backend)
+        monkeypatch.setattr(quota, "preflight_identity", _healthy_identity)
         fleet = ScriptedFleet(storage, plan, clock=clock)
 
         def broke() -> quota.CreditBalance:
@@ -632,6 +636,186 @@ class TestPreflightCredits:
     def test_a_pre_plan_estimate_falls_back_to_the_projection(self):
         """The preflight runs before any plan exists, so it must still answer."""
         assert quota.estimate_run_credits() > 0
+
+
+class TestCreditCalibration:
+    """The model, checked against an invoice rather than against itself.
+
+    The S30W065 acceptance run of 2026-08-23 billed **268.11 credits** where the
+    old per-VM-hour model estimated 75 -- wrong by 3.6x, and wrong in the
+    direction that lets an unaffordable run start. It could not see that a
+    16-vCPU composite VM costs twice an 8-vCPU offsets VM for the same wall
+    clock, because Coiled bills per vCPU-hour.
+    """
+
+    #: What the run actually was, from its billing events by cluster.
+    BILLED = 268.11
+    SHAPE: ClassVar[list[tuple[float, int, float]]] = [
+        (15.0, 8, 31 / 60),  # offse-r1: ~15 x r6i.2xlarge, ~31 min
+        (14.0, 8, 7 / 60),  # offse-r2: 14 x r6i.2xlarge, ~7 min
+        (35.0, 16, 26 / 60),  # compo-r1: 35 x m6i.4xlarge, 20-32 min
+    ]
+
+    def test_the_billed_run_is_reproduced_within_the_observed_band(self):
+        estimate = quota.credits_for_fleets(self.SHAPE)
+
+        assert 0.5 * self.BILLED <= estimate <= 2.0 * self.BILLED, (
+            f"{estimate:.0f} credits for the S30W065 shape against {self.BILLED} billed"
+        )
+
+    def test_it_errs_high_rather_than_low(self):
+        """The old model was 3.6x *low*, which is the dangerous direction.
+
+        This one is about 19% high on the same shape -- inside the observed
+        0.6-1.25 band, and conservative: over-estimating refuses a run that
+        would have fit, where under-estimating starts one that gets killed
+        mid-stage and loses the whole tile.
+        """
+        estimate = quota.credits_for_fleets(self.SHAPE)
+
+        assert self.BILLED <= estimate <= 1.35 * self.BILLED
+
+    def test_vcpus_are_what_separate_the_two_fleets(self):
+        """Same VM count, same wall clock, twice the cores: twice the credits."""
+        eight = quota.credits_for_fleets([(35.0, 8, 0.5)])
+        sixteen = quota.credits_for_fleets([(35.0, 16, 0.5)])
+
+        assert sixteen == pytest.approx(2 * eight)
+
+    @pytest.mark.parametrize(
+        ("vm_type", "expected"),
+        [
+            ("r6i.2xlarge", 8),
+            ("m6i.4xlarge", 16),
+            ("m6i.8xlarge", 32),  # not in the table; parsed from the name
+            ("c7g.large", 2),
+            ("m6i.xlarge", 4),
+        ],
+    )
+    def test_vcpus_are_known_or_parsed(self, vm_type, expected):
+        """A type nobody tabulated must not silently price as one core."""
+        from landsat_lst.projection import vcpus
+
+        assert vcpus(vm_type) == expected
+
+    def test_the_estimate_prices_both_fleets_at_their_own_vm_type(self, plan):
+        offsets, composite, export = quota.run_fleets(plan, units=2)
+
+        assert offsets[1] == 8, "offsets runs on the default preference list"
+        assert composite[1] == 16, "composite runs on shard_composite_vm_type"
+        assert export[1] == 16
+
+    def test_a_pre_plan_estimate_still_prices_per_vcpu(self):
+        """The preflight runs before a plan exists and must still be calibrated."""
+        fleets = quota.run_fleets()
+
+        assert fleets
+        assert all(cpus in (8, 16) for _, cpus, _ in fleets)
+        assert quota.estimate_run_credits() > 0
+
+    def test_the_estimate_stays_comparable_to_an_invoice(self, monkeypatch):
+        """The safety factor belongs to the decision, not to the number."""
+        monkeypatch.setattr(settings, "coiled_credit_safety", 5.0)
+
+        assert quota.credits_for_fleets([(1.0, 8, 1.0)]) == pytest.approx(8.0)
+
+
+class TestIdentityPreflight:
+    """An expired SSO session, caught before the startup rather than after it.
+
+    Three times now the driver has spent a STAC query, a plan, and a fleet's
+    boot before discovering that nothing it wrote could reach S3. The session
+    expires within hours; a tile takes longer than that.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "message"),
+        [
+            ("UnauthorizedSSOTokenError", "The SSO session has expired"),
+            ("NoCredentialsError", "Unable to locate credentials"),
+            ("TokenRetrievalError", "Error when retrieving token"),
+            ("ProfileNotFound", "The config profile could not be found"),
+        ],
+    )
+    def test_a_dead_session_refuses_and_names_the_command(self, name, message, monkeypatch):
+        monkeypatch.setenv("AWS_PROFILE", "radiant-earth")
+
+        with pytest.raises(quota.IdentityRefused) as excinfo:
+            quota.preflight_identity(caller=_raises(_named_error(name, message)))
+
+        assert "aws sso login --profile radiant-earth" in str(excinfo.value)
+
+    def test_an_expired_token_response_is_recognised(self):
+        """Credentials that exist but are stale come back as an STS error code."""
+        error = _named_error("ClientError", "An error occurred (ExpiredToken)")
+        error.response = {"Error": {"Code": "ExpiredToken"}}
+
+        with pytest.raises(quota.IdentityRefused, match="aws sso login"):
+            quota.preflight_identity(caller=_raises(error))
+
+    def test_the_hint_falls_back_to_the_configured_profile(self, monkeypatch):
+        monkeypatch.delenv("AWS_PROFILE", raising=False)
+        monkeypatch.setattr(settings, "aws_profile", "some-profile")
+
+        with pytest.raises(quota.IdentityRefused, match="--profile some-profile"):
+            quota.preflight_identity(caller=_raises(_named_error("NoCredentialsError", "")))
+
+    def test_a_healthy_session_proceeds_and_returns_the_arn(self):
+        arn = "arn:aws:sts::123456789012:assumed-role/dev/nissim"
+
+        assert quota.preflight_identity(caller=lambda: {"Arn": arn}) == arn
+
+    def test_an_injected_submitter_skips_the_identity_check(
+        self, storage, plan, job, clock, monkeypatch
+    ):
+        """The same exemption the backend guard and the credit gate already take.
+
+        A caller that injects its own submitter starts no clusters and writes
+        nowhere but a temporary directory, so it needs no AWS session -- and if
+        it did, every scenario in this file would pass on a laptop with an SSO
+        session and refuse on a credential-less runner. It is pinned here
+        because the rule is easy to break by moving one line.
+        """
+
+        def explode(**_kwargs) -> str:
+            raise AssertionError("a locally-driven run must not call STS")
+
+        monkeypatch.setattr(quota, "preflight_identity", explode)
+        fleet = ScriptedFleet(storage, plan, clock=clock)
+
+        assert _drive(job, storage, fleet, clock).completed
+
+    def test_identity_is_checked_before_credits(self, storage, plan, job, clock, monkeypatch):
+        """A session that cannot call STS cannot read a Coiled balance either."""
+        import landsat_lst.shard_driver as driver
+
+        monkeypatch.setattr(driver, "require_shared_storage", _allow_any_backend)
+        fleet = ScriptedFleet(storage, plan, clock=clock)
+        asked: list[str] = []
+
+        def identity() -> str:
+            asked.append("identity")
+            raise quota.IdentityRefused("expired; run: aws sso login")
+
+        def balance() -> quota.CreditBalance:
+            asked.append("credits")
+            return quota.CreditBalance(remaining=10_000.0, source="fake")
+
+        monkeypatch.setattr(quota, "preflight_identity", identity)
+
+        with pytest.raises(quota.IdentityRefused):
+            drive_tile(
+                job,
+                run_id=RUN_ID,
+                storage=storage,
+                submit=_as_real_submitter(fleet, monkeypatch),
+                clock=clock,
+                cluster_probe=None,
+                balance_source=balance,
+            )
+
+        assert asked == ["identity"], "credits must not be read after identity failed"
+        assert fleet.calls == []
 
 
 class TestErrorTaxonomy:
@@ -725,6 +909,33 @@ def test_the_whole_state_machine_suite_runs_without_real_waiting():
 
     assert clock.elapsed == 7200
     assert time.monotonic() - started < 1.0
+
+
+def _healthy_identity(**_kwargs) -> str:
+    """A logged-in session, for scenarios that are not about being logged in.
+
+    Any test that reaches the real ``preflight_identity`` passes on a laptop
+    with an SSO session and refuses on a credential-less CI runner. That is not
+    a test; it is a reading of the machine it ran on.
+    """
+    return "arn:aws:sts::123456789012:assumed-role/test/runner"
+
+
+def _named_error(name: str, message: str) -> Exception:
+    """An exception standing in for a botocore class, by name.
+
+    ``quota`` classifies these by class *name* rather than by identity, so it
+    never has to import botocore to decide -- and so a test never has to
+    construct one of botocore's several incompatible signatures.
+    """
+    return type(name, (Exception,), {})(message)
+
+
+def _raises(error: Exception):
+    def caller() -> dict:
+        raise error
+
+    return caller
 
 
 def _allow_any_backend(*_args, **_kwargs) -> None:

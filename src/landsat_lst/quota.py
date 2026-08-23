@@ -8,7 +8,11 @@ and in both cases the driver learned it the expensive way: once as a silent
 kill misread as slow shards, once as an error with no message.
 
 A quota is knowable *before* a submission, and this module makes the driver ask.
-Three sources, best first, because the answer's quality varies and pretending
+Two gates run here, in this order. **Identity first**: an AWS SSO session
+expires within hours, which is less than a tile takes, and a driver whose
+credentials are stale cannot write an artifact or read a barrier -- it used to
+spend its whole startup before finding out. **Then credits**, from three
+sources, best first, because the answer's quality varies and pretending
 otherwise is how a preflight becomes a rubber stamp:
 
 1. **The workspace usage endpoint.** ``/api/v2/user/account/{workspace}/usage``
@@ -43,7 +47,7 @@ import structlog
 from landsat_lst.config import settings
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from landsat_lst.shards import TilePlan
 
@@ -52,15 +56,139 @@ log = structlog.get_logger()
 #: Where a person checks a workspace's credit balance by eye.
 TEAM_URL = "https://cloud.coiled.io/team?organization=nissim-lebovits"
 
-#: Credits per VM-hour. Calibrated from the observed billing events, whose
-#: ``amount_credits`` cluster around ``-2.7823`` for the instance types this
-#: project runs. **The uncertainty is real and it is in the denominator**: the
-#: event stream does not say what interval an event covers, so this assumes one
-#: event is roughly one VM-hour. If an event is really a whole cluster
-#: lifetime, this over-estimates a run's cost and the preflight is
-#: conservative; if an event covers less than an hour, it under-estimates.
-#: Treat a preflight pass as "not obviously unaffordable", never as a promise.
-CREDITS_PER_VM_HOUR = 2.7823
+#: Credits per **vCPU-hour**, which is Coiled's documented billing unit and
+#: not the per-VM-hour guess this replaces.
+#:
+#: Calibrated against the S30W065 acceptance run of 2026-08-23, which billed
+#: **268.11 credits** where the old model estimated 75 -- wrong by 3.6x, and
+#: wrong in the direction that lets an unaffordable run start. Per cluster:
+#:
+#: =============  =======  ==========================  ==================
+#: cluster        credits  fleet                       credits/vCPU-hour
+#: =============  =======  ==========================  ==================
+#: offse-r1        67.81   ~15 x r6i.2xlarge, ~31 min   ~1.09
+#: offse-r2        16.15    14 x r6i.2xlarge, ~7 min    ~1.24
+#: compo-r1       184.15    35 x m6i.4xlarge, 20-32 min ~0.62-0.99
+#: =============  =======  ==========================  ==================
+#:
+#: The observed band is **0.6 to 1.25**, and the spread is staggered VM
+#: lifetimes rather than a different rate: a fleet's VMs do not all boot or
+#: finish together, so dividing one cluster's credits by its *nominal* wall
+#: clock understates the rate for a fleet that finished early and overstates it
+#: for one that straggled. 1.0 sits inside the band and prices the run's own
+#: shape at ~318 credits against the 268.11 billed -- about 19% **high**, which
+#: is the direction to be wrong in: over-estimating refuses a run that would
+#: have fit, where under-estimating starts one that is killed mid-stage and
+#: loses the whole tile. Both bounds are pinned by a regression test.
+#:
+#: Still an estimate. ``settings.coiled_credit_safety`` carries the band's
+#: width, which is why its default is 2.0 rather than 1.5.
+CREDITS_PER_VCPU_HOUR = 1.0
+
+
+#: Botocore exception names that mean "your AWS session is gone", matched by
+#: name rather than by class so this module never imports botocore to decide.
+#: The SSO session expires within hours, which is shorter than a tile.
+_EXPIRED_IDENTITY = (
+    "UnauthorizedSSOTokenError",
+    "NoCredentialsError",
+    "TokenRetrievalError",
+    "SSOTokenLoadError",
+    "CredentialRetrievalError",
+    "ProfileNotFound",
+)
+
+#: Error codes an STS call returns when the credentials exist but are stale.
+_EXPIRED_CODES = ("ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId")
+
+
+class IdentityRefused(RuntimeError):
+    """AWS credentials are missing or expired, so the run cannot start."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _sso_login_hint() -> str:
+    """The exact command that fixes it, with the profile actually in play."""
+    import os  # noqa: PLC0415
+
+    profile = os.environ.get("AWS_PROFILE") or settings.aws_profile
+    return f"aws sso login --profile {profile}" if profile else "aws sso login"
+
+
+def _caller_identity() -> dict:
+    """One STS call, with a short timeout and no retries.
+
+    Short because this runs before anything else and a hung control plane must
+    not become the reason a run did not start; no retries because an expired
+    token does not un-expire.
+    """
+    import boto3  # noqa: PLC0415
+    from botocore.config import Config  # noqa: PLC0415
+
+    session = boto3.Session()
+    client = session.client(
+        "sts",
+        config=Config(
+            connect_timeout=5, read_timeout=5, retries={"max_attempts": 1, "mode": "standard"}
+        ),
+    )
+    return client.get_caller_identity()
+
+
+def preflight_identity(*, caller: Callable[[], dict] | None = None) -> str:
+    """Verify AWS credentials before anything is submitted. Terminal on failure.
+
+    This has bitten three times. The SSO session expires within hours -- less
+    than a tile takes -- and the driver used to spend its whole startup (a STAC
+    query, a plan, a fleet's boot) before discovering that nothing it wrote
+    could reach S3. An expired token is not a transient failure and no backoff
+    fixes it, so it fails now and names the command.
+
+    Runs *before* the credit preflight: a session that cannot call STS cannot
+    read a Coiled balance either, and "log in again" is a better message than
+    "the balance could not be read".
+
+    Args:
+        caller: Where the identity comes from. Injectable so every refusal path
+            is testable without a control plane.
+
+    Returns:
+        The caller ARN, for the driver to log.
+
+    Raises:
+        IdentityRefused: If credentials are missing, expired, or rejected.
+    """
+    probe = caller or _caller_identity
+    try:
+        identity = probe()
+    except Exception as e:
+        name = type(e).__name__
+        code = ""
+        response = getattr(e, "response", None)
+        if isinstance(response, dict):
+            code = str(response.get("Error", {}).get("Code", ""))
+
+        text = f"{name}: {e}".strip().rstrip(":")
+        expired = (
+            name in _EXPIRED_IDENTITY
+            or code in _EXPIRED_CODES
+            or "expired" in text.lower()
+            or "token has expired" in text.lower()
+        )
+        if expired or name.endswith(("Error", "Exception")):
+            raise IdentityRefused(
+                f"AWS credentials are not usable ({text}). The shard driver writes "
+                f"every artifact to S3 and reads every barrier from it, so it cannot "
+                f"start. Run: {_sso_login_hint()}"
+            ) from e
+        raise
+
+    arn = str(identity.get("Arn", "")) if isinstance(identity, dict) else ""
+    log.info("identity_preflight_ok", arn=arn or "unknown")
+    return arn
 
 
 class QuotaRefused(RuntimeError):
@@ -206,30 +334,83 @@ def read_balance() -> CreditBalance:
     return CreditBalance(remaining=None, source="unavailable")
 
 
+def credits_for_fleets(fleets: Iterable[tuple[float, int, float]]) -> float:
+    """Credits for ``(fleet_size, vcpus_each, wall_hours)`` triples.
+
+    The whole model, in one line, so a regression test can hand it the shape of
+    a run that has actually been billed and check the arithmetic against the
+    invoice rather than against itself.
+    """
+    return sum(size * cpus * hours for size, cpus, hours in fleets) * CREDITS_PER_VCPU_HOUR
+
+
+def run_fleets(
+    plan: TilePlan | None = None, *, units: int | None = None
+) -> list[tuple[float, int, float]]:
+    """Each stage as ``(fleet_size, vcpus_each, wall_hours)``.
+
+    Wall hours are *per VM*, because that is what a fleet bills: every VM in a
+    stage pays its own boot, and then its share of the stage's work. Reading
+    the stage's total wall clock instead would price a fleet of thirty-five as
+    if it were one machine.
+    """
+    from landsat_lst.projection import vcpus  # noqa: PLC0415
+
+    offsets_cpus = vcpus(settings.coiled_vm_types[0])
+    composite_cpus = vcpus(settings.shard_composite_vm_type)
+
+    if plan is None:
+        # The preflight runs before shard 0 has written a plan, so the shape
+        # comes from the pre-plan estimator this project already trusts.
+        from landsat_lst import budgets  # noqa: PLC0415
+        from landsat_lst.projection import tile_projection  # noqa: PLC0415
+
+        projected = tile_projection()
+        offsets_vms = max(1.0, round(projected.n_vms_offsets))
+        composite_vms = max(1.0, round(projected.n_vms_composite))
+        boot_h = budgets.VM_BOOT_S / 3600.0
+        return [
+            (
+                offsets_vms,
+                offsets_cpus,
+                boot_h + budgets.RESOLVE_S / 3600.0 + projected.offsets_hours_1vm / offsets_vms,
+            ),
+            (
+                composite_vms,
+                composite_cpus,
+                boot_h + projected.composite_hours_1vm / composite_vms,
+            ),
+        ]
+
+    from landsat_lst import budgets  # noqa: PLC0415
+    from landsat_lst.shards import offsets_fleet_units  # noqa: PLC0415
+
+    offsets_vms = float(units or offsets_fleet_units())
+    return [
+        (offsets_vms, offsets_cpus, budgets.stage_budget("offsets", plan).work_s / 3600.0),
+        (
+            float(len(plan.bands)),
+            composite_cpus,
+            budgets.stage_budget("composite", plan).work_s / 3600.0,
+        ),
+        (1.0, composite_cpus, budgets.stage_budget("export", plan).work_s / 3600.0),
+    ]
+
+
 def estimate_run_credits(plan: TilePlan | None = None, *, units: int | None = None) -> float:
     """What this tile is expected to cost, in credits.
 
     Built from the same budget model the deadlines come from, so a run whose
-    geometry grows costs more here without anyone editing a number. Before the
-    plan exists -- which is when the preflight runs -- it falls back to
-    ``projection.tile_projection``'s VM-hours, the pre-plan estimator this
-    project already trusts for cost.
+    geometry grows costs more here without anyone editing a number -- and
+    priced per **vCPU-hour**, which is what Coiled bills. The per-VM-hour
+    model this replaces was wrong by 3.6x on the first run that could check it,
+    because it could not see that a 16-vCPU composite VM costs twice an 8-vCPU
+    offsets VM for the same wall clock.
+
+    Raw: the safety factor lives in :func:`preflight_credits`, so this number
+    stays comparable to an invoice.
     """
-    if plan is None:
-        from landsat_lst.projection import tile_projection  # noqa: PLC0415
-
-        vm_hours = tile_projection().vm_hours_per_tile
-    else:
-        from landsat_lst import budgets  # noqa: PLC0415
-        from landsat_lst.shards import offsets_fleet_units  # noqa: PLC0415
-
-        offsets_vms = units or offsets_fleet_units()
-        vm_hours = (
-            budgets.stage_budget("offsets", plan).work_s * offsets_vms
-            + budgets.stage_budget("composite", plan).work_s * len(plan.bands)
-            + budgets.stage_budget("export", plan).work_s
-        ) / 3600.0
-    return vm_hours * CREDITS_PER_VM_HOUR
+    return credits_for_fleets(run_fleets(plan, units=units))
 
 
 def preflight_credits(
