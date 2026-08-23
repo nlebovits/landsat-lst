@@ -55,6 +55,7 @@ from tests.unit.shard_fixtures import (
     make_plan,
     publish_legacy_plan,
     publish_plan,
+    stub_tile_geoboxes,
     write_offset_cache,
 )
 
@@ -792,6 +793,10 @@ def _stub_loader(monkeypatch, plan, shape: tuple[int, int], *, follow_geobox: bo
     monkeypatch.setattr("landsat_lst.pipeline.load_scenes", load_scenes)
     monkeypatch.setattr("landsat_lst.pipeline._build_land_mask", build_land_mask)
     monkeypatch.setattr("landsat_lst.pipeline._patch_url_for", lambda _items: None)
+    # And the grids the tasks derive from the real tile name, which are the
+    # production 18,000-column ones however small the plan is. See
+    # stub_tile_geoboxes.
+    stub_tile_geoboxes(monkeypatch, plan)
 
 
 def _stub_coarse_load(monkeypatch, plan):

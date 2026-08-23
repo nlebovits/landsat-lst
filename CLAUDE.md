@@ -654,6 +654,19 @@ Rules worth keeping:
 
 ## Testing
 
+- **A toy plan does not make a toy grid.** The shard tasks derive their geobox from the
+  real tile name (`geobox_for_bbox(job.tile.bbox)`), which is the production 18,000-column
+  global grid however small the fixture plan is. Composite-path tests were therefore
+  computing float64 quantile intermediates over 18,000-wide bands: 3.2-3.6 GB peak RSS per
+  test family, enough that three of them colocated on one 7 GB CI xdist worker OOM-killed
+  it, and which families colocate is decided by the total test count. Any test exercising
+  `run_composite_shard` or `run_export_merge` must call
+  `shard_fixtures.stub_tile_geoboxes`, which is what `_stub_loader` does. **Never fix this
+  by changing the production derivation** — a band's pixels must be the tile's pixels
+  (ADR-008).
+- `--timeout` lives in the CI workflow, never in `pyproject.toml`: a local debugging
+  session must not be killed mid-breakpoint.
+
 - Unit tests: `uv run pytest tests/unit/`
 - Integration tests: `uv run pytest tests/integration/`
 - Full tile test (slow): `uv run pytest -m tile`

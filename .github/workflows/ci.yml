@@ -114,13 +114,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --frozen
 
-      - name: Runner telemetry (diagnostic, remove after CI stall is found)
-        run: free -m && nproc && df -h /tmp | tail -1
+      # --timeout lives here rather than in pyproject so a local debugging
+      # session is never killed mid-breakpoint. 300s is far above the slowest
+      # unit test and well below the job's own timeout, so a wedged worker
+      # surfaces as a named stack trace instead of a silent stall.
       - name: Run unit tests
         run: >
-          uv run --with pytest-timeout pytest tests/unit -v
+          uv run pytest tests/unit -v
           --cov=src/landsat_lst --cov-report=xml -n auto
-          --timeout=120 --timeout-method=thread
+          --timeout=300 --timeout-method=thread
 
       - name: Upload coverage
         if: matrix.python-version == '3.11'
