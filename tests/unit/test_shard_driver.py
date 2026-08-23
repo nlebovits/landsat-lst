@@ -502,8 +502,16 @@ class TestExportClaim:
         watching = LandsOnPoll(storage, plan, "export", after=3)
         fleet = FakeFleet(storage, plan)
 
+        from landsat_lst.shard_driver import Clock
+
         outcome = _await_export(
-            run_id=RUN_ID, tile=TILE, root=root, storage=watching, plan=plan, submit=fleet
+            run_id=RUN_ID,
+            tile=TILE,
+            root=root,
+            storage=watching,
+            plan=plan,
+            submit=fleet,
+            clock=Clock(),
         )
 
         assert fleet.calls == []

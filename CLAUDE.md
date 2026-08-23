@@ -605,6 +605,30 @@ Rules worth keeping:
   used to collide: `Unable to add batch jobs to existing cluster '...-climato'`. Cluster
   names now carry the round (`stage_cluster_name`, run id hashed so truncation cannot eat
   the marker).
+- **Nothing submits before the credit quota is checked.** `quota.preflight_credits` is
+  state zero, and it refuses rather than guessing. A workspace at its quota gets its
+  healthy fleet killed mid-stage (2026-08-22, 400 credits) and its cluster creates
+  rejected with an *empty* `ServerError`. The estimate comes from the budget model;
+  `--ack-quota` is the escape when no balance can be read.
+- **Deadlines are derived, never typed.** `landsat_lst.budgets` computes each stage's
+  deadline from bytes over measured rates, per shard, times `shard_budget_safety`.
+  `shard_barrier_timeout_s` is now an explicit override defaulting to `None`. The
+  *widest* shard sets the budget (a barrier waits for the slowest), and the composite
+  budget includes an `offsets_tail` phase because that fleet boots during phase B.
+- **Every round gets a deadline computed when that round opens.** A barrier used to
+  measure from the first submission, so round 2 opened at T+46min against a deadline that
+  expired at T+45 and failed having watched for nothing. Pinned by a test asserting two
+  rounds cost two budgets of wall clock.
+- **Control-plane errors are classified.** Terminal (quota/credits/billing/auth) fails the
+  tile now with the reason surfaced; everything else — **including an error with no
+  message** — is transient and retried with backoff. An empty `ServerError` killed the
+  driver once; guessing "terminal" for the unknown case would bring that back.
+- **A cluster reported dead ends its barrier early.** The probe can only end a barrier
+  *sooner*, never declare success, and a dead report is re-checked against the bucket
+  first (a fleet whose last task uploaded and then stopped is a finished stage).
+- **The driver takes an injectable `Clock`.** `tests/unit/test_driver_state_machine.py`
+  runs 45 scenarios in under a second. Both defects above are time arithmetic; time
+  arithmetic that cannot be tested is time arithmetic nobody checks.
 - **Failure is bounded.** On barrier expiry the driver resubmits *only the missing
   indexes*, at most `shard_barrier_rounds` submissions per stage **counted across
   drivers**, then fails naming the keys. Per-driver counting would hand every resume a

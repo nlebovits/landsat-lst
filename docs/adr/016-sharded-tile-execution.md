@@ -242,6 +242,87 @@ composite reports `shard_offsets_wait`. Time spent waiting at an in-process barr
 majority of what a consolidated run can waste, so it has to be attributable — otherwise the
 next round of tuning is guesswork again.
 
+## The driver is a state machine, and its deadlines are budgets
+
+**Amendment, 2026-08-23.** A night's fleet died at the Coiled workspace credit quota
+(`Scheduler Stopped -> Instance Stopped: You have reached the workspace quota of 400
+Coiled credits`), and the same gate had earlier produced an empty `ServerError` on a
+cluster create. Neither was a driver bug. The driver's part was worse: it *masked* both,
+and the post-mortem found a real defect underneath.
+
+### Every deadline is derived, none is typed
+
+`shard_barrier_timeout_s` was a hand-entered 7200 for every stage — a guess that ages
+badly and that nobody recomputes when the window, the fleet width, or a measured rate
+moves. `landsat_lst.budgets` replaces it with the model `projection.py` already uses for
+cost: bytes over measured rates, per *shard*, plus the named fixed costs a shard pays
+before it reads anything (`VM_BOOT_S`, `RESOLVE_S`), each carrying its provenance.
+
+A stage's deadline is its budget times `shard_budget_safety` — one named factor, not one
+per stage, so widening it is a conversation rather than a silent edit. The setting stays
+as an explicit override defaulting to `None` (= derived), for the case where somebody is
+holding a stopwatch during an incident.
+
+Two consequences worth stating. The *widest* shard sets each stage's budget, because a
+barrier waits for the slowest one; the shares come from the same `balance_by_land` split
+the shards use, since an even division understates the widest group on a coastal tile.
+And the composite budget includes an `offsets_tail` phase, because that fleet is started
+from inside the offsets barrier and spends real time polling for a record the driver has
+not written yet.
+
+### Every round gets its own deadline
+
+The observed defect. A barrier's deadline was measured from the first submission, so
+round 2 opened at T+46min against a deadline that had expired at T+45, watched for
+nothing, and failed instantly. `StageMachine` computes a fresh deadline **when a round
+opens** — `clock.now() + deadline_s` on submit, `record.submitted_at + deadline_s` on
+adopt. Pinned by a test that makes a never-landing shard cost *two* budgets of wall
+clock; an inherited deadline spends one and quits.
+
+### Errors are classified, not swallowed
+
+A control-plane failure is `terminal` or `transient`. Terminal — quota, credits, billing,
+auth — stops the tile now and surfaces the reason: an exhausted quota will not clear
+inside a backoff, and burning the remaining rounds against it turns a two-line
+explanation into a 45-minute silence. Everything else, **including an error with no
+message at all**, is transient and retried with backoff up to `shard_submit_retries`,
+then reported. Guessing "terminal" for the unknown case would reintroduce the failure
+where an empty `ServerError` killed the driver outright.
+
+At barrier level the driver also probes the round's cluster (`coiled.list_clusters`).
+A cluster reported `error` or `stopped` while artifacts are missing raises
+`ShardFleetKilled` with the reason attached, rather than waiting out the barrier — a
+killed fleet produces no artifacts and never will. The probe can only end a barrier
+*sooner*; it never declares success, and a dead report is re-checked against the bucket
+first, because a fleet whose last task uploaded and then stopped is a finished stage.
+
+### Nothing submits before the quota is checked
+
+`quota.preflight_credits` is state zero. Three sources, best first: the workspace usage
+endpoint `coiled login` itself reads (`has_quota` is authoritative for exhausted-or-not);
+`coiled_credit_quota` minus the billing-activity debits in a recent window; and, if
+neither answers, a refusal that prints the team page and demands `--ack-quota`. The run's
+credit estimate comes from the same budget model, so geometry moves it.
+
+The fallback's approximation is documented rather than hidden: nothing observable says
+when the quota period resets, so "the period" is the last `coiled_credit_period_days`.
+Too short under-counts spend and lets an unaffordable run start; too long over-counts and
+refuses an affordable one. `CREDITS_PER_VM_HOUR` (2.7823) is calibrated from the observed
+event amounts on the assumption that one event is roughly one VM-hour, which the event
+stream does not state. **A preflight pass means "not obviously unaffordable", never a
+promise.**
+
+### A clock seam, and what it bought
+
+Every wait, poll, deadline, and backoff goes through an injectable `Clock`. That is not
+mainly a speed argument: both defects above are time arithmetic, and time arithmetic that
+cannot be tested is time arithmetic nobody checks.
+`tests/unit/test_driver_state_machine.py` runs 45 scenarios — fresh run, already
+complete, adoption, restart at every boundary, worker failure, partial completion across
+rounds, the fresh-deadline regression, exhausted rounds, stale records, deterministic
+failure, transient and terminal API failures, a killed fleet, both export paths, and the
+preflight — **in under a second**, and asserts that no scenario waits for real.
+
 ## The three latent defects the seams pass fixed
 
 Stage 3's first PR opened five narrow seams in existing code. Three of them closed

@@ -476,13 +476,81 @@ class Settings(BaseSettings):
         "poll, which is how the driver learns a shard finished: Coiled Batch "
         "has no dependency mechanism and an exit code is not completion.",
     )
-    shard_barrier_timeout_s: int = Field(
-        default=7200,
+    shard_barrier_timeout_s: int | None = Field(
+        default=None,
         ge=0,
-        description="How long one stage may run before the driver gives up "
-        "waiting and resubmits whichever shard indexes are still missing. Two "
-        "hours covers a phase that projects to well under one, with room for a "
-        "spot replacement to boot and redo a shard.",
+        description="Explicit override for every stage barrier deadline, in "
+        "seconds. None (the default) derives each stage's deadline from "
+        "landsat_lst.budgets: bytes over measured rates, per shard, times "
+        "shard_budget_safety. It was a hand-entered 7200 for every stage, "
+        "which is a guess that ages badly and that nobody recomputes when the "
+        "window, the fleet width, or a measured rate moves. Set it only to "
+        "reach for a stopwatch during an incident.",
+    )
+    coiled_credit_quota: float = Field(
+        default=400.0,
+        gt=0,
+        description="Credits the workspace is allowed per period. Provenance: "
+        "the kill message of 2026-08-22, 'You have reached the workspace quota "
+        "of 400 Coiled credits'. Used only when the usage endpoint gives no "
+        "remaining figure, as the base a run's debits are subtracted from.",
+    )
+    coiled_credit_period_days: int = Field(
+        default=30,
+        ge=1,
+        description="How far back the billing-activity fallback sums debits. "
+        "An approximation: nothing observable says when the quota period "
+        "resets. Too short under-counts spend and lets an unaffordable run "
+        "start; too long over-counts and refuses an affordable one. 30 days is "
+        "the conservative reading of a monthly quota.",
+    )
+    coiled_billing_max_pages: int = Field(
+        default=20,
+        ge=1,
+        description="Pages of billing activity the fallback will read. The "
+        "observed history is ~1,294 events; this bounds a preflight so it "
+        "cannot become slower than the run it precedes.",
+    )
+    coiled_credit_safety: float = Field(
+        default=1.5,
+        ge=1.0,
+        description="Headroom a run must have beyond its credit estimate. The "
+        "estimate is built on an assumed credits-per-VM-hour whose interval "
+        "the billing events do not state, so it is uncertain in both "
+        "directions; being killed mid-stage costs the whole tile, while "
+        "refusing costs a re-check.",
+    )
+    ack_quota: bool = Field(
+        default=False,
+        description="Proceed when the credit balance cannot be read, on the "
+        "strength of an operator's manual check. The driver refuses otherwise "
+        "rather than guessing, because an exhausted quota kills a healthy "
+        "fleet mid-stage.",
+    )
+    shard_budget_safety: float = Field(
+        default=2.0,
+        gt=0,
+        description="The only slack in a barrier deadline: a stage may take "
+        "this multiple of its projected work before the driver acts. One "
+        "number rather than one per stage, so widening it is a conversation "
+        "rather than a silent edit. 2.0 covers a spot replacement booting and "
+        "redoing the slowest shard.",
+    )
+    shard_submit_retries: int = Field(
+        default=3,
+        ge=1,
+        description="Attempts at one submission API call before it is treated "
+        "as terminal. A transient failure must not kill the driver: on "
+        "2026-08-22 an empty ServerError from a cluster create -- the Coiled "
+        "credit quota, as it turned out -- ended the run outright rather than "
+        "being retried or reported.",
+    )
+    shard_submit_backoff_s: float = Field(
+        default=5.0,
+        ge=0,
+        description="First wait between submission retries; doubled each time. "
+        "Short, because a submission is a control-plane call rather than the "
+        "work, and the fleet is idle while it is retried.",
     )
     # Consolidation (ADR-016, "One fleet per side"). Boots and queueing, not
     # compute: offsets-side shards computed ~6 minutes each while their stages
