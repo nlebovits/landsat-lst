@@ -387,6 +387,32 @@ also went from one pass per band to one pass total. Do not restore an eager `.va
 observations is data), so it is the LST band's `VALID_PERCENT` and the coverage line, not
 the QA one, that catch a run that filled wholesale.
 
+### The QA COG's header and pyramid, and why `cog_validate` cannot guard them
+
+The S30W065 tile shipped on 2026-08-23 with both wrong, and passed validation anyway.
+`cog_validate` checks structure, not content. Two rules hold it:
+
+- **`qa_count` carries no nodata, and that is asserted, not declared.** A `Product`
+  saying `nodata=None` is not enough: `qa_count` reaches the writer with a `nodata` attr
+  off the loaded stack so `rio.to_raster` stamps 0.0 on the intermediate, `merge_bands`
+  copies band 0's profile into a sharded tile, and `cog_translate(nodata=None)` declines
+  to *set* a nodata rather than clearing one. The shipped header said 0 was absent while
+  its own tags said `VALID_PERCENT` 100 and `MINIMUM` 0. So `qa_product` strips it from
+  the array **and** `finish_product` assigns `src.nodata = product.nodata` on the open
+  raster — the one point both the whole-tile and the merge path cross.
+- **Every translate passes `BIGTIFF=IF_SAFER`.** `cog_translate` builds the pyramid in an
+  *uncompressed* scratch raster, where a production `qa_count` is 12 × 18,000² uint8 =
+  3.62 GiB — just under the 4 GiB ceiling of a classic TIFF's 32-bit offsets, so GDAL's
+  default `IF_NEEDED` declines to promote it and the overviews then run off the end of the
+  file. Level 2 truncated at row 2048 of 9000 and levels 4–64 were never written, so
+  anything past 1:4 rendered blank. `IF_SAFER` rather than `YES` keeps the decision GDAL's:
+  an LST tile (one uint16 band) still writes a byte-identical classic TIFF. **This is
+  size-dependent and silent** — no affordable fixture reproduces it, so `tests/unit`
+  pins the option and `tests/integration` pins the cascade's semantics.
+
+`scripts/reexport_qa_count.py` repairs an already-published tile from its band slabs
+without recomputing the composite, and refuses to upload a rebuild that fails either rule.
+
 ---
 
 ## Output grid — one shared grid, always

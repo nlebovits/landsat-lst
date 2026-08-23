@@ -12,8 +12,10 @@ import numpy as np
 import pytest
 import rasterio
 import xarray as xr
+from rasterio.enums import MaskFlags
 from structlog.testing import capture_logs
 
+from landsat_lst import cog as cog_module
 from landsat_lst.cog import _coverage_summary, export_lst_cog, export_qa_cog
 from landsat_lst.encoding import LST_OFFSET, LST_SCALE
 
@@ -178,6 +180,81 @@ def test_all_fill_band_reports_zero_valid_percent(tmp_path):
     tags = _band_tags(path, 1)
     assert tags.keys() >= STATISTIC_KEYS
     assert float(tags["STATISTICS_VALID_PERCENT"]) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# The nodata contract
+# ---------------------------------------------------------------------------
+
+
+def test_qa_declares_no_nodata_on_the_dataset_or_any_band(qa_cog):
+    """0 observations is data, so ``qa_count`` must claim no absent value.
+
+    The shipped S30W065 tile carried ``nodata=0.0`` while its own statistics
+    said ``VALID_PERCENT`` 100 and ``MINIMUM`` 0 -- a header contradicting its
+    own tags. It leaked in three places at once: ``qa_count`` reaches the
+    writer carrying a ``nodata`` attr off the loaded stack, ``merge_bands``
+    copies band 0's profile into a sharded tile, and
+    ``cog_translate(nodata=None)`` declines to set a nodata rather than
+    clearing one. So assert the whole surface, not just the dataset.
+    """
+    with rasterio.open(qa_cog) as src:
+        assert src.nodata is None
+        assert set(src.nodatavals) == {None}
+        assert src.count == 12
+        for bidx in range(1, 13):
+            assert src.mask_flag_enums[bidx - 1] == [MaskFlags.all_valid], f"band {bidx}"
+
+
+def test_lst_still_declares_its_fill_as_nodata(lst_cog):
+    """The QA fix must not reach the LST product, whose DN 0 really is absent."""
+    with rasterio.open(lst_cog) as src:
+        assert src.nodata == 0
+        assert src.mask_flag_enums[0] == [MaskFlags.nodata]
+
+
+def test_a_nodata_attr_on_the_input_does_not_reach_the_qa_cog(tmp_path):
+    """The exact leak: an attr the pipeline leaves on ``qa_count``.
+
+    ``rio.to_raster`` reads ``rio.nodata`` off the array, so without the
+    explicit strip in ``qa_product`` this attr alone reinstates the defect --
+    on the intermediate, on every sharded band slab, and from there on the COG.
+    """
+    dataset = _qa_dataset(_striped_qa(n=64))
+    dataset["qa_count"].attrs["nodata"] = 0
+
+    path = export_qa_cog(dataset, tmp_path / "qa.tif")
+
+    with rasterio.open(path) as src:
+        assert src.nodata is None
+        assert set(src.nodatavals) == {None}
+
+
+def test_translate_forces_bigtiff_so_a_deep_pyramid_cannot_overrun(tmp_path):
+    """A white-box guard, because the real failure costs 3.62 GiB to reproduce.
+
+    ``cog_translate`` builds the pyramid in an *uncompressed* scratch raster.
+    A production ``qa_count`` is 12 x 18,000 x 18,000 uint8 = 3.62 GiB there,
+    just under the 4 GiB ceiling of a classic TIFF's 32-bit offsets, so GDAL's
+    default ``IF_NEEDED`` declines to promote it -- and then the overviews
+    append past the end of the addressable file. The shipped tile lost levels
+    4 through 64 entirely and ``cog_validate`` still returned True.
+
+    No affordable fixture reproduces that, so this pins the option instead.
+    ``tests/integration/test_cog.py`` pins the cascade's semantics.
+    """
+    captured: dict[str, object] = {}
+    real = cog_module.cog_translate
+
+    def spy(src, dst, profile, **kwargs):
+        captured["profile"] = dict(profile)
+        return real(src, dst, profile, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cog_module, "cog_translate", spy)
+        export_qa_cog(_qa_dataset(_striped_qa(n=64)), tmp_path / "qa.tif")
+
+    assert captured["profile"]["BIGTIFF"] == "IF_SAFER"
 
 
 # ---------------------------------------------------------------------------

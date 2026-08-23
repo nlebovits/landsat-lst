@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import rasterio
 import xarray as xr
+from rio_cogeo import cogeo
 from rio_cogeo.cogeo import cog_validate
 
 from landsat_lst.cog import cog_export, export_lst_cog, export_qa_cog
@@ -238,3 +239,107 @@ def test_cog_export_handles_a_half_lazy_composite(tmp_path):
         np.testing.assert_array_equal(src.read(1), np.full((128, 128), 8500, dtype=np.uint16))
     with rasterio.open(qa_cog) as src:
         np.testing.assert_array_equal(src.read(7), np.full((128, 128), 7, dtype=np.uint8))
+
+
+# ---------------------------------------------------------------------------
+# The overview cascade
+# ---------------------------------------------------------------------------
+
+#: Smallest square that forces four overview levels through the production
+#: profile. ``get_maximum_overview_level`` halves until ``min(w, h)`` reaches the
+#: 512 blocksize, so levels follow the *shorter* side and a cheap thin strip
+#: gets no pyramid at all: 8192 -> 4096, 2048, 1024, 512.
+DEEP_PYRAMID_SIZE = 8192
+
+#: Three of the twelve months. The cascade is per band, so band count changes
+#: nothing it asserts, and the full product would cost 805 MB of fixture.
+DEEP_PYRAMID_BANDS = 3
+
+
+def _deep_pyramid_native() -> xr.Dataset:
+    """Alternating zero and ``2 * band`` columns, so every 2x2 block is mixed.
+
+    Dask-backed and built from constant blocks so the fixture streams rather
+    than materializing.
+
+    The interleave is what gives the test its second edge. Every 2x2 window
+    holds two genuine zero counts and two of the constant, so averaging *all*
+    of them lands on ``band`` exactly, at every level, while averaging only the
+    nonzero ones would land on ``2 * band``. A block-aligned half-and-half
+    split cannot tell those apart -- an all-nodata block averages to nodata,
+    which is 0, so its mean survives either way -- and an earlier draft of this
+    fixture was exactly that and passed with ``nodata=0`` reinstated.
+    """
+    n = DEEP_PYRAMID_SIZE
+    chunks = (DEEP_PYRAMID_BANDS, 1024, 1024)
+    column = np.zeros(n, dtype=np.uint8)
+    column[::2] = 1  # 1 where a count lands, 0 where it genuinely does not
+    bands = [
+        da.from_array(np.broadcast_to(column * 2 * (m + 1), (n, n)), chunks=chunks[1:])
+        for m in range(DEEP_PYRAMID_BANDS)
+    ]
+    qa = xr.DataArray(
+        da.stack(bands),
+        dims=["month", "latitude", "longitude"],
+        coords={
+            "month": np.arange(1, DEEP_PYRAMID_BANDS + 1),
+            "latitude": np.linspace(-30.0, -35.0, n),
+            "longitude": np.linspace(-65.0, -60.0, n),
+        },
+    )
+    return xr.Dataset({"qa_count": qa}, attrs=dict(PROVENANCE))
+
+
+@pytest.mark.integration
+def test_qa_deep_overview_levels_survive_and_average_zeros_as_data(tmp_path, monkeypatch):
+    """Every level keeps its counts; none collapses to zero.
+
+    The shipped S30W065 tile failed both halves of this: level 2 was truncated
+    at row 2048 of 9000 and levels 4 through 64 were entirely zero, so a viewer
+    zoomed past 1:4 saw a blank QA layer. ``cog_validate`` passed it, because
+    it checks structure and not content -- which is why the assertion here is
+    on the values at every level rather than on the pyramid's existence.
+
+    The scratch raster that the pyramid is built in is forced onto the
+    temp-file path, which is the branch a production 18,000-square tile always
+    takes and the one whose 4 GiB ceiling the truncation ran into.
+    """
+    monkeypatch.setattr(cogeo, "IN_MEMORY_THRESHOLD", 1)
+
+    qa_cog = export_qa_cog(_deep_pyramid_native(), tmp_path / "qa.tif")
+
+    assert cog_validate(str(qa_cog))[0]
+    with rasterio.open(qa_cog) as src:
+        assert src.overviews(1) == [2, 4, 8, 16], "fixture must force four levels"
+        for bidx in range(1, DEEP_PYRAMID_BANDS + 1):
+            # Half the columns hold 2*bidx and half hold 0, so the mean is bidx
+            # at every level -- but only if the zeros are averaged in as data.
+            expected = float(bidx)
+            native = src.read(bidx)
+            assert (native != 0).mean() == pytest.approx(0.5), "fixture zeros are real"
+
+            for factor in [1, *src.overviews(bidx)]:
+                level = src.read(bidx, out_shape=(src.height // factor, src.width // factor))
+                assert level.any(), f"band {bidx} level {factor} collapsed to all-zero"
+                assert level.mean() == pytest.approx(expected, abs=0.01), (
+                    f"band {bidx} level {factor}"
+                )
+
+
+@pytest.mark.integration
+def test_qa_cog_declares_no_nodata_while_lst_keeps_its_fill(tmp_path):
+    """The two products' nodata contracts, asserted side by side.
+
+    ``qa_count`` must claim no absent value -- 0 observations is data -- while
+    ``lst_p95`` must keep DN 0 as nodata. The shipped tile had both wrong in
+    the same direction, so pinning them together is what keeps a future fix to
+    one from silently reaching the other.
+    """
+    lst_cog, qa_cog = tmp_path / "lst.tif", tmp_path / "qa.tif"
+    cog_export(_native(), lst_cog, qa_cog)
+
+    with rasterio.open(qa_cog) as src:
+        assert src.nodata is None
+        assert set(src.nodatavals) == {None}
+    with rasterio.open(lst_cog) as src:
+        assert src.nodata == 0
