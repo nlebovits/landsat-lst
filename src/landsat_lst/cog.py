@@ -56,6 +56,39 @@ onto the fill pixel and report -50 C. ``tests/unit/test_cog_stats.py`` pins this
 behaviour, so a GDAL upgrade that changed it would fail the suite rather than
 quietly cool the pyramid. For ``qa_count`` averaging is the plain correct
 semantic anyway: zeros are genuine observation counts.
+
+**Every translate forces ``BIGTIFF=IF_SAFER``, and ``qa_count`` is why.**
+:func:`cog_translate` builds the pyramid in a *temporary* raster and then copies
+it out, and that scratch file is **uncompressed** however the output is
+compressed (``rio_cogeo/cogeo.py:322`` pops ``compress`` unless
+``allow_intermediate_compression``). A production ``qa_count`` tile is
+12 x 18,000 x 18,000 uint8 = 3.62 GiB, which sits just *under* the 4 GiB ceiling
+of a classic TIFF's 32-bit offsets — so GDAL's default ``BIGTIFF=IF_NEEDED``
+declines to promote it, and then ``build_overviews`` appends a 972 MB level 2 on
+top and runs off the end of the addressable file. The shipped S30W065 tile lost
+its pyramid exactly there: level 2 truncated at row 2048 of 9000, levels 4
+through 64 never written at all, so anything zoomed past 1:4 rendered a blank QA
+layer. ``cog_validate`` returns **True** on that file — it checks structure, not
+content — which is how the damage shipped. Reproduced and fixed at full 18,000²
+scale; ``tests/integration/test_cog.py`` pins a smaller multi-level case.
+
+``IF_SAFER`` rather than ``YES`` so the decision stays GDAL's and tracks the
+actual product: an LST tile (one uint16 band, 648 MB) still writes a classic
+TIFF, byte-for-byte what it wrote before. Do not "simplify" this to a bare
+translate — the failure is silent, size-dependent, and validates clean.
+
+**Nodata is applied to the raster explicitly, never inherited.** A
+:class:`Product` declaring ``nodata=None`` is not sufficient on its own, and
+``qa_count`` proved it twice over. It reaches the writer carrying a ``nodata``
+attr off the loaded stack, so ``rio.to_raster`` stamped 0.0 onto the
+intermediate; :func:`merge_bands` copies band 0's profile verbatim, so a sharded
+tile inherited it too; and ``cog_translate(nodata=None)`` does not *clear* a
+source's nodata, it merely declines to set one. The shipped tile therefore
+carried a header saying 0 is absent data while its own ``STATISTICS_*`` tags
+(``VALID_PERCENT`` 100, ``MINIMUM`` 0) said 0 is data. Zero observations **is**
+data. So :func:`qa_product` strips it from the array and :func:`finish_product`
+assigns ``src.nodata = product.nodata`` on the open raster — the one point both
+the whole-tile and the merge path pass through.
 """
 
 from __future__ import annotations
@@ -96,6 +129,11 @@ _BLOCKSIZE = 512
 
 # Empirically verified to honour nodata for both products; see module docstring.
 _OVERVIEW_RESAMPLING = "average"
+
+# The pyramid is built in an *uncompressed* scratch raster, so a 12-band uint8
+# tile crosses the 4 GiB classic-TIFF ceiling there and nowhere else. Without
+# this the deep overview levels are silently lost; see the module docstring.
+_BIGTIFF = "IF_SAFER"
 
 _STATISTIC_KEYS = (
     "STATISTICS_MINIMUM",
@@ -299,10 +337,16 @@ def _coverage_summary(histogram: np.ndarray) -> dict[str, float]:
 def _to_cog(src_tif: Path, cog_path: Path, *, nodata: float | None) -> None:
     """Translate a plain GeoTIFF to a validated deflate COG with average overviews."""
     cog_path.parent.mkdir(parents=True, exist_ok=True)
+    # rio_cogeo merges the profile into the scratch raster's creation options as
+    # well as the output's, which is the half that matters: the pyramid is built
+    # there, uncompressed, and that is where a 12-band tile overruns a classic
+    # TIFF's 32-bit offsets.
+    profile = cog_profiles.get("deflate")
+    profile["BIGTIFF"] = _BIGTIFF
     cog_translate(
         str(src_tif),
         str(cog_path),
-        cog_profiles.get("deflate"),
+        profile,
         overview_resampling=_OVERVIEW_RESAMPLING,
         nodata=nodata,
         # Without this the STATISTICS_* band tags are dropped on the floor.
@@ -359,9 +403,12 @@ def qa_product(native: xr.Dataset, cog_path: Path) -> Product:
             src.set_band_description(band_idx, _MONTH_NAMES[band_idx - 1])
 
     # No nodata anywhere on this product: 0 observations is data, not absence of
-    # data, and it has to stay visible for gap diagnosis.
+    # data, and it has to stay visible for gap diagnosis. The explicit strip is
+    # load-bearing -- qa_count arrives carrying a nodata attr off the loaded
+    # stack, and rio.to_raster would otherwise stamp 0.0 onto the intermediate,
+    # from where merge_bands and cog_translate both inherit it.
     return Product(
-        da=qa,
+        da=qa.rio.write_nodata(None),
         nodata=None,
         cog_path=cog_path,
         scratch_prefix="qa_cog_",
@@ -406,6 +453,11 @@ def finish_product(src_tif: Path, product: Product, attrs: Mapping[str, Any]) ->
     """
     with rasterio.open(src_tif, "r+") as src:
         product.describe(src)
+        # Assert the product's nodata rather than trusting what the intermediate
+        # happens to carry. A merged tile inherits band 0's profile, and
+        # cog_translate(nodata=None) declines to set one rather than clearing
+        # one, so this is the only point that holds for both paths.
+        src.nodata = product.nodata
         src.update_tags(**_dataset_tags(attrs))
         histogram = _embed_statistics(src, product.nodata, coverage=product.coverage)
     if histogram is not None:
