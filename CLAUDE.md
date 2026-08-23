@@ -452,6 +452,22 @@ If you see values like -124°C, the data didn't load correctly (DN=0 → invalid
   outside `[settings.lst_valid_min, settings.lst_valid_max]` (default −50 / 80 °C).
   This removes the ~−124 °C artifacts produced when reprojection interpolates near
   the DN=0 fill (not caught by the exact `!= 0` test), plus high-DN saturation junk.
+- **ASTER GED emissivity-gap mask** (`ged.gap_mask_for_geobox`, applied in
+  `process_tile` and `run_composite_shard`): drops LST pixels whose ~1 km
+  AG100 cell has `NumObs == 0`, plus a 1-cell buffer
+  (`settings.ged_gap_mask`, `settings.ged_gap_buffer_cells`). USGS
+  interpolates emissivity there; the fringe yields spurious 70-78 °C
+  retrievals the P95 promotes, the cores yield ST fill. Verified per-pixel on
+  S30W065 (2026-08-23): 0.863% of valid pixels removed, 92.45% of the ≥70 °C
+  tail; the 211-px residue on NumObs 1-3 cells is deliberately not chased.
+  Output-side like the land mask, **LST only** — `qa_count` is never masked
+  (0 observations is data) and the offset estimator never sees it (cached
+  offsets stay valid; no `ALGORITHM_VERSION` bump). Source is the
+  `data/ged_gap_mask.npz` artifact (preferred; 2.8 MB, gitignored — built by
+  `scripts/build_ged_gap_mask.py`, and what a fleet VM ships) or the local granules in
+  `data/aster_ged/`; a granule the mask needs but the archive lacks is an
+  error naming the ids, never a silent skip. See
+  [findings](docs/findings-aster-ged-gaps.md) and docs/methodology.md.
 - **`qa_count` is a 12-month climatology** (`(month, latitude, longitude)`, `uint8`),
   not a single annual count: month M = valid observations in calendar month M pooled
   across the window. It exports as a 12-band monthly COG (`cog.py`). It counts only

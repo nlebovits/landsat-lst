@@ -790,8 +790,19 @@ def _stub_loader(monkeypatch, plan, shape: tuple[int, int], *, follow_geobox: bo
             coords={"latitude": latitude, "longitude": longitude},
         )
 
+    def build_ged_gap_mask(geobox, latitude, longitude):
+        return xr.DataArray(
+            np.zeros((latitude.size, longitude.size), dtype=bool),
+            dims=["latitude", "longitude"],
+            coords={"latitude": latitude, "longitude": longitude},
+        )
+
     monkeypatch.setattr("landsat_lst.pipeline.load_scenes", load_scenes)
     monkeypatch.setattr("landsat_lst.pipeline._build_land_mask", build_land_mask)
+    # No-gap by default, for the same reason the land mask above is all-land:
+    # these tests are about the shard machinery, and the real mask would read
+    # whatever GED artifact the machine happens to carry.
+    monkeypatch.setattr("landsat_lst.pipeline._build_ged_gap_mask", build_ged_gap_mask)
     monkeypatch.setattr("landsat_lst.pipeline._patch_url_for", lambda _items: None)
     # And the grids the tasks derive from the real tile name, which are the
     # production 18,000-column ones however small the plan is. See

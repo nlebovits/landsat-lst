@@ -141,6 +141,46 @@ class Settings(BaseSettings):
         "high-DN saturation/fill artifacts without clipping real extreme heat.",
     )
 
+    # ASTER GED emissivity-gap mask. See docs/findings-aster-ged-gaps.md and
+    # the 2026-08-23 per-pixel verification (results/ged-mask-check/).
+    ged_gap_mask: bool = Field(
+        default=True,
+        description="Drop composite pixels whose ASTER GED v3 (AG100) cell has "
+        "NumObs == 0, plus a buffer (ged_gap_buffer_cells). USGS interpolates "
+        "GED emissivity over these cells, and the contaminated fringe produces "
+        "spurious 70-78 degC retrievals that the P95 promotes while the gap "
+        "cores produce ST fill. Verified per-pixel on S30W065 (2026-08-23): the "
+        "rule removes 0.863% of valid pixels and 92.45% of the >= 70 degC "
+        "artifact tail. Applies to the LST output only, exactly like the land "
+        "mask -- never to offset estimation, and never to qa_count (zero "
+        "observations is data; the count layer stays the evidence).",
+    )
+    ged_gap_buffer_cells: int = Field(
+        default=1,
+        ge=0,
+        description="Dilation radius of the GED gap mask, in GED cells (~1 km "
+        "each, 8-connected). 1 is the verified rule: on S30W065 the unbuffered "
+        "gap cores catch the ST-fill blobs but leave the hot fringe, and one "
+        "cell of buffer takes the >= 70 degC tail from 2,793 pixels to 211 "
+        "(92.45% removed) for 0.863% of valid pixels. The residue sits on "
+        "NumObs 1-3 cells and is deliberately not chased: chasing it "
+        "(NumObs <= 2 + buffer) costs 11.4% of valid pixels.",
+    )
+    ged_dir: Path = Field(
+        default=Path("data/aster_ged"),
+        description="Directory of local AG100 v3 granules "
+        "(AG1km.v003.{lat}.{lon}.0010.h5). The fallback mask source when no "
+        "artifact exists; a granule the mask needs but the directory lacks is "
+        "an error naming the granule ids, never a silent skip.",
+    )
+    ged_artifact: Path = Field(
+        default=Path("data/ged_gap_mask.npz"),
+        description="Compact global gap-cell artifact written by "
+        "scripts/build_ged_gap_mask.py. Preferred over ged_dir when present: "
+        "a fleet VM ships this one file, not 8,776 granules. Verified to "
+        "produce a mask identical to the granule path on S30W065.",
+    )
+
     # Season-aware per-scene normalization (de-striping). See issue #46, ADR-007.
     destripe: bool = Field(
         default=True,

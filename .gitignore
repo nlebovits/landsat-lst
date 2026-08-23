@@ -71,6 +71,9 @@ data/*.gpkg
 # Reference datasets cached by scripts/aster_gap_urban_analysis.py
 data/ghsl/
 data/aster_ged/
+# Global GED gap-cell artifact (2.8 MB, over the pre-commit size cap);
+# rebuilt deterministically by scripts/build_ged_gap_mask.py
+data/ged_gap_mask.npz
 .serena/
 
 # Environment
