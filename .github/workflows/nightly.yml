@@ -153,7 +153,7 @@ jobs:
       # five PRs. The trend file is what a human reads afterwards.
       - name: Upload trend
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-trend
           path: results/benchmark/trend.jsonl
