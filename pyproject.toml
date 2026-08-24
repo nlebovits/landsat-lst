@@ -99,7 +99,7 @@ dev = [
     # upstream regression rather than a tightened profile, since Portolan's own
     # spec makes file:checksum a SHOULD. The ceiling is temporary and #97 owns
     # removing it -- do not widen it without resolving that first.
-    "rashid>=0.1.4,<0.1.6",
+    "rashid>=0.1.4,<0.1.8",
     # Pre-commit
     "prek>=0.1.0",
     # Profiling
