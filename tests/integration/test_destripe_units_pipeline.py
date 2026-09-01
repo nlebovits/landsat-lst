@@ -26,7 +26,11 @@ from landsat_lst.pipeline import compute_annual_composite
 
 pytestmark = pytest.mark.integration
 
+#: Source-grid side. A multiple of the aggregation factor, as a real source
+#: stack always is.
 GRID = 96
+#: Delivered side the composite comes back on.
+OUTPUT_GRID = GRID // 3
 
 
 def _dataset(*, scenes: int = 36, seed: int = 5, bias: np.ndarray | None = None):
@@ -68,15 +72,25 @@ def _dataset(*, scenes: int = 36, seed: int = 5, bias: np.ndarray | None = None)
 
 
 def _land_mask(fraction: float = 0.75) -> xr.DataArray:
-    """Land over most of the grid, ocean along the eastern edge."""
-    mask = np.zeros((GRID, GRID), dtype=bool)
-    mask[:, : int(GRID * fraction)] = True
+    """Land over most of the grid, ocean along the eastern edge.
+
+    On the DELIVERED grid, because ``compute_annual_composite`` aggregates
+    before it applies a land mask (ADR-017). Its coordinates reproduce what the
+    aggregator will label its result with when no geobox is handed in: the
+    per-block means of the source coordinates.
+    """
+    mask = np.zeros((OUTPUT_GRID, OUTPUT_GRID), dtype=bool)
+    mask[:, : int(OUTPUT_GRID * fraction)] = True
+    source = {
+        "latitude": np.linspace(-33.4, -34.4, GRID),
+        "longitude": np.linspace(-61.1, -60.1, GRID),
+    }
+    factor = settings.spatial_aggregation_factor
     return xr.DataArray(
         mask,
         dims=["latitude", "longitude"],
         coords={
-            "latitude": np.linspace(-33.4, -34.4, GRID),
-            "longitude": np.linspace(-61.1, -60.1, GRID),
+            dim: values.reshape(OUTPUT_GRID, factor).mean(axis=1) for dim, values in source.items()
         },
     )
 
@@ -128,7 +142,7 @@ class TestCompositeIsUnchangedByTheSplit:
         unmasked = _composite(data, bounded=True)
         masked_vals = np.asarray(units["lst_p95"].values)
         assert not np.array_equal(masked_vals, np.asarray(unmasked["lst_p95"].values))
-        ocean = masked_vals[:, int(GRID * 0.75) :]
+        ocean = masked_vals[:, int(OUTPUT_GRID * 0.75) :]
         assert len(np.unique(ocean)) == 1, "ocean should be a single fill value"
 
     def test_rejection_decisions_agree_on_a_biased_scene(self):

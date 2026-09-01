@@ -24,8 +24,9 @@ Three properties hold the seams together and each is pinned in
   shard reduce a different set of pixels than the whole-tile path does.
 - :func:`band_edges` cuts on multiples of the COG block size, so a band's rows
   land on a destination block boundary and the merge is a block-aligned copy
-  rather than a read-modify-write. The last band absorbs the ragged remainder,
-  which is mandatory rather than tidy: 18,000 = 512 x 35 + 80.
+  rather than a read-modify-write. It cuts over *delivered* rows (ADR-017), and
+  the last band absorbs the ragged remainder, which is mandatory rather than
+  tidy: 6,000 = 512 x 11 + 368.
 - :class:`TilePlan` carries a :attr:`~TilePlan.digest` over every setting that
   changes what a shard computes, so a shard started under a different
   configuration refuses the plan instead of contributing an incompatible piece
@@ -352,12 +353,16 @@ def band_edges(height: int, n_bands: int, chunk: int) -> list[Band]:
     copy instead of a read-modify-write of a straddling block.
 
     The last band absorbs the ragged remainder because the production grid
-    leaves one: 18,000 rows is 512 x 35 + 80, so the final band is 80 rows
-    shorter than a whole number of blocks. A cut rule that assumed an exact
-    division would be wrong on every tile this project writes.
+    leaves one: the delivered 6,000 rows are 512 x 11 + 368, so the final band
+    is 144 rows short of a whole number of blocks. (The source grid left one
+    too, at 18,000 = 512 x 35 + 80. Moving to the delivered grid changed the
+    remainder and not the rule.) A cut rule that assumed an exact division
+    would be wrong on every tile this project writes.
 
     Args:
-        height: Rows in the output grid.
+        height: Rows in the DELIVERED grid. A band's source rows are ``factor``
+            times its own ``(start, stop)``; see
+            :func:`landsat_lst.shard_tasks.run_composite_shard`.
         n_bands: How many bands to cut. Must not exceed the number of
             ``chunk``-sized rows available, or a band would be empty.
         chunk: Block height every boundary must be a multiple of.
@@ -514,7 +519,9 @@ class TilePlan:
     offset_factor: int
     #: ``(height, width)`` of the grid offsets are estimated on.
     coarse_shape: tuple[int, int]
-    #: ``(height, width)`` of the output grid.
+    #: ``(height, width)`` of the SOURCE grid -- what the bands actually read,
+    #: and what the byte model in :mod:`landsat_lst.budgets` is priced against.
+    #: Aggregation reduces the *output*, never the read.
     native_shape: tuple[int, int]
     block_edge: int
     blocks: list[Span]
@@ -522,6 +529,15 @@ class TilePlan:
     #: Half-open scene ranges, as ``normalization._scene_batches`` cut them.
     scene_batches: list[tuple[int, int]]
     bands: list[Band]
+    #: ``(height, width)`` of the DELIVERED grid: ``native_shape`` divided by
+    #: ``settings.spatial_aggregation_factor``, exactly. The row bands are cut
+    #: over these rows, so a band's source slice is ``factor`` times its own
+    #: ``(start, stop)``. Defaulted, and empty means "derive it from
+    #: ``native_shape``" -- which is what a plan written before ADR-017 needs,
+    #: and what keeps every fixture that predates the delivered grid valid.
+    #: Filled by :meth:`__post_init__` when left empty, so every reader sees a
+    #: real shape rather than a sentinel it has to remember to resolve.
+    output_shape: tuple[int, int] = (0, 0)
     #: How many processes each stage is split across.
     ref_shards: int = 1
     scene_shards: int = 1
@@ -529,6 +545,21 @@ class TilePlan:
     #: Digest of the configuration the plan was cut under, filled in by
     #: :meth:`to_dict` and checked by :meth:`from_dict`.
     _digest: str | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Derive the delivered shape when the caller left it empty.
+
+        A plan written before ADR-017 carries no ``output_shape``, and so does
+        every fixture built by hand from a source shape. Resolving it once here
+        rather than at each use means ``budgets``, the planner, and the merge
+        cannot disagree about what an unset shape meant -- and a zero leaking
+        into a budget would silently give the export stage no time at all.
+        """
+        if self.output_shape and all(self.output_shape):
+            return
+        factor = settings.spatial_aggregation_factor
+        height, width = self.native_shape
+        object.__setattr__(self, "output_shape", (int(height) // factor, int(width) // factor))
 
     @property
     def digest(self) -> str:
@@ -544,6 +575,7 @@ class TilePlan:
         planner's ranges do not share, and pay an extra read of every straddled
         chunk for pieces that still merge.
         """
+        from landsat_lst.aggregate import AGGREGATION_VERSION  # noqa: PLC0415
         from landsat_lst.offsets import ALGORITHM_VERSION  # noqa: PLC0415
         from landsat_lst.pipeline import TIME_CHUNK  # noqa: PLC0415
 
@@ -555,6 +587,14 @@ class TilePlan:
                 f"destripe_offset_resolution_factor={settings.destripe_offset_resolution_factor}",
                 f"lst_valid_min={settings.lst_valid_min}",
                 f"lst_valid_max={settings.lst_valid_max}",
+                # The delivered grid and the valid-area rule decide what a band
+                # *contains*, not merely how it is shaped, so a shard running a
+                # different aggregation contract must refuse the plan rather
+                # than contribute a band that merges cleanly and means
+                # something else. See ADR-017.
+                f"output_pixels_per_degree={settings.output_pixels_per_degree}",
+                f"min_valid_source_cells={settings.min_valid_source_cells}",
+                f"aggregation_version={AGGREGATION_VERSION}",
                 f"time_chunk={TIME_CHUNK}",
                 f"load_chunk_size={settings.load_chunk_size}",
                 f"load_chunk_size_offsets={settings.load_chunk_size_offsets}",
@@ -570,6 +610,7 @@ class TilePlan:
         payload.pop("_digest")
         payload["coarse_shape"] = list(self.coarse_shape)
         payload["native_shape"] = list(self.native_shape)
+        payload["output_shape"] = list(self.output_shape)
         payload["blocks"] = [list(span) for span in self.blocks]
         payload["scene_batches"] = [list(span) for span in self.scene_batches]
         payload["bands"] = [list(span) for span in self.bands]
@@ -598,6 +639,10 @@ class TilePlan:
             offset_factor=int(payload["offset_factor"]),
             coarse_shape=tuple(payload["coarse_shape"]),  # type: ignore[arg-type]
             native_shape=tuple(payload["native_shape"]),  # type: ignore[arg-type]
+            # Absent on a plan written before ADR-017; __post_init__ derives it
+            # and the digest, which covers output_pixels_per_degree, is what
+            # refuses such a plan if the delivered grid has moved since.
+            output_shape=tuple(payload.get("output_shape") or (0, 0)),  # type: ignore[arg-type]
             block_edge=int(payload["block_edge"]),
             blocks=[tuple(span) for span in payload["blocks"]],  # type: ignore[misc]
             block_has_land=[bool(flag) for flag in payload["block_has_land"]],

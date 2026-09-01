@@ -29,4 +29,8 @@ _.mock_lwir_band  # noqa: F821
 _.fixtures_dir  # noqa: F821
 _.data_cache_dir  # noqa: F821
 _.fast_barriers  # noqa: F821
+# Taken as an argument purely to apply, never read: the fixture's whole effect
+# is a monkeypatch on settings. See tests/unit/conftest.py.
+_.source_grid_output  # noqa: F821
+_.no_destripe  # noqa: F821
 _.s3_backend  # noqa: F821

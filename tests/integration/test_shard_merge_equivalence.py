@@ -64,11 +64,18 @@ pytestmark = pytest.mark.integration
 #: what is under test is the sharding of the reduction, not its scale.
 GRID = 96
 
-#: Composite geometry. 1,536 rows is 512 x 3, so three row bands each start on
-#: a COG block row -- the alignment ``shards.band_edges`` guarantees on the
-#: production grid and that ``merge_bands`` copies along.
-BAND_H, BAND_W = 1536, 512
+#: Composite geometry, DELIVERED. 1,536 rows is 512 x 3, so three row bands
+#: each start on a COG block row -- the alignment ``shards.band_edges``
+#: guarantees on the production grid and that ``merge_bands`` copies along.
+#: ``band_edges`` cuts delivered rows (ADR-017), so these are the rows it sees.
+BAND_H, BAND_W = 1536, 96
 BLOCKSIZE = 512
+
+#: The SOURCE geometry those bands read: exactly ``factor`` times as many
+#: cells in each direction, as a real band's slice of the tile's two geoboxes
+#: is. A test whose two shapes were unrelated would exercise a geometry no
+#: tile has.
+SRC_H, SRC_W = BAND_H * 3, BAND_W * 3
 
 STATISTIC_KEYS = (
     "STATISTICS_MINIMUM",
@@ -244,22 +251,29 @@ class TestShardedComposite:
         reason the concatenation works. Re-estimating per band would give each
         one its own reference climatology and leave a seam at every boundary.
         """
-        data = _dataset(scenes=18, height=BAND_H, width=BAND_W, chunk=256)
+        factor = settings.spatial_aggregation_factor
+        data = _dataset(scenes=18, height=SRC_H, width=SRC_W, chunk=258)
+        # Offsets are estimated on the SOURCE grid and the composite's land
+        # mask lives on the delivered one. Two masks, because they are two
+        # grids; the same ocean edge in both, because they describe one tile.
+        source_land = _land_mask(SRC_H, SRC_W)
         land = _land_mask(BAND_H, BAND_W)
-        lst = _celsius_stack(data, land)
+        lst = _celsius_stack(data, source_land)
 
         with (
             patch.object(settings, "destripe_unit_memory_gb", 0.02),
             patch.object(settings, "destripe_compute_panel", 128),
         ):
-            offsets = offsets_as_units(lst, land_mask=land)
+            offsets = offsets_as_units(lst, land_mask=source_land)
 
             whole = compute_annual_composite(data, land_mask=land, offsets=offsets)
 
+            # Delivered rows, and a source slice ``factor`` times as wide --
+            # exactly what ``run_composite_shard`` does with the same numbers.
             bands = band_edges(BAND_H, 3, BLOCKSIZE)
             pieces = [
                 compute_annual_composite(
-                    data.isel(latitude=slice(start, stop)),
+                    data.isel(latitude=slice(factor * start, factor * stop)),
                     land_mask=land.isel(latitude=slice(start, stop)),
                     offsets=offsets,
                 )

@@ -114,7 +114,7 @@ class CatalogSpec:
 _CATALOG_DESCRIPTION = (
     "Global land surface temperature composites derived from Landsat "
     "Collection 2 Level-2 surface temperature. One collection per observation "
-    "window, each cut from a single global 1/3600-degree grid and published as "
+    "window, each cut from a single global 1/1200-degree grid and published as "
     "one cloud-optimized GeoTIFF pair per five-degree tile."
 )
 
@@ -123,11 +123,22 @@ def _collection_description(window: str) -> str:
     return (
         f"Hot-season land surface temperature for {window}, expressed as the "
         "95th percentile of every cloud-free Landsat 8/9 observation pooled "
-        "across the window, on a 1/3600-degree (about 30 m) WGS84 grid. Each "
-        "five-degree tile carries the percentile composite and a twelve-band "
-        "monthly count of the observations behind it. Scenes are de-striped "
-        "against a per-pixel monthly climatology and scenes whose offset "
-        "cannot be trusted are discarded rather than corrected."
+        "across the window, on a 1/1200-degree WGS84 grid. That spacing is "
+        "nominal ~100 m: the grid is geographic, so a cell is about 93 m wide "
+        "at the equator and about 46 m at 60 degrees, and about 93 m tall "
+        "everywhere. Each observation is aggregated from the delivered USGS "
+        "30 m cells before the percentile, an area-weighted mean over the "
+        "valid cells of each aligned 3x3 block, requiring at least 5 of 9. "
+        "TIRS acquires thermal radiance at 100 m, so the product does not "
+        "present the delivered 30 m cells as independent thermal "
+        "observations, and aggregation reconstructs neither native TIRS nor "
+        "ASTER measurements. Each five-degree tile is 6000 x 6000 pixels and "
+        "carries the percentile composite and a twelve-band monthly count of "
+        "the observations behind it. Scenes are de-striped against a "
+        "per-pixel monthly climatology and scenes whose offset cannot be "
+        "trusted are discarded rather than corrected. Absolute accuracy is "
+        "inherited from USGS Collection 2 and is not independently validated "
+        "here."
     )
 
 

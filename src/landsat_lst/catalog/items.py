@@ -24,13 +24,13 @@ from landsat_lst.catalog.spec import (
     RENDER_EXTENSION_URI,
 )
 from landsat_lst.encoding import LST_FILL_VALUE, LST_OFFSET, LST_SCALE
-from landsat_lst.tiling import parse_tile_name, tile_geobox
+from landsat_lst.tiling import output_tile_geobox, parse_tile_name
 
 if TYPE_CHECKING:
     from landsat_lst.catalog.scan import BandStats, CogHeader, TilePair
     from landsat_lst.catalog.spec import CatalogSpec
 
-#: A tile edge is a whole number of 1/3600-degree pixels, so agreement between
+#: A tile edge is a whole number of 1/1200-degree pixels, so agreement between
 #: the header and the grid is exact up to float64 round-off in the transform.
 _BBOX_TOLERANCE_DEG = 1e-9
 
@@ -69,8 +69,14 @@ def _polygon(bbox: tuple[float, float, float, float]) -> dict[str, Any]:
 
 
 def _check_grid(tile: str, bbox: tuple[float, float, float, float]) -> None:
-    """Raise unless the header footprint matches the tile's grid extent."""
-    box = tile_geobox(parse_tile_name(tile)).boundingbox
+    """Raise unless the header footprint matches the tile's grid extent.
+
+    Checked against the DELIVERED grid, which is what a published COG is on.
+    The two grids cover the identical extent, so this would pass either way
+    today -- but a check written against the grid the product is not published
+    on is a check that stops meaning anything the moment they diverge.
+    """
+    box = output_tile_geobox(parse_tile_name(tile)).boundingbox
     expected = (box.left, box.bottom, box.right, box.top)
     if any(
         not math.isclose(a, b, abs_tol=_BBOX_TOLERANCE_DEG)
@@ -78,7 +84,7 @@ def _check_grid(tile: str, bbox: tuple[float, float, float, float]) -> None:
     ):
         msg = (
             f"tile {tile}: COG bbox {bbox} disagrees with the global grid extent "
-            f"{expected}; the raster is not on the shared 1/3600-degree grid"
+            f"{expected}; the raster is not on the shared 1/1200-degree grid"
         )
         raise GridMismatchError(msg)
 

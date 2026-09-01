@@ -100,9 +100,10 @@ def get_land_mask_for_bbox(
     if target_shape is not None:
         height, width = target_shape
     else:
-        # Round rather than truncate. The resolution is 1/3600, which no float
-        # represents exactly, so a 5-degree span divides to 17999.999999999996
-        # and int() would silently drop a pixel row and column.
+        # Round rather than truncate. Neither 1/3600 nor 1/1200 is exactly
+        # representable, so a 5-degree span divides to 17999.999999999996 on
+        # the source grid and 5999.999999999999 on the delivered one, and
+        # int() would silently drop a pixel row and column on either.
         width = round((east - west) / resolution)
         height = round((north - south) / resolution)
 
@@ -136,8 +137,10 @@ def get_land_mask_for_geobox(
     The transform comes from ``geobox.transform``, not from
     ``rasterio.transform.from_bounds``. They agree to about fifteen digits and
     that is not enough: ``from_bounds`` divides the span by the pixel count, so
-    a five-degree tile gets a pixel size of ``5/18000`` rather than the grid's
-    ``1/3600``, and a row band cut out of that tile gets ``(rows/3600)/rows``.
+    a five-degree delivered tile gets a pixel size of ``5/6000`` rather than the
+    grid's ``1/1200``, and a row band cut out of that tile gets
+    ``(rows/1200)/rows``. (The same argument held one grid up, at ``5/18000``
+    against ``1/3600``; this function serves both and cares about neither.)
     Those differ in the last bits, which is enough to move a polygon edge
     across a pixel centre and flip a pixel between a band's mask and the
     corresponding rows of the tile's. A shard's mask has to be the *slice* of

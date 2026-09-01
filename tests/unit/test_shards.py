@@ -42,7 +42,11 @@ pytestmark = pytest.mark.unit
 
 #: The production grid. 18,000 = 512 x 35 + 80, so every band test that matters
 #: runs against a ragged tail rather than a tidy division.
+#: Source rows a production tile reads.
 NATIVE = 18_000
+#: Delivered rows a production tile publishes, and the rows ``band_edges``
+#: cuts (ADR-017). Exactly a third of the source.
+OUTPUT = NATIVE // 3
 BLOCKSIZE = 512
 
 
@@ -103,39 +107,54 @@ class TestBandEdges:
     """Row bands, cut where the merge can copy blocks whole."""
 
     def test_the_production_grid_has_a_ragged_tail(self):
-        """18,000 is not a multiple of 512, and the rule has to say so.
+        """6,000 is not a multiple of 512, and the rule has to say so.
 
         A cut that assumed an exact division would be wrong on every tile this
         project writes, so the last band absorbing the remainder is mandatory
-        rather than a tidiness preference.
+        rather than a tidiness preference. The source grid left a remainder too,
+        at 18,000 = 512 x 35 + 80; moving to the delivered grid changed the
+        remainder to 368 and changed nothing about the rule.
         """
-        bands = band_edges(NATIVE, 4, BLOCKSIZE)
+        bands = band_edges(OUTPUT, 4, BLOCKSIZE)
 
-        assert bands[-1][1] == NATIVE
-        assert (bands[-1][1] - bands[-1][0]) % BLOCKSIZE == 80 % BLOCKSIZE
+        assert OUTPUT == 6_000
+        assert bands[-1][1] == OUTPUT
+        assert (bands[-1][1] - bands[-1][0]) % BLOCKSIZE == 368 % BLOCKSIZE
         assert all((start % BLOCKSIZE) == 0 for start, _ in bands)
 
-    @pytest.mark.parametrize("n_bands", [1, 2, 3, 4, 5, 7, 12, 35])
+    def test_a_source_slice_of_any_band_is_whole_blocks(self):
+        """3 x a multiple of 512 is still a whole number of source cells.
+
+        This is what lets a composite shard read ``[3*start, 3*stop)`` and know
+        that no aligned 3x3 block was split across two bands -- which would put
+        a partial block on the shared grid and give the two bands different
+        answers along their shared edge.
+        """
+        for start, stop in band_edges(OUTPUT, 4, BLOCKSIZE):
+            assert (3 * start) % 3 == 0
+            assert (3 * (stop - start)) % 3 == 0
+
+    @pytest.mark.parametrize("n_bands", [1, 2, 3, 4, 5, 7, 11, 12])
     def test_bands_cover_the_grid_exactly(self, n_bands):
-        bands = band_edges(NATIVE, n_bands, BLOCKSIZE)
+        bands = band_edges(OUTPUT, n_bands, BLOCKSIZE)
 
         assert len(bands) == n_bands
         assert bands[0][0] == 0
-        assert bands[-1][1] == NATIVE
+        assert bands[-1][1] == OUTPUT
         for (_, stop), (next_start, _) in pairwise(bands):
             assert stop == next_start
         assert all(start < stop for start, stop in bands)
 
-    @pytest.mark.parametrize("n_bands", [1, 2, 3, 4, 5, 7, 12, 35])
+    @pytest.mark.parametrize("n_bands", [1, 2, 3, 4, 5, 7, 11, 12])
     def test_every_boundary_is_a_block_row(self, n_bands):
         """What makes the merge a copy rather than a read-modify-write."""
-        bands = band_edges(NATIVE, n_bands, BLOCKSIZE)
+        bands = band_edges(OUTPUT, n_bands, BLOCKSIZE)
 
         for start, _ in bands:
             assert start % BLOCKSIZE == 0
 
     def test_it_is_deterministic(self):
-        assert band_edges(NATIVE, 6, BLOCKSIZE) == band_edges(NATIVE, 6, BLOCKSIZE)
+        assert band_edges(OUTPUT, 6, BLOCKSIZE) == band_edges(OUTPUT, 6, BLOCKSIZE)
 
     def test_more_bands_than_chunk_rows_is_refused(self):
         """Silently returning empty bands would hand a shard nothing to do."""
@@ -294,11 +313,12 @@ def _plan(**overrides) -> TilePlan:
         "offset_factor": 2,
         "coarse_shape": (9000, 9000),
         "native_shape": (NATIVE, NATIVE),
+        "output_shape": (OUTPUT, OUTPUT),
         "block_edge": 2048,
         "blocks": block_spans((9000, 9000), 2048),
         "block_has_land": [True] * len(block_spans((9000, 9000), 2048)),
         "scene_batches": [(0, 1), (1, 2)],
-        "bands": band_edges(NATIVE, 4, BLOCKSIZE),
+        "bands": band_edges(OUTPUT, 4, BLOCKSIZE),
         "ref_shards": 3,
         "scene_shards": 2,
         "band_shards": 4,
@@ -321,6 +341,7 @@ class TestTilePlan:
         assert back.offset_factor == plan.offset_factor
         assert back.coarse_shape == plan.coarse_shape
         assert back.native_shape == plan.native_shape
+        assert back.output_shape == plan.output_shape
         assert back.block_edge == plan.block_edge
         assert back.blocks == plan.blocks
         assert back.block_has_land == plan.block_has_land
@@ -365,6 +386,43 @@ class TestTilePlan:
         monkeypatch.setattr(
             settings, "load_chunk_size_offsets", settings.load_chunk_size_offsets * 2
         )
+
+        with pytest.raises(ValueError, match="different configuration"):
+            TilePlan.from_dict(payload)
+
+    def test_a_plan_with_no_output_shape_derives_one(self):
+        """A plan written before ADR-017 stays readable.
+
+        Its digest still refuses it if the delivered grid has moved since,
+        which is the guard that matters; inventing a shape it never had is what
+        ``from_dict`` exists to prevent, and deriving the only shape it could
+        have meant is not that.
+        """
+        payload = _plan().to_dict()
+        del payload["output_shape"]
+
+        assert TilePlan.from_dict(payload).output_shape == (OUTPUT, OUTPUT)
+
+    def test_a_drifted_delivered_grid_is_refused(self, monkeypatch):
+        """The grid decides what a band *contains*, not merely its shape."""
+        payload = _plan().to_dict()
+        monkeypatch.setattr(settings, "output_pixels_per_degree", 900)
+
+        with pytest.raises(ValueError, match="different configuration"):
+            TilePlan.from_dict(payload)
+
+    def test_a_drifted_valid_area_rule_is_refused(self, monkeypatch):
+        """Two shards on different thresholds merge cleanly and mean nothing."""
+        payload = _plan().to_dict()
+        monkeypatch.setattr(settings, "min_valid_source_cells", 9)
+
+        with pytest.raises(ValueError, match="different configuration"):
+            TilePlan.from_dict(payload)
+
+    def test_the_aggregation_version_is_in_the_digest(self, monkeypatch):
+        """The escape hatch for reducer changes a hash cannot see."""
+        payload = _plan().to_dict()
+        monkeypatch.setattr("landsat_lst.aggregate.AGGREGATION_VERSION", 99)
 
         with pytest.raises(ValueError, match="different configuration"):
             TilePlan.from_dict(payload)

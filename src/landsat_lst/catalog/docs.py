@@ -72,12 +72,20 @@ cloud-optimized GeoTIFFs with hrefs relative to the item JSON:
 
 ## Grid
 
-- CRS EPSG:4326, one shared global grid of {settings.pixels_per_degree} pixels
-  per degree (1/{settings.pixels_per_degree} degrees, about 30 m at the
-  equator).
+- CRS EPSG:4326, one shared global grid of
+  {settings.output_pixels_per_degree} pixels per degree
+  (1/{settings.output_pixels_per_degree} degrees). Nominal ~100 m: the grid is
+  geographic, so a cell is about 93 m wide at the equator and about 46 m at 60
+  degrees, and about 93 m tall everywhere. State it as nominal wherever you
+  restate the resolution.
 - Tiles are cut from that one grid, never anchored to their own bounding box,
   so neighbouring tiles register pixel for pixel. A five-degree tile is
-  18000 x 18000 pixels.
+  6000 x 6000 pixels.
+- Each observation was aggregated from the delivered USGS 30 m cells *before*
+  the temporal percentile: an area-weighted mean over the valid cells of each
+  aligned 3x3 block, requiring at least 5 of 9 valid. TIRS acquires thermal
+  radiance at 100 m; these are not independent 30 m thermal observations, and
+  the aggregation reconstructs neither native TIRS nor ASTER measurements.
 - Item `bbox` and `geometry` are read from the COG header and checked against
   the grid at build time.
 
@@ -95,9 +103,12 @@ cloud-optimized GeoTIFFs with hrefs relative to the item JSON:
 ## `qa_count` semantics
 
 - Twelve `uint8` bands, one per calendar month, January first.
-- Band M = the number of valid observations in calendar month M, pooled across
-  {spec.window}, counted after de-striping. It reports the evidence behind the
-  percentile, not raw data availability.
+- Band M = the number of valid ~100 m solar-day observations in calendar month
+  M, pooled across {spec.window}, counted after de-striping. It reports the
+  evidence behind the percentile, not raw data availability.
+- These are counts of *aggregated* observations, never sums of 30 m counts. A
+  month's value cannot exceed the number of solar days it holds, and an
+  observation counts only if its 3x3 block met the 5-of-9 rule.
 - Value 0 means no valid observation in that month. It is a real value, so the
   asset declares no nodata and 0 must stay visible.
 

@@ -203,8 +203,10 @@ nlebovits/landsat-lst/
         └── qa_count.tif       # uint8, 12 bands (Jan..Dec)
 ```
 
-Every asset is a window cut from one shared global grid at exactly 1/3600°, so tiles
-line up pixel for pixel and any number of them can be treated as a single raster.
+Every asset is a window cut from one shared global grid at exactly 1/1200°, so tiles
+line up pixel for pixel and any number of them can be treated as a single raster. A
+five-degree tile is 6,000 × 6,000 pixels. That spacing is **nominal ~100 m**: the grid is
+geographic, so a cell is about 93 m wide at the equator and about 46 m at 60°.
 
 ### Python
 
@@ -305,11 +307,45 @@ Key choices:
 - **Data source**: Earth Search (Landsat C2 L2)
 - **Output format**: COG with 512×512 blocks, published as a Portolan STAC catalog ([ADR-009](docs/adr/009-cog-output-and-stac-catalog.md))
 - **CRS**: EPSG:4326
-- **Tiling**: 5° × 5° grid on one shared global grid at 1/3600° ([ADR-008](docs/adr/008-global-mosaic-topology.md))
+- **Tiling**: 5° × 5° grid on one shared global grid at 1/1200° ([ADR-008](docs/adr/008-global-mosaic-topology.md))
+- **Resolution**: nominal ~100 m, aggregated from the delivered USGS 30 m cells before the temporal percentile ([ADR-017](docs/adr/017-nominal-100m-output-grid.md))
 - **Temporal**: Multi-year window composites (pooled P95); production default 2021–2025
 - **Spatial**: Land only, ±60° latitude
 
 ## Known Limitations
+
+### Nominal ~100 m is a grid spacing, not a cell size
+
+The product is published at 1/1200°. Because the grid is geographic, a cell is about 93 m
+tall everywhere but its width shrinks with the cosine of latitude: roughly 93 m at the
+equator, 80 m at 30°, and 46 m at 60°. Describe the resolution as nominal ~100 m rather
+than as 100 m cells, and use an equal-area projection for any area-weighted statistic.
+
+### The resolution is a support claim, not a rendering choice
+
+TIRS acquires thermal radiance at 100 m and USGS resamples it to the delivered 30 m grid;
+the retrieval also depends on ~1 km ASTER emissivity. This product therefore aggregates
+each masked solar-day observation to nominal ~100 m *before* the temporal percentile, and
+publishes nothing at 30 m.
+
+Two things follow from that, and one does not:
+
+- Each delivered cell is an area-weighted mean of the valid 30 m cells in its aligned 3×3
+  block, requiring at least 5 of 9 valid. Below that it is nodata for that day.
+- `qa_count` counts ~100 m solar-day observations, never 30 m cells.
+- **Aggregation is not de-striping and does not reconstruct native measurements.** It
+  makes a WRS-aligned seam less sharp without making it less wrong, and it summarizes the
+  delivered USGS estimates rather than recovering TIRS or ASTER.
+
+See [ADR-017](docs/adr/017-nominal-100m-output-grid.md) and
+[docs/methodology.md](docs/methodology.md).
+
+### Accuracy is inherited from USGS
+
+Absolute temperature accuracy comes from Landsat Collection 2 Level-2 and is not
+independently validated here. Two upstream artifacts reach the product unchanged: visible
+~1 km blockiness from the ASTER emissivity grid, and the known anomalies of the Collection
+2 NDVI-based vegetation adjustment.
 
 ### Permanent gaps from ASTER emissivity
 

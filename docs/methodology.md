@@ -112,6 +112,12 @@ normalization are not counted, so the numbers reflect the evidence behind each v
 raw data availability. Publishing them makes data availability explicit rather than leaving
 users to infer confidence from the temperature values alone.
 
+A count is a number of **nominal ~100 m solar-day observations**, never a sum of counts over
+the nine 30 m cells behind each one. An observation counts once if its aligned 3x3 block met
+the 5-of-9 valid-area rule, and not at all otherwise, so a month's value can never exceed the
+number of solar days it holds. The counts and the percentile read the same set of valid
+observations by construction.
+
 ## Missing observations
 
 Clouds, cloud shadows, snow, and other observations that fail quality screening are excluded
@@ -167,15 +173,91 @@ Ocean pixels are excluded using Natural Earth land polygons with a conservative 
 buffer that preserves barrier islands, estuaries, and other coastal landforms. See
 [findings-land-mask-buffer.md](findings-land-mask-buffer.md).
 
-## Output grid
+## Output grid and spatial resolution
 
-Every tile is cut from one global grid at 3,600 pixels per degree, roughly 30 m at the equator,
-in EPSG:4326. The grid is 1,296,000 by 432,000 pixels, and a 5-degree tile is exactly 18,000 by
-18,000. Pixel density is an integer rather than a rounded resolution, so tiles share pixel edges
-exactly and adjacent tiles abut with no gap or overlap.
+The product is published on one global EPSG:4326 grid at **1,200 pixels per degree**, a
+spacing of 1/1200 degree. The grid is 432,000 by 144,000 pixels, and a 5-degree tile is
+exactly 6,000 by 6,000. Pixel density is an integer rather than a rounded resolution, so
+tiles share pixel edges exactly and adjacent tiles abut with no gap or overlap.
 
-That property matters for the overviews. Coarsening blocks are cut from the global array rather
-than from a tile, which keeps block boundaries aligned across what used to be tile edges. A tile
-would not support this on its own: 18,000 divides by 4 and by 16 but not by 64, so a per-tile
-64x overview would trim its edge and shift block phase against its neighbour. The global grid
-divides cleanly by all three. See [ADR-008](adr/008-global-mosaic-topology.md).
+**This is a nominal ~100 m geographic grid, not 100 by 100 metre cells.** A cell is about
+93 m tall everywhere and about 93 m wide at the equator, narrowing with the cosine of
+latitude to about 46 m at 60 degrees. Please state the resolution as nominal wherever you
+restate it.
+
+### Why 100 m and not 30 m
+
+Landsat 8/9 TIRS acquires thermal radiance at **100 m**. USGS resamples it with cubic
+convolution onto the delivered 30 m Collection 2 grid, and the Level-2 retrieval also
+depends on ASTER GED emissivity at roughly 1 km. Delivery spacing is not resolving power.
+Publishing the delivered 30 m cells as independent thermal observations would overstate
+what the product knows, so V1 publishes a single nominal ~100 m product and no parallel
+30 m rendering.
+
+The exact 3x coarsening of the existing grid was chosen over a true metric 100 m grid to
+keep tile bounds, names, adjacency, CRS, and the catalog intact. A global equal-area
+redesign is scientifically tidier and is out of scope for V1. See
+[ADR-017](adr/017-nominal-100m-output-grid.md).
+
+### How each observation is aggregated
+
+Aggregation happens to **each solar-day observation, before the temporal percentile**.
+Computing a 30 m P95 and coarsening the result afterwards is a different statistic, and it
+would do the expensive work first and then discard most of it.
+
+The order is: fuse same-day granules on the delivered USGS 30 m grid; apply the QA mask,
+the fill test, the Collection 2 scaling, and the plausibility clamp; then reduce each
+aligned 3x3 block to one cell.
+
+The reducer is an **area-weighted mean over the valid source cells**, and a block needs
+**at least 5 of 9 valid** to produce an observation at all. Below that the cell is nodata
+for that day. An invalid cell contributes nothing to the numerator and nothing to the
+denominator, so a fill value or a zero can never enter the mean.
+
+Weights come from the cells' true areas: on a sphere, area is proportional to
+`sin(lat_top) - sin(lat_bottom)`, so within one block the three rows differ slightly and
+the three columns do not. The variation is under 2e-5 relative even at 60 degrees, so an
+unweighted mean would agree to well inside float32. The weights are computed anyway,
+because a reducer whose correctness rests on the error being small is one nobody can
+check.
+
+The 5/9 default is pre-registered, with 1/9 and 9/9 as sensitivity arms
+(`landsat-lst sensitivity`). The threshold is not re-picked after looking at the result.
+
+**What aggregation is not.** It is not de-striping. Reducing 3x3 blocks makes a
+WRS-aligned seam less sharp without making it less wrong, and none of it addresses the
+scene-normalization work described above. It also reconstructs neither native TIRS nor
+ASTER measurements: it summarizes the delivered USGS estimates and nothing more.
+
+### Overviews
+
+Coarsening blocks are cut from the global array rather than from a tile, which keeps block
+boundaries aligned across what used to be tile edges. A tile would not support this on its
+own: 6,000 = 2^4 x 3 x 5^3 divides by 4 and by 16 but not by 64, so a per-tile 64x overview
+would trim its edge and shift block phase against its neighbour. (18,000 had the identical
+property, for the identical reason.) The global grid divides cleanly by all three. See
+[ADR-008](adr/008-global-mosaic-topology.md).
+
+## Accuracy, and what this project validates
+
+Absolute surface-temperature accuracy is **inherited from USGS Landsat Collection 2
+Level-2**, which remains the authoritative retrieval. This project does not independently
+validate that retrieval, and it does not claim a global accuracy assessment of its own.
+
+What it does validate, and what the test suite is about, is the correctness and
+reproducibility of everything this pipeline adds: the QA masking, the fill and scaling
+handling, the plausibility clamp, the solar-day fusion, the spatial aggregation and its
+valid-area rule, the scene normalization, the temporal percentile, the encoding, and the
+publication.
+
+Three upstream limitations are worth restating because they reach the delivered product
+unchanged:
+
+- **ASTER GED gaps.** Where ASTER never caught clear sky, USGS produces no Surface
+  Temperature in any year, and the gaps are nodata here. Aggregation does not fill them.
+- **ASTER blockiness.** Emissivity arrives at roughly 1 km, so retrieved temperature can
+  carry visible ~1 km structure that the delivered grid spacing does not create and
+  cannot remove.
+- **The vegetation adjustment.** Collection 2 adjusts emissivity for vegetation using
+  NDVI, which introduces known anomalies over some surfaces. Those anomalies are part of
+  the input.

@@ -22,6 +22,15 @@ The byte model:
   are skipped and never read); phase B reads the full footprint.
 - Native pass bytes = native_edge^2 * scenes * 2 bands * 2 B, read once
   (ADR-013), full footprint regardless of land.
+
+**Aggregating to nominal ~100 m does not reduce the read.** Every delivered
+cell is reduced from nine source cells, and those nine still have to be fetched
+and decoded, so ``native_pass_gb`` is unchanged by ADR-017. What falls is the
+output: nine times fewer pixels to percentile, to hold, to encode, and to
+publish. ``R_COMPOSITE_MB_S`` is a decode rate measured before the aggregation
+existed, and whether reducing the percentile's working set moves it is an open
+empirical question -- an acceptance run answers it, this module does not
+presume it. Do not scale these projections by the pixel-count ratio.
 """
 
 from __future__ import annotations
@@ -101,6 +110,9 @@ class TileProjection:
     land_fraction: float
     coarse_pass_gb: float
     native_pass_gb: float
+    #: Uncompressed delivered bytes for both products, before COG compression
+    #: and file overhead. The one term ADR-017 moves.
+    output_gb: float
     offsets_hours_1vm: float
     composite_hours_1vm: float
     minutes_per_tile_1vm: float
@@ -123,6 +135,8 @@ class TileProjection:
             f"(${self.cost_on_demand_usd:.2f} on-demand, "
             f"${self.cost_spot_usd_range[0]:.2f}-"
             f"${self.cost_spot_usd_range[1]:.2f} spot)",
+            f"read: {self.native_pass_gb:.0f} GB source (unchanged by "
+            f"aggregation) -> {self.output_gb:.2f} GB delivered, uncompressed",
             f"60-min fleet: {self.n_vms_offsets:.0f} offset VMs "
             f"({OFFSET_BUDGET_MIN:.0f} min) + {self.n_vms_composite:.0f} "
             f"composite VMs ({COMPOSITE_BUDGET_MIN:.0f} min)",
@@ -151,8 +165,11 @@ def tile_projection(
     """
     factor = settings.destripe_offset_resolution_factor
     native_edge = round(5 * settings.pixels_per_degree)  # 18,000 on a 5-deg tile
+    output_edge = round(5 * settings.output_pixels_per_degree)  # 6,000 delivered
     coarse = (native_edge // factor) ** 2 * scenes * 2 * 2
     native = native_edge**2 * scenes * 2 * 2
+    # 2 B of uint16 LST plus 12 B of monthly uint8 counts, per delivered cell.
+    output = output_edge**2 * 14
 
     offsets_bytes = coarse * (land_fraction + 1.0)  # phase A (land only) + phase B
     off_h = offsets_bytes / (r_offsets_mb_s * 1e6) / 3600
@@ -167,6 +184,7 @@ def tile_projection(
         land_fraction=round(land_fraction, 3),
         coarse_pass_gb=round(coarse / 1e9, 1),
         native_pass_gb=round(native / 1e9, 1),
+        output_gb=round(output / 1e9, 3),
         offsets_hours_1vm=round(off_h, 2),
         composite_hours_1vm=round(comp_h, 2),
         minutes_per_tile_1vm=round((off_h + comp_h) * 60, 0),

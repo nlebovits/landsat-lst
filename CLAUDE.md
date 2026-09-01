@@ -415,23 +415,91 @@ without recomputing the composite, and refuses to upload a rebuild that fails ei
 
 ---
 
-## Output grid — one shared grid, always
+## Three grids — source, delivered, offset — and never one
 
-`settings.pixels_per_degree` (3600) is the grid definition; `settings.resolution` is a
-**derived property** (`1/3600`), not a settable field. Do not reintroduce a resolution float:
-the old `0.00027778` truncated 1/3600 and left every tile anchored to its own bbox, overshooting
-its eastern edge by 0.484 px and misregistering ~0.14 px against its neighbour.
+The single most likely thing to get wrong here. They used to be one grid; since
+[ADR-017](docs/adr/017-nominal-100m-output-grid.md) they are three, and each has its own
+setting, its own geobox constructor, and its own reason to exist.
 
-Load scenes through `tiling.geobox_for_bbox(bbox, factor)` and pass `geobox=` to `stac_load`.
-Never pass `crs` + `resolution` + `bbox` — odc-stac anchors the grid to the bbox, which is
-exactly the bug above.
+| Grid | Setting / constructor | Spacing | 5° tile | What lives on it |
+|---|---|---|---|---|
+| **Source** | `pixels_per_degree` (3600) / `geobox_for_bbox` | 1/3600° | 18,000² | scene load, solar-day fusion, QA, scaling, clamp |
+| **Delivered** | `output_pixels_per_degree` (1200) / `output_geobox_for_bbox` | 1/1200° | 6,000² | correction, P95, `qa_count`, land + GED masks, both COGs |
+| **Offset** | `destripe_offset_resolution_factor` (2) / `geobox_for_bbox(bbox, 2)` | 1/1800° | 9,000² | per-scene offset estimation, nothing else |
 
-Numbers worth remembering: global grid 1,296,000 × 432,000; a 5° tile is 18,000² = 2⁴·3²·5³.
-That divides by 4 and 16 but **not** by 64, which is why overviews belong to the global array
-and not to a tile. See [ADR-008](docs/adr/008-global-mosaic-topology.md).
+`settings.source_resolution`, `output_resolution`, and `offset_resolution` are **derived
+properties**, never settable fields. There is no `settings.resolution` any more — it was
+ambiguous the moment there were two grids. Do not reintroduce a resolution float: the old
+`0.00027778` truncated 1/3600 and left every tile anchored to its own bbox, overshooting its
+eastern edge by 0.484 px and misregistering ~0.14 px against its neighbour.
+
+Rules worth keeping:
+
+- **The estimator does not move because the output moved.** `compute_annual_composite`
+  estimates offsets on the source or offset grid and applies them to the aggregated
+  delivered stack. `destripe_min_scene_pixels` counts *offset-grid* pixels and the accuracy
+  bound was calibrated there, so estimating after aggregation would silently move a
+  calibrated constant. Deferring the application is free: subtracting one scalar per scene
+  commutes exactly with an area-weighted mean. `tests/benchmark/test_aggregation_cost.py`
+  asserts the offset graph is task-identical on both grids.
+- **Load scenes through `geobox_for_bbox` and pass `geobox=` to `stac_load`.** Never pass
+  `crs` + `resolution` + `bbox` — odc-stac anchors the grid to the bbox, which is the bug
+  above. A row band slices *the tile's* geobox, on both grids: source
+  `[3*start, 3*stop)`, delivered `[start, stop)`.
+- **Delivered coordinates come from the geobox, not from `coarsen`'s means.** The mean of
+  three source centres lands on the delivered centre only to float64 round-off, which is
+  enough to look right and not enough to *align* — xarray joins a mask on exact index
+  equality. Pass `output_geobox=` to `compute_annual_composite`.
+- **Native load chunks round up to a multiple of 3** (512 → 513, via
+  `aggregate.aligned_source_chunk`). A straddling chunk makes `coarsen` rechunk the stack
+  first, unevenly. Correctness is unaffected; it is a shuffle for nothing.
+- **A source stack always covers whole delivered cells.** Any fixture, synthetic dataset,
+  or crop handed to the reducer must have both spatial extents divisible by 3, and it
+  raises rather than trimming. `profiling.synthetic_dataset` rounds up for this reason.
+
+Numbers worth remembering: source global grid 1,296,000 × 432,000, delivered 432,000 ×
+144,000. A 5° tile is 18,000² = 2⁴·3²·5³ on the source grid and 6,000² = 2⁴·3·5³ on the
+delivered one. **Both** divide by 4 and 16 but **not** by 64, which is why overviews belong
+to the global array and not to a tile. See [ADR-008](docs/adr/008-global-mosaic-topology.md).
 
 Beware `int()` on a resolution-derived span: `int(5 / (1/3600))` is 17999, not 18000. Use
 `round()`.
+
+## The delivered product is nominal ~100 m, and say so
+
+TIRS acquires thermal radiance at **100 m**; USGS resamples it to the delivered 30 m grid,
+and the retrieval also leans on ~1 km ASTER GED. So V1 publishes one nominal ~100 m product
+and no 30 m rendering. Anywhere resolution is described — catalog, README, methodology —
+state that it is **nominal**: the grid is geographic, so a cell is ~93 m wide at the equator
+and ~46 m at 60°.
+
+- **Aggregation happens per solar-day observation, before the percentile.** Computing a
+  30 m P95 and coarsening it afterwards is a different statistic and is explicitly
+  non-compliant with the #120 decision. Order: fuse granules (source) → QA, fill, scale,
+  clamp (source) → aggregate (delivered) → correct → P95 → counts → output-only masks.
+- **The reducer is an area-weighted mean over valid cells, at least 5 of 9.** An invalid
+  cell contributes nothing to the numerator **and** nothing to the denominator; a fill value
+  or a zero can never enter the mean. Below the threshold the cell is nodata for that day.
+  Weights come from `sin(lat_top) - sin(lat_bottom)`; the spread across a block is 1.7e-5 at
+  60°, so they are computed for checkability rather than for magnitude.
+- **`5/9` is pre-registered, and is not tuned after looking.** `landsat-lst sensitivity`
+  runs the 1/9, 5/9, 9/9 arms against a cached fixture with bounds declared in
+  `landsat_lst.sensitivity`. An unstable result is a finding to report, not a menu.
+- **`qa_count` counts delivered solar-day observations**, never a sum of 30 m counts, and
+  can never exceed the solar days in a month. The percentile and the counts read the same
+  NaN pattern by construction.
+- **Aggregation is not de-striping.** It makes a WRS-aligned seam less sharp without making
+  it less wrong. #119 stands on its own terms.
+- **The read does not fall.** Nine source cells are still fetched and decoded per delivered
+  cell, so `budgets._native_bytes` and `projection.native_pass_gb` stay on the *source*
+  shape. What falls is output size (exactly 9×) and the percentile's working set: measured
+  locally at 0.90× peak RSS at 24 scenes, 0.79× at 60, 0.67× at 120
+  (`results/decision/aggregation_cost_local.json`). The graph gets *bigger* — three coarsen
+  reductions, 2.53× tasks at 24 scenes. `R_COMPOSITE_MB_S` is a pre-ADR-017 decode rate and
+  has not been re-measured; do not scale a projection by the pixel-count ratio.
+- **The plan digest covers the contract**: `output_pixels_per_degree`,
+  `min_valid_source_cells`, and `aggregate.AGGREGATION_VERSION`. **Bump the version** when a
+  change to `aggregate.py` would change delivered values.
 
 ## Data Quality
 

@@ -665,6 +665,14 @@ def seasonal_debias(
     through with a zero offset, so nothing downstream sees a scene whose
     correction was not applied.
 
+    **The production pipeline no longer calls this.** Under ADR-017 the
+    estimate is made on the source or offset grid and the correction is applied
+    to the aggregated delivered stack, which are two different grids and so
+    cannot be one call; ``compute_annual_composite`` therefore pairs
+    :func:`scene_offsets` with :func:`debias_with_offsets` directly. This
+    function remains the single-grid form -- the equivalence oracle the tests
+    check the split against, and what a caller with one grid still wants.
+
     The offset is one scalar per scene, so it does not need a full-resolution
     climatology to estimate. Passing a coarser ``offset_source`` computes it
     from far fewer pixels; the correction still applies at ``lst``'s own

@@ -30,9 +30,14 @@ WINDOW = "2021-2025"
 RUN_ID = "shard-test"
 SCENES = 4
 
-#: 1,024 rows is 512 x 2, so two row bands each start on a COG block row -- the
-#: alignment ``band_edges`` guarantees on the production grid.
-NATIVE = (1024, 1024)
+#: The DELIVERED shape. 1,024 rows is 512 x 2, so two row bands each start on a
+#: COG block row -- the alignment ``band_edges`` guarantees on the production
+#: grid.
+OUTPUT = (1024, 1024)
+#: The SOURCE shape, exactly three times the delivered one. A band reads
+#: ``factor`` times its own rows and publishes its own, so a fixture whose two
+#: shapes were unrelated would exercise a geometry no tile has (ADR-017).
+NATIVE = (OUTPUT[0] * 3, OUTPUT[1] * 3)
 COARSE = (8, 8)
 BLOCK = 4
 
@@ -71,11 +76,12 @@ def make_plan(*, ref_shards: int = 2, scene_shards: int = 2, band_shards: int = 
         offset_factor=settings.destripe_offset_resolution_factor,
         coarse_shape=COARSE,
         native_shape=NATIVE,
+        output_shape=OUTPUT,
         block_edge=BLOCK,
         blocks=blocks,
         block_has_land=[True, True, True, False],
         scene_batches=[(0, 2), (2, 4)],
-        bands=shards.band_edges(NATIVE[0], band_shards, settings.cog_blocksize),
+        bands=shards.band_edges(OUTPUT[0], band_shards, settings.cog_blocksize),
         ref_shards=ref_shards,
         scene_shards=scene_shards,
         band_shards=band_shards,
@@ -131,7 +137,14 @@ def stub_tile_geoboxes(monkeypatch, plan) -> None:
         shape = plan.coarse_shape if resolution_factor > 1 else plan.native_shape
         return GeoBox.from_bbox(tuple(bbox), crs="EPSG:4326", shape=shape)
 
+    def output_geobox_for_bbox(bbox):
+        return GeoBox.from_bbox(tuple(bbox), crs="EPSG:4326", shape=plan.output_shape)
+
     monkeypatch.setattr(shard_tasks, "geobox_for_bbox", geobox_for_bbox)
+    # The delivered grid needs the same treatment and for the same reason. It
+    # also has to stay an exact ``factor`` coarsening of the source stub, or a
+    # band would aggregate to a shape its own land mask does not have.
+    monkeypatch.setattr(shard_tasks, "output_geobox_for_bbox", output_geobox_for_bbox)
 
 
 def publish_legacy_plan(storage, plan, *, run_id: str = RUN_ID, items=None) -> str:

@@ -140,8 +140,8 @@ def main() -> None:
     parser.add_argument(
         "--resolution",
         type=float,
-        default=settings.resolution,
-        help=f"Pixel resolution in degrees (default: {settings.resolution})",
+        default=settings.source_resolution,
+        help=f"Pixel resolution in degrees (default: {settings.source_resolution})",
     )
 
     args = parser.parse_args()

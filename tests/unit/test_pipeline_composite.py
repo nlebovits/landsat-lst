@@ -13,6 +13,17 @@ from landsat_lst.config import settings
 from landsat_lst.encoding import LST_OFFSET, LST_SCALE, encode_lst_uint16
 from landsat_lst.pipeline import compute_annual_composite
 
+#: Source-grid side of the mock stacks. A multiple of
+#: ``settings.spatial_aggregation_factor``, because a real source stack always
+#: covers a whole number of delivered cells; 51 = 3 x 17.
+SOURCE_SIDE = 51
+#: Delivered side the composite comes back on.
+OUTPUT_SIDE = SOURCE_SIDE // 3
+#: Clouded source rows, and the delivered rows they map to. Both multiples of
+#: the aggregation factor, so the cloud edge falls on a delivered cell edge.
+CLOUD_ROWS = 24
+CLOUD_OUTPUT_ROWS = CLOUD_ROWS // 3
+
 
 def _monthly_times(year: int = 2024, per_month: int = 2) -> np.ndarray:
     """Datetime coords with ``per_month`` observations in each calendar month."""
@@ -28,19 +39,26 @@ class TestComputeAnnualComposite:
     def mock_landsat_data(self) -> xr.Dataset:
         """Mock Landsat data with 2 observations per calendar month (24 total).
 
-        January (first 2 time steps) is clouded for the top half of the scene, so
-        the per-month climatology should show January coverage 0 there and 2 for
-        every other month / the bottom half.
+        January (first 2 time steps) is clouded for the top ``CLOUD_ROWS`` rows,
+        so the per-month climatology should show January coverage 0 there and 2
+        for every other month and every other row.
+
+        The source grid is 51 squared rather than 50 because a source stack
+        always covers a whole number of delivered cells: 51 is 3 x 17. The
+        cloud edge is likewise a multiple of 3, so no delivered cell straddles
+        it and the 5-of-9 rule never has to arbitrate the boundary. That case
+        is worth testing and is tested in ``test_aggregate.py``; here it would
+        only obscure what these assertions are about.
         """
         np.random.seed(42)
         times = _monthly_times()
         n_time = len(times)  # 24
-        n_y, n_x = 50, 50
+        n_y, n_x = SOURCE_SIDE, SOURCE_SIDE
 
         lwir_values = np.random.uniform(42000, 45000, (n_time, n_y, n_x)).astype(np.float32)
 
         qa_values = np.zeros((n_time, n_y, n_x), dtype=np.uint16)
-        qa_values[0:2, :25, :] = 8  # Cloud bit on both January obs, top half
+        qa_values[0:2, :CLOUD_ROWS, :] = 8  # Cloud bit on both January obs
 
         return xr.Dataset(
             {
@@ -68,8 +86,8 @@ class TestComputeAnnualComposite:
         assert qa.sizes["month"] == 12
         assert list(qa["month"].values) == list(range(1, 13))
         # Spatial dims preserved.
-        assert qa.sizes["y"] == 50
-        assert qa.sizes["x"] == 50
+        assert qa.sizes["y"] == OUTPUT_SIDE
+        assert qa.sizes["x"] == OUTPUT_SIDE
 
     def test_p95_in_reasonable_range(self, mock_landsat_data):
         """Test that P95 values are in reasonable temperature range."""
@@ -88,10 +106,13 @@ class TestComputeAnnualComposite:
         result = compute_annual_composite(mock_landsat_data)
         qa = result["qa_count"]
 
-        # January (month=1): top half clouded -> 0, bottom half -> 2.
+        # January (month=1): clouded rows -> 0, the rest -> 2. The counts are
+        # of *delivered* solar-day observations, so 2 is the number of January
+        # observations in the window, never a sum over the nine source cells
+        # behind each delivered one.
         jan = qa.sel(month=1).values
-        assert jan[:25, :].max() == 0
-        assert jan[25:, :].min() == 2
+        assert jan[:CLOUD_OUTPUT_ROWS, :].max() == 0
+        assert jan[CLOUD_OUTPUT_ROWS:, :].min() == 2
 
         # Every other month has both observations everywhere.
         feb_to_dec = qa.sel(month=slice(2, 12)).values
@@ -129,8 +150,14 @@ class TestComputeAnnualComposite:
         )
 
     def test_with_all_nan_pixel(self, mock_landsat_data):
-        """A pixel clouded in every observation is nodata with zero monthly counts."""
-        mock_landsat_data["qa_pixel"][:, 0, 0] = 8  # All cloud, all months
+        """A cell clouded in every observation is nodata with zero monthly counts.
+
+        The whole 3x3 source block is clouded, not one source cell. Clouding
+        one would leave eight valid, clear the 5-of-9 rule, and produce a
+        perfectly good delivered observation -- which is the rule working, not
+        the nodata path this test is about.
+        """
+        mock_landsat_data["qa_pixel"][:, :3, :3] = 8  # All cloud, all months
 
         result = compute_annual_composite(mock_landsat_data)
 
@@ -179,7 +206,7 @@ class TestFloorAnomalyGuard:
             coords={"time": times, "y": np.arange(n_y), "x": np.arange(n_x)},
         )
 
-    def test_floor_pixel_with_observations_becomes_nodata(self, warm_scene):
+    def test_floor_pixel_with_observations_becomes_nodata(self, warm_scene, source_grid_output):
         """A pixel whose P95 sits on the encoding floor is flagged as missing."""
         warm_scene["lwir11"][:, 2, 2] = self.LWIR_ON_FLOOR
 
@@ -189,7 +216,7 @@ class TestFloorAnomalyGuard:
         # The pixel did have valid observations; only the value was rejected.
         assert int(result["qa_count"].values[:, 2, 2].sum()) == len(warm_scene.time)
 
-    def test_neighbors_of_floor_pixel_are_untouched(self, warm_scene):
+    def test_neighbors_of_floor_pixel_are_untouched(self, warm_scene, source_grid_output):
         """The guard rejects one pixel without disturbing the surrounding data."""
         warm_scene["lwir11"][:, 2, 2] = self.LWIR_ON_FLOOR
 
@@ -199,7 +226,7 @@ class TestFloorAnomalyGuard:
         surrounding = np.delete(neighborhood.ravel(), 4)  # drop the centre pixel
         assert np.all(surrounding > 0), f"guard leaked into neighbors: {surrounding}"
 
-    def test_cold_but_encodable_pixel_survives(self, warm_scene):
+    def test_cold_but_encodable_pixel_survives(self, warm_scene, source_grid_output):
         """A value above the floor is kept, so the guard is not a blanket cold cut."""
         warm_scene["lwir11"][:, 1, 1] = self.LWIR_ABOVE_FLOOR
 
@@ -207,7 +234,7 @@ class TestFloorAnomalyGuard:
 
         assert result["lst_p95"].values[1, 1] == pytest.approx(-49.96, abs=0.01)
 
-    def test_rejected_pixel_encodes_to_fill(self, warm_scene):
+    def test_rejected_pixel_encodes_to_fill(self, warm_scene, source_grid_output):
         """Composite and encoded output agree: the rejected pixel becomes DN 0."""
         warm_scene["lwir11"][:, 2, 2] = self.LWIR_ON_FLOOR
 
@@ -217,7 +244,7 @@ class TestFloorAnomalyGuard:
         assert encoded.values[2, 2] == 0
         assert encoded.values[0, 0] != 0
 
-    def test_clean_scene_is_unaffected(self, warm_scene):
+    def test_clean_scene_is_unaffected(self, warm_scene, source_grid_output):
         """With no anomalies present the guard changes nothing."""
         result = compute_annual_composite(warm_scene)
 
@@ -235,12 +262,15 @@ class TestDaskComposite:
         np.random.seed(42)
         times = _monthly_times()
         n_time = len(times)
-        n_y, n_x = 50, 50
+        n_y, n_x = SOURCE_SIDE, SOURCE_SIDE
 
         lwir_np = np.random.uniform(42000, 45000, (n_time, n_y, n_x)).astype(np.float32)
         qa_np = np.zeros((n_time, n_y, n_x), dtype=np.uint16)
-        qa_np[0:2, :25, :] = 8  # Cloud in January, top half
+        qa_np[0:2, :CLOUD_ROWS, :] = 8  # Cloud in January
 
+        # A chunk edge that is not a multiple of the aggregation factor, on
+        # purpose: ``coarsen`` has to rechunk to reduce it, and the answer must
+        # not depend on whether the caller aligned its load.
         lwir_dask = da.from_array(lwir_np, chunks=(6, 25, 25))
         qa_dask = da.from_array(qa_np, chunks=(6, 25, 25))
 

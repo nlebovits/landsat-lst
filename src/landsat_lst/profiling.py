@@ -397,8 +397,10 @@ def synthetic_dataset(
     shape of the time axis.
 
     Args:
-        shape: ``(height, width)`` in pixels. Pass a real tile's shape from
-            :func:`~landsat_lst.tiling.tile_geobox` to plan a real tile.
+        shape: ``(height, width)`` in SOURCE pixels. Pass a real tile's shape
+            from :func:`~landsat_lst.tiling.tile_geobox` to plan a real tile.
+            Rounded up to a whole number of delivered cells, which a real tile
+            shape already is.
         scenes: Time steps to build.
         chunk_size: Spatial chunk edge. Defaults to
             ``settings.load_chunk_size``.
@@ -417,6 +419,7 @@ def synthetic_dataset(
     """
     import dask.array as da  # noqa: PLC0415
 
+    from landsat_lst.aggregate import aligned_source_chunk  # noqa: PLC0415
     from landsat_lst.pipeline import TIME_CHUNK  # noqa: PLC0415
 
     height, width = shape
@@ -424,7 +427,16 @@ def synthetic_dataset(
         msg = f"synthetic_dataset needs a positive shape and scene count, got {shape} x {scenes}"
         raise ValueError(msg)
 
-    csize = settings.load_chunk_size if chunk_size is None else chunk_size
+    # A real source stack always covers a whole number of delivered cells: the
+    # source and delivered global grids share an origin and 3600 is 3 x 1200.
+    # A synthetic stack that did not would build a graph no tile builds -- it
+    # would carry ``coarsen``'s implicit rechunk, which is the one thing the
+    # planner must not measure and production never pays. Rounding up rather
+    # than refusing keeps every caller's chosen geometry usable. See ADR-017.
+    height = aligned_source_chunk(height)
+    width = aligned_source_chunk(width)
+
+    csize = aligned_source_chunk(settings.load_chunk_size if chunk_size is None else chunk_size)
     chunks = (min(TIME_CHUNK, scenes), min(csize, height), min(csize, width))
     size = (scenes, height, width)
     rng = da.random.default_rng(seed)
@@ -731,8 +743,10 @@ def plan_tile(
 
     Costs no network and no pixels. Grids come from
     :func:`~landsat_lst.tiling.tile_geobox`, so the shapes are the tile's real
-    ones: 18,000 squared at native resolution, and that divided by
-    ``destripe_offset_resolution_factor`` for the offset pass.
+    ones: 18,000 squared at source resolution, and that divided by
+    ``destripe_offset_resolution_factor`` for the offset pass. The composite
+    phase loads that same source stack and aggregates it to the delivered
+    6,000 squared grid, so its graph is the production one (ADR-017).
 
     The composite phase is built with de-striping disabled, because
     :func:`~landsat_lst.pipeline.compute_annual_composite` computes the offsets

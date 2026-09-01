@@ -20,19 +20,27 @@ import xarray as xr
 from landsat_lst.config import settings
 from landsat_lst.models import ProcessingJob, TileId
 from landsat_lst.pipeline import process_tile
-from landsat_lst.tiling import geobox_for_bbox
+from landsat_lst.tiling import geobox_for_bbox, output_geobox_for_bbox
 
 h5py = pytest.importorskip("h5py")
 
-#: A 0.1-degree corner of tile N40W075: 360 x 360 native pixels, 10 x 10 GED
-#: cells, all inside granule (40, -75).
+#: A 0.1-degree corner of tile N40W075: 360 x 360 source pixels, 120 x 120
+#: delivered pixels, 10 x 10 GED cells, all inside granule (40, -75).
 BBOX = (-75.0, 39.9, -74.9, 40.0)
 
-#: The gap cell and its expected buffered native footprint (buffer 1 cell):
-#: cell (2, 3) -> native rows [36, 144), cols [72, 180).
+#: Delivered pixels per 0.01-degree GED cell: 12 at 1,200 px/deg. Derived
+#: rather than typed, because the mask is applied on the DELIVERED grid now
+#: (ADR-017) and a hard-coded 36 would be a source-grid number quietly
+#: asserting the mask had not moved with it.
+PX_PER_GED_CELL = round(0.01 * settings.output_pixels_per_degree)
+
+#: The gap cell and its expected buffered delivered footprint (buffer 1 cell):
+#: cell (2, 3) spans cells [1, 4) x [2, 5) once buffered, so delivered rows
+#: [12, 48) and cols [24, 60) -- a 36 x 36 square.
 GAP_CELL = (2, 3)
-GAP_ROWS = slice(36, 144)
-GAP_COLS = slice(72, 180)
+GAP_EDGE = 3 * PX_PER_GED_CELL
+GAP_ROWS = slice((GAP_CELL[0] - 1) * PX_PER_GED_CELL, (GAP_CELL[0] + 2) * PX_PER_GED_CELL)
+GAP_COLS = slice((GAP_CELL[1] - 1) * PX_PER_GED_CELL, (GAP_CELL[1] + 2) * PX_PER_GED_CELL)
 
 
 def _write_granule(ged_dir, lat_top, lon_west, numobs):
@@ -50,6 +58,11 @@ def _write_granule(ged_dir, lat_top, lon_west, numobs):
 def stubbed_pipeline(tmp_path, monkeypatch):
     """process_tile with external I/O stubbed and a real synthetic GED source."""
     geobox = geobox_for_bbox(BBOX)
+    # The delivered grid the composite comes back on, and the grid the GED gap
+    # mask is now rasterized against. Real, not a toy: the mask under test maps
+    # ~1 km GED cells onto whatever grid it is handed, and the point of this
+    # test is that it lands on the same pixels the composite publishes.
+    output_geobox = output_geobox_for_bbox(BBOX)
     height, width = int(geobox.shape[0]), int(geobox.shape[1])
     t = geobox.transform
     lons = t.c + t.a * (np.arange(width) + 0.5)
@@ -83,6 +96,7 @@ def stubbed_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr("landsat_lst.pipeline.resolve_items", lambda _job: [object(), object()])
     monkeypatch.setattr("landsat_lst.pipeline._patch_url_for", lambda _items: None)
     monkeypatch.setattr("landsat_lst.pipeline.geobox_for_bbox", lambda _bbox, _factor=1: geobox)
+    monkeypatch.setattr("landsat_lst.pipeline.output_geobox_for_bbox", lambda _bbox: output_geobox)
     monkeypatch.setattr("landsat_lst.pipeline.load_scenes", load_scenes)
     monkeypatch.setattr("landsat_lst.pipeline._build_land_mask", build_land_mask)
     monkeypatch.setattr("landsat_lst.pipeline.cache_for_items", lambda **_kwargs: None)
@@ -111,13 +125,13 @@ class TestGedMaskInComposite:
         expected[GAP_ROWS, GAP_COLS] = True
 
         np.testing.assert_array_equal(np.isnan(lst), expected)
-        assert int(np.isnan(lst).sum()) == 108 * 108
+        assert int(np.isnan(lst).sum()) == GAP_EDGE * GAP_EDGE
 
         # qa_count is untouched: every pixel of every month keeps its count,
         # gap cells included. Two scenes in two months over all-clear QA means
         # those months carry 1 everywhere.
         qa = composite["qa_count"].values
-        assert qa[:, GAP_ROWS, GAP_COLS].sum() == qa[:, 0:108, 0:1].sum() * 108
+        assert qa[:, GAP_ROWS, GAP_COLS].sum() == qa[:, 0:GAP_EDGE, 0:1].sum() * GAP_EDGE
         assert int(qa.sum(axis=0).min()) == 2
 
     def test_toggle_off_is_a_noop(self, stubbed_pipeline, monkeypatch):

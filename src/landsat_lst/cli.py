@@ -1254,6 +1254,125 @@ def _sweep_publisher(run_id, counts, blocks, chunk, threads):
 
 
 @main.command()
+@click.option("--tile", "-t", default="N40W075", help="Tile whose fixture to read")
+@click.option("--year", "-y", type=int, default=2021, help="First year of the fixture window")
+@click.option("--end-year", type=int, default=2025, help="Last year, inclusive")
+@click.option("--max-scenes", type=int, default=300, help="Scenes the fixture holds")
+@click.option("--factor", type=int, default=8, help="Resolution factor the fixture was built at")
+@click.option(
+    "--rows",
+    type=str,
+    default=None,
+    help="Crop as START:STOP in source rows, e.g. 0:900. Whole fixture if omitted.",
+)
+@click.option(
+    "--cols",
+    type=str,
+    default=None,
+    help="Crop as START:STOP in source columns.",
+)
+@click.option("--name", default="crop", help="Name this crop appears under in the report")
+@click.option(
+    "--out",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write the report JSON here as well as printing it",
+)
+def sensitivity(
+    *,
+    tile: str,
+    year: int,
+    end_year: int,
+    max_scenes: int,
+    factor: int,
+    rows: str | None,
+    cols: str | None,
+    name: str,
+    out: Path | None,
+) -> None:
+    """Run the pre-registered 1/9, 5/9, 9/9 valid-area check on a cached crop.
+
+    Reads a fixture built by ``landsat-lst fixture``, so it runs on a laptop
+    against retained scenes and starts no cloud work. The three arms share one
+    loaded stack, so a difference between them is a difference in the
+    valid-area rule and in nothing else.
+
+    The bounds are pre-registered in ``landsat_lst.sensitivity``. A run that
+    falls outside them is a result to report, never a threshold to re-pick.
+    """
+    from landsat_lst.config import settings
+    from landsat_lst.fixture import FixtureSpec, load_fixture
+    from landsat_lst.qa import apply_qa_mask, convert_to_celsius
+    from landsat_lst.sensitivity import SensitivityReport, run_threshold_sweep
+
+    def _slice(text: str | None) -> slice:
+        if not text:
+            return slice(None)
+        start, _, stop = text.partition(":")
+        return slice(int(start) if start else None, int(stop) if stop else None)
+
+    spec = FixtureSpec(
+        tile=tile, year=year, end_year=end_year, max_scenes=max_scenes, factor=factor
+    )
+    data = load_fixture(spec)
+    lst = convert_to_celsius(apply_qa_mask(data)["lwir11"])
+
+    row_dim, col_dim = ("latitude", "longitude")
+    lst = lst.isel({row_dim: _slice(rows), col_dim: _slice(cols)})
+
+    # The crop has to cover whole aligned blocks, exactly as a tile does.
+    aggregation = settings.spatial_aggregation_factor
+    trimmed = {
+        dim: slice(0, int(lst.sizes[dim]) // aggregation * aggregation)
+        for dim in (row_dim, col_dim)
+    }
+    lst = lst.isel(trimmed)
+    if min(lst.sizes[row_dim], lst.sizes[col_dim]) < aggregation:
+        console.print("[red]Crop is smaller than one delivered cell.[/red]")
+        raise SystemExit(1)
+
+    console.print(
+        f"[bold]Valid-area sensitivity[/bold] {tile} {spec.window} "
+        f"crop {lst.sizes[row_dim]}x{lst.sizes[col_dim]} source cells, "
+        f"{lst.sizes['time']} observations"
+    )
+
+    arms, comparisons = run_threshold_sweep(lst, crop=name)
+    report = SensitivityReport(crops=[name], arms=arms, comparisons=comparisons)
+    report.notes.append(
+        f"fixture factor {factor}: offsets and absolute values are coarse-grid, "
+        "so read the arms against each other and never as production values"
+    )
+
+    for row in arms[name]:
+        console.print(
+            f"  {row['min_valid_cells']}/9  coverage {row['coverage']:.4f}  "
+            f"observations {row['observations']:,}  "
+            f"P95 mean {row['p95_mean']}  hotspot cells {row['hotspot_cells']:,}"
+        )
+    for row in comparisons[name]:
+        console.print(
+            f"  {row['min_valid_cells']}/9 vs default: "
+            f"+{row['cells_gained']:,}/-{row['cells_lost']:,} cells, "
+            f"max |d| {row['max_abs_delta_c']} C, "
+            f"rank r {row['rank_correlation']}, "
+            f"hotspot agreement {row['hotspot_agreement']}"
+        )
+
+    verdict = report.stable()
+    if verdict is True:
+        console.print("[green]Inside the pre-registered bounds.[/green]")
+    elif verdict is False:
+        console.print(
+            "[red]Outside the pre-registered bounds. Stop and report this "
+            "rather than choosing another threshold.[/red]"
+        )
+
+    if out is not None:
+        console.print(f"wrote {report.write(out)}")
+
+
+@main.command()
 @click.option("--tile", "-t", default="N40W075", help="Tile to cache")
 @click.option("--year", "-y", type=int, default=2021, help="First year of the window")
 @click.option("--end-year", type=int, default=2025, help="Last year, inclusive")

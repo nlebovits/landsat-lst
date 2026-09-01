@@ -396,7 +396,7 @@ def query_and_load(bbox: tuple, start_year: int, end_year: int) -> xr.Dataset:
         items,
         bands=["lwir11"],
         crs=settings.crs,
-        resolution=settings.resolution,
+        resolution=settings.source_resolution,
         chunks={"time": 1, "latitude": 1024, "longitude": 1024},
         groupby="solar_day",
         bbox=bbox,

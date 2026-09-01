@@ -1,0 +1,81 @@
+{
+  "what": "Local before/after cost of ADR-017 spatial aggregation, on synthetic geometry.",
+  "measured_on": "2026-09-01",
+  "tier": "CI regression tier (landsat_lst.benchmarks). Not a production measurement.",
+  "geometry": {
+    "source_side_px": 1026,
+    "delivered_side_px": 342,
+    "blocks": 4,
+    "chunk": 256,
+    "chunk_effective": 258,
+    "threads": 2,
+    "graph": "composite"
+  },
+  "method": "landsat_lst.benchmarks.measure, one fresh subprocess per configuration, peak RSS from /proc/self/status VmHWM. The two arms differ only in Geometry.aggregate.",
+  "rows": [
+    {
+      "scenes": 24,
+      "aggregate": false,
+      "composite_tasks": 828,
+      "peak_rss_mb": 295.4,
+      "wall_s": 0.64,
+      "native_passes": 1.0
+    },
+    {
+      "scenes": 24,
+      "aggregate": true,
+      "composite_tasks": 2094,
+      "peak_rss_mb": 266.1,
+      "wall_s": 0.93,
+      "native_passes": 1.0
+    },
+    {
+      "scenes": 60,
+      "aggregate": false,
+      "composite_tasks": 1116,
+      "peak_rss_mb": 342.0,
+      "wall_s": 1.16,
+      "native_passes": 1.0
+    },
+    {
+      "scenes": 60,
+      "aggregate": true,
+      "composite_tasks": 3630,
+      "peak_rss_mb": 271.8,
+      "wall_s": 1.91,
+      "native_passes": 1.0
+    },
+    {
+      "scenes": 120,
+      "aggregate": false,
+      "composite_tasks": 1692,
+      "peak_rss_mb": 441.9,
+      "wall_s": 1.9,
+      "native_passes": 1.0
+    },
+    {
+      "scenes": 120,
+      "aggregate": true,
+      "composite_tasks": 6702,
+      "peak_rss_mb": 297.2,
+      "wall_s": 3.84,
+      "native_passes": 1.0
+    }
+  ],
+  "offset_graph_tasks": {
+    "aggregate_false": 2668,
+    "aggregate_true": 2668
+  },
+  "findings": [
+    "The source read is unchanged: 1.00 native passes in every arm. Aggregation reduces the output, never the bytes fetched and decoded.",
+    "The offset graph is identical on both grids (2,668 tasks). The estimator does not move when the output grid moves.",
+    "Composite task count RISES: 2.53x at 24 scenes, 3.25x at 60, 3.96x at 120. Three coarsen reductions over the full stack account for it.",
+    "Peak RSS falls, and the saving grows with scene depth: 0.90x at 24 scenes, 0.79x at 60, 0.67x at 120. The scene-dependent term is the single-time-chunk rechunk, which is nine times smaller on the delivered grid; the flat terms are not.",
+    "Wall time rises at this geometry (0.64 to 0.93 s at 24 scenes). Nothing streams at 1,026 squared, so the added reduction is pure cost here. It is not evidence about a production tile either way."
+  ],
+  "not_measured": [
+    "Peak RSS at production geometry (18,000 squared, ~2,930 scenes). Only a VM reports a peak; see docs/findings-memory-model.md.",
+    "Whether R_COMPOSITE_MB_S moves. It is a decode rate measured before this change and is unchanged in landsat_lst.projection until an acceptance run re-measures it.",
+    "Output size on a real tile after COG compression. The projection reports 0.50 GB uncompressed against 4.54 GB, an exact 9x, which is arithmetic rather than a measurement."
+  ]
+}

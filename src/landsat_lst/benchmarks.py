@@ -88,6 +88,13 @@ class Geometry:
     chunk: int = 512
     threads: int = 4
     graph: str = GRAPH_BOTH
+    #: Aggregate to the delivered nominal ~100 m grid before the composite, as
+    #: production does (ADR-017). ``False`` measures the pre-ADR-017 arm, which
+    #: is the only way to state what the change cost or saved rather than
+    #: asserting it. The offset graph is unaffected either way: it is built on
+    #: the source stack in both arms, because the estimator does not move when
+    #: the output does.
+    aggregate: bool = True
 
     def __post_init__(self) -> None:
         if self.graph not in GRAPH_CHOICES:
@@ -104,7 +111,11 @@ class Geometry:
 
     @property
     def label(self) -> str:
-        return f"{self.graph} {self.scenes}sc {self.side}x{self.side} c{self.chunk} t{self.threads}"
+        grid = "100m" if self.aggregate else "source"
+        return (
+            f"{self.graph} {self.scenes}sc {self.side}x{self.side} "
+            f"c{self.chunk} t{self.threads} {grid}"
+        )
 
 
 #: The configuration ``tests/benchmark/`` pins. Small enough that a CI runner
@@ -201,6 +212,7 @@ side = int(os.environ["LSTB_SIDE"])
 chunk = int(os.environ["LSTB_CHUNK"])
 threads = int(os.environ["LSTB_THREADS"])
 graph = os.environ["LSTB_GRAPH"]
+aggregate = os.environ.get("LSTB_AGGREGATE", "1") == "1"
 
 from landsat_lst.config import settings
 
@@ -214,6 +226,7 @@ dask.config.set(scheduler="threads", num_workers=threads)
 
 import xarray as xr
 
+from landsat_lst.aggregate import aggregate_to_output_grid
 from landsat_lst.normalization import offset_graph
 from landsat_lst.pipeline import TIME_CHUNK, _composite_graph
 from landsat_lst.profiling import graph_stats, predict_peak, synthetic_dataset
@@ -306,13 +319,17 @@ offset_tasks = composite_tasks = 0
 pending = []
 
 if graph in ("offsets", "both"):
+    # Always the SOURCE stack. The estimator's grid is a coarsening of this
+    # one and does not move when the output grid does (ADR-017), so an
+    # offset count that changed between the two arms would be a defect.
     offset, n_valid = offset_graph(lst)
     paired = xr.Dataset({"offset": offset, "n_valid": n_valid})
     offset_tasks = graph_stats(paired).tasks
     pending.append(paired)
 
 if graph in ("composite", "both"):
-    composite = _composite_graph(lst)
+    composited = aggregate_to_output_grid(lst) if aggregate else lst
+    composite = _composite_graph(composited)
     composite_tasks = graph_stats(composite).tasks
     pending.append(composite)
 
@@ -359,6 +376,7 @@ def measure(geometry: Geometry, *, timeout_s: int = DEFAULT_TIMEOUT_S) -> Measur
         "LSTB_CHUNK": str(geometry.chunk),
         "LSTB_THREADS": str(geometry.threads),
         "LSTB_GRAPH": geometry.graph,
+        "LSTB_AGGREGATE": "1" if geometry.aggregate else "0",
     }
     started = time.monotonic()
     try:

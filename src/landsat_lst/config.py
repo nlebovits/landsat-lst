@@ -104,19 +104,79 @@ class Settings(BaseSettings):
 
     pixels_per_degree: int = Field(
         default=3600,
-        description="Pixel density of the global grid, in pixels per degree (~30m at the "
-        "equator). An integer rather than a resolution float so the global grid, and "
-        "every tile cut from it, come out with a whole number of pixels. The earlier "
-        "0.00027778 truncated 1/3600 and left each tile anchored to its own bbox, "
-        "overshooting its eastern edge by ~0.5px and misregistering against its "
-        "neighbour by ~0.14px. See ADR-008.",
+        description="Pixel density of the SOURCE grid -- the grid scenes are "
+        "loaded and solar-day fused on -- in pixels per degree (~30 m at the "
+        "equator). This is the grid USGS delivers Collection 2 ST_B10 on, and "
+        "it is NOT the grid the product is published on; see "
+        "output_pixels_per_degree. An integer rather than a resolution float so "
+        "the global grid, and every tile cut from it, come out with a whole "
+        "number of pixels. The earlier 0.00027778 truncated 1/3600 and left "
+        "each tile anchored to its own bbox, overshooting its eastern edge by "
+        "~0.5px and misregistering against its neighbour by ~0.14px. See "
+        "ADR-008.",
+    )
+
+    output_pixels_per_degree: int = Field(
+        default=1200,
+        description="Pixel density of the DELIVERED grid, in pixels per degree. "
+        "1200 is an exact 3x coarsening of the 3600 source grid: 1/1200 degree "
+        "spacing, 6000 x 6000 pixels per five-degree tile, nine times fewer "
+        "output pixels, and the same tile bounds, names, adjacency, and CRS. "
+        "Described as NOMINAL ~100 m: the grid is geographic, so a cell's "
+        "east-west physical width varies with latitude (about 93 m at the "
+        "equator and about 46 m at 60 degrees). TIRS acquires thermal radiance "
+        "at 100 m and the Collection 2 retrieval also leans on ~100 m ASTER "
+        "GED inputs, so publishing the delivered 30 m cells as independent "
+        "thermal observations would overstate the product. Must divide "
+        "pixels_per_degree exactly. See ADR-017 and issue #120.",
+    )
+
+    min_valid_source_cells: int = Field(
+        default=5,
+        description="How many of the 9 source cells in an aligned 3x3 block "
+        "must be valid before the block yields a nominal ~100 m observation. "
+        "The V1 default is 5, i.e. a minimum valid-area fraction of 5/9. A "
+        "block below the threshold is nodata for that solar-day observation; "
+        "invalid cells never contribute a zero or a fill value to the mean. "
+        "The pre-registered sensitivity arms are 1, 5, and 9 -- run "
+        "`landsat-lst sensitivity` rather than tuning this after looking. Must "
+        "be between 1 and spatial_aggregation_factor**2. See ADR-017.",
     )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
-    def resolution(self) -> float:
-        """Output resolution in degrees, derived from :attr:`pixels_per_degree`."""
+    def source_resolution(self) -> float:
+        """Source-grid spacing in degrees, derived from :attr:`pixels_per_degree`.
+
+        The grid scenes load onto and are solar-day fused on. Not the grid the
+        product is published on.
+        """
         return 1.0 / self.pixels_per_degree
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def output_resolution(self) -> float:
+        """Delivered-grid spacing in degrees, from :attr:`output_pixels_per_degree`."""
+        return 1.0 / self.output_pixels_per_degree
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def offset_resolution(self) -> float:
+        """Grid the per-scene de-striping offsets are estimated on, in degrees.
+
+        A coarsening of the *source* grid by
+        :attr:`destripe_offset_resolution_factor`, and deliberately independent
+        of :attr:`output_resolution`. The estimator's accuracy bound was
+        calibrated against this factor (docs/findings-offset-subsampling.md);
+        moving the output grid must not move it.
+        """
+        return self.source_resolution * self.destripe_offset_resolution_factor
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def spatial_aggregation_factor(self) -> int:
+        """Source cells per output cell edge. 3 for the V1 3600 -> 1200 grid."""
+        return self.pixels_per_degree // self.output_pixels_per_degree
 
     crs: str = Field(
         default="EPSG:4326",
@@ -739,6 +799,48 @@ class Settings(BaseSettings):
                     f"{label} of {degrees} deg is {pixels} pixels at "
                     f"{self.pixels_per_degree} px/deg, which is not a whole number. "
                     "Tiles would not share a grid."
+                )
+                raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _output_grid_must_be_an_exact_coarsening(self) -> "Settings":
+        """Reject an output grid that is not a whole-number division of the source.
+
+        The V1 contract is an *exact* 3x aggregation of aligned 3x3 blocks
+        (ADR-017). A factor that did not divide evenly would put an output cell
+        across a fractional number of source cells, which is neither the
+        declared reducer nor a grid neighbouring tiles could share.
+        """
+        source, output = self.pixels_per_degree, self.output_pixels_per_degree
+        if output <= 0 or source % output != 0:
+            msg = (
+                f"output_pixels_per_degree {output} does not divide "
+                f"pixels_per_degree {source} exactly, so output cells would not "
+                "cover a whole number of source cells."
+            )
+            raise ValueError(msg)
+
+        factor = self.spatial_aggregation_factor
+        cells = factor * factor
+        if not 1 <= self.min_valid_source_cells <= cells:
+            msg = (
+                f"min_valid_source_cells {self.min_valid_source_cells} is outside "
+                f"1..{cells}, the source cells an output cell covers at "
+                f"aggregation factor {factor}."
+            )
+            raise ValueError(msg)
+
+        for label, degrees in {
+            "global longitude span (360 deg)": 360.0,
+            "global latitude span": self.max_latitude - self.min_latitude,
+            "tile size": self.tile_size_degrees,
+        }.items():
+            pixels = degrees * output
+            if pixels != int(pixels):
+                msg = (
+                    f"{label} of {degrees} deg is {pixels} output pixels at "
+                    f"{output} px/deg, which is not a whole number."
                 )
                 raise ValueError(msg)
         return self

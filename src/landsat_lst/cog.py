@@ -77,6 +77,14 @@ actual product: an LST tile (one uint16 band, 648 MB) still writes a classic
 TIFF, byte-for-byte what it wrote before. Do not "simplify" this to a bare
 translate — the failure is silent, size-dependent, and validates clean.
 
+**ADR-017 moved the product below that ceiling, and the option stays anyway.**
+On the delivered 1/1200-degree grid a ``qa_count`` tile is 12 x 6,000 x 6,000
+uint8 = 412 MiB, nowhere near 4 GiB, so ``IF_NEEDED`` would now write the same
+file. Keeping ``IF_SAFER`` costs nothing — it is a *decision*, not a format, and
+GDAL still picks classic for both products — and removing a guard because the
+current geometry happens to clear it is how a size-dependent, silent, cleanly
+validating failure comes back the next time a band count or a dtype moves.
+
 **Nodata is applied to the raster explicitly, never inherited.** A
 :class:`Product` declaring ``nodata=None`` is not sufficient on its own, and
 ``qa_count`` proved it twice over. It reaches the writer carrying a ``nodata``
@@ -231,8 +239,10 @@ def _statistics_tags(
 class _BandMoments:
     """Running moments for one band, exact in float64.
 
-    Accumulators are float64 so a full 18,000 x 18,000 uint16 band sums without
-    loss. Statistics are of raw DN, per GDAL convention.
+    Accumulators are float64 so a whole band sums without loss -- with room to
+    spare at the delivered 6,000 x 6,000, and enough for the 18,000 squared
+    source grid it was sized against. Statistics are of raw DN, per GDAL
+    convention.
     """
 
     __slots__ = ("maximum", "minimum", "total", "total_sum", "total_sumsq", "valid")

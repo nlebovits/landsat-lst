@@ -708,7 +708,7 @@ def validate_tile(tile_name: str, year: int, out_dir: Path) -> dict[str, Any]:
     composite = process_tile(ProcessingJob(tile=tile, year=year))
     shape = (len(composite.latitude), len(composite.longitude))
     land = get_land_mask_for_bbox(
-        tile.bbox, settings.resolution, load_land_polygons(), target_shape=shape
+        tile.bbox, settings.source_resolution, load_land_polygons(), target_shape=shape
     )
 
     # process_tile zeroes qa_count over ocean, so the land mask -- not

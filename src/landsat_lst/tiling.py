@@ -743,8 +743,29 @@ LAND_TILES: frozenset[str] = frozenset(
 )
 
 
+def _global_geobox(pixels_per_degree: int) -> GeoBox:
+    """The one global array at a given pixel density.
+
+    Both the source grid and the delivered grid are cut from a construction of
+    this shape, with the same origin and the same latitude bounds. That shared
+    origin is what makes the delivered grid an *exact* aggregation of aligned
+    source blocks rather than a resampling that happens to be close: an output
+    cell covers source cells ``[3i, 3i+3)`` with no remainder anywhere on the
+    globe. See ADR-017.
+    """
+    return GeoBox.from_bbox(
+        (-180.0, settings.min_latitude, 180.0, settings.max_latitude),
+        crs=settings.crs,
+        resolution=1.0 / pixels_per_degree,
+        tight=True,
+    )
+
+
 def global_geobox() -> GeoBox:
-    """The single grid every tile and every overview level is cut from.
+    """The single SOURCE grid every scene load is cut from.
+
+    Scenes load and solar-day fuse here; the product is published on
+    :func:`output_global_geobox`, an exact 3x coarsening of it.
 
     ``pixels_per_degree`` is an integer, so this comes out at exactly
     1,296,000 x 432,000 px and divides cleanly by every overview factor down to
@@ -752,12 +773,17 @@ def global_geobox() -> GeoBox:
     16 but not by 64 -- the reason overviews belong to the global array rather
     than to a tile. See ADR-008.
     """
-    return GeoBox.from_bbox(
-        (-180.0, settings.min_latitude, 180.0, settings.max_latitude),
-        crs=settings.crs,
-        resolution=settings.resolution,
-        tight=True,
-    )
+    return _global_geobox(settings.pixels_per_degree)
+
+
+def output_global_geobox() -> GeoBox:
+    """The single DELIVERED grid every published tile is cut from.
+
+    At the V1 default of 1,200 px/deg this is 432,000 x 144,000 px, and a
+    five-degree tile is 6,000 x 6,000. Nominal ~100 m: the spacing is
+    geographic, so physical cell width varies with latitude.
+    """
+    return _global_geobox(settings.output_pixels_per_degree)
 
 
 def geobox_for_bbox(
@@ -783,6 +809,20 @@ def geobox_for_bbox(
     Raises:
         ValueError: If ``bbox`` falls outside the global grid's latitude bounds.
     """
+    geobox = _cut(bbox, settings.pixels_per_degree, global_geobox())
+    return geobox.zoom_out(resolution_factor) if resolution_factor > 1 else geobox
+
+
+def _cut(
+    bbox: tuple[float, float, float, float],
+    pixels_per_degree: int,
+    grid: GeoBox,
+) -> GeoBox:
+    """Window ``bbox`` out of ``grid``, indexing in that grid's own pixels.
+
+    Raises:
+        ValueError: If ``bbox`` falls outside the global grid's latitude bounds.
+    """
     west, south, east, north = bbox
     if south < settings.min_latitude or north > settings.max_latitude:
         msg = (
@@ -791,20 +831,48 @@ def geobox_for_bbox(
         )
         raise ValueError(msg)
 
-    ppd = settings.pixels_per_degree
-    col0 = round((west + 180.0) * ppd)
-    col1 = round((east + 180.0) * ppd)
+    col0 = round((west + 180.0) * pixels_per_degree)
+    col1 = round((east + 180.0) * pixels_per_degree)
     # Latitude descends north-down, so row 0 is the northern edge of the grid.
-    row0 = round((settings.max_latitude - north) * ppd)
-    row1 = round((settings.max_latitude - south) * ppd)
+    row0 = round((settings.max_latitude - north) * pixels_per_degree)
+    row1 = round((settings.max_latitude - south) * pixels_per_degree)
 
-    geobox = global_geobox()[row0:row1, col0:col1]
-    return geobox.zoom_out(resolution_factor) if resolution_factor > 1 else geobox
+    return grid[row0:row1, col0:col1]
+
+
+def output_geobox_for_bbox(bbox: tuple[float, float, float, float]) -> GeoBox:
+    """Cut the DELIVERED grid for ``bbox`` out of :func:`output_global_geobox`.
+
+    Covers the identical extent and the identical row/column blocks as
+    ``geobox_for_bbox(bbox).zoom_out(spatial_aggregation_factor)``, pinned that
+    way in ``tests/unit/test_tiling.py``. The two transforms differ by one ULP
+    and this form is the authority: ``zoom_out`` computes ``(1/3600) * 3 =
+    0.0008333333333333333`` where the integer density gives ``1/1200 =
+    0.0008333333333333334``. That is ADR-008's argument one grid down -- a
+    density is an integer and a spacing is derived from it, never the reverse
+    -- and it is why the delivered grid is cut here rather than zoomed into
+    existence. Cut from the global array rather than computed by zooming a
+    tile out, for the same reason
+    :func:`geobox_for_bbox` is: a grid derived from an area's own bounds
+    anchors to those bounds, and neighbouring areas then disagree by a fraction
+    of a pixel (ADR-008).
+
+    There is no ``resolution_factor`` here. Zooming the delivered grid out
+    further would produce a grid the product is not published on, and every
+    coarse read this project makes -- the offset estimator's -- is a coarsening
+    of the *source* grid, which is a separate axis on purpose (ADR-017).
+    """
+    return _cut(bbox, settings.output_pixels_per_degree, output_global_geobox())
 
 
 def tile_geobox(tile: TileId, resolution_factor: int = 1) -> GeoBox:
-    """Cut a tile's grid out of :func:`global_geobox`."""
+    """Cut a tile's SOURCE grid out of :func:`global_geobox`."""
     return geobox_for_bbox(tile.bbox, resolution_factor)
+
+
+def output_tile_geobox(tile: TileId) -> GeoBox:
+    """Cut a tile's DELIVERED grid out of :func:`output_global_geobox`."""
+    return output_geobox_for_bbox(tile.bbox)
 
 
 def generate_land_tiles(

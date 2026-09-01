@@ -1,9 +1,17 @@
 # ADR-008: Build the pyramid on one global sparse mosaic, not on 700 per-tile pyramids
 
-**Status:** Partly superseded by [ADR-009](009-cog-output-and-stac-catalog.md). The shared-grid
-decision stands.
+**Status:** Partly superseded by [ADR-009](009-cog-output-and-stac-catalog.md) and
+[ADR-017](017-nominal-100m-output-grid.md). The shared-grid decision stands.
 **Date:** 2026-08-07
 **Authors:** @nlebovits
+
+> **Partly superseded (2026-09-01) by [ADR-017](017-nominal-100m-output-grid.md).** The
+> product is published at 1/1200 degree, not 1/3600, and a five-degree tile is 6,000 px
+> rather than 18,000. Everything below about *topology* holds unchanged and now holds for
+> two grids: one global array, an integer pixel density, tiles cut from the grid rather
+> than anchored to their own bounds, overviews owned by the global array. 6,000 divides by
+> 4 and 16 but not 64, exactly as 18,000 does, so the pyramid argument is untouched. Read
+> `1/3600` below as the **source** grid, which is still where scenes load and fuse.
 
 > **Partly superseded (2026-08-12) by [ADR-009](009-cog-output-and-stac-catalog.md).** The mosaic
 > decision below is superseded: the output is per-tile COGs cataloged as one STAC collection, and

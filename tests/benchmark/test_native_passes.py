@@ -57,12 +57,23 @@ def test_separate_exports_still_cost_a_pass_each(measure_one):
     )
 
 
-#: Composite-only, at the pinned geometry. Measured 306 and 310 MB on two runs;
-#: deleting the shared time rechunk takes it to 842, a factor of 2.73.
-COMPOSITE_PEAK_MB = 308.0
+#: Composite-only, at the pinned geometry. Re-measured 266 MB on 2026-09-01,
+#: after ADR-017 moved the composite onto the delivered grid; it was 306-310 MB
+#: on the source grid. The regression this guards -- deleting the shared time
+#: rechunk -- took the source-grid graph to 842 MB, a factor of 2.73.
+COMPOSITE_PEAK_MB = 266.0
 
-#: Composite-only task count at the same geometry, 1,326 without the rechunk.
-COMPOSITE_ONLY_TASKS = 828
+#: Composite-only task count at the same geometry: 2,094 with aggregation,
+#: against 828 without it.
+#:
+#: **The 1.60x figure below was measured on the pre-ADR-017 graph and has not
+#: been re-derived.** Deleting the rechunk no longer produces a comparable
+#: number: ``nanquantile_last`` needs a whole time core dimension, and without
+#: the rechunk the composite child now fails outright rather than building a
+#: more expensive graph. That is a stricter failure than the one this band was
+#: sized for, so the band is retained rather than widened, and the memory
+#: assertion above remains the sharper of the two guards.
+COMPOSITE_ONLY_TASKS = 2_094
 
 #: Wide enough for a different runner, narrow enough for a 2.73x regression.
 COMPOSITE_PEAK_BAND = 2.0

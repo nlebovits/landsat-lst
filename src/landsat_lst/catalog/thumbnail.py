@@ -7,7 +7,7 @@ the cell its footprint claims. Coverage gaps stay transparent, so the preview
 reports what the collection actually holds rather than implying a full globe.
 
 The read is deliberately coarse. Asking rasterio for a 20x20 window of an
-18000x18000 tile is served out of the COG's smallest overview, so the whole
+6000x6000 tile is served out of the COG's smallest overview, so the whole
 mosaic costs a few kilobytes per tile whether the files are local, on
 ``/vsicurl``, or on S3.
 

@@ -24,8 +24,29 @@ from landsat_lst.normalization import offset_diagnostics, scene_offsets, seasona
 from landsat_lst.pipeline import compute_annual_composite
 
 # Comfortably above destripe_min_scene_pixels (500) so grid size never drives
-# rejection except where a test means it to.
-GRID = 40
+# rejection except where a test means it to. That floor counts pixels on the
+# grid the offsets are *estimated* on, which is the source grid here, so 42
+# squared is the number that matters and the delivered 14 squared is not.
+#
+# A multiple of the aggregation factor, because a source stack always covers a
+# whole number of delivered cells (ADR-017).
+GRID = 42
+#: The delivered side the composite comes back on.
+OUTPUT_GRID = GRID // 3
+
+
+def _output_coords(data: xr.Dataset) -> dict[str, np.ndarray]:
+    """The delivered coordinates ``compute_annual_composite`` will produce.
+
+    Without a geobox to stamp from, the aggregator labels its result with
+    ``coarsen``'s per-block coordinate means. A mask built for that result has
+    to carry the same labels or xarray refuses to align it, so this reproduces
+    them rather than guessing.
+    """
+    factor = settings.spatial_aggregation_factor
+    return {
+        dim: data[dim].coarsen({dim: factor}).mean().values for dim in ("latitude", "longitude")
+    }
 
 
 def _times(years=(2021, 2022, 2023, 2024, 2025), per_month=2) -> np.ndarray:
@@ -360,20 +381,29 @@ class TestCompositeIntegration:
         assert int(result["qa_count"].sel(month=1).max()) == 10
 
     def test_land_mask_restricts_composite(self, monkeypatch):
-        """A supplied land mask blanks ocean pixels in the composite."""
+        """A supplied land mask blanks ocean cells in the composite.
+
+        The mask is on the DELIVERED grid, because that is where the composite
+        lives from the aggregation onward. A source-grid mask would not align
+        and would not be silently accepted.
+        """
         monkeypatch.setattr(settings, "destripe", True)
         data = self._dataset()
+        half = OUTPUT_GRID // 2
+        result_coords = _output_coords(data)
         mask = xr.DataArray(
-            np.r_[np.ones((GRID // 2, GRID)), np.zeros((GRID // 2, GRID))].astype(bool),
+            np.r_[np.ones((half, OUTPUT_GRID)), np.zeros((OUTPUT_GRID - half, OUTPUT_GRID))].astype(
+                bool
+            ),
             dims=["latitude", "longitude"],
-            coords={"latitude": data.latitude, "longitude": data.longitude},
+            coords=result_coords,
         )
 
         result = compute_annual_composite(data, land_mask=mask)
 
-        assert int(result["qa_count"].values[:, GRID // 2 :, :].max()) == 0
-        assert int(result["qa_count"].values[:, : GRID // 2, :].max()) > 0
-        assert result["lst_p95"].values[GRID // 2 :, :].max() == settings.nodata
+        assert int(result["qa_count"].values[:, half:, :].max()) == 0
+        assert int(result["qa_count"].values[:, :half, :].max()) > 0
+        assert result["lst_p95"].values[half:, :].max() == settings.nodata
 
 
 class TestOffsetGraphFormulation:

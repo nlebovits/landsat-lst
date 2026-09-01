@@ -192,16 +192,22 @@ def test_predict_peak_fits_in_compares_against_a_vm():
 
 
 def test_synthetic_dataset_matches_what_load_scenes_returns():
-    """Bands, dtypes, dims, and chunking are the contract the graph rests on."""
+    """Bands, dtypes, dims, and chunking are the contract the graph rests on.
+
+    Shape and chunk edge are both rounded up to a whole number of delivered
+    cells, exactly as ``load_scenes`` rounds its own native chunk. A real tile
+    shape already is one; a hand-picked benchmark geometry is not, and the
+    graph must be the same either way (ADR-017).
+    """
     data = synthetic_dataset(shape=(1024, 512), scenes=40, chunk_size=256)
     assert set(data.data_vars) == {"lwir11", "qa_pixel"}
     assert data["lwir11"].dtype == np.uint16
     assert data["qa_pixel"].dtype == np.uint16
     assert data["lwir11"].dims == ("time", "latitude", "longitude")
-    assert data.sizes == {"time": 40, "latitude": 1024, "longitude": 512}
+    assert data.sizes == {"time": 40, "latitude": 1026, "longitude": 513}
     # Chunked exactly as pipeline.load_scenes chunks a real load.
     assert data["lwir11"].chunks[0][0] == TIME_CHUNK
-    assert data["lwir11"].chunks[1][0] == 256
+    assert data["lwir11"].chunks[1][0] == 258
 
 
 def test_synthetic_dataset_spans_every_calendar_month():

@@ -43,3 +43,18 @@ def fast_barriers(monkeypatch):
     monkeypatch.setattr(settings, "shard_unit_poll_s", 0.001)
     monkeypatch.setattr(settings, "shard_offset_vms", 2)
     monkeypatch.setattr(settings, "shard_export_claim_fallback_s", 0)
+
+
+@pytest.fixture
+def source_grid_output(monkeypatch):
+    """Pin the delivered grid to the source grid, making aggregation an identity.
+
+    For tests whose subject is a per-pixel property -- the encoding-floor
+    anomaly guard, say -- rather than the grid. At the production factor of 3 a
+    single planted pixel is averaged with its eight neighbours and the property
+    under test stops being observable, which would make the test about
+    aggregation instead of about the guard. Aggregation itself is covered by
+    ``tests/unit/test_aggregate.py`` and the delivered-grid path by
+    ``tests/integration/test_output_grid.py``.
+    """
+    monkeypatch.setattr(settings, "output_pixels_per_degree", settings.pixels_per_degree)

@@ -29,7 +29,7 @@ class TestSettings:
         """Resolution derives from an integer pixel density, not a rounded float."""
         settings = Settings()
         assert settings.pixels_per_degree == 3600
-        assert settings.resolution == 1.0 / 3600
+        assert settings.source_resolution == 1.0 / 3600
 
     def test_grid_is_integral(self):
         """The globe and a tile both land on whole pixels (ADR-008)."""
@@ -43,6 +43,43 @@ class TestSettings:
         """A tile size that lands mid-pixel fails at construction, not at write time."""
         with pytest.raises(ValidationError, match="not a whole number"):
             Settings(tile_size_degrees=0.00015)
+
+    def test_the_three_grids_are_separate_and_named(self):
+        """Source, delivered, and offset. Conflating them is the ADR-017 trap."""
+        settings = Settings()
+        assert settings.source_resolution == 1.0 / 3600
+        assert settings.output_resolution == 1.0 / 1200
+        assert (
+            settings.offset_resolution == (1.0 / 3600) * settings.destripe_offset_resolution_factor
+        )
+
+    def test_the_delivered_grid_is_an_exact_third_of_the_source(self):
+        settings = Settings()
+        assert settings.output_pixels_per_degree == 1200
+        assert settings.spatial_aggregation_factor == 3
+        assert settings.pixels_per_degree == 3 * settings.output_pixels_per_degree
+
+    def test_the_delivered_grid_is_integral_too(self):
+        """A five-degree tile is 6,000 delivered pixels, and the globe divides."""
+        settings = Settings()
+        oppd = settings.output_pixels_per_degree
+        assert 360.0 * oppd == 432_000
+        assert (settings.max_latitude - settings.min_latitude) * oppd == 144_000
+        assert settings.tile_size_degrees * oppd == 6_000
+
+    def test_an_output_grid_that_does_not_divide_the_source_is_rejected(self):
+        """A partial block cannot sit on a shared global grid."""
+        with pytest.raises(ValidationError, match="does not divide"):
+            Settings(output_pixels_per_degree=700)
+
+    def test_the_valid_area_default_is_five_of_nine(self):
+        assert Settings().min_valid_source_cells == 5
+
+    @pytest.mark.parametrize("cells", [0, 10])
+    def test_a_valid_area_rule_outside_the_block_is_rejected(self, cells):
+        """0 would emit a temperature with no observation; 10 is unreachable."""
+        with pytest.raises(ValidationError, match="outside"):
+            Settings(min_valid_source_cells=cells)
 
     def test_collection_default(self):
         """Verify default collection is landsat-c2-l2."""

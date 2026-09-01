@@ -31,20 +31,20 @@ class TestLandMask:
         # N40W075 bbox: west=-75, south=40, east=-70, north=45
         bbox = (-75.0, 40.0, -70.0, 45.0)
 
-        mask = get_land_mask_for_bbox(bbox, settings.resolution, land_polygons)
+        mask = get_land_mask_for_bbox(bbox, settings.source_resolution, land_polygons)
 
         # Mask shape should match expected tile dimensions
         # round(), not int(): 1/3600 has no exact float, so a 5-degree span
         # divides to 17999.999999999996 and truncation loses a pixel.
-        expected_width = round((bbox[2] - bbox[0]) / settings.resolution)
-        expected_height = round((bbox[3] - bbox[1]) / settings.resolution)
+        expected_width = round((bbox[2] - bbox[0]) / settings.source_resolution)
+        expected_height = round((bbox[3] - bbox[1]) / settings.source_resolution)
         assert mask.shape == (expected_height, expected_width)
 
         # Convert lat/lon to pixel indices
         # Note: rasterio convention is north-down, so row 0 is north
         def latlon_to_pixel(lat, lon):
-            col = int((lon - bbox[0]) / settings.resolution)
-            row = int((bbox[3] - lat) / settings.resolution)  # north-down
+            col = int((lon - bbox[0]) / settings.source_resolution)
+            row = int((bbox[3] - lat) / settings.source_resolution)  # north-down
             return row, col
 
         # Test point in Atlantic Ocean (should be False/water)
@@ -66,14 +66,14 @@ class TestLandMask:
     def test_land_mask_dtype_is_bool(self, land_polygons):
         """Land mask should be boolean array."""
         bbox = (-75.0, 40.0, -70.0, 45.0)
-        mask = get_land_mask_for_bbox(bbox, settings.resolution, land_polygons)
+        mask = get_land_mask_for_bbox(bbox, settings.source_resolution, land_polygons)
         assert mask.dtype == bool
 
     def test_coastal_tile_has_mixed_mask(self, land_polygons):
         """Coastal tiles should have both True and False values."""
         # N40W075 is a coastal tile
         bbox = (-75.0, 40.0, -70.0, 45.0)
-        mask = get_land_mask_for_bbox(bbox, settings.resolution, land_polygons)
+        mask = get_land_mask_for_bbox(bbox, settings.source_resolution, land_polygons)
 
         land_pixels = np.sum(mask)
         water_pixels = np.sum(~mask)
@@ -118,7 +118,11 @@ class TestMaskOrientation:
             pytest.skip("No STAC items found for test")
 
         data = stac_load(
-            items, bands=["lwir11"], crs="EPSG:4326", resolution=settings.resolution, bbox=bbox
+            items,
+            bands=["lwir11"],
+            crs="EPSG:4326",
+            resolution=settings.source_resolution,
+            bbox=bbox,
         )
 
         lat = data.latitude.values
@@ -140,11 +144,11 @@ class TestMaskOrientation:
         from landsat_lst.masks import get_land_mask_for_bbox
 
         bbox = (-75.0, 39.5, -73.5, 41.0)
-        mask = get_land_mask_for_bbox(bbox, settings.resolution, land_polygons)
+        mask = get_land_mask_for_bbox(bbox, settings.source_resolution, land_polygons)
 
         west, south, east, north = bbox
-        width = round((east - west) / settings.resolution)
-        height = round((north - south) / settings.resolution)
+        width = round((east - west) / settings.source_resolution)
+        height = round((north - south) / settings.source_resolution)
         transform = rasterio.transform.from_bounds(west, south, east, north, width, height)
 
         # Manhattan - definitely land
@@ -240,7 +244,7 @@ class TestDataQualityEndToEnd:
             items,
             bands=["lwir11", "qa_pixel"],
             crs="EPSG:4326",
-            resolution=settings.resolution,
+            resolution=settings.source_resolution,
             chunks={"time": 5, "latitude": 512, "longitude": 512},
             groupby="solar_day",
             bbox=bbox,

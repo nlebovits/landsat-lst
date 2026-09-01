@@ -113,7 +113,7 @@ def load_scenes_with_chunks(items: list, chunk_size: int) -> xr.Dataset:
         items,
         bands=["lwir11", "qa_pixel"],
         crs=settings.crs,
-        resolution=settings.resolution,
+        resolution=settings.source_resolution,
         chunks={"time": 10, "latitude": chunk_size, "longitude": chunk_size},
         groupby="solar_day",
         bbox=SWEEP_BBOX,

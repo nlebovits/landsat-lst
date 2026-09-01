@@ -58,7 +58,9 @@ R_EXPORT_MB_S = 100.0
 #: Bytes per pixel per scene in the source pair: two ``uint16`` bands.
 _SOURCE_BYTES_PER_PIXEL = 2 * 2
 
-#: Output bytes per pixel: ``lst_p95`` as ``uint16`` plus 12 ``uint8`` months.
+#: Output bytes per DELIVERED pixel: ``lst_p95`` as ``uint16`` plus 12
+#: ``uint8`` months. At the nominal ~100 m grid a five-degree tile is 6,000
+#: squared, so the export moves 504 MB where the source grid moved 4.5 GB.
 _OUTPUT_BYTES_PER_PIXEL = 2 + 12
 
 
@@ -112,7 +114,14 @@ def _coarse_bytes(plan: shards.TilePlan) -> float:
 
 
 def _native_bytes(plan: shards.TilePlan) -> float:
-    """One full pass over the native stack (ADR-013: the tile reads it once)."""
+    """One full pass over the source stack (ADR-013: the tile reads it once).
+
+    Deliberately the *source* shape. Aggregating to nominal ~100 m divides the
+    output by nine and the bytes read by one: every delivered cell is still
+    reduced from nine delivered 30 m source cells, which still have to be
+    fetched and decoded. A budget scaled by the output grid would give the
+    composite stage a ninth of the time its reads need. See ADR-017.
+    """
     height, width = plan.native_shape
     return float(height) * float(width) * _scene_count(plan) * _SOURCE_BYTES_PER_PIXEL
 
@@ -145,8 +154,13 @@ def _widest_scene_share(plan: shards.TilePlan) -> float:
 
 
 def _widest_band_share(plan: shards.TilePlan) -> float:
-    """The tallest row band's share of the output rows."""
-    rows = plan.native_shape[0]
+    """The tallest row band's share of the output rows.
+
+    A share, so it is grid-independent: bands are cut over delivered rows and
+    measured against delivered rows. What it scales is ``_native_bytes``, the
+    *source* read, which aggregation does not reduce.
+    """
+    rows = plan.output_shape[0]
     if not plan.bands or rows == 0:
         return 1.0
     return max(stop - start for start, stop in plan.bands) / rows
@@ -206,7 +220,7 @@ def export_stage_budget(plan: shards.TilePlan) -> StageBudget:
     worker claims it and is already running. This deadline governs the
     driver's *fallback* submission, which does boot.
     """
-    height, width = plan.native_shape
+    height, width = plan.output_shape
     output_mb = float(height) * float(width) * _OUTPUT_BYTES_PER_PIXEL / 1e6
     # Downloaded, merged, then translated: three passes over the output.
     export_s = 3.0 * output_mb / R_EXPORT_MB_S

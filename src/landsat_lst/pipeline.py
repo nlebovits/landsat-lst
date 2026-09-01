@@ -15,6 +15,7 @@ from odc.stac import stac_load
 from pystac_client.stac_api_io import StacApiIO
 from urllib3.util.retry import Retry
 
+from landsat_lst.aggregate import aggregate_to_output_grid, aligned_source_chunk
 from landsat_lst.config import settings
 from landsat_lst.encoding import LST_MIN_TRUSTED_C
 from landsat_lst.ged import gap_mask_for_geobox
@@ -26,12 +27,11 @@ from landsat_lst.normalization import (
     rejection_floor,
     scene_keep_mask,
     scene_offsets,
-    seasonal_debias,
 )
 from landsat_lst.offsets import OffsetCache, OffsetKey, cache_for_items
 from landsat_lst.progress import report_phase, timed_section
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
-from landsat_lst.tiling import geobox_for_bbox
+from landsat_lst.tiling import geobox_for_bbox, output_geobox_for_bbox
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -283,7 +283,16 @@ def load_scenes(
     # term and takes the probe-measured larger request size; the native load
     # feeds the composite, whose single-time-chunk rechunk caps it at 512.
     # See the two fields' docstrings in config.py.
-    csize = settings.load_chunk_size_offsets if resolution_factor > 1 else settings.load_chunk_size
+    # The native chunk is rounded up to a whole number of delivered cells (512
+    # -> 513 at factor 3). ``coarsen`` on a straddling chunk has to rechunk the
+    # stack first, and it picks an uneven split; aligning the request costs one
+    # extra source column per chunk and skips the shuffle entirely. The coarse
+    # offset path is never aggregated, so it keeps its own chunk untouched.
+    csize = (
+        settings.load_chunk_size_offsets
+        if resolution_factor > 1
+        else aligned_source_chunk(settings.load_chunk_size)
+    )
 
     # Averaging only helps the thermal band, and only when coarsening. qa_pixel
     # is a bitfield and must be sampled, never interpolated -- averaging bit
@@ -374,6 +383,34 @@ def scene_cloud_cover(
     )
 
 
+def _output_coords(geobox: GeoBox | None) -> dict[str, np.ndarray] | None:
+    """Delivered-grid coordinate values for the aggregator to stamp on.
+
+    ``None`` when no geobox is given, which is the bare-Dataset path a unit
+    test takes. Every production caller passes one, so every published pixel is
+    labelled from the grid rather than from an average of source labels.
+    """
+    if geobox is None:
+        return None
+    return {name: coord.values for name, coord in geobox.coords.items()}
+
+
+def geobox_coords(geobox: GeoBox) -> tuple[xr.DataArray, xr.DataArray]:
+    """The ``(latitude, longitude)`` cell centres of a geobox, as coordinates.
+
+    The delivered grid carries no loaded array to take coordinates from -- the
+    stack is loaded on the source grid and only becomes delivered-grid data
+    after :func:`~landsat_lst.aggregate.aggregate_to_output_grid` reduces it.
+    So the output-side masks take their coordinates from the geobox's own
+    affine, which is the same authority ``get_land_mask_for_geobox`` and
+    ``gap_mask_for_geobox`` rasterize against.
+    """
+    coords = geobox.coords
+    latitude = xr.DataArray(coords["latitude"].values, dims=["latitude"])
+    longitude = xr.DataArray(coords["longitude"].values, dims=["longitude"])
+    return latitude, longitude
+
+
 def _build_land_mask(
     geobox: GeoBox,
     latitude: xr.DataArray,
@@ -429,8 +466,10 @@ def compute_annual_composite(
     land_mask: xr.DataArray | None = None,
     offset_source: xr.Dataset | None = None,
     offset_land_mask: xr.DataArray | None = None,
+    source_land_mask: xr.DataArray | None = None,
     offset_cache: OffsetCache | None = None,
     offsets: tuple[xr.DataArray, xr.DataArray] | None = None,
+    output_geobox: GeoBox | None = None,
 ) -> xr.Dataset:
     """Compute an LST P95 composite with a per-month observation count.
 
@@ -439,12 +478,22 @@ def compute_annual_composite(
     years -- the correct way to build a multi-year percentile (never average
     per-year P95s: percentile-of-percentiles is wrong).
 
-    ``qa_count`` is a **12-month climatology**: for month M it is the number of
-    valid (cloud-free, QA-passing) observations in month M pooled across all
-    years in the window. Dims ``(month, latitude, longitude)``, always 12
-    months (missing months filled 0), dtype ``uint8`` (counts stay well under
-    255 even for a 5-year window). It counts only observations that reach the
-    composite, so scenes dropped by de-striping are excluded.
+    **Grids.** ``data`` arrives on the source grid, already fused into one
+    observation per solar day. Everything from
+    :func:`~landsat_lst.aggregate.aggregate_to_output_grid` onward -- the land
+    mask, the correction, the percentile, the counts, and the returned Dataset
+    -- is on the delivered nominal ~100 m grid. ``land_mask`` must therefore be
+    on the *delivered* grid, and ``offset_source`` on the offset grid, which is
+    a coarsening of the source grid and independent of both (ADR-017).
+
+    ``qa_count`` is a **12-month climatology of delivered observations**: for
+    month M it is the number of nominal ~100 m solar-day observations in month
+    M that met the valid-area rule, pooled across all years in the window. It
+    is not a sum of source-cell counts, and it never exceeds the number of
+    solar days. Dims ``(month, latitude, longitude)``, always 12 months
+    (missing months filled 0), dtype ``uint8`` (counts stay well under 255 even
+    for a 5-year window). It counts only observations that reach the composite,
+    so scenes dropped by de-striping are excluded.
 
     When ``settings.destripe`` is on, each scene is shifted by a single
     scene-wide offset before compositing and scenes whose offset is implausible
@@ -456,12 +505,18 @@ def compute_annual_composite(
 
     Args:
         data: Dataset with thermal and QA bands across time.
-        land_mask: Optional boolean land mask on ``(latitude, longitude)``.
-            Applied before de-biasing so per-scene offsets are estimated over
-            land only; ocean is thermally stable and would otherwise damp the
-            estimate on coastal tiles.
+        land_mask: Optional boolean land mask on the **delivered** grid's
+            ``(latitude, longitude)``. Applied after aggregation and before
+            de-biasing, so per-scene offsets estimated on this path are
+            estimated over land only; ocean is thermally stable and would
+            otherwise damp the estimate on coastal tiles.
         offset_source: Optional coarse stack to estimate the offsets from.
         offset_land_mask: Land mask on ``offset_source``'s grid.
+        source_land_mask: Land mask on the **source** grid, used only when no
+            ``offset_source`` is given -- the offset factor is then 1, the
+            estimator reads the source stack itself, and this is what keeps it
+            estimating over land. Never applied to the delivered output; that
+            is ``land_mask``'s job.
         offset_cache: Optional :class:`~landsat_lst.offsets.OffsetCache`. A hit
             replaces the tile's longest compute with a kilobyte read. Only the
             estimate is cached, never the rejection, so a cap sweep re-reads one
@@ -477,6 +532,11 @@ def compute_annual_composite(
             correction, i.e. a horizontal seam at every band boundary. The
             pair must be aligned by time coordinate, not position; see
             :func:`~landsat_lst.normalization.debias_with_offsets`.
+        output_geobox: The delivered grid this stack aggregates onto, used to
+            label the result from the grid definition rather than from averaged
+            source labels. Every production caller passes one; omitting it is
+            for a bare Dataset with no mask to align against. See
+            :func:`~landsat_lst.aggregate.aggregate_to_output_grid`.
 
     Returns:
         Dataset with ``lst_p95`` ``(latitude, longitude)`` and ``qa_count``
@@ -486,61 +546,94 @@ def compute_annual_composite(
         P50 (median) was removed per stakeholder feedback - hot season temps
         (P95) are what matter for urban heat applications. See issue #22.
     """
+    # Steps 2 and 3 of the V1 order, in this order and no other (issue #120).
+    # ``data`` arrives already fused into one observation per solar day, on the
+    # source grid, by odc-stac's ``groupby="solar_day"``. QA, the DN=0 fill
+    # test, the Collection 2 scaling, and the plausibility clamp all run on the
+    # source cells, so a cell dropped by any of them is invisible to the
+    # reducer rather than averaged in as a number.
     masked = apply_qa_mask(data)
 
     lst = convert_to_celsius(masked["lwir11"])
 
-    if land_mask is not None:
-        lst = lst.where(land_mask)
-
-    scenes_kept = None
-    if settings.destripe and offsets is not None:
-        # A shard's path: the estimate arrived with the job, so all that is
-        # left is rejection and subtraction. The floor follows the grid the
-        # estimate was made on, which the configured factor names -- the same
-        # rule the estimating path applies, read from the setting rather than
-        # from the presence of a coarse stack this process never loaded.
-        with timed_section("destriping"):
-            lst, offset, keep = debias_with_offsets(
-                lst,
-                *offsets,
-                max_offset_c=settings.destripe_max_offset_c,
-                min_scene_pixels=settings.destripe_min_scene_pixels,
-                min_offset_samples=settings.destripe_min_offset_samples,
-                offset_source_given=settings.destripe_offset_resolution_factor > 1,
-            )
-        diagnostics = offset_diagnostics(offset, keep)
-        log.info("destripe_offsets_degC", **diagnostics)
-        scenes_kept = int(diagnostics["n_kept"])
-    elif settings.destripe:
+    # The estimate is made on the SOURCE side and applied on the delivered
+    # side. That split is deliberate and is the whole of ADR-017's rule 7: the
+    # offset grid is a coarsening of the source grid, its accuracy bound was
+    # calibrated there (docs/findings-offset-subsampling.md), and
+    # ``destripe_min_scene_pixels`` counts pixels in it. Estimating after
+    # aggregation would silently move all three because the *output* moved. The
+    # correction still applies after aggregation, as the V1 order requires, and
+    # costs nothing to defer: subtracting one scalar per scene commutes exactly
+    # with an area-weighted mean over that scene's cells.
+    estimate = offsets
+    if settings.destripe and estimate is None:
         # The offset is one scalar per scene, so it can be estimated from a
         # coarse stack read off the source COGs' overviews. That cuts bytes
         # read, which post-load subsampling cannot do: dask must materialize a
         # whole chunk before discarding most of it.
-        source = None
         if offset_source is not None:
-            source = convert_to_celsius(apply_qa_mask(offset_source)["lwir11"])
-            if offset_land_mask is not None:
-                source = source.where(offset_land_mask)
+            estimation_source = convert_to_celsius(apply_qa_mask(offset_source)["lwir11"])
+            estimation_mask = offset_land_mask
+        else:
+            estimation_source = lst
+            estimation_mask = source_land_mask
+        if estimation_mask is not None:
+            estimation_source = estimation_source.where(estimation_mask)
 
         # Estimating the offsets is the first real compute of the tile, and on a
         # five-year window it runs for many minutes, so the watcher hears about
         # it before it starts rather than after. With a warm cache it is a
         # kilobyte read instead, and the phase passes in under a second.
         with timed_section("destriping"):
-            lst, offset, keep = seasonal_debias(
-                lst,
-                max_offset_c=settings.destripe_max_offset_c,
-                min_scene_pixels=settings.destripe_min_scene_pixels,
-                min_offset_samples=settings.destripe_min_offset_samples,
-                offset_source=source,
+            estimate = scene_offsets(
+                estimation_source,
                 cache=offset_cache,
                 # The mask on whichever grid the offsets are estimated on, so
                 # phase A can skip blocks that hold no land at all. On a
                 # coastal tile most blocks are ocean; the skip is free work
                 # reduction and value-identical (an all-NaN block's medians
                 # are NaN either way).
-                land_mask=offset_land_mask if source is not None else land_mask,
+                land_mask=estimation_mask,
+            )
+
+    # Aggregate every masked solar-day observation onto the delivered grid
+    # *before* the correction and the percentile. Computing a P95 on the source
+    # grid and coarsening the result afterwards is a different statistic and
+    # saves none of the percentile work; the V1 decision rules it out
+    # explicitly. See :mod:`landsat_lst.aggregate` and ADR-017.
+    with timed_section("aggregating"):
+        lst = aggregate_to_output_grid(lst, coords=_output_coords(output_geobox))
+
+    # On the delivered grid from here down, which is the grid ``land_mask``
+    # must already be on. Land is an output-side policy (step 7): it is applied
+    # here rather than before aggregation so that a coastal cell's support is
+    # decided by QA alone, and a 4-of-9-land cell is not silently starved of
+    # support by a mask that has nothing to say about cloud. Applying it ahead
+    # of de-biasing still keeps the factor-1 estimating path estimating over
+    # land only, which is what it is here for.
+    if land_mask is not None:
+        lst = lst.where(land_mask)
+
+    scenes_kept = None
+    if settings.destripe:
+        if estimate is None:  # pragma: no cover - unreachable; the branch above sets it
+            msg = (
+                "de-striping is on but no offset estimate exists. Either pass "
+                "``offsets``, or leave the estimating branch above to build one."
+            )
+            raise ValueError(msg)
+        # Rejection and subtraction, on the delivered stack. The floor follows
+        # the grid the estimate was made on, which the configured factor names
+        # -- read from the setting rather than from the presence of a coarse
+        # stack a shard process never loaded.
+        with timed_section("destriping"):
+            lst, offset, keep = debias_with_offsets(
+                lst,
+                *estimate,
+                max_offset_c=settings.destripe_max_offset_c,
+                min_scene_pixels=settings.destripe_min_scene_pixels,
+                min_offset_samples=settings.destripe_min_offset_samples,
+                offset_source_given=settings.destripe_offset_resolution_factor > 1,
             )
         diagnostics = offset_diagnostics(offset, keep)
         log.info("destripe_offsets_degC", **diagnostics)
@@ -577,8 +670,13 @@ def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
     # notnull() (not ~np.isnan) so the result stays a typed xarray DataArray.
     valid_mask = lst.notnull()
 
-    # Per-calendar-month climatology of valid observations. groupby pools every
-    # year in the window into its month bucket; reindex guarantees all 12 months.
+    # Per-calendar-month climatology of valid observations. ``lst`` is already
+    # on the delivered grid, so a "valid observation" here is one nominal
+    # ~100 m solar-day cell that met the valid-area rule -- never a count of
+    # source cells, and never more than the number of solar days in the month.
+    # The two populations agree by construction: the same NaN pattern gates the
+    # percentile and the counts. groupby pools every year in the window into
+    # its month bucket; reindex guarantees all 12 months.
     qa_count = (
         valid_mask.groupby("time.month")
         .sum()
@@ -772,7 +870,10 @@ def process_tile(
     report_phase("loading", scenes_found=len(items))
 
     patch_url = _patch_url_for(items)
+    # Two grids, named apart. Scenes load and solar-day fuse on the source
+    # grid; every mask and every published pixel lives on the delivered one.
     native_geobox = geobox_for_bbox(job.tile.bbox)
+    output_geobox = output_geobox_for_bbox(job.tile.bbox)
 
     # A 5-year window pulls ~1900 scenes, so at least one transient read failure
     # is near-certain. Fill that scene with nodata rather than aborting the load;
@@ -784,20 +885,29 @@ def process_tile(
         items, job.tile.bbox, patch_url=patch_url, fail_on_error=False, geobox=native_geobox
     )
 
-    # Built before the composite so de-striping estimates each scene's offset
-    # over land only. Ocean is thermally stable and would damp the estimate on
-    # coastal tiles. Rasterizing Natural Earth over an 18,000 px grid runs no
-    # dask graph and is not free, so it gets its own phase rather than hiding
-    # inside `loading`.
+    # On the delivered grid, because that is where the composite lives from the
+    # aggregation onward. Built before the composite so de-striping estimates
+    # each scene's offset over land only. Ocean is thermally stable and would
+    # damp the estimate on coastal tiles. Rasterizing Natural Earth runs no dask
+    # graph and is not free, so it gets its own phase rather than hiding inside
+    # `loading`.
     with timed_section("land_mask"):
-        land_mask_da = _build_land_mask(native_geobox, data.latitude, data.longitude)
+        land_mask_da = _build_land_mask(output_geobox, *geobox_coords(output_geobox))
 
     # A coarse second load for the de-striping offsets. Reading from the source
     # overviews costs ~factor**2 fewer bytes than a second native-resolution
     # pass, and the offset is a per-scene scalar that gains nothing from detail.
     offset_source = None
     offset_land_mask = None
+    source_land_mask = None
     factor = settings.destripe_offset_resolution_factor
+    if settings.destripe and factor == 1:
+        # Factor 1 means the offset grid *is* the source grid, so the estimator
+        # reads the native stack and needs a native-grid land mask to estimate
+        # over land only. Not a production configuration -- the default factor
+        # is 2 -- but the alternative is an estimate quietly taken over ocean.
+        with timed_section("land_mask"):
+            source_land_mask = _build_land_mask(native_geobox, data.latitude, data.longitude)
     if settings.destripe and factor > 1:
         # Timed in its own right. Building this graph is single-threaded Python
         # over every scene in the window, and sitting untimed between two
@@ -822,6 +932,8 @@ def process_tile(
         land_mask=land_mask_da,
         offset_source=offset_source,
         offset_land_mask=offset_land_mask,
+        source_land_mask=source_land_mask,
+        output_geobox=output_geobox,
         offset_cache=cache_for_items(
             tile=job.tile.name,
             window=job.window_label,
@@ -853,7 +965,7 @@ def process_tile(
     # mask out of the estimator keeps every cached offset record valid).
     if settings.ged_gap_mask:
         with timed_section("ged_gap_mask"):
-            gap_mask_da = _build_ged_gap_mask(native_geobox, data.latitude, data.longitude)
+            gap_mask_da = _build_ged_gap_mask(output_geobox, *geobox_coords(output_geobox))
         composite["lst_p95"] = composite["lst_p95"].where(~gap_mask_da)
 
     composite.attrs["tile"] = job.tile.name

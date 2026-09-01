@@ -10,6 +10,9 @@ from landsat_lst.tiling import (
     generate_land_tiles,
     geobox_for_bbox,
     global_geobox,
+    output_geobox_for_bbox,
+    output_global_geobox,
+    output_tile_geobox,
     parse_tile_name,
     tile_from_point,
     tile_geobox,
@@ -261,3 +264,80 @@ class TestTileGeobox:
     def test_bbox_outside_latitude_bounds_raises(self):
         with pytest.raises(ValueError, match="outside the global grid"):
             geobox_for_bbox((-75.0, -80.0, -70.0, -75.0))
+
+
+class TestDeliveredGeobox:
+    """The published grid, an exact 3x of the source one. See ADR-017."""
+
+    def test_the_global_delivered_array_is_exact(self):
+        assert output_global_geobox().shape == (144_000, 432_000)
+
+    def test_it_divides_by_every_overview_factor(self):
+        """The pyramid argument survives the grid change unaltered."""
+        height, width = output_global_geobox().shape
+        for factor in (4, 16, 64):
+            assert height % factor == 0
+            assert width % factor == 0
+
+    def test_a_delivered_tile_still_fails_the_coarsest_factor(self):
+        """6,000 = 2^4 * 3 * 5^3: divisible by 4 and 16, not by 64.
+
+        Exactly the property 18,000 had, and the reason overviews still belong
+        to the global array rather than to a tile.
+        """
+        tile_px = int(settings.tile_size_degrees * settings.output_pixels_per_degree)
+        assert tile_px == 6_000
+        assert tile_px % 4 == 0
+        assert tile_px % 16 == 0
+        assert tile_px % 64 != 0
+
+    def test_a_delivered_tile_is_whole_pixels(self):
+        assert output_tile_geobox(TileId(lat=40, lon=-75)).shape == (6_000, 6_000)
+
+    def test_it_covers_the_same_ground_as_the_source_tile(self):
+        source = tile_geobox(TileId(lat=40, lon=-75)).boundingbox
+        delivered = output_tile_geobox(TileId(lat=40, lon=-75)).boundingbox
+        assert tuple(delivered) == pytest.approx(tuple(source), abs=1e-9)
+
+    def test_adjacent_delivered_tiles_are_contiguous(self):
+        """One pixel step across a shared edge, with no gap and no overlap."""
+        west = output_tile_geobox(TileId(lat=40, lon=-75))
+        east = output_tile_geobox(TileId(lat=40, lon=-70))
+        lon_west = west.coordinates["longitude"].values
+        lon_east = east.coordinates["longitude"].values
+        step = lon_west[1] - lon_west[0]
+        assert (lon_east[0] - lon_west[-1]) == pytest.approx(step, rel=1e-9)
+
+    def test_vertically_adjacent_delivered_tiles_are_contiguous(self):
+        north = output_tile_geobox(TileId(lat=40, lon=-75))
+        south = output_tile_geobox(TileId(lat=35, lon=-75))
+        lat_north = north.coordinates["latitude"].values
+        lat_south = south.coordinates["latitude"].values
+        step = lat_north[1] - lat_north[0]
+        assert (lat_south[0] - lat_north[-1]) == pytest.approx(step, rel=1e-9)
+
+    def test_it_agrees_with_zooming_the_source_grid_out_by_three(self):
+        """Same shape and same extent. The transforms differ by one ULP.
+
+        ``zoom_out`` computes ``(1/3600) * 3 = 0.0008333333333333333`` where the
+        integer density gives ``1/1200 = 0.0008333333333333334``. The integer
+        form is the authority -- a density is an integer and a spacing derives
+        from it, never the reverse (ADR-008) -- so this pins agreement on
+        everything except that last bit, and pins the spacing separately.
+        """
+        zoomed = tile_geobox(TileId(lat=40, lon=-75)).zoom_out(3)
+        delivered = output_tile_geobox(TileId(lat=40, lon=-75))
+        assert zoomed.shape == delivered.shape
+        assert tuple(zoomed.boundingbox) == pytest.approx(tuple(delivered.boundingbox), abs=1e-9)
+        assert delivered.transform.a == 1.0 / 1200
+        assert delivered.transform.a != zoomed.transform.a
+
+    def test_a_sub_tile_bbox_snaps_to_the_delivered_grid(self):
+        box = output_geobox_for_bbox((-60.6, -34.0, -60.4, -33.8)).boundingbox
+        assert (box.left, box.bottom, box.right, box.top) == pytest.approx(
+            (-60.6, -34.0, -60.4, -33.8), abs=1e-9
+        )
+
+    def test_a_delivered_bbox_outside_latitude_bounds_raises(self):
+        with pytest.raises(ValueError, match="outside the global grid"):
+            output_geobox_for_bbox((-75.0, -80.0, -70.0, -75.0))

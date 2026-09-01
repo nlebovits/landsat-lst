@@ -32,7 +32,13 @@ pytestmark = pytest.mark.benchmark
 #: originally measured values rather than re-pinned on every upgrade, since a
 #: constant that chases the measurement stops being a reference.
 OFFSET_TASKS = 2_668
-COMPOSITE_TASKS = 828
+#: Re-pinned 2026-09-01 for ADR-017: the composite graph now aggregates to the
+#: delivered nominal ~100 m grid before the percentile, and the three coarsen
+#: reductions took this configuration from 828 tasks to 2,094. The offset count
+#: did **not** move, and must not: the estimator reads the source grid and does
+#: not notice the output grid. ``tests/benchmark/test_aggregation_cost.py``
+#: asserts that invariance directly.
+COMPOSITE_TASKS = 2_094
 
 #: Half to double, for the offset graph. A graph that restructures moves task
 #: count by more than this; nothing else does. Chosen so that a 3% drift never

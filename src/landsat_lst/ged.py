@@ -323,9 +323,14 @@ def gap_mask_for_geobox(
     Pixel centers come from ``geobox.transform`` -- the grid's own affine, so
     a row band's mask is the exact slice of its tile's (the same argument as
     :func:`landsat_lst.masks.get_land_mask_for_geobox`). Each center maps to
-    its 0.01-degree GED cell by floor division; centers sit at odd multiples
-    of 1/7200 degree while cell edges sit at multiples of 1/100, so a center
-    can never land on a cell boundary and the mapping has no float knife-edge.
+    its 0.01-degree GED cell by floor division, and the mapping has no float
+    knife-edge on either grid this project uses. A center sits at an odd
+    multiple of half the spacing -- 1/2400 degree on the delivered grid, 1/7200
+    on the source one -- while cell edges sit at multiples of 1/100. Writing
+    both over the delivered spacing: a center is ``(2k+1)/2400`` and an edge is
+    ``24m/2400``, odd against even, so a center can never land on a boundary.
+    The same parity argument holds for any grid whose pixels-per-degree is an
+    even multiple of 100, which both are.
 
     The cell window is padded by ``buffer_cells`` beyond the geobox, because
     a gap cell just outside the tile buffers into it. The verification pass

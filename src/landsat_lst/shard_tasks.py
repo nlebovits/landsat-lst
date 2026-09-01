@@ -65,7 +65,7 @@ from landsat_lst.offsets import (
 from landsat_lst.progress import TileHeartbeat, capture_task_log, report_phase, timed_section
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 from landsat_lst.storage import PRODUCTS, get_storage
-from landsat_lst.tiling import geobox_for_bbox, parse_tile_name
+from landsat_lst.tiling import geobox_for_bbox, output_geobox_for_bbox, parse_tile_name
 
 if TYPE_CHECKING:
     from landsat_lst.storage import StorageBackend
@@ -424,6 +424,8 @@ def resolve_tile_plan(
 
     coarse_shape = (int(source.sizes["latitude"]), int(source.sizes["longitude"]))
     native_shape = (int(native_geobox.shape[0]), int(native_geobox.shape[1]))
+    output_geobox = output_geobox_for_bbox(job.tile.bbox)
+    output_shape = (int(output_geobox.shape[0]), int(output_geobox.shape[1]))
 
     block_edge = _io_block_edge(lst, settings.destripe_unit_memory_gb)
     blocks = shards.block_spans(coarse_shape, block_edge)
@@ -433,7 +435,10 @@ def resolve_tile_plan(
     ref_shards, scene_shards, band_shards = shards.stage_shard_counts(
         blocks=len(blocks),
         scene_batches=len(scene_batches),
-        block_rows=native_shape[0] // settings.cog_blocksize,
+        # Delivered rows, because that is what band_edges cuts. Passing source
+        # rows would offer three times as many bands as the output has block
+        # rows, and the widest of them would be empty.
+        block_rows=output_shape[0] // settings.cog_blocksize,
         # The offsets-side widths are the fused fleet's width, which the driver
         # fixed before this plan existed. See stage_shard_counts.
         units=units,
@@ -449,11 +454,12 @@ def resolve_tile_plan(
         offset_factor=factor,
         coarse_shape=coarse_shape,
         native_shape=native_shape,
+        output_shape=output_shape,
         block_edge=block_edge,
         blocks=blocks,
         block_has_land=block_has_land,
         scene_batches=scene_batches,
-        bands=shards.band_edges(native_shape[0], band_shards, settings.cog_blocksize),
+        bands=shards.band_edges(output_shape[0], band_shards, settings.cog_blocksize),
         ref_shards=ref_shards,
         scene_shards=scene_shards,
         band_shards=band_shards,
@@ -948,9 +954,12 @@ def run_composite_shard(
 
     The band loads onto a *slice of the tile's geobox* rather than a grid
     derived from its own bounds, and masks against that same geobox's affine,
-    so its pixels are the tile's pixels down to the last bit (ADR-008). Both
-    products are written in one ``dask.compute``, so ADR-013's single native
-    pass holds inside a shard as it does inside a whole tile.
+    so its pixels are the tile's pixels down to the last bit (ADR-008). It does
+    that on both grids: the source slice it reads and the delivered slice it
+    publishes are the corresponding windows of the tile's two geoboxes, which
+    is what makes a band's aggregation identical to the whole tile's over the
+    same rows. Both products are written in one ``dask.compute``, so ADR-013's
+    single native pass holds inside a shard as it does inside a whole tile.
 
     The slabs are plain tiled GeoTIFFs, never COGs: overviews belong to the
     assembled tile.
@@ -965,6 +974,7 @@ def run_composite_shard(
         _build_land_mask,
         _patch_url_for,
         compute_annual_composite,
+        geobox_coords,
         load_scenes,
     )
 
@@ -979,16 +989,28 @@ def run_composite_shard(
 
     offsets = _tile_offsets(ctx) if settings.destripe else None
 
-    geobox = geobox_for_bbox(ctx.job.tile.bbox)[start:stop, :]
+    # Two grids, two slices of the same rows. ``(start, stop)`` are DELIVERED
+    # rows, so the band loads source rows ``[factor*start, factor*stop)`` and
+    # publishes ``stop - start`` rows. Both slices come from the tile's own
+    # global-grid geobox rather than from the band's bounds, which is what
+    # keeps a band's pixels the tile's pixels (ADR-008); ``band_edges`` cuts on
+    # multiples of the COG block size, and ``factor`` times a multiple of 512
+    # is still a whole number of source cells, so no aligned 3x3 block is ever
+    # split across two bands.
+    factor = settings.spatial_aggregation_factor
+    geobox = geobox_for_bbox(ctx.job.tile.bbox)[factor * start : factor * stop, :]
+    output_geobox = output_geobox_for_bbox(ctx.job.tile.bbox)[start:stop, :]
     patch_url = _patch_url_for(ctx.items)
     report_phase("loading", scenes_found=len(ctx.items))
     data = load_scenes(
         ctx.items, ctx.job.tile.bbox, patch_url=patch_url, fail_on_error=False, geobox=geobox
     )
     with timed_section("land_mask"):
-        land = _build_land_mask(geobox, data.latitude, data.longitude)
+        land = _build_land_mask(output_geobox, *geobox_coords(output_geobox))
 
-    composite = compute_annual_composite(data, land_mask=land, offsets=offsets)
+    composite = compute_annual_composite(
+        data, land_mask=land, offsets=offsets, output_geobox=output_geobox
+    )
     # The same two lines process_tile applies, for the same reason: ocean must
     # be nodata in the LST band and zero in the counts, and a band that skipped
     # them would differ from the whole tile exactly along its own rows.
@@ -1000,7 +1022,7 @@ def run_composite_shard(
     # (ADR-008). LST only; qa_count stays the evidence layer.
     if settings.ged_gap_mask:
         with timed_section("ged_gap_mask"):
-            gap = _build_ged_gap_mask(geobox, data.latitude, data.longitude)
+            gap = _build_ged_gap_mask(output_geobox, *geobox_coords(output_geobox))
         composite["lst_p95"] = composite["lst_p95"].where(~gap)
     composite.attrs.update(_tile_attrs(ctx.plan))
 

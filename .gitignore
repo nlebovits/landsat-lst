@@ -90,3 +90,4 @@ results/
 !results/decision/destripe_cap_calibration.json
 !results/decision/offset_subsampling_validation.json
 !results/decision/destripe_composite_comparison.json
+!results/decision/aggregation_cost_local.json
