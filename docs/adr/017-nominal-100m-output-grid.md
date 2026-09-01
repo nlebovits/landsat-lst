@@ -132,6 +132,19 @@ at 24 scenes, 0.79× at 60, 0.67× at 120 — because the scene-dependent term i
 single-time-chunk rechunk, which is nine times smaller on the delivered grid, while the
 flat terms are not. At 2,930 production scenes that term dominates.
 
+**End-to-end speed is unmeasured.** A microbenchmark of the percentile kernel alone
+(`nanquantile_last`, 900² against 300² at 300 scenes, median of five runs) gives **8.5×**:
+1.22 s to 0.14 s. That is one kernel in isolation, on random data, outside dask, and it is
+reported on its own terms. What share of a tile's wall clock that kernel holds is not known,
+so it does not convert into a tile speedup and no such figure is claimed here.
+
+`R_COMPOSITE_MB_S` cannot be used to derive one either. It is an *end-to-end composite* rate
+with the percentile inside it, not an I/O rate, so ADR-017 makes it **stale rather than still
+valid** — dividing unchanged bytes by it assumes the answer. Backing the percentile's share
+out of it is not possible from the existing probe: the arm behind 45.5 MB/s ran on a
+4.4%-land tile whose ocean nodata deflated ~8× on the wire, which confounds the comparison
+against the 210–386 MB/s arm. Only an acceptance run settles this.
+
 **The graph gets bigger.** Three coarsen reductions over the full stack add tasks: 2.53×
 at 24 scenes, 3.96× at 120. ADR-013's single native pass survives — 1.00 passes in every
 arm — because within one `dask.compute` each source key is produced once whatever is
@@ -187,3 +200,49 @@ exists to avoid making.
 
 **Keeping 30 m.** Rejected. The detail is not independently supported below 100 m, and it
 costs nine times the output for it.
+
+**Loading directly onto the delivered grid, letting GDAL do the reduction.** This is the
+tempting one, and the only alternative here that would have been *cheaper* than what was
+built. Rejected, because it cannot implement the decision.
+
+`stac_load` accepts any geobox, the source COGs carry overviews at `[2, 4, 8, 16, 32, 64]`,
+and a coarser request is served from them — which is how the offset pass already reads at
+1/1800°. So a direct 1/1200° load would cut bytes read, where this ADR cuts none. That is a
+real lever and it is being given up deliberately.
+
+It fails on four counts, and each is a decision on #120 rather than an implementation detail:
+
+- **QA cannot precede aggregation.** GDAL averages `lwir11` *inside the read*, before any of
+  our masking exists. A cloudy, shadowed, or snow-flagged 30 m temperature therefore enters
+  the 100 m mean and cannot be taken back out. Masking the cell afterwards masks a value that
+  is already contaminated.
+- **The 5-of-9 rule is unrepresentable.** `qa_pixel` is a bitfield and must be nearest-sampled,
+  so a 100 m read yields *one sampled QA value standing for nine*, never a count of them.
+  There is no support number to threshold.
+- **Scene-edge validity stops being honest.** Coarse loading over-reports it, measured: a scene
+  with exactly 1 valid native pixel reported 13 at factor 8, because GDAL's `average` yields a
+  valid coarse pixel from a block holding one valid fine pixel
+  ([findings](../findings-offset-subsampling.md)). Fusion would also operate on already-averaged
+  cells, so a granule covering one of nine subcells could fill a cell as though it covered all
+  nine — the property `test_a_scene_edge_keeps_its_support_after_fusion` exists to pin.
+- **`qa_count` degrades.** With no support count it becomes "cells whose one sampled QA bit read
+  clear", which over-reports for the same reason and is a weaker claim than the decision defines.
+
+The hybrid — ST at 100 m, `qa_pixel` at 30 m — does not rescue it. A true support count becomes
+available, but the mean was already formed over the cloudy contributors, so the first failure
+stands. The saving also mostly evaporates: both bands are `uint16`, so holding QA at full
+resolution while ST drops to overview 2 reads `0.5 x 0.25 + 0.5 x 1 = 0.625` of the bytes, a
+1.6x cut rather than 4x.
+
+Two further problems, recorded because they would need answering if this is ever revisited:
+
+- The reduction would be **anisotropic and latitude-dependent**. A 1/1200° cell is 92.8 m tall
+  everywhere but 92.8 m wide at the equator and 46.4 m at 60°, so the downsampling ratio runs
+  3.09 on both axes at the equator and 1.55 by 3.09 at 60°. GDAL picks one overview level per
+  read, so both the effective source footprint per delivered cell and the bytes read would vary
+  with latitude.
+- How USGS built the **`lwir11`** overviews is **not established**. The repo verified only that
+  `qa_pixel`'s are nearest or mode. If `lwir11`'s are decimated, a direct read would average a
+  warp kernel over pixels that were themselves a 1-in-4 sample — not an area-weighted mean of
+  the nine source cells. That question is deliberately left open: it cannot rescue the four
+  failures above, so it is worth answering only if review overturns them.

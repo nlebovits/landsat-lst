@@ -495,8 +495,14 @@ and ~46 m at 60°.
   shape. What falls is output size (exactly 9×) and the percentile's working set: measured
   locally at 0.90× peak RSS at 24 scenes, 0.79× at 60, 0.67× at 120
   (`results/decision/aggregation_cost_local.json`). The graph gets *bigger* — three coarsen
-  reductions, 2.53× tasks at 24 scenes. `R_COMPOSITE_MB_S` is a pre-ADR-017 decode rate and
-  has not been re-measured; do not scale a projection by the pixel-count ratio.
+  reductions, 2.53× tasks at 24 scenes.
+- **End-to-end speed is unmeasured, and must not be quoted.** `R_COMPOSITE_MB_S` (45.5) is an
+  *end-to-end composite* rate with the percentile inside it, not an I/O rate, so it is stale
+  rather than still-valid and needs re-measuring on a VM. A microbenchmark puts the percentile
+  kernel alone at **8.5×** cheaper on the delivered grid (`nanquantile_last`, 900² vs 300² at
+  300 scenes, median of 5). That is one kernel in isolation; what share of a tile it holds is
+  not known. Do not turn it into a tile speedup, and do not scale a projection by the
+  pixel-count ratio.
 - **The plan digest covers the contract**: `output_pixels_per_degree`,
   `min_valid_source_cells`, and `aggregate.AGGREGATION_VERSION`. **Bump the version** when a
   change to `aggregate.py` would change delivered values.

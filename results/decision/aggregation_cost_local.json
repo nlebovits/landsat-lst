@@ -74,8 +74,29 @@
     "Wall time rises at this geometry (0.64 to 0.93 s at 24 scenes). Nothing streams at 1,026 squared, so the added reduction is pure cost here. It is not evidence about a production tile either way."
   ],
   "not_measured": [
+    "End-to-end wall time for a tile, on either grid. No figure is claimed.",
     "Peak RSS at production geometry (18,000 squared, ~2,930 scenes). Only a VM reports a peak; see docs/findings-memory-model.md.",
-    "Whether R_COMPOSITE_MB_S moves. It is a decode rate measured before this change and is unchanged in landsat_lst.projection until an acceptance run re-measures it.",
+    "R_COMPOSITE_MB_S after the change. It is an END-TO-END COMPOSITE rate with the percentile inside it, not an I/O rate, so ADR-017 makes it stale rather than still valid. Its percentile share cannot be backed out of the existing probe: the 45.5 MB/s arm ran on a 4.4%-land tile whose ocean nodata deflated ~8x on the wire.",
     "Output size on a real tile after COG compression. The projection reports 0.50 GB uncompressed against 4.54 GB, an exact 9x, which is arithmetic rather than a measurement."
-  ]
+  ],
+  "percentile_microbenchmark": {
+    "what": "nanquantile_last alone, the dominant composite compute, at equal scene depth.",
+    "method": "numpy only, outside dask, random float32 with 30% NaN, median of 5 runs.",
+    "scenes": 300,
+    "source_grid": {
+      "side": 900,
+      "seconds_median": 1.224,
+      "seconds_min": 1.219,
+      "seconds_max": 1.243
+    },
+    "delivered_grid": {
+      "side": 300,
+      "seconds_median": 0.144,
+      "seconds_min": 0.139,
+      "seconds_max": 0.145
+    },
+    "ratio": 8.49,
+    "caveat": "One kernel in isolation on synthetic data. What share of a tile's wall clock it holds is unmeasured, so this does not convert into a tile speedup."
+  },
+  "wall_time_note": "The wall_s column in `rows` is NOT evidence about production speed. In this harness the source is da.random.integers over the full source-grid stack, which runs identically in both arms and dominates a 1,026 squared run; the percentile is too small to register. Read those rows for task count and peak RSS only."
 }

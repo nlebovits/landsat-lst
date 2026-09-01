@@ -27,10 +27,20 @@ The byte model:
 cell is reduced from nine source cells, and those nine still have to be fetched
 and decoded, so ``native_pass_gb`` is unchanged by ADR-017. What falls is the
 output: nine times fewer pixels to percentile, to hold, to encode, and to
-publish. ``R_COMPOSITE_MB_S`` is a decode rate measured before the aggregation
-existed, and whether reducing the percentile's working set moves it is an open
-empirical question -- an acceptance run answers it, this module does not
-presume it. Do not scale these projections by the pixel-count ratio.
+publish.
+
+**``R_COMPOSITE_MB_S`` must be re-measured, and these projections are stale
+until it is.** It is not an I/O rate. It is an *end-to-end composite* rate from
+the packing probe, so the percentile is inside the number, and ADR-017 changed
+the percentile. Dividing unchanged bytes by it and reading off a wall time
+therefore assumes exactly what is in question. The direction is unknown here:
+a microbenchmark puts the percentile kernel alone at 8.5x cheaper on the
+delivered grid, but what share of this rate that kernel holds is unmeasured,
+and the probe arm behind 45.5 MB/s ran on a 4.4%-land tile whose ocean nodata
+deflated ~8x on the wire, which confounds any attempt to back it out.
+
+**So do not quote an end-to-end speedup from this module.** Do not scale these
+projections by the pixel-count ratio either. Only an acceptance run settles it.
 """
 
 from __future__ import annotations
