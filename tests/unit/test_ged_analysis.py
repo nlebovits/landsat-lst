@@ -148,16 +148,18 @@ class TestGridAndMapping:
         assert rows["0"]["hot_pixels"] == PX_PER_CELL * PX_PER_CELL
 
     def test_orientation_north_up_west_left(self, scene):
-        """A gap in the granule's NW-most cell lands in the raster's NW corner.
+        """A gap at cell (row 1, col 3) lands at pixels (36:72, 108:144).
 
-        A flipped mapping would put these 36x36 hot pixels in another corner,
-        which is exactly the silent failure ged.read_granule_numobs guards.
+        The cell is deliberately off-diagonal and off-corner. A flipped
+        mapping puts the hot block in another quadrant and a *transposed* one
+        swaps the axes -- and (0, 0), which an earlier version of this test
+        used, is a fixed point of both, so it could detect neither.
         """
         ged_dir, numobs, tmp_path = scene
-        numobs[0, 0] = 0  # geobox NW corner: lat 39.99-40.0, lon -75.0
+        numobs[1, 3] = 0
         write_granule(ged_dir, 40, -75, numobs)
         dn = np.full((360, 360), 11000, dtype=np.uint16)
-        dn[:PX_PER_CELL, :PX_PER_CELL] = 13000  # hot in the NW corner only
+        dn[PX_PER_CELL : 2 * PX_PER_CELL, 3 * PX_PER_CELL : 4 * PX_PER_CELL] = 13000
         raster = write_raster(tmp_path / "lst.tif", dn)
 
         record = analyze(raster=str(raster), tile=None, ged_dir=ged_dir, buffer_cells=0)
@@ -165,13 +167,30 @@ class TestGridAndMapping:
         assert rows["0"]["hot_pixels"] == PX_PER_CELL * PX_PER_CELL
         assert rows[">=4"]["hot_pixels"] == 0
 
-    @pytest.mark.parametrize("buffer_cells", [0, 1, 2])
-    def test_the_mapping_is_the_production_mask(self, scene, monkeypatch, buffer_cells):
-        """The analysis footprint is `gap_mask_for_geobox`'s, pixel for pixel.
+    def test_a_transposed_mapping_would_fail_this_suite(self, scene):
+        """Guards the guard: the fixture really is asymmetric.
 
-        This is the point of routing both through
-        `ged.cell_indices_for_geobox`: if the two ever disagreed, the table
-        would describe pixels the mask does not drop.
+        If the hot block and the gap cell were placed symmetrically, the test
+        above would pass under a transposed mapping. Here the transposed cell
+        is explicitly shown to be a different, non-gap cell.
+        """
+        _, numobs, _ = scene
+        numobs[1, 3] = 0
+        assert numobs[1, 3] == 0
+        assert numobs[3, 1] != 0
+
+    @pytest.mark.parametrize("buffer_cells", [0, 1, 2])
+    def test_analysis_and_mask_stay_consistent(self, scene, monkeypatch, buffer_cells):
+        """A CONSISTENCY check, not independent evidence of correctness.
+
+        Both sides call `ged.cell_indices_for_geobox`, so this cannot detect a
+        wrong mapping -- it would agree with itself just as happily. What it
+        does catch is the two paths *diverging*: a future change to the
+        buffering, the window padding, or the artifact path that moves the
+        mask without moving the table. Independent evidence lives in
+        `tests/unit/test_ged_coverage.py::TestAgainstRealGranules` (the
+        convention against a granule's own geolocation) and in
+        `TestRegistrationScan` (the data's own opinion of the alignment).
         """
         from landsat_lst.config import settings
 
@@ -291,6 +310,57 @@ class TestCountConservation:
             rules["numobs<=2"]["valid_pixels_removed"]
             >= (rules["numobs==0"]["valid_pixels_removed"])
         )
+
+
+class TestRegistrationScan:
+    """Does the *data* agree the grid is aligned, independent of the code?"""
+
+    @pytest.fixture
+    def shifted(self, scene):
+        ged_dir, numobs, tmp_path = scene
+        numobs[1, 3] = 0
+        write_granule(ged_dir, 40, -75, numobs)
+        dn = np.full((360, 360), 11000, dtype=np.uint16)
+        dn[PX_PER_CELL : 2 * PX_PER_CELL, 3 * PX_PER_CELL : 4 * PX_PER_CELL] = 13000
+        raster = write_raster(tmp_path / "lst.tif", dn)
+        return analyze(raster=str(raster), tile=None, ged_dir=ged_dir, buffer_cells=0)
+
+    def test_the_identity_shift_wins(self, shifted):
+        scan = shifted["registration_scan"]
+        assert scan["best_shift"] == [0, 0]
+        assert scan["identity_is_best"] is True
+
+    def test_the_scan_covers_plus_minus_two_cells(self, shifted):
+        scan = shifted["registration_scan"]
+        assert scan["radius"] == 2
+        assert len(scan["table"]) == 25
+        assert {(r["d_row"], r["d_col"]) for r in scan["table"]} == {
+            (dr, dc) for dr in range(-2, 3) for dc in range(-2, 3)
+        }
+
+    def test_a_one_cell_shift_loses_every_hot_pixel(self, shifted):
+        """The gap cell is isolated, so a shift of one cell finds nothing."""
+        table = {
+            (r["d_row"], r["d_col"]): r["hot_on_gap_cells"]
+            for r in shifted["registration_scan"]["table"]
+        }
+        assert table[(0, 0)] == PX_PER_CELL * PX_PER_CELL
+        assert table[(1, 0)] == 0
+        assert table[(0, 1)] == 0
+
+    def test_a_deliberately_misregistered_grid_is_detected(self, scene):
+        """Move the gap cell one north of the hot block; the peak must move."""
+        ged_dir, numobs, tmp_path = scene
+        numobs[0, 3] = 0
+        write_granule(ged_dir, 40, -75, numobs)
+        dn = np.full((360, 360), 11000, dtype=np.uint16)
+        dn[PX_PER_CELL : 2 * PX_PER_CELL, 3 * PX_PER_CELL : 4 * PX_PER_CELL] = 13000
+        raster = write_raster(tmp_path / "lst.tif", dn)
+        scan = analyze(raster=str(raster), tile=None, ged_dir=ged_dir, buffer_cells=0)[
+            "registration_scan"
+        ]
+        assert scan["best_shift"] == [-1, 0]
+        assert scan["identity_is_best"] is False
 
 
 class TestRecord:

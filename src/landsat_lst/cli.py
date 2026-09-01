@@ -1667,6 +1667,120 @@ def tile_info(tile_name: str) -> None:
 
 @main.command()
 @click.option(
+    "--ged-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Granule archive to measure (default: settings.ged_dir)",
+)
+@click.option(
+    "--artifact",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Measure this artifact's consumed manifest instead of a directory",
+)
+@click.option(
+    "--fetch-domain",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="180x360 .npy of the 1-degree cells the archive's fetch requested. "
+    "Refines *why* a granule is absent; it is not an upstream inventory.",
+)
+@click.option("--buffer-cells", type=int, default=None, help="Margin ring, default from settings")
+@click.option(
+    "--out",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write the machine-readable record here",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the record instead of a table")
+def ged_coverage(
+    *,
+    ged_dir: Path | None,
+    artifact: Path | None,
+    fetch_domain: Path | None,
+    buffer_cells: int | None,
+    out: Path | None,
+    as_json: bool,
+) -> None:
+    """Check a GED source against what all 700 production land tiles need.
+
+    The expected manifest is local arithmetic over the production tile list,
+    the global grid, the configured buffer, and the granule naming grammar --
+    no network, no credentials, no fetching.
+
+    \b
+    Exits non-zero when the source cannot cover production, because
+    `ged_gap_mask` defaults on and a tile that reaches an unheld granule
+    fails rather than shipping unmasked.
+
+    Absence is classified by what was *requested*, never by what the
+    collection holds: no authoritative offline inventory of AG100 v003
+    exists, so upstream absence cannot be established here.
+    """
+    import json as json_module
+
+    from landsat_lst.ged_coverage import build_report
+
+    report = build_report(
+        ged_dir=ged_dir,
+        artifact=artifact,
+        buffer_cells=buffer_cells,
+        fetch_domain=fetch_domain,
+    )
+    counts = report.counts()
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json_module.dumps(report.as_dict(), indent=2) + "\n")
+    if as_json:
+        click.echo(json_module.dumps(report.as_dict(), indent=2))
+    else:
+        _print_ged_coverage(report, counts)
+        if out is not None:
+            console.print(f"\n  Written to {out}")
+    if not report.complete:
+        raise SystemExit(1)
+
+
+def _print_ged_coverage(report, counts: dict) -> None:
+    """Render the completeness verdict."""
+    source = report.fetch_domain_source
+    console.print("[bold]ASTER GED coverage against the production tile list[/bold]")
+    console.print(
+        f"  {counts['tiles']} land tiles, buffer {report.buffer_cells} cell "
+        f"-> {counts['expected']:,} granules expected"
+    )
+    console.print(
+        f"  held: {counts['consumed_of_expected']:,}   "
+        f"missing: {counts['missing']:,}   "
+        f"(of which inside a tile, not its margin: {counts['missing_core']:,})"
+    )
+    console.print(
+        f"  tiles that would fail: {counts['tiles_missing_core']:,} of {counts['tiles']}"
+        f"   tiles missing any granule: {counts['tiles_missing_any']:,}"
+    )
+    console.print(f"  held but not expected: {counts['extra_not_expected']:,}")
+    for key, value in sorted(counts.items()):
+        if key.startswith("class_"):
+            console.print(f"    {key[len('class_') :]:<32} {value:,}")
+    if source is None:
+        console.print(
+            "  [dim]No fetch-domain grid given, so every absence is unverified-upstream.[/dim]"
+        )
+    else:
+        console.print(f"  [dim]fetch domain: {source}[/dim]")
+    console.print(
+        "  [dim]No offline inventory of AG100 v003 exists, so none of these "
+        "labels claims a granule is absent upstream.[/dim]"
+    )
+    if report.complete:
+        console.print("\n[green]COMPLETE[/green] -- this source covers production.")
+    else:
+        console.print("\n[red]INCOMPLETE[/red] -- must not be packaged as the production mask.")
+
+
+@main.command()
+@click.option(
     "--raster",
     required=True,
     help="Published LST P95 COG: a local path, or an https/vsicurl URL. "

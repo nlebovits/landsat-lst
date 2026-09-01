@@ -187,6 +187,27 @@ observation counts. It does not trace which observations USGS used to retrieve
 any pixel's emissivity, so on its own it cannot show that interpolated
 emissivity *caused* a hot retrieval.
 
+### Whether a GED source can cover production at all
+
+The mask is on by default for all 700 land tiles, so the archive backing it has
+to be checked against what they need. That is local arithmetic -- the tile list,
+the global grid, the buffer, the naming grammar -- and it is
+`landsat-lst ged-coverage`, recorded in `results/decision/ged_coverage.json`.
+
+```bash
+uv run landsat-lst ged-coverage \
+  --ged-dir data/aster_ged \
+  --fetch-domain data/ghsl/cells_1deg_21_22_23_30.npy \
+  --out results/decision/ged_coverage.json
+```
+
+The local archive does **not** cover production: 19,300 granules are needed and
+8,444 of them are held, leaving 615 of 700 tiles missing a granule that falls
+inside the tile rather than its margin. That follows directly from the fetch
+described above, which requested urban cells only. No artifact is packaged into
+the wheel until this reports complete, because an artifact built from a partial
+archive reads exactly like one built over a region with no gaps.
+
 ## References
 
 - [ADR-006: Leave ASTER GED coverage gaps empty](adr/006-no-aster-gap-filling.md)

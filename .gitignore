@@ -73,6 +73,9 @@ data/ghsl/
 data/aster_ged/
 # Global GED gap-cell artifact (2.8 MB, over the pre-commit size cap);
 # rebuilt deterministically by scripts/build_ged_gap_mask.py
+# Slash-anchored, so this matches the repo-root build output only and NOT
+# src/landsat_lst/data/ged_gap_mask.npz, which is the packaged artifact and
+# must stay trackable. Do not broaden this to a bare glob.
 data/ged_gap_mask.npz
 .serena/
 
@@ -98,3 +101,4 @@ results/decision/*
 !results/decision/offset_subsampling_validation.json
 !results/decision/destripe_composite_comparison.json
 !results/decision/ged_gap_s30w065.json
+!results/decision/ged_coverage.json

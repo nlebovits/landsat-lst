@@ -143,6 +143,8 @@ class _Accumulator:
         default_factory=lambda: np.zeros(len(TIER_LABELS) * _N_STATES, dtype=np.int64)
     )
     rules: dict[str, np.ndarray] = field(default_factory=dict)
+    hot_rows: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int32))
+    hot_cols: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int32))
 
     def rule(self, name: str) -> np.ndarray:
         """The ``(cool, hot, missing)`` tally for one candidate mask rule."""
@@ -261,6 +263,8 @@ def _walk(
     acc = _Accumulator()
     n_codes = len(TIER_LABELS) * _N_STATES
     width = int(src.width)
+    hot_rows: list[np.ndarray] = []
+    hot_cols: list[np.ndarray] = []
     for row0 in range(0, int(src.height), block_rows):
         rows = min(block_rows, int(src.height) - row0)
         # from_slices, not the Window constructor: attrs generates the latter's
@@ -277,12 +281,22 @@ def _walk(
         code = cell_tiers[index].astype(np.int64) * _N_STATES + state
         acc.hist += np.bincount(code.ravel(), minlength=n_codes)
 
+        # The hot tail is a few thousand pixels on a 324 M-pixel tile, so
+        # keeping its coordinates costs nothing and buys the registration
+        # scan an independent check on the cell mapping.
+        hr, hc = np.nonzero(hot & ~missing)
+        if hr.size:
+            hot_rows.append(hr.astype(np.int32) + row0)
+            hot_cols.append(hc.astype(np.int32))
+
         for name, cells in rule_cells.items():
             removed = cells[index]
             tally = acc.rule(name)
             tally[0] += int(np.count_nonzero(removed & ~missing & ~hot))
             tally[1] += int(np.count_nonzero(removed & hot))
             tally[2] += int(np.count_nonzero(removed & missing))
+    acc.hot_rows = np.concatenate(hot_rows) if hot_rows else np.empty(0, dtype=np.int32)
+    acc.hot_cols = np.concatenate(hot_cols) if hot_cols else np.empty(0, dtype=np.int32)
     return acc
 
 
@@ -361,6 +375,68 @@ def _tradeoffs(acc: _Accumulator, totals: dict[str, Any]) -> list[dict[str, Any]
     return out
 
 
+def registration_scan(
+    *,
+    numobs: np.ndarray,
+    row_cells: np.ndarray,
+    col_cells: np.ndarray,
+    hot_rows: np.ndarray,
+    hot_cols: np.ndarray,
+    radius: int = 2,
+) -> dict[str, Any]:
+    """Shift the GED grid against the output grid and see where the tail lands.
+
+    An independent check on the mapping. Every unit test of orientation and
+    cell size is a statement about code agreeing with itself; this one asks
+    the *data* whether the alignment is right. If the hot tail concentrates
+    in ``NumObs == 0`` cells only when the grid is offset by a cell, the
+    mapping is wrong however self-consistent it looks -- and a future change
+    that shifts registration by one cell shows up here as the peak moving off
+    ``(0, 0)``.
+
+    Returns:
+        The count of hot pixels landing on a gap cell at each shift, the
+        winning shift, and whether it is the identity.
+    """
+    gap = numobs == 0
+    height, width = gap.shape
+    base_r = row_cells[hot_rows]
+    base_c = col_cells[hot_cols]
+    counts: dict[tuple[int, int], int] = {}
+    for dr in range(-radius, radius + 1):
+        for dc in range(-radius, radius + 1):
+            r, c = base_r + dr, base_c + dc
+            # Out of the window is a miss, never a clamp: clipping would fold
+            # every over-shifted pixel onto the edge row and let an impossible
+            # shift tie with the true one.
+            inside = (r >= 0) & (r < height) & (c >= 0) & (c < width)
+            counts[(dr, dc)] = int(np.count_nonzero(gap[r[inside], c[inside]]))
+    # Sorted so the identity is considered first and a tie keeps the smallest
+    # shift rather than whichever the loop happened to reach first.
+    order = sorted(counts, key=lambda s: (abs(s[0]) + abs(s[1]), s))
+    best, best_count = (0, 0), -1
+    for shift in order:
+        if counts[shift] > best_count:
+            best, best_count = shift, counts[shift]
+    table = [
+        {"d_row": dr, "d_col": dc, "hot_on_gap_cells": counts[(dr, dc)]}
+        for dr in range(-radius, radius + 1)
+        for dc in range(-radius, radius + 1)
+    ]
+    return {
+        "radius": radius,
+        "table": table,
+        "best_shift": list(best),
+        "best_count": best_count,
+        "identity_is_best": best == (0, 0),
+        "note": (
+            "Hot pixels landing on NumObs == 0 cells, as the GED grid is "
+            "shifted against the output grid. The identity shift must win, or "
+            "the cell mapping is misregistered."
+        ),
+    }
+
+
 def analyze(
     *,
     raster: str,
@@ -425,6 +501,13 @@ def analyze(
         )
 
     table = _cross_tab(acc)
+    registration = registration_scan(
+        numobs=numobs,
+        row_cells=row_cells,
+        col_cells=col_cells,
+        hot_rows=acc.hot_rows,
+        hot_cols=acc.hot_cols,
+    )
     return {
         "analysis_version": ANALYSIS_VERSION,
         "association_only": (
@@ -451,5 +534,6 @@ def analyze(
             "rule": "valid pixels with DN >= hot_threshold_dn",
         },
         **table,
+        "registration_scan": registration,
         "mask_tradeoffs": _tradeoffs(acc, table["tile_totals"]),
     }

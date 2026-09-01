@@ -235,7 +235,11 @@ class TestArtifact:
         numobs[3, 3] = 0
         fixture_granules(ged_env, core_numobs=numobs)
         report = build_artifact(ged_env, settings.ged_artifact)
-        assert report == {"granules": 4, "gap_cells": 1}
+        assert report["granules"] == 4
+        assert report["gap_cells"] == 1
+        # v2 also records provenance; tests/unit/test_ged_artifact.py owns it.
+        assert len(report["content_sha256"]) == 64
+        assert report["complete"] is False
 
     def test_build_refuses_an_empty_dir(self, ged_env):
         ged_env.mkdir(parents=True, exist_ok=True)

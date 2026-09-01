@@ -182,6 +182,143 @@
       "missing_enrichment_vs_tile": null
     }
   ],
+  "registration_scan": {
+    "radius": 2,
+    "table": [
+      {
+        "d_row": -2,
+        "d_col": -2,
+        "hot_on_gap_cells": 593
+      },
+      {
+        "d_row": -2,
+        "d_col": -1,
+        "hot_on_gap_cells": 773
+      },
+      {
+        "d_row": -2,
+        "d_col": 0,
+        "hot_on_gap_cells": 1238
+      },
+      {
+        "d_row": -2,
+        "d_col": 1,
+        "hot_on_gap_cells": 1208
+      },
+      {
+        "d_row": -2,
+        "d_col": 2,
+        "hot_on_gap_cells": 534
+      },
+      {
+        "d_row": -1,
+        "d_col": -2,
+        "hot_on_gap_cells": 1012
+      },
+      {
+        "d_row": -1,
+        "d_col": -1,
+        "hot_on_gap_cells": 1313
+      },
+      {
+        "d_row": -1,
+        "d_col": 0,
+        "hot_on_gap_cells": 1589
+      },
+      {
+        "d_row": -1,
+        "d_col": 1,
+        "hot_on_gap_cells": 1213
+      },
+      {
+        "d_row": -1,
+        "d_col": 2,
+        "hot_on_gap_cells": 617
+      },
+      {
+        "d_row": 0,
+        "d_col": -2,
+        "hot_on_gap_cells": 779
+      },
+      {
+        "d_row": 0,
+        "d_col": -1,
+        "hot_on_gap_cells": 1297
+      },
+      {
+        "d_row": 0,
+        "d_col": 0,
+        "hot_on_gap_cells": 2231
+      },
+      {
+        "d_row": 0,
+        "d_col": 1,
+        "hot_on_gap_cells": 1699
+      },
+      {
+        "d_row": 0,
+        "d_col": 2,
+        "hot_on_gap_cells": 952
+      },
+      {
+        "d_row": 1,
+        "d_col": -2,
+        "hot_on_gap_cells": 590
+      },
+      {
+        "d_row": 1,
+        "d_col": -1,
+        "hot_on_gap_cells": 964
+      },
+      {
+        "d_row": 1,
+        "d_col": 0,
+        "hot_on_gap_cells": 1235
+      },
+      {
+        "d_row": 1,
+        "d_col": 1,
+        "hot_on_gap_cells": 1248
+      },
+      {
+        "d_row": 1,
+        "d_col": 2,
+        "hot_on_gap_cells": 1086
+      },
+      {
+        "d_row": 2,
+        "d_col": -2,
+        "hot_on_gap_cells": 555
+      },
+      {
+        "d_row": 2,
+        "d_col": -1,
+        "hot_on_gap_cells": 827
+      },
+      {
+        "d_row": 2,
+        "d_col": 0,
+        "hot_on_gap_cells": 912
+      },
+      {
+        "d_row": 2,
+        "d_col": 1,
+        "hot_on_gap_cells": 658
+      },
+      {
+        "d_row": 2,
+        "d_col": 2,
+        "hot_on_gap_cells": 745
+      }
+    ],
+    "best_shift": [
+      0,
+      0
+    ],
+    "best_count": 2231,
+    "identity_is_best": true,
+    "note": "Hot pixels landing on NumObs == 0 cells, as the GED grid is shifted against the output grid. The identity shift must win, or the cell mapping is misregistered."
+  },
   "mask_tradeoffs": [
     {
       "rule": "numobs==0",

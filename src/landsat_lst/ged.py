@@ -1,14 +1,23 @@
 """ASTER GED emissivity-gap masking.
 
 USGS's Landsat Collection 2 surface temperature is retrieved against ASTER
-GED v3 (AG100) emissivity. Where GED has no observations (``NumObs == 0``)
-the emissivity is interpolated, and the per-pixel check on S30W065
-(2026-08-23, results/ged-mask-check/) showed the consequence: the gap cores
-produce ST fill (the missing blobs) and the contaminated fringe produces
-spurious 70-78 degC retrievals that the P95 promotes. The confirmed rule is
-to mask ``NumObs == 0`` cells plus a 1 km buffer, which on S30W065 removes
-0.863% of valid pixels and 92.45% of the >= 70 degC artifact tail. See
-docs/findings-aster-ged-gaps.md and docs/methodology.md.
+GED v3 (AG100) emissivity, which USGS interpolates where GED has no
+observations (``NumObs == 0``). The tracked per-pixel cross-tab of the
+published S30W065 tile (``landsat-lst ged-analyze``, recorded in
+results/decision/ged_gap_s30w065.json) measures a strong
+**spatial association** with those cells: they hold 79.9% of the tile's
+>= 70 degC pixels at 369x the tile's base rate, and 99.6% of its missing
+pixels, while ``NumObs >= 4`` cells hold none of the tail at all. The
+association is not a causal trace -- nothing here follows which ASTER
+observations produced a given pixel's emissivity -- so the mask is justified
+by where the artifacts sit, not by a demonstrated mechanism.
+
+The adopted rule masks ``NumObs == 0`` cells plus a 1 km buffer, which on
+S30W065 removes 0.8642% of valid pixels and 92.45% of the >= 70 degC tail
+(whose maximum is 77.87 degC, from the published COG's own band statistics).
+Note 0.8642%, not the 0.863% quoted before: the earlier pass clipped its
+dilation at the tile edge, and the production form pads the cell window
+instead. See docs/findings-aster-ged-gaps.md and docs/methodology.md.
 
 The mask applies to the **composite output only** -- masked pixels become
 nodata in the LST P95 COG, exactly like the land mask. It never reaches
@@ -19,11 +28,15 @@ evidence behind every P95 value.
 Two sources build the same mask:
 
 - **The artifact** (:func:`build_artifact`'s ``.npz``): one compact global
-  record of every gap cell plus a 1-degree granule-coverage grid, built once
-  by ``scripts/build_ged_gap_mask.py`` from the local granule archive. This
-  is the production path -- a fleet VM ships one small file, not 8,776
-  granules. A 1-degree cell outside the coverage grid holds no granule in
-  the collection (open ocean; the land mask owns it) and contributes no gap.
+  record of every gap cell plus the manifest of granules the build actually
+  consumed, built by ``scripts/build_ged_gap_mask.py`` from a granule
+  archive. This is the production path -- a fleet VM ships one small file,
+  not thousands of granules. An earlier version stored a 1-degree "coverage
+  grid" and read a cell outside it as holding no granule upstream; that was
+  circular, because the grid was built by listing the local directory, so an
+  undownloaded granule and an ocean cell set the same bit. The consumed
+  manifest replaces it, and a geobox reaching outside it now raises
+  :class:`MissingGranuleError` rather than quietly reading zero gaps.
 - **The granules** (AG100 v3 HDF5, 1x1 degree, 100x100 cells of 0.01 deg):
   read directly when no artifact exists. A granule that is *absent* on this
   path is an error naming the granule ids, never a silent skip -- a missing
@@ -35,6 +48,9 @@ Both paths were verified to produce identical masks on S30W065.
 
 from __future__ import annotations
 
+import hashlib
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -45,7 +61,7 @@ from landsat_lst.config import settings
 log = structlog.get_logger()
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Sequence
 
     from odc.geo.geobox import GeoBox
 
@@ -65,8 +81,22 @@ GLOBAL_CELL_COLS = 360 * GED_CELLS_PER_DEGREE
 NUMOBS_ABSENT = -1
 
 #: Bumped when the artifact layout changes; a mismatched artifact is refused
-#: rather than reinterpreted.
-ARTIFACT_FORMAT_VERSION = 1
+#: rather than reinterpreted. v2 adds the consumed manifest, its per-granule
+#: digests, the expected manifest, and the canonical content hash -- without
+#: which a partial archive is indistinguishable from a gap-free region.
+ARTIFACT_FORMAT_VERSION = 2
+
+#: Recorded in the artifact and hashed into its content digest.
+GED_PRODUCT = "ASTER GED AG100 v003 (AG1km.v003, 0010)"
+
+#: The content hash of the *published* artifact, verified on load. ``None``
+#: means no artifact is published with this package: the local archive covers
+#: 8,771 of the 19,300 granules the 700 production land tiles need, so any
+#: artifact built today is partial and packaging one would ship a mask that
+#: looks successful while masking nothing over two thirds of the world. See
+#: ``landsat-lst ged-coverage``. Pin the digest here in the same commit that
+#: adds ``src/landsat_lst/data/ged_gap_mask.npz``.
+GED_ARTIFACT_CONTENT_SHA256: str | None = None
 
 
 class MissingGranuleError(FileNotFoundError):
@@ -80,17 +110,28 @@ class MissingGranuleError(FileNotFoundError):
     for.
     """
 
-    def __init__(self, granules: list[str], ged_dir: Path) -> None:
+    def __init__(self, granules: list[str], source: Path, *, source_kind: str = "granules") -> None:
         self.granules = granules
+        self.source_kind = source_kind
         listing = ", ".join(granules)
-        super().__init__(
-            f"{len(granules)} ASTER GED granule(s) missing from {ged_dir}: "
-            f"{listing}. A missing granule means an unmasked tile, so this is "
-            "an error, never a skip. Fetch the granules, or build the global "
-            "artifact with scripts/build_ged_gap_mask.py -- its coverage grid "
-            "distinguishes a granule the collection never had (open ocean, no "
-            "gap contribution) from one this machine is missing."
-        )
+        if source_kind == "artifact":
+            detail = (
+                f"the artifact {source} was built without them. An unconsumed "
+                "granule contributes no gap cells, which is byte-identical to a "
+                "granule that has none -- so continuing would mask nothing here "
+                "and the tile would ship looking successful. Rebuild the "
+                "artifact from an archive that covers these granules "
+                "(scripts/build_ged_gap_mask.py); `landsat-lst ged-coverage` "
+                "lists everything the 700 production tiles need."
+            )
+        else:
+            detail = (
+                f"they are missing from {source}. A missing granule means an "
+                "unmasked tile, so this is an error, never a skip. Fetch the "
+                "granules, or build the global artifact with "
+                "scripts/build_ged_gap_mask.py from an archive that has them."
+            )
+        super().__init__(f"{len(granules)} ASTER GED granule(s) needed: {listing}. {detail}")
 
 
 def granule_name(lat_top: int, lon_west: int) -> str:
@@ -140,33 +181,101 @@ def read_granule_numobs(path: Path) -> np.ndarray:
     return numobs
 
 
-def build_artifact(ged_dir: Path, out_path: Path) -> dict[str, int]:
+def _build_code_digest() -> str:
+    """A digest of the code that decides artifact *content*.
+
+    Narrow on purpose: the granule reader, the name grammar, and the build
+    itself. Hashing the whole module would churn on every docstring edit and
+    make the digest meaningless as a "would this rebuild differ" signal.
+    """
+    import inspect  # noqa: PLC0415
+
+    src = "".join(
+        inspect.getsource(fn)
+        for fn in (granule_name, read_granule_numobs, granules_for_window, build_artifact)
+    )
+    return hashlib.sha256(src.encode()).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def canonical_content_hash(
+    *,
+    gap_rows: np.ndarray,
+    gap_cols: np.ndarray,
+    consumed: Sequence[str],
+    consumed_sha256: Sequence[str],
+    product: str,
+) -> str:
+    """Hash the artifact's *content*, independent of how it was serialized.
+
+    Over canonically ordered array bytes rather than the ``.npz`` file: a zip
+    embeds timestamps and per-member compression state, so two byte-identical
+    builds produce different file digests and a file digest can never be
+    pinned. Gap cells are sorted and written as fixed big-endian ``int32``,
+    so the digest is stable across platforms as well as across rebuilds.
+    """
+    order = np.lexsort((gap_cols, gap_rows))
+    h = hashlib.sha256()
+    h.update(f"ged-artifact-v{ARTIFACT_FORMAT_VERSION}\n".encode())
+    h.update(f"{product}\n".encode())
+    for name, digest in sorted(zip(consumed, consumed_sha256, strict=True)):
+        h.update(f"{name} {digest}\n".encode())
+    h.update(np.asarray(gap_rows, dtype=">i4")[order].tobytes())
+    h.update(np.asarray(gap_cols, dtype=">i4")[order].tobytes())
+    return h.hexdigest()
+
+
+def build_artifact(
+    ged_dir: Path, out_path: Path, *, expected: Sequence[str] | None = None
+) -> dict[str, object]:
     """Scan every granule under ``ged_dir`` into one compact global artifact.
 
-    The artifact stores the *unbuffered* gap cells (``NumObs == 0``) as
-    global cell indices plus a 1-degree coverage grid of which granules
-    exist. The buffer is applied at load time from
+    The artifact stores the *unbuffered* gap cells (``NumObs == 0``) as global
+    cell indices. The buffer is applied at load time from
     ``settings.ged_gap_buffer_cells``, so a buffer change never needs a
     rebuild. Gap cells are rare (0.24% of cells on S30W065), which is why a
     sparse index list beats the 0.93 GB dense global grid.
 
+    It also stores **what it consumed**, and that is the load-bearing part.
+    An artifact built from a partial archive is indistinguishable, cell for
+    cell, from one built from a complete archive over a region with no gaps:
+    both say "no gap cells here". The consumed manifest is what lets
+    :func:`gap_mask_for_geobox` tell those apart and refuse the first.
+
+    Args:
+        ged_dir: Directory of AG100 v003 granules to consume.
+        out_path: Where to write the ``.npz``.
+        expected: The manifest a complete artifact would need, from
+            :func:`landsat_lst.ged_coverage.expected_granules`. Recorded
+            alongside the consumed set so the artifact carries its own
+            completeness verdict rather than relying on a separate report.
+
     Returns:
-        Counts for the build report: granules scanned and gap cells found.
+        The build report, including the canonical content hash.
     """
     rows: list[np.ndarray] = []
     cols: list[np.ndarray] = []
-    coverage = np.zeros((180, 360), dtype=np.uint8)
 
     granules = sorted(ged_dir.glob("AG1km.v003.*.0010.h5"))
     if not granules:
         msg = f"no AG1km.v003.*.0010.h5 granules under {ged_dir}"
         raise FileNotFoundError(msg)
 
+    consumed: list[str] = []
+    digests: list[str] = []
     for path in granules:
         parts = path.name.split(".")
         lat_top, lon_west = int(parts[2]), int(parts[3])
-        coverage[90 - lat_top, lon_west + 180] = 1
         numobs = read_granule_numobs(path)
+        consumed.append(path.name)
+        digests.append(_file_sha256(path))
         gap_r, gap_c = np.nonzero(numobs == 0)
         if gap_r.size:
             row0 = (90 - lat_top) * GRANULE_CELLS
@@ -176,19 +285,50 @@ def build_artifact(ged_dir: Path, out_path: Path) -> dict[str, int]:
 
     gap_rows = np.concatenate(rows) if rows else np.empty(0, dtype=np.int32)
     gap_cols = np.concatenate(cols) if cols else np.empty(0, dtype=np.int32)
+    expected_list = sorted(expected) if expected is not None else []
+    missing = sorted(set(expected_list) - set(consumed))
+    content = canonical_content_hash(
+        gap_rows=gap_rows,
+        gap_cols=gap_cols,
+        consumed=consumed,
+        consumed_sha256=digests,
+        product=GED_PRODUCT,
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out_path,
         format_version=np.int32(ARTIFACT_FORMAT_VERSION),
         gap_rows=gap_rows,
         gap_cols=gap_cols,
-        coverage=coverage,
-        granule_count=np.int32(len(granules)),
+        product=np.str_(GED_PRODUCT),
+        consumed=np.array(consumed, dtype=np.str_),
+        consumed_sha256=np.array(digests, dtype=np.str_),
+        expected=np.array(expected_list, dtype=np.str_),
+        missing_expected=np.array(missing, dtype=np.str_),
+        content_sha256=np.str_(content),
+        build_code_sha256=np.str_(_build_code_digest()),
     )
-    return {"granules": len(granules), "gap_cells": int(gap_rows.size)}
+    return {
+        "granules": len(consumed),
+        "gap_cells": int(gap_rows.size),
+        "expected": len(expected_list),
+        "missing_expected": len(missing),
+        "content_sha256": content,
+        "build_code_sha256": _build_code_digest(),
+        "complete": expected is not None and not missing,
+    }
 
 
-def _load_artifact(path: Path) -> dict[str, np.ndarray]:
+@dataclass(frozen=True)
+class _Artifact:
+    """A loaded, verified artifact: its gap cells and what it was built from."""
+
+    gap_rows: np.ndarray
+    gap_cols: np.ndarray
+    consumed: frozenset[str]
+
+
+def _load_artifact(path: Path) -> _Artifact:
     with np.load(path) as data:
         version = int(data["format_version"])
         if version != ARTIFACT_FORMAT_VERSION:
@@ -198,22 +338,162 @@ def _load_artifact(path: Path) -> dict[str, np.ndarray]:
                 "scripts/build_ged_gap_mask.py"
             )
             raise ValueError(msg)
-        return {"gap_rows": data["gap_rows"], "gap_cols": data["gap_cols"]}
+        gap_rows = data["gap_rows"]
+        gap_cols = data["gap_cols"]
+        consumed = [str(x) for x in data["consumed"]]
+        digests = [str(x) for x in data["consumed_sha256"]]
+        stored = str(data["content_sha256"])
+        product = str(data["product"])
+
+    recomputed = canonical_content_hash(
+        gap_rows=gap_rows,
+        gap_cols=gap_cols,
+        consumed=consumed,
+        consumed_sha256=digests,
+        product=product,
+    )
+    if recomputed != stored:
+        msg = (
+            f"GED gap artifact {path} is self-inconsistent: it stores content "
+            f"hash {stored} but its arrays hash to {recomputed}. The file is "
+            "corrupt or was edited after the build; rebuild it with "
+            "scripts/build_ged_gap_mask.py."
+        )
+        raise ValueError(msg)
+    if GED_ARTIFACT_CONTENT_SHA256 is not None and stored != GED_ARTIFACT_CONTENT_SHA256:
+        msg = (
+            f"GED gap artifact {path} has content hash {stored}, but this code "
+            f"pins {GED_ARTIFACT_CONTENT_SHA256}. A mask built from different "
+            "granules is a different product; update GED_ARTIFACT_CONTENT_SHA256 "
+            "in landsat_lst/ged.py deliberately, or point LST_GED_ARTIFACT at "
+            "the pinned artifact."
+        )
+        raise ValueError(msg)
+    return _Artifact(gap_rows=gap_rows, gap_cols=gap_cols, consumed=frozenset(consumed))
 
 
 def _cells_from_artifact(
-    artifact: Path, *, row0: int, row1: int, col0: int, col1: int
+    artifact: Path,
+    *,
+    row0: int,
+    row1: int,
+    col0: int,
+    col1: int,
+    core: tuple[int, int, int, int],
 ) -> np.ndarray:
-    """Cut the [row0:row1, col0:col1] window of gap cells out of the artifact."""
+    """Cut the [row0:row1, col0:col1] window of gap cells out of the artifact.
+
+    Refuses first. A granule the build never consumed contributes no gap
+    cells, which is byte-identical to a granule that genuinely has none -- so
+    an artifact built from a partial archive would mask a tile's gaps away
+    silently, and the tile would ship looking successful. The consumed
+    manifest turns that into a :class:`MissingGranuleError` naming the ids,
+    matching what the granule path already does for an absent file.
+    """
     data = _load_artifact(artifact)
+    consumed = data.consumed
+    missing_core: list[str] = []
+    missing_margin: list[str] = []
+    for name, _, _, touches_core in granules_for_window(
+        row0=row0, row1=row1, col0=col0, col1=col1, core=core
+    ):
+        if name not in consumed:
+            (missing_core if touches_core else missing_margin).append(name)
+    if missing_core:
+        raise MissingGranuleError(missing_core, artifact, source_kind="artifact")
+    if missing_margin:
+        log.warning(
+            "ged_margin_granules_absent",
+            granules=missing_margin,
+            note="margin-ring only; outside the artifact's consumed manifest",
+        )
+
     cells = np.zeros((row1 - row0, col1 - col0), dtype=bool)
-    rows, cols = data["gap_rows"].astype(np.int64), data["gap_cols"].astype(np.int64)
+    rows = data.gap_rows.astype(np.int64)
+    cols = data.gap_cols.astype(np.int64)
     # A window past the antimeridian addresses columns modulo the globe.
     for shift in (0, GLOBAL_CELL_COLS, -GLOBAL_CELL_COLS):
         c = cols + shift
         inside = (rows >= row0) & (rows < row1) & (c >= col0) & (c < col1)
         cells[rows[inside] - row0, c[inside] - col0] = True
     return cells
+
+
+def granules_for_window(
+    *,
+    row0: int,
+    row1: int,
+    col0: int,
+    col1: int,
+    core: tuple[int, int, int, int] | None = None,
+) -> list[tuple[str, int, int, bool]]:
+    """Every granule a cell window touches, as ``(name, row0, col0, core)``.
+
+    The one place the window-to-granule grammar lives. :func:`numobs_window`
+    reads with it, :mod:`landsat_lst.ged_coverage` derives the expected
+    manifest with it, and the artifact's coverage check tests against it, so
+    a tile can never need a granule the completeness report did not count.
+
+    ``core`` is the un-padded window; a granule overlapping it is flagged,
+    because a *core* absence leaves unmasked pixels inside the tile while a
+    *margin* absence only forgoes a buffer contribution. Columns wrap the
+    antimeridian modulo the globe.
+
+    Returns:
+        One entry per granule: its filename, its global cell origin, and
+        whether it overlaps ``core`` (always True when ``core`` is None).
+    """
+    core_row0, core_row1, core_col0, core_col1 = (
+        core
+        if core is not None
+        else (
+            row0,
+            row1,
+            col0,
+            col1,
+        )
+    )
+    out: list[tuple[str, int, int, bool]] = []
+    for grow in range(row0 // GRANULE_CELLS, (row1 - 1) // GRANULE_CELLS + 1):
+        lat_top = 90 - grow
+        g_r0 = grow * GRANULE_CELLS
+        for gcol in range(col0 // GRANULE_CELLS, (col1 - 1) // GRANULE_CELLS + 1):
+            lon_west = (gcol % 360) - 180
+            g_c0 = gcol * GRANULE_CELLS
+            touches_core = (
+                g_r0 < core_row1
+                and g_r0 + GRANULE_CELLS > core_row0
+                and g_c0 < core_col1
+                and g_c0 + GRANULE_CELLS > core_col0
+            )
+            out.append((granule_name(lat_top, lon_west), g_r0, g_c0, touches_core))
+    return out
+
+
+def cell_window_for_geobox(
+    geobox: GeoBox, buffer_cells: int
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """The padded cell window a geobox needs, and its un-padded core.
+
+    Returns ``(row_cells, col_cells, core, padded)``, where the cell index
+    arrays are global (subtract the padded origin to index a window array).
+    Shared so the mask, the NumObs reader, and the coverage report all agree
+    on which cells -- and therefore which granules -- a tile reaches.
+    """
+    row_cells, col_cells = cell_indices_for_geobox(geobox)
+    core = (
+        int(row_cells[0]),
+        int(row_cells[-1]) + 1,
+        int(col_cells[0]),
+        int(col_cells[-1]) + 1,
+    )
+    padded = (
+        max(core[0] - buffer_cells, 0),
+        min(core[1] + buffer_cells, GLOBAL_CELL_ROWS),
+        core[2] - buffer_cells,
+        core[3] + buffer_cells,
+    )
+    return row_cells, col_cells, core, padded
 
 
 def numobs_window(
@@ -243,34 +523,23 @@ def numobs_window(
     path also cannot see would make the two paths disagree. The absence is
     logged, never silent.
     """
-    core_row0, core_row1, core_col0, core_col1 = core
     cells = np.full((row1 - row0, col1 - col0), NUMOBS_ABSENT, dtype=np.int16)
     missing_core: list[str] = []
     missing_margin: list[str] = []
-    for grow in range(row0 // GRANULE_CELLS, (row1 - 1) // GRANULE_CELLS + 1):
-        lat_top = 90 - grow
-        g_r0 = grow * GRANULE_CELLS
-        for gcol in range(col0 // GRANULE_CELLS, (col1 - 1) // GRANULE_CELLS + 1):
-            lon_west = (gcol % 360) - 180
-            g_c0 = gcol * GRANULE_CELLS
-            name = granule_name(lat_top, lon_west)
-            path = ged_dir / name
-            if not path.exists():
-                touches_core = (
-                    g_r0 < core_row1
-                    and g_r0 + GRANULE_CELLS > core_row0
-                    and g_c0 < core_col1
-                    and g_c0 + GRANULE_CELLS > core_col0
-                )
-                (missing_core if touches_core else missing_margin).append(name)
-                continue
-            numobs = read_granule_numobs(path).astype(np.int16, copy=False)
-            # Granule's global cell window, clipped to the requested one.
-            r_lo, r_hi = max(g_r0, row0), min(g_r0 + GRANULE_CELLS, row1)
-            c_lo, c_hi = max(g_c0, col0), min(g_c0 + GRANULE_CELLS, col1)
-            cells[r_lo - row0 : r_hi - row0, c_lo - col0 : c_hi - col0] = numobs[
-                r_lo - g_r0 : r_hi - g_r0, c_lo - g_c0 : c_hi - g_c0
-            ]
+    for name, g_r0, g_c0, touches_core in granules_for_window(
+        row0=row0, row1=row1, col0=col0, col1=col1, core=core
+    ):
+        path = ged_dir / name
+        if not path.exists():
+            (missing_core if touches_core else missing_margin).append(name)
+            continue
+        numobs = read_granule_numobs(path).astype(np.int16, copy=False)
+        # Granule's global cell window, clipped to the requested one.
+        r_lo, r_hi = max(g_r0, row0), min(g_r0 + GRANULE_CELLS, row1)
+        c_lo, c_hi = max(g_c0, col0), min(g_c0 + GRANULE_CELLS, col1)
+        cells[r_lo - row0 : r_hi - row0, c_lo - col0 : c_hi - col0] = numobs[
+            r_lo - g_r0 : r_hi - g_r0, c_lo - g_c0 : c_hi - g_c0
+        ]
     if missing_core:
         raise MissingGranuleError(missing_core, ged_dir)
     if missing_margin:
@@ -360,35 +629,68 @@ def numobs_for_geobox(
         granule; ``row_cells`` and ``col_cells`` are *window-relative* indices,
         one per geobox row and column.
     """
-    row_cells, col_cells = cell_indices_for_geobox(geobox)
-    core = (
-        int(row_cells[0]),
-        int(row_cells[-1]) + 1,
-        int(col_cells[0]),
-        int(col_cells[-1]) + 1,
-    )
-    row0 = max(core[0] - pad_cells, 0)
-    row1 = min(core[1] + pad_cells, GLOBAL_CELL_ROWS)
-    col0 = core[2] - pad_cells
-    col1 = core[3] + pad_cells
+    row_cells, col_cells, core, padded = cell_window_for_geobox(geobox, pad_cells)
+    row0, row1, col0, col1 = padded
     numobs = numobs_window(ged_dir, row0=row0, row1=row1, col0=col0, col1=col1, core=core)
     return numobs, row_cells - row0, col_cells - col0
 
 
+#: Where a published artifact ships inside the wheel. Nothing is packaged
+#: there today (see :data:`GED_ARTIFACT_CONTENT_SHA256`); the resolver looks
+#: for it regardless, so publishing one is a build step and not a code change.
+PACKAGED_ARTIFACT = ("landsat_lst", "data/ged_gap_mask.npz")
+
+
+def packaged_artifact_path() -> Path | None:
+    """The artifact shipped inside the wheel, or None if none is packaged.
+
+    ``importlib.resources``, not a path relative to the working directory:
+    ``settings.ged_artifact``'s default is ``data/ged_gap_mask.npz``, which
+    resolves against the *CWD*. A fleet VM runs from wherever Coiled drops it
+    and never has the repo, so that default can only ever find the file on a
+    developer laptop sitting in the checkout.
+    """
+    from importlib.resources import as_file, files  # noqa: PLC0415
+
+    package, name = PACKAGED_ARTIFACT
+    # joinpath on a relative path, so no __init__.py is needed under data/.
+    try:
+        resource = files(package).joinpath(name)
+    except (ModuleNotFoundError, FileNotFoundError):
+        return None
+    if not resource.is_file():
+        return None
+    with as_file(resource) as path:
+        return Path(path)
+
+
 def _resolve_source() -> tuple[str, Path]:
-    """Pick the artifact when present, granules otherwise; refuse silence."""
+    """Pick a mask source, in a fixed order, and refuse silence.
+
+    1. ``settings.ged_artifact`` if that file exists -- the explicit override.
+    2. The artifact packaged in the wheel, which is what a VM has.
+    3. ``settings.ged_dir`` granules, the local-dev and build-time path.
+    4. Otherwise raise, naming all three, because the alternative is a
+       composite that ships unmasked without saying so.
+    """
     artifact = settings.ged_artifact
     if artifact.exists():
         return "artifact", artifact
+    packaged = packaged_artifact_path()
+    if packaged is not None:
+        return "artifact", packaged
     ged_dir = settings.ged_dir
     if ged_dir.is_dir():
         return "granules", ged_dir
+    packaged_name = "/".join(PACKAGED_ARTIFACT)
     msg = (
-        f"no GED gap-mask source: artifact {artifact} does not exist and "
-        f"granule directory {ged_dir} does not exist. The composite must not "
-        "ship unmasked; build the artifact with scripts/build_ged_gap_mask.py, "
-        "or set LST_GED_ARTIFACT / LST_GED_DIR, or disable the mask explicitly "
-        "with LST_GED_GAP_MASK=false."
+        "no GED gap-mask source. Tried, in order: the configured artifact "
+        f"{artifact} (absent); the packaged artifact {packaged_name} (not "
+        f"shipped in this build); the granule directory {ged_dir} (absent). "
+        "The composite must not ship unmasked, so this is an error. Set "
+        "LST_GED_ARTIFACT or LST_GED_DIR, build an artifact with "
+        "scripts/build_ged_gap_mask.py, or disable the mask explicitly with "
+        "LST_GED_GAP_MASK=false."
     )
     raise FileNotFoundError(msg)
 
@@ -429,22 +731,12 @@ def gap_mask_for_geobox(
     if buffer_cells is None:
         buffer_cells = settings.ged_gap_buffer_cells
 
-    row_cells, col_cells = cell_indices_for_geobox(geobox)
-
-    core = (
-        int(row_cells[0]),
-        int(row_cells[-1]) + 1,
-        int(col_cells[0]),
-        int(col_cells[-1]) + 1,
-    )
-    row0 = max(core[0] - buffer_cells, 0)
-    row1 = min(core[1] + buffer_cells, GLOBAL_CELL_ROWS)
-    col0 = core[2] - buffer_cells
-    col1 = core[3] + buffer_cells
+    row_cells, col_cells, core, padded = cell_window_for_geobox(geobox, buffer_cells)
+    row0, row1, col0, col1 = padded
 
     kind, source = _resolve_source()
     if kind == "artifact":
-        cells = _cells_from_artifact(source, row0=row0, row1=row1, col0=col0, col1=col1)
+        cells = _cells_from_artifact(source, row0=row0, row1=row1, col0=col0, col1=col1, core=core)
     else:
         cells = _cells_from_granules(source, row0=row0, row1=row1, col0=col0, col1=col1, core=core)
 
