@@ -85,8 +85,16 @@ data/ged_gap_mask.npz
 digest.txt
 
 # Decision-run outputs (large COGs + icechunk repo)
-results/
+results/*
 # ...except small calibration artifacts that justify a shipped default.
+# An excluded *directory* is never descended into, so a file inside it cannot
+# be re-included however specific the negation. `results/` therefore has to be
+# `results/*`, and every level down to the file re-included in turn; the bare
+# `!results/decision/x.json` these lines used to carry never matched anything,
+# and the files below are tracked only because they were force-added.
+!results/decision/
+results/decision/*
 !results/decision/destripe_cap_calibration.json
 !results/decision/offset_subsampling_validation.json
 !results/decision/destripe_composite_comparison.json
+!results/decision/ged_gap_s30w065.json

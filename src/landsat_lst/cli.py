@@ -1665,6 +1665,145 @@ def tile_info(tile_name: str) -> None:
     console.print("[red]Not yet implemented[/red]")
 
 
+@main.command()
+@click.option(
+    "--raster",
+    required=True,
+    help="Published LST P95 COG: a local path, or an https/vsicurl URL. "
+    "S30W065 is published at https://s3.us-west-2.amazonaws.com/"
+    "us-west-2.opendata.source.coop/nlebovits/landsat-lst/"
+    "lst-p95-2021-2025/S30W065/lst_p95_2021-2025_S30W065.tif",
+)
+@click.option("--tile", "-t", required=True, help="Tile the raster must be, e.g. S30W065")
+@click.option(
+    "--ged-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="AG100 v003 granule directory. Defaults to settings.ged_dir. The "
+    "tiering needs observation counts, which the compact gap artifact does "
+    "not carry -- it stores only the NumObs == 0 cells.",
+)
+@click.option("--threshold-c", type=float, default=70.0, help="Hot-tail lower bound, Celsius")
+@click.option("--buffer-cells", type=int, default=1, help="Dilation radius for the mask rules")
+@click.option("--block-rows", type=int, default=512, help="Rows per windowed read")
+@click.option(
+    "--out",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write the machine-readable record here",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the record instead of a table")
+def ged_analyze(
+    *,
+    raster: str,
+    tile: str,
+    ged_dir: Path | None,
+    threshold_c: float,
+    buffer_cells: int,
+    block_rows: int,
+    out: Path | None,
+    as_json: bool,
+) -> None:
+    """Cross-tab a published LST tile by ASTER GED observation count.
+
+    Every output pixel is placed in the ~1 km GED cell it falls inside and
+    counted as valid, missing, or hot-tail, per NumObs tier. The mapping is
+    `ged.cell_indices_for_geobox`, the same one the production mask uses, so
+    the analysis and the mask cannot drift apart.
+
+    \b
+    The result is a **spatial association**, not a causal trace: it does not
+    follow which ASTER observations produced any pixel's emissivity.
+
+    Reads are windowed, so an 18,000-squared tile costs one pass and a few
+    hundred MB whether the raster is local or an https URL.
+    """
+    import json as json_module
+
+    from landsat_lst.config import settings
+    from landsat_lst.ged_analysis import AnalysisInputError, analyze
+
+    source = ged_dir if ged_dir is not None else settings.ged_dir
+    if not Path(source).is_dir():
+        msg = f"GED granule directory {source} does not exist; pass --ged-dir or set LST_GED_DIR"
+        raise click.ClickException(msg)
+
+    try:
+        record = analyze(
+            raster=raster,
+            tile=tile,
+            ged_dir=Path(source),
+            hot_threshold_c=threshold_c,
+            buffer_cells=buffer_cells,
+            block_rows=block_rows,
+        )
+    except AnalysisInputError as e:
+        raise click.ClickException(str(e)) from e
+
+    text = json_module.dumps(record, indent=2, sort_keys=False)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text + "\n")
+    if as_json:
+        click.echo(text)
+        return
+    _print_ged_analysis(record)
+    if out is not None:
+        console.print(f"\n  Written to {out}")
+
+
+def _print_ged_analysis(record: dict) -> None:
+    """Render the cross-tab and the mask tradeoffs as tables."""
+    from rich.table import Table
+
+    raster, totals = record["raster"], record["tile_totals"]
+    console.print(f"[bold]{raster['source']}[/bold]")
+    console.print(
+        f"  {raster['height']} x {raster['width']} {raster['dtype']}  {raster['crs']}  "
+        f"nodata {raster['nodata']}  scale {raster['scale']}  offset {raster['offset']}"
+    )
+    console.print(f"  scenes: {raster['scene_count']}  ({raster['scene_count_source']})")
+    console.print(
+        f"  threshold: >= {record['threshold']['hot_threshold_c']} C "
+        f"= DN {record['threshold']['hot_threshold_dn']}"
+    )
+    console.print(
+        f"  tile: {totals['total_pixels']:,} px, {totals['valid_pixels']:,} valid, "
+        f"{totals['missing_pixels']:,} missing, {totals['hot_pixels']:,} hot "
+        f"({totals['hot_pct_of_valid']:.6f}% of valid)"
+    )
+
+    table = Table(title="Pixels by ASTER GED NumObs tier (spatial association)")
+    for name in ("NumObs", "total", "valid", "missing", "hot", "hot/valid %", "hot enrich."):
+        table.add_column(name, justify="left" if name == "NumObs" else "right")
+    for row in record["by_numobs_tier"]:
+        enrich = row["hot_enrichment_vs_tile"]
+        table.add_row(
+            row["tier"],
+            f"{row['total_pixels']:,}",
+            f"{row['valid_pixels']:,}",
+            f"{row['missing_pixels']:,}",
+            f"{row['hot_pixels']:,}",
+            "-" if row["hot_pct_of_tier_valid"] is None else f"{row['hot_pct_of_tier_valid']:.4f}",
+            "-" if enrich is None else f"{enrich:,.1f}x",
+        )
+    console.print(table)
+
+    trade = Table(title="Candidate mask rules")
+    for name in ("rule", "valid removed", "valid %", "hot removed", "hot %", "missing annotated"):
+        trade.add_column(name, justify="left" if name == "rule" else "right")
+    for row in record["mask_tradeoffs"]:
+        trade.add_row(
+            row["rule"],
+            f"{row['valid_pixels_removed']:,}",
+            f"{row['valid_pixels_removed_pct']:.3f}",
+            f"{row['hot_pixels_removed']:,}",
+            f"{row['hot_pixels_removed_pct']:.2f}",
+            f"{row['missing_pixels_annotated']:,}",
+        )
+    console.print(trade)
+
+
 @main.group()
 def catalog() -> None:
     """Build and validate the published STAC catalog."""

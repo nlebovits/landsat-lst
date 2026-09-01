@@ -166,6 +166,27 @@ Outputs land in `results/aster-gaps/`: `gap_by_class.csv`, `summary.json`,
 `fig_gap_by_class.png`, `report.md`, and the full tier mosaic on the SMOD grid
 as `gap_tiers_smod_grid.tif`.
 
+### The published-tile cross-tab
+
+The output mask adopted in #116 rests on a per-pixel pass over the published
+S30W065 tile, cross-tabbing every output pixel by the observation count of the
+GED cell it falls in. That pass is `landsat-lst ged-analyze`, and its record is
+`results/decision/ged_gap_s30w065.json`. Reading is windowed, so it costs one
+pass over the COG (~35 s, ~1.2 GB resident) and no cloud compute.
+
+```bash
+uv run --extra analysis landsat-lst ged-analyze \
+  --raster https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/landsat-lst/lst-p95-2021-2025/S30W065/lst_p95_2021-2025_S30W065.tif \
+  --tile S30W065 \
+  --ged-dir data/aster_ged \
+  --out results/decision/ged_gap_s30w065.json
+```
+
+The table is a **spatial association** between output pixels and ASTER
+observation counts. It does not trace which observations USGS used to retrieve
+any pixel's emissivity, so on its own it cannot show that interpolated
+emissivity *caused* a hot retrieval.
+
 ## References
 
 - [ADR-006: Leave ASTER GED coverage gaps empty](adr/006-no-aster-gap-filling.md)

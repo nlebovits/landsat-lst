@@ -60,6 +60,10 @@ GRANULE_CELLS = 100
 GLOBAL_CELL_ROWS = 180 * GED_CELLS_PER_DEGREE
 GLOBAL_CELL_COLS = 360 * GED_CELLS_PER_DEGREE
 
+#: Sentinel for a cell the AG100 collection holds no granule for. Distinct from
+#: ``NumObs == 0`` (a granule that exists and saw nothing), which is the gap.
+NUMOBS_ABSENT = -1
+
 #: Bumped when the artifact layout changes; a mismatched artifact is refused
 #: rather than reinterpreted.
 ARTIFACT_FORMAT_VERSION = 1
@@ -212,7 +216,7 @@ def _cells_from_artifact(
     return cells
 
 
-def _cells_from_granules(
+def numobs_window(
     ged_dir: Path,
     *,
     row0: int,
@@ -221,7 +225,11 @@ def _cells_from_granules(
     col1: int,
     core: tuple[int, int, int, int],
 ) -> np.ndarray:
-    """Mosaic NumObs == 0 over the cell window, reading granules from disk.
+    """Mosaic NumObs over the cell window, reading granules from disk.
+
+    Returns ``int16`` observation counts, with :data:`NUMOBS_ABSENT` where the
+    collection holds no granule. The gap mask is ``result == 0``, so an absent
+    granule contributes no gap -- matching the artifact path exactly.
 
     ``core`` is the un-padded cell window of the geobox itself. A granule
     covering any core cell must exist; absences are collected and raised
@@ -236,7 +244,7 @@ def _cells_from_granules(
     logged, never silent.
     """
     core_row0, core_row1, core_col0, core_col1 = core
-    cells = np.zeros((row1 - row0, col1 - col0), dtype=bool)
+    cells = np.full((row1 - row0, col1 - col0), NUMOBS_ABSENT, dtype=np.int16)
     missing_core: list[str] = []
     missing_margin: list[str] = []
     for grow in range(row0 // GRANULE_CELLS, (row1 - 1) // GRANULE_CELLS + 1):
@@ -256,12 +264,11 @@ def _cells_from_granules(
                 )
                 (missing_core if touches_core else missing_margin).append(name)
                 continue
-            numobs = read_granule_numobs(path)
-            gap = numobs == 0
+            numobs = read_granule_numobs(path).astype(np.int16, copy=False)
             # Granule's global cell window, clipped to the requested one.
             r_lo, r_hi = max(g_r0, row0), min(g_r0 + GRANULE_CELLS, row1)
             c_lo, c_hi = max(g_c0, col0), min(g_c0 + GRANULE_CELLS, col1)
-            cells[r_lo - row0 : r_hi - row0, c_lo - col0 : c_hi - col0] = gap[
+            cells[r_lo - row0 : r_hi - row0, c_lo - col0 : c_hi - col0] = numobs[
                 r_lo - g_r0 : r_hi - g_r0, c_lo - g_c0 : c_hi - g_c0
             ]
     if missing_core:
@@ -273,6 +280,19 @@ def _cells_from_granules(
             note="margin-ring only; no gap contribution, matching the artifact path",
         )
     return cells
+
+
+def _cells_from_granules(
+    ged_dir: Path,
+    *,
+    row0: int,
+    row1: int,
+    col0: int,
+    col1: int,
+    core: tuple[int, int, int, int],
+) -> np.ndarray:
+    """The ``NumObs == 0`` gap cells of :func:`numobs_window`."""
+    return numobs_window(ged_dir, row0=row0, row1=row1, col0=col0, col1=col1, core=core) == 0
 
 
 def dilate_cells(cells: np.ndarray, buffer_cells: int) -> np.ndarray:
@@ -293,6 +313,66 @@ def dilate_cells(cells: np.ndarray, buffer_cells: int) -> np.ndarray:
             src = cells[max(-dr, 0) : height - max(dr, 0), max(-dc, 0) : width - max(dc, 0)]
             out[max(dr, 0) : height + min(dr, 0), max(dc, 0) : width + min(dc, 0)] |= src
     return out
+
+
+def cell_indices_for_geobox(geobox: GeoBox) -> tuple[np.ndarray, np.ndarray]:
+    """Global GED cell index of every pixel center, as ``(rows, cols)``.
+
+    This is *the* grid mapping: :func:`gap_mask_for_geobox` masks with it and
+    any analysis cross-tabbing output pixels by ``NumObs`` must use it too, so
+    the two can never drift apart.
+
+    Pixel centers come from ``geobox.transform`` -- the grid's own affine, so a
+    row band's indices are the exact slice of its tile's. Each center maps to
+    its 0.01-degree cell by floor division; centers sit at odd multiples of
+    1/7200 degree while cell edges sit at multiples of 1/100, so a center can
+    never land on a cell boundary and the mapping has no float knife-edge.
+    """
+    height, width = int(geobox.shape[0]), int(geobox.shape[1])
+    t = geobox.transform
+    lon_centers = t.c + t.a * (np.arange(width) + 0.5)
+    lat_centers = t.f + t.e * (np.arange(height) + 0.5)
+    row_cells = np.floor((90.0 - lat_centers) * GED_CELLS_PER_DEGREE).astype(np.int64)
+    col_cells = np.floor((lon_centers + 180.0) * GED_CELLS_PER_DEGREE).astype(np.int64)
+    return row_cells, col_cells
+
+
+def numobs_for_geobox(
+    geobox: GeoBox, ged_dir: Path, *, pad_cells: int = 0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """NumObs over the geobox's cell window, plus the per-pixel cell indices.
+
+    The production mask is a boolean and the artifact stores only the gap
+    cells, so tiering pixels by observation count (0, 1, 2, 3, >= 4) needs the
+    granules. The window is returned as *cells*, not pixels: a five-degree tile
+    is 500x500 cells against 18,000x18,000 pixels, so the caller expands it one
+    row band at a time instead of materialising a full-tile array.
+
+    Args:
+        geobox: The grid the composite was computed on.
+        ged_dir: Directory of AG100 v3 granules.
+        pad_cells: Cells of margin beyond the geobox, for a dilation that must
+            see gap cells just outside the tile.
+
+    Returns:
+        ``(numobs, row_cells, col_cells)``. ``numobs`` is ``int16`` over the
+        padded window with :data:`NUMOBS_ABSENT` where the collection has no
+        granule; ``row_cells`` and ``col_cells`` are *window-relative* indices,
+        one per geobox row and column.
+    """
+    row_cells, col_cells = cell_indices_for_geobox(geobox)
+    core = (
+        int(row_cells[0]),
+        int(row_cells[-1]) + 1,
+        int(col_cells[0]),
+        int(col_cells[-1]) + 1,
+    )
+    row0 = max(core[0] - pad_cells, 0)
+    row1 = min(core[1] + pad_cells, GLOBAL_CELL_ROWS)
+    col0 = core[2] - pad_cells
+    col1 = core[3] + pad_cells
+    numobs = numobs_window(ged_dir, row0=row0, row1=row1, col0=col0, col1=col1, core=core)
+    return numobs, row_cells - row0, col_cells - col0
 
 
 def _resolve_source() -> tuple[str, Path]:
@@ -346,13 +426,7 @@ def gap_mask_for_geobox(
     if buffer_cells is None:
         buffer_cells = settings.ged_gap_buffer_cells
 
-    height, width = int(geobox.shape[0]), int(geobox.shape[1])
-    t = geobox.transform
-    lon_centers = t.c + t.a * (np.arange(width) + 0.5)
-    lat_centers = t.f + t.e * (np.arange(height) + 0.5)
-
-    row_cells = np.floor((90.0 - lat_centers) * GED_CELLS_PER_DEGREE).astype(np.int64)
-    col_cells = np.floor((lon_centers + 180.0) * GED_CELLS_PER_DEGREE).astype(np.int64)
+    row_cells, col_cells = cell_indices_for_geobox(geobox)
 
     core = (
         int(row_cells[0]),
