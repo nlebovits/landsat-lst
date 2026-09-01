@@ -408,10 +408,13 @@ def gap_mask_for_geobox(
     can never land on a cell boundary and the mapping has no float knife-edge.
 
     The cell window is padded by ``buffer_cells`` beyond the geobox, because
-    a gap cell just outside the tile buffers into it. The verification pass
-    clipped its dilation at the tile edge instead; on S30W065 the two agree
-    everywhere because no edge granule carries a boundary-adjacent gap cell,
-    and the padded form is the correct one for the general tile.
+    a gap cell just outside the tile buffers into it. The 2026-08-23
+    verification pass clipped its dilation at the tile edge instead, and the
+    two do **not** agree on S30W065: its margin ring carries 6 gap cells, 2 of
+    which buffer into the tile, so the padded form removes 2 more cells (up to
+    2,592 pixels). That is the whole of the 0.863% / 0.864% gap between the
+    figure this docstring used to quote and ``landsat-lst ged-analyze``'s.
+    The padded form is the correct one, here and for the general tile.
 
     Args:
         geobox: The grid the composite was computed on -- native tiles, row
