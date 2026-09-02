@@ -589,11 +589,7 @@ def submit_shard_stage(
         "forward_aws_credentials": False,
     }
 
-    if stage == "composite":
-        kwargs["vm_type"] = [settings.shard_composite_vm_type]
-        kwargs["env"] = {**environ, "LST_LOAD_CHUNK_SIZE": str(settings.shard_composite_chunk)}
-    elif stage == "export":
-        kwargs["disk_size"] = settings.shard_export_disk_gb
+    kwargs.update(_stage_vm_overrides(stage, environ))
 
     log.info(
         "shard_stage_submit",
@@ -621,6 +617,217 @@ def submit_shard_stage(
         run_id=run_id,
         tile=tile,
         stage=stage,
+        cluster_id=submission.cluster_id,
+        job_id=submission.job_id,
+        name=name,
+    )
+    return submission
+
+
+def _stage_vm_overrides(stage: str, environ: dict[str, str]) -> dict[str, Any]:
+    """Per-stage Coiled overrides, in one place for both submitters.
+
+    Two copies of this would drift, and the way they would drift is the
+    expensive way: ``shard_spot_policy`` is not repeated here at all, so a
+    consolidated array cannot acquire an on-demand fallback that the per-tile
+    array does not have.
+
+    - ``composite`` runs on :attr:`~landsat_lst.config.Settings.shard_composite_vm_type`
+      and carries ``LST_LOAD_CHUNK_SIZE``, because it is the native read.
+    - ``export`` asks for :attr:`~landsat_lst.config.Settings.shard_export_disk_gb`
+      of scratch: it holds every band slab, a full-tile intermediate, and the
+      COG being translated out of it, all at once.
+    """
+    if stage == "composite":
+        return {
+            "vm_type": [settings.shard_composite_vm_type],
+            "env": {**environ, "LST_LOAD_CHUNK_SIZE": str(settings.shard_composite_chunk)},
+        }
+    if stage == "export":
+        return {"disk_size": settings.shard_export_disk_gb}
+    return {}
+
+
+@dataclass(frozen=True)
+class FleetStageSubmission:
+    """What one consolidated wave handed to Coiled.
+
+    ``units`` carries ``(tile, index)`` pairs rather than bare indexes, which is
+    the whole difference from :class:`StageSubmission`: one array, many tiles.
+    """
+
+    stage: str
+    units: list[tuple[str, int]]
+    cluster_id: int | None
+    job_id: int | None
+    command: str
+    name: str = ""
+    wave: int = 1
+    max_workers: int = 0
+
+    @property
+    def tiles(self) -> list[str]:
+        """Distinct tiles this wave carried, in first-seen order."""
+        seen: dict[str, None] = {}
+        for tile, _ in self.units:
+            seen.setdefault(tile, None)
+        return list(seen)
+
+
+def fleet_cluster_name(run_id: str, stage: str, wave: int) -> str:
+    """A cluster name unique per stage *and per wave*.
+
+    Same constraint :func:`stage_cluster_name` answers -- ``coiled.batch_run``
+    refuses a name that matches a running cluster -- with the tile taken out,
+    because a consolidated wave has no single tile. The run id is hashed rather
+    than spelled so the wave marker can never be truncated away, which is the
+    mistake the per-tile name made once and paid for.
+    """
+    digest = hashlib.sha256(run_id.encode()).hexdigest()[:8]
+    return f"lst-{digest}-fleet-{stage[:5]}-w{wave}"[:_CLUSTER_NAME_MAX]
+
+
+def _fleet_task_command(*, stage: str, run_id: str, units: int | None = None) -> str:
+    """The shell script one VM runs for one unit of a consolidated wave.
+
+    The task input is a ``tile:index`` token rather than a bare index, so one
+    command serves every tile in the array. Everything else that varies per
+    tile -- the window, the scene cap -- is read on the VM from the fleet
+    manifest, not restated here: a command carrying one window could not carry
+    an array whose tiles disagree about it, and a *missing* flag silently
+    reverts to a default and resolves a different scene set.
+
+    ``--units`` still travels on the command, because it is the fused offsets
+    fleet's width, it is the same for every tile, and it was fixed by the
+    driver before any of these plans existed.
+    """
+    parts = [
+        "python",
+        "-m",
+        "landsat_lst.cli",
+        "shard",
+        "unit",
+        "--run-id",
+        run_id,
+        "--stage",
+        stage,
+    ]
+    if units is not None:
+        parts += ["--units", str(units)]
+    quoted = shlex.join(parts)
+    return f'#!/bin/bash\n{quoted} --token "${TASK_INPUT_VAR}"\n'
+
+
+def submit_fleet_stage(
+    *,
+    stage: str,
+    run_id: str,
+    units: Sequence[tuple[str, int]],
+    wave: int = 1,
+    max_workers: int | None = None,
+    fleet_units: int | None = None,
+) -> FleetStageSubmission:
+    """Start one wave of one stage as a single Coiled Batch array. See ADR-018.
+
+    The consolidation is entirely in ``map_over_values``: a wave with more units
+    than workers has Coiled queue the surplus onto workers that already booted,
+    so ``budgets.VM_BOOT_S`` is paid once per VM per wave instead of once per VM
+    per stage per tile.
+
+    ``max_workers`` is therefore a real decision here, unlike in
+    :func:`submit_shard_stage` where it is the shard count. It is the run's
+    concurrency cap, and the driver owns it: see
+    :attr:`~landsat_lst.config.Settings.fleet_max_vms`.
+
+    Args:
+        stage: One of :data:`landsat_lst.shards.STAGES`.
+        run_id: Run token, shared by every tile in the fleet.
+        units: ``(tile, index)`` pairs this array carries.
+        wave: Which wave of this stage this is, counting from 1. It names the
+            cluster, so a later wave cannot collide with one still in flight.
+        max_workers: VMs to start. Defaults to one per unit, which is the
+            uncapped case and not what a fleet run should be doing.
+        fleet_units: The fused offsets fleet's width, forwarded to the planner.
+
+    Returns:
+        The :class:`FleetStageSubmission`, with the cluster it started.
+
+    Raises:
+        ImportError: If Coiled is not installed.
+        ValueError: If ``units`` is empty or ``stage`` is unknown.
+    """
+    try:
+        import coiled  # noqa: PLC0415
+    except ImportError as e:
+        msg = "Coiled is required for distributed execution. Install with: pip install coiled"
+        raise ImportError(msg) from e
+
+    if stage not in shards.STAGES:
+        msg = f"unknown shard stage {stage!r}; expected one of {shards.STAGES}"
+        raise ValueError(msg)
+    if not units:
+        msg = f"no units to submit for stage {stage!r}"
+        raise ValueError(msg)
+
+    pairs = [(str(tile), int(index)) for tile, index in units]
+    command = _fleet_task_command(stage=stage, run_id=run_id, units=fleet_units)
+    environ = _worker_environ()
+    name = fleet_cluster_name(run_id, stage, wave)
+    workers = max(1, min(int(max_workers or len(pairs)), len(pairs)))
+
+    kwargs: dict[str, Any] = {
+        "command": command,
+        "name": name,
+        "region": settings.coiled_region,
+        "vm_type": settings.coiled_vm_types,
+        # Unchanged from the per-tile path, and deliberately not re-decided
+        # here: a silent per-VM fallback to on-demand is the one failure mode
+        # that converts a spot-priced build into the on-demand bill without
+        # anyone choosing it.
+        "spot_policy": settings.shard_spot_policy,
+        "max_workers": workers,
+        "max_retries": settings.coiled_retries,
+        "job_timeout": settings.coiled_job_timeout,
+        "map_over_values": [shards.fleet_unit_token(tile, index) for tile, index in pairs],
+        "env": environ,
+        "tag": {
+            "project": "landsat-lst",
+            "run_id": run_id,
+            "stage": stage,
+            "wave": str(wave),
+            "fleet": "1",
+        },
+        "forward_aws_credentials": False,
+    }
+    kwargs.update(_stage_vm_overrides(stage, environ))
+
+    log.info(
+        "fleet_stage_submit",
+        run_id=run_id,
+        stage=stage,
+        wave=wave,
+        units=len(pairs),
+        tiles=len({tile for tile, _ in pairs}),
+        max_workers=workers,
+        vm_type=kwargs["vm_type"],
+        name=name,
+    )
+    result = coiled.batch_run(**kwargs)
+    submission = FleetStageSubmission(
+        stage=stage,
+        units=pairs,
+        cluster_id=result.get("cluster_id"),
+        job_id=result.get("job_id"),
+        command=command,
+        name=name,
+        wave=wave,
+        max_workers=workers,
+    )
+    log.info(
+        "fleet_stage_submitted",
+        run_id=run_id,
+        stage=stage,
+        wave=wave,
         cluster_id=submission.cluster_id,
         job_id=submission.job_id,
         name=name,

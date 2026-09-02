@@ -659,6 +659,39 @@ class Settings(BaseSettings):
         "bill all night against a shard that is failing deterministically.",
     )
 
+    # Fleet consolidation: many tiles through one work array per stage per
+    # wave (ADR-018). A wave with more units than workers has Coiled queue the
+    # surplus onto VMs that already booted, which is the whole saving.
+    fleet_max_vms: int = Field(
+        default=64,
+        ge=1,
+        description="Hard ceiling on VMs in flight across the whole "
+        "consolidated run, counted against live waves rather than against "
+        "submissions. This is the cost cap, and it is the only one: a wave is "
+        "never submitted wider than the headroom left, so a run cannot exceed "
+        "it by racing two stages against each other.",
+    )
+    fleet_wave_window_s: float = Field(
+        default=120.0,
+        ge=0.0,
+        description="How long buffered units wait for more tiles to join "
+        "before a wave is submitted anyway. The batching window is what keeps "
+        "the submission count independent of the tile count: without it, a "
+        "stage whose tiles become ready one at a time would submit one array "
+        "per tile and buy nothing. Paid at most once per wave, and skipped "
+        "entirely when no other tile could still join.",
+    )
+    fleet_poll_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Seconds between fleet driver polls. One listing per "
+        "shared prefix per poll serves every tile, so this is a request-rate "
+        "knob rather than a latency one; the per-tile barriers are minutes "
+        "wide. It also bounds the resolution of the per-wave completion "
+        "timestamps, which are observations of the bucket rather than reports "
+        "from a worker.",
+    )
+
     # Live observability for batch tiles. A batch task is a plain process that
     # never registers with dask, so the cluster dashboard reports nothing about
     # it and its stdout stays on the VM until it exits. These knobs drive the

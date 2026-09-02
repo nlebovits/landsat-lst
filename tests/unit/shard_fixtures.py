@@ -55,16 +55,22 @@ def scene_times(n: int = SCENES) -> list[str]:
     return _times_iso(coord)  # type: ignore[arg-type]
 
 
-def make_plan(*, ref_shards: int = 2, scene_shards: int = 2, band_shards: int = 2):
+def make_plan(
+    *, ref_shards: int = 2, scene_shards: int = 2, band_shards: int = 2, tile: str = TILE
+):
     """A four-scene, four-block, two-band plan.
 
     One block is marked land-free on purpose: the phase-A stage publishes a
     zero-byte marker for it rather than a plane of NaN, and both the shard and
     the driver have to agree on which key that is.
+
+    ``tile`` is a parameter only so a consolidated run can have several plans at
+    once (ADR-018). Every tile in a fleet gets its own ``shard_root``, so two
+    plans built here never share a key.
     """
     blocks = shards.block_spans(COARSE, BLOCK)
     return shards.TilePlan(
-        tile=TILE,
+        tile=tile,
         window=WINDOW,
         scene_ids=[f"scene-{i}" for i in range(SCENES)],
         scene_times=scene_times(),
