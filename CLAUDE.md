@@ -707,6 +707,78 @@ Rules worth keeping:
 
 ---
 
+## Many tiles across one fleet — waves, not per-tile submissions
+
+ADR-016 pays a fleet's boot once per stage **per tile**. On S30W065 an
+offsets-side shard computed about six minutes while its stage held a fleet about
+thirty, and 700 tiles across two stages repeats that idle 700 times. So the unit
+of submission is a *wave*: one work array for one stage, carrying units from
+every tile that was ready when it flushed. See
+[ADR-018](docs/adr/018-fleet-consolidation.md) and issue #108.
+
+```bash
+landsat-lst shard fleet -t N40W075 -t N40W080   # drives many tiles; prints a run id
+landsat-lst shard resume-fleet <run-id>         # continues from the bucket
+landsat-lst shard unit --run-id <id> --stage offsets --token N40W075:3   # what a VM runs
+```
+
+Rules worth keeping:
+
+- **This amortizes provisioning across tiles. It does not make one tile
+  faster.** A fleet run of a single tile is ADR-016 with extra indirection and
+  no saving. Do not sell it as a speed-up for a rerun.
+- **The saving is queue depth, and so is the deadline.** With
+  `R = ceil(units / workers)` serial rounds, capture is `1 - 1/R`, so a wave
+  worth submitting always has `R > 1`. The first draft gave every wave **one
+  shard's** budget whatever its depth, so any wave deep enough to save a boot
+  expired long before it could finish, released width its workers were still
+  using, and admitted the next wave into headroom that existed only on paper.
+  `budgets.wave_deadline_s` derives it from three named terms:
+  `(boot + (R + 1) x unit_work) x safety`. The tail term is the list-scheduling
+  bound, not padding.
+- **Capacity comes back on evidence: a landed artifact, or a backend that
+  reports the submission dead. Never a clock.** Several facts about the driver
+  look like facts about a VM and are not. A tile that exhausted its barrier
+  rounds gave up; its workers did not. A track sitting in its offsets barrier
+  has stopped looking at the composite stage; that stage has not finished. A
+  wave whose submission raised through every retry holds nothing at all, and
+  counting it deadlocks the run rather than over-running it. Adoption obeys the
+  same rule: a resumed driver adopts every recorded wave and retires it on
+  artifacts or a probe, which is why the wave record carries its unit tokens.
+- **Held width is per unit, not per wave.** A worker that published its
+  artifact moved on, so a 60-unit wave with 45 artifacts down holds at most 15.
+  Counting the requested width until the whole wave settles deadlocks any run
+  whose first wave is wider than the cap, which is every run at 700 tiles.
+- **Barriers are per tile and never block.** `TileTrack.step` returns what a
+  tile wants started, or nothing. A tile that fails is recorded and the loop
+  continues. Only a terminal control-plane failure (quota, credits, billing,
+  auth) stops the run, because that one is about no tile in particular.
+- **Submission records stay per tile; wave records are new and separate.**
+  `stage_submission_key` keeps doing its per-tile jobs, adoption and a round
+  budget counted across drivers. `fleet_submission_key` answers the question
+  only a fleet asks: how many VMs are in flight, against which deadline.
+- **One listing per shared prefix per poll, and the keys are kept sorted.**
+  Asking per tile made LIST calls linear in tile count, about 1,400 serial
+  listings a cycle at 700 tiles against a 30 s poll. Requests now scale with
+  keys published rather than tiles driven, roughly 35 a poll. That is a smaller
+  exponent, not a constant, and it is documented as such.
+- **Idle is measured in two halves, and one half alone is a bound.** The wave
+  record carries `submitted_at`, `first_completion_at` and `last_completion_at`,
+  which bound billed VM time; they cannot say how much of it was work, because
+  a worker between units looks like a worker running one. So each unit writes
+  its own duration under `_shards/timings/{run_id}/`, kept out of the prefix the
+  driver lists every poll. Both writes are best-effort.
+- **The driver depends on `fleet_backend.FleetBackend`, never on Coiled.**
+  `BACKEND_CONTRACT` is declared by each backend and checked at construction, so
+  an AWS Batch evaluation is a checklist rather than a reading exercise. The
+  state-machine suite runs against a pure in-memory backend, which is what keeps
+  it credential-less.
+- **`queues_surplus` is read from documented semantics and has not been
+  measured.** The whole economic case rests on `coiled.batch_run` running every
+  unit of an over-subscribed array on at most `max_workers` VMs. A small cloud
+  probe is a required gate before any capture figure is quoted. It has not been
+  run.
+
 ## Testing
 
 - **A toy plan does not make a toy grid.** The shard tasks derive their geobox from the
