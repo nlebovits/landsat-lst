@@ -43,6 +43,7 @@ from landsat_lst import budgets, shards
 from landsat_lst.config import settings
 from landsat_lst.fleet_driver import Demand, FleetDriver, PollIndex, TileTrack, _tracks
 from tests.unit.adversarial_fleet_harness import (
+    CensusSimBackend,
     MemoryStorage,
     SimBackend,
     SimClock,
@@ -237,6 +238,48 @@ def test_a_confirmable_death_is_the_control_for_the_two_above(monkeypatch):
     summary = sim.run()
 
     assert_every_tile_settled_once(_tiles(sim), summary)
+
+
+def test_one_hung_unit_does_not_take_the_rest_of_the_run_with_it(monkeypatch):
+    """The regression the reap wiring closes, measured end to end.
+
+    One offsets unit of one tile never lands, in the *first* wave, so every
+    other tile is queued behind an array that will not end. With a census the
+    driver charges that array for its full width and must never release it on a
+    timer, which leaves exactly one way out: ask the substrate to stop it and
+    wait for the census to say it did. Before the driver asked, this returned 0
+    of 10 completed and 10 failed at every scale tried, 50 and 700 included.
+
+    The stuck tile still fails, and that is the correct answer for it. What must
+    not happen is the other nine failing with it.
+    """
+    names = tile_names(10)
+    sim = build_simulation(
+        monkeypatch,
+        n_tiles=10,
+        cap=CAP,
+        backend_cls=CensusSimBackend,
+        never={("offsets", names[0], index) for index in range(15)},
+    )
+    summary = sim.run()
+
+    assert_every_tile_settled_once(_tiles(sim), summary)
+    assert sorted(summary.completed) == sorted(names[1:]), (
+        "every healthy tile completes; only the tile with the hung unit fails"
+    )
+    assert summary.failed == [names[0]]
+    assert sim.backend.reap_calls, "the stranded array was asked to stop"
+    assert sim.ledger.peak() <= CAP, _cap_message(sim, sim.ledger.peak())
+
+
+def test_a_healthy_run_under_a_census_asks_nothing_to_stop(monkeypatch):
+    """The control. Reaping is for a stranded wave, and nothing else is stranded."""
+    sim = build_simulation(monkeypatch, n_tiles=10, cap=CAP, backend_cls=CensusSimBackend)
+    summary = sim.run()
+
+    assert len(summary.completed) == 10
+    assert sim.backend.reap_calls == []
+    assert sim.backend.census_calls > 0, "the premise: this substrate was asked"
 
 
 def test_a_resumed_driver_over_an_unconfirmable_wave_still_settles_every_tile(monkeypatch):

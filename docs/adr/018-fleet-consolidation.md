@@ -345,6 +345,54 @@ Two rules close it:
 The same run that used to poll out silently now fails in 591 polls with all ten
 tiles named.
 
+### Knowing an array is alive is worth nothing until something asks it to stop
+
+The census answers "is a VM billing" and the driver charges what it finds. On
+its own that is correct on cost and fatal on liveness. One offsets unit that
+never lands holds its wave's whole width, the census keeps reporting the
+identity, `_discharge_reason` correctly refuses to give the charge back on
+anything weaker, the cap stays full, and no other tile is ever admitted. The
+run then ends through `_stalled` with every tile failed. Measured on the
+consolidated driver before this was wired: **0 of 50 tiles and 0 of 700**, on a
+substrate that answers a census and on one that does not. The driver it replaced
+completed 9 of 9 healthy tiles in the same scenario, at 127 VMs against a cap of
+64. Trading a silent doubling of the bill for a total loss of the run is not the
+trade this ADR set out to make.
+
+`FleetBackend.reap` was written for this and was never called. `FleetDriver`
+now asks, once a poll, for every wave it has declared stranded:
+
+- **Only a stranded wave is asked.** Not one past its deadline, which is merely
+  late, and not one the driver suspects. The state is the one `Wave.stranded`
+  already computes: a whole budget plus one `VM_BOOT_S` since the last unit this
+  wave was seen to land. Reaping on expiry alone would kill deep waves that are
+  working, which is the mistake `stranded_at` was rewritten to stop making.
+- **The ask releases nothing.** It does not set `discharged`, does not touch
+  `intent_charge`, and does not move `Ĥ(t)`. The width comes back through
+  `_discharge_reason` on a later census that omits the identity, and through
+  nothing else. A reap is a request and a census is the only confirmation, so
+  treating the request as the result would put the driver back to freeing a cap
+  on a guess, which is the whole defect the census replaced.
+- **The ask repeats, and the grace it buys does not.** `reap` is idempotent, so
+  repeating it every poll is how a driver outlasts a control plane that dropped
+  the first one. `_stalled` waits one `VM_BOOT_S` from the *first* request
+  before it will abandon the run, so a substrate that never acts on a reap still
+  ends the run loudly and bounded, exactly as before.
+- **A failed reap is logged and swallowed**, and a backend that predates the
+  census contract has none at all. A recovery attempt that fails must not be
+  worse than the stall it was trying to clear.
+
+With that seam the same scenario gives **49 of 50 and 699 of 700**, peak 64 on
+two independent oracles, zero duplicate dispatch and zero tiles in neither list.
+The tile with the hung unit still fails, which is the correct answer for it.
+
+One case is unchanged and stays open: a substrate that has **never** answered a
+census. Rule 5 above is gated on `_census_seen`, so a stranded wave there is
+never discharged, and the reap has nothing that can confirm it. That run still
+fails every tile. Closing it means discharging on a request plus a timer rather
+than on a measurement, which is the thing this design refuses to do, so it is
+recorded here rather than papered over.
+
 ### An unanswered submission is not an unstarted one
 
 The first draft held no capacity for a wave whose submission raised through
@@ -547,6 +595,9 @@ re-measure.
   rather than the landed units', and it is the cost of the fix rather than a
   defect in it. The budget-boundary degradation bounds how long a *broken* wave
   can impose it. A healthy one imposes it for exactly as long as it runs.
+- A stranded wave is asked to stop, and its width still comes back only from a
+  census. Those are two statements, and keeping them apart is what stops the
+  liveness fix from undoing the cost fix.
 - A run can now end with every tile failed and no tile silent. Failing loudly
   on a wave nothing can settle is the intended outcome, not a fallback: the
   alternative on offer was returning normally with the tiles unaccounted for.

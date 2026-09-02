@@ -1040,6 +1040,16 @@ class Wave:
     #: a discharged wave leaves ``_live`` in the same pass.
     discharged: bool = False
     discharged_by: str = ""
+    #: When the driver *first* asked the substrate to terminate this identity,
+    #: or ``None`` if it never has. A request, never a result: it records that
+    #: the ask went out, and it is deliberately not read by
+    #: :meth:`intent_charge`, which only a census may discharge. The first
+    #: request is kept rather than the last so the grace it buys cannot be
+    #: renewed forever by re-asking.
+    reap_requested_at: float | None = None
+    #: How many times the ask has been repeated. ``reap`` is idempotent, so
+    #: repetition is the documented way to wait one out.
+    reap_requests: int = 0
 
     def stranded(self, now: float) -> bool:
         """Past a whole budget and a boot since this wave last showed a sign of life.
@@ -1142,6 +1152,8 @@ class Wave:
             "attempts": self.attempts,
             "last_attempt_at": self.last_attempt_at,
             "acknowledged": self.acknowledged,
+            "reap_requested_at": self.reap_requested_at,
+            "reap_requests": self.reap_requests,
             "first_completion_at": self.first_completion_at,
             "last_completion_at": self.last_completion_at,
             "provisioning_idle_s": self.provisioning_idle_s,
@@ -1547,13 +1559,98 @@ class FleetDriver:
         them are not a stall: the tiles they carried re-demand when their own
         records age out and either run or exhaust their barrier rounds, which
         is the ordinary bounded-failure path and already correct.
+
+        A wave the driver has just asked the substrate to terminate is not
+        counted, for one boot interval from the *first* ask. That is the window
+        in which a reap can still turn into the census that discharges it, and
+        abandoning the run inside it would throw away the recovery the ask was
+        for. The grace runs from the first request rather than the latest, so
+        repeating the ask every poll cannot extend it, and a substrate that
+        never acts on a reap ends the run here exactly as it did before.
         """
         now = self.clock.now()
+        if any(self._reap_pending(wave, now) for wave in self._live):
+            return False
         return (
             bool(self._live)
             and self.headroom <= 0
             and all(wave.stranded(now) or self._unobservable(wave) for wave in self._live)
         )
+
+    @staticmethod
+    def _reap_pending(wave: Wave, now: float) -> bool:
+        """Whether a termination request is still young enough to answer."""
+        if wave.reap_requested_at is None:
+            return False
+        return now < wave.reap_requested_at + budgets.VM_BOOT_S
+
+    def _reap_stranded(self) -> None:
+        """Ask the substrate to stop every wave the driver has declared stranded.
+
+        The missing half of the census contract. Charging a wave the substrate
+        is still billing for is correct on cost and, on its own, fatal on
+        liveness: an array with one unit that never finishes keeps its whole
+        width, the cap stays full, no other tile is ever admitted, and a run of
+        700 tiles returns 700 failures against a correct bill. Knowing which
+        arrays are alive is worth nothing if nothing ever asks one to stop.
+
+        Two properties hold this in place, and both are the point rather than
+        an implementation detail:
+
+        - **Only a formally stranded wave is asked.** Not a wave past its
+          deadline, which is merely late, and not one the driver suspects: the
+          state is the one :meth:`Wave.stranded` already computes, a whole
+          budget plus a boot since the last unit this wave was seen to land.
+          Reaping on expiry alone would kill deep waves that are working, which
+          is the mistake ``stranded_at`` was rewritten to stop making.
+        - **The ask releases nothing.** It does not clear ``discharged``, does
+          not touch ``intent_charge``, and does not move ``H(t)``. Capacity
+          comes back through :meth:`_discharge_reason` on a later census that
+          omits the identity, and through nothing else. A reap is a request and
+          the census is the only confirmation, so treating the request as the
+          result would put the driver back to freeing a cap on a guess.
+
+        Repeated every poll while the wave is still stranded and still live,
+        which the backend contract sanctions: ``reap`` is idempotent, and
+        repetition is the only way to outlast a control plane that dropped the
+        first ask. It stops on its own, because the census that ends it also
+        retires the wave.
+
+        A backend that predates the census contract has no ``reap`` at all, and
+        a reap that raises is logged and swallowed: this is a recovery path,
+        and failing a run because a recovery attempt failed would be worse than
+        the stall it is trying to clear.
+        """
+        ask = getattr(self.backend, "reap", None)
+        if ask is None:
+            return
+        now = self.clock.now()
+        for wave in self._live:
+            if not wave.identity or not wave.stranded(now):
+                continue
+            try:
+                ask(self.run_id, wave.identity)
+            except Exception as e:
+                log.warning(
+                    "fleet_reap_failed",
+                    run_id=self.run_id,
+                    identity=wave.identity,
+                    error=str(e),
+                )
+                continue
+            wave.reap_requests += 1
+            if wave.reap_requested_at is None:
+                wave.reap_requested_at = now
+                log.warning(
+                    "fleet_wave_reap_requested",
+                    run_id=self.run_id,
+                    stage=wave.stage,
+                    wave=wave.wave,
+                    identity=wave.identity,
+                    width=self.wave_held(wave),
+                    note="stranded; asked the substrate to stop it. The charge "
+                    "stays until a census omits the identity",
+                )
 
     def _settle_stragglers(self, reason: str) -> None:
         """Fail every tile the run is about to abandon, so none is left unstated.
@@ -2287,6 +2384,11 @@ class FleetDriver:
                 track.dead_handles = self._dead_handles
                 track.dead_identities = self._dead_identities
             self._retire()
+            # After retirement, so a wave a census already settled is not asked
+            # to stop, and before the stall check, so the ask happens on the
+            # poll the wave becomes stranded rather than a poll after the run
+            # would have been abandoned.
+            self._reap_stranded()
             self._publish_held_units()
             if self._stalled():
                 # Loud already, through ``fleet_run_stranded`` and one failure

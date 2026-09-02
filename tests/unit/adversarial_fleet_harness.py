@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING
 
 from landsat_lst import budgets, shard_tasks, shards
 from landsat_lst.config import settings
-from landsat_lst.fleet_backend import BACKEND_CONTRACT, WaveHandle
+from landsat_lst.fleet_backend import BACKEND_CONTRACT, WaveHandle, WorkerCensus
 from landsat_lst.models import ProcessingJob
 from landsat_lst.shard_driver import Clock, _expected_keys, classify_failure
 from landsat_lst.storage import PRODUCTS, StorageBackend, collection_prefix
@@ -460,6 +460,63 @@ class SimBackend:
         )
 
 
+class CensusSimBackend(SimBackend):
+    """:class:`SimBackend` that can also be *asked what it is billing*.
+
+    The plain one predates the census contract, so every simulation built on it
+    drives the driver's degraded, never-seen-a-census path. That is a real mode
+    and worth keeping, but it is not the one production runs in, and the
+    liveness defect the reap wiring closes only appears when a census answers:
+    with one, a stranded wave is charged until the substrate stops reporting it,
+    and something has to ask the substrate to stop.
+
+    ``reap`` is honoured rather than recorded. A stub that only counted the ask
+    would let a driver that never gets its width back still look correct here,
+    which is the whole failure being pinned.
+    """
+
+    name = "adversarial-sim-census"
+
+    def __init__(self, *args, answerable: bool = True, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.answerable = answerable
+        self.census_calls = 0
+        self.reap_calls: list[str] = []
+
+    def submission_identity(self, run_id: str, stage: str, wave: int) -> str:
+        return self.wave_name(run_id, stage, wave)
+
+    def census(self, run_id: str):
+        self.census_calls += 1
+        if not self.answerable:
+            return None
+        now = self.clock.now()
+        by_identity: dict[str, int] = {}
+        for call, wave in zip(self.calls, self.waves, strict=False):
+            ends = wave.array_ends_at
+            if call["at"] > now or (ends is not None and now >= ends):
+                continue
+            identity = self.submission_identity(run_id, call["stage"], call["wave"])
+            by_identity[identity] = by_identity.get(identity, 0) + call["max_workers"]
+        return WorkerCensus(
+            as_of=now,
+            total=sum(by_identity.values()),
+            by_identity=dict(by_identity),
+            identities=frozenset(by_identity),
+        )
+
+    def reap(self, run_id: str, identity: str) -> None:
+        """Stop one array, the way ``delete_cluster`` does. Idempotent, and silent."""
+        self.reap_calls.append(identity)
+        now = self.clock.now()
+        for call, wave in zip(self.calls, self.waves, strict=False):
+            if self.submission_identity(run_id, call["stage"], call["wave"]) != identity:
+                continue
+            if wave.killed_at is None or wave.killed_at > now:
+                wave.killed_at = now
+                wave.array_ends_at = now
+
+
 # --------------------------------------------------------------------------
 # tile artifacts
 # --------------------------------------------------------------------------
@@ -714,6 +771,7 @@ def build_simulation(
     polls_target: int | None = None,
     wave_window_s: float = 0.0,
     probe_waves: bool = False,
+    backend_cls: type[SimBackend] = SimBackend,
     **backend_kw,
 ) -> Simulation:
     """A whole run, wired up: production-shaped plans, a physical substrate, a ledger.
@@ -737,7 +795,7 @@ def build_simulation(
     stub_scientific_work(monkeypatch, writers)
 
     terms = stage_terms(plans[0])
-    backend = SimBackend(storage, writers, clock=clock, ledger=ledger, terms=terms, **backend_kw)
+    backend = backend_cls(storage, writers, clock=clock, ledger=ledger, terms=terms, **backend_kw)
     storage.on_list = backend.tick
 
     if poll_s is None:

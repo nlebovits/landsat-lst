@@ -35,7 +35,7 @@ import types
 
 import pytest
 
-from landsat_lst import batch, shards
+from landsat_lst import batch, budgets, shards
 from landsat_lst.config import settings
 from landsat_lst.fleet_backend import (
     BACKEND_CONTRACT,
@@ -694,6 +694,176 @@ class TestTheCoiledCensusCountsConservatively:
         assert census is not None
         assert census.total == 5
         assert census.identities == frozenset({batch.fleet_cluster_prefix(RUN_ID) + "offse-w1"})
+
+
+# --------------------------------------------------------------------------
+# reap: the request the census exists to confirm
+# --------------------------------------------------------------------------
+
+
+class TestReapIsAskedOnlyForAStrandedWave:
+    """The other half of the census contract, and the whole of its liveness.
+
+    Charging an array the substrate is still billing for is correct on cost and
+    fatal on its own: one unit that never finishes holds a wave's whole width,
+    the cap stays full, nothing else is ever admitted, and a run of 700 tiles
+    returns 700 failures against an accurate bill. Measured at 0 of 50 and 0 of
+    700 before this was wired, and 49 of 50 and 699 of 700 after.
+    """
+
+    def test_a_wave_that_is_merely_overdue_is_not_asked_to_stop(self, storage, clock):
+        """Late is not dead. A deep wave landing units steadily must be left alone."""
+        backend = InMemoryFleetBackend(clock=clock)
+        driver = _driver(storage, clock, backend)
+        wave = _wave(submitted_at=clock.now(), deadline_s=100.0)
+        driver._live = [wave]
+
+        clock.advance(150.0)
+        assert wave.expired(clock.now()), "the premise: this wave is past its deadline"
+        assert not wave.stranded(clock.now())
+        driver._reap_stranded()
+
+        assert backend.reaped == []
+        assert wave.reap_requested_at is None
+
+    def test_a_stranded_wave_is_asked_to_stop(self, storage, clock):
+        backend = InMemoryFleetBackend(clock=clock)
+        driver = _driver(storage, clock, backend)
+        wave = _wave(submitted_at=clock.now(), deadline_s=100.0)
+        driver._live = [wave]
+
+        clock.advance(100.0 + budgets.VM_BOOT_S + 1.0)
+        driver._reap_stranded()
+
+        assert backend.reaped == [wave.identity]
+        assert wave.reap_requested_at == clock.now()
+        assert wave.reap_requests == 1
+
+    def test_the_ask_repeats_but_the_grace_it_buys_does_not(self, storage, clock):
+        """``reap`` is idempotent, so repeating is how a driver outlasts a dropped ask.
+
+        The *first* request is what the stall check measures from, so re-asking
+        every poll cannot postpone the run's own bounded failure forever.
+        """
+        backend = InMemoryFleetBackend(clock=clock)
+        driver = _driver(storage, clock, backend)
+        wave = _wave(submitted_at=clock.now(), deadline_s=100.0)
+        driver._live = [wave]
+
+        clock.advance(100.0 + budgets.VM_BOOT_S + 1.0)
+        first_at = clock.now()
+        driver._reap_stranded()
+        clock.advance(60.0)
+        driver._reap_stranded()
+
+        assert backend.reaped == [wave.identity, wave.identity]
+        assert wave.reap_requests == 2
+        assert wave.reap_requested_at == first_at
+
+    def test_a_reap_that_raises_is_swallowed(self, storage, clock):
+        """A recovery attempt that fails must not be worse than the stall it clears."""
+
+        class _Angry(InMemoryFleetBackend):
+            def reap(self, run_id, identity):
+                msg = "control plane says no"
+                raise RuntimeError(msg)
+
+        backend = _Angry(clock=clock)
+        driver = _driver(storage, clock, backend)
+        wave = _wave(submitted_at=clock.now(), deadline_s=100.0)
+        driver._live = [wave]
+        clock.advance(100.0 + budgets.VM_BOOT_S + 1.0)
+
+        driver._reap_stranded()
+
+        assert wave.reap_requested_at is None
+        assert wave.intent_charge() == 2
+
+    def test_a_backend_with_no_reap_at_all_is_tolerated(self, storage, clock):
+        class _Old(InMemoryFleetBackend):
+            reap = None
+
+        driver = _driver(storage, clock, _Old(clock=clock))
+        wave = _wave(submitted_at=clock.now(), deadline_s=100.0)
+        driver._live = [wave]
+        clock.advance(100.0 + budgets.VM_BOOT_S + 1.0)
+
+        driver._reap_stranded()
+
+        assert wave.reap_requested_at is None
+
+
+class TestReapDoesNotReleaseCapacity:
+    """The non-negotiable. A request is not a result, and only a census confirms.
+
+    If the ask discharged the charge, the driver would be back to freeing a cap
+    on a guess -- the exact defect the census replaced, wearing a new name.
+    """
+
+    def test_asking_changes_neither_the_charge_nor_the_headroom(self, storage, clock):
+        backend = InMemoryFleetBackend(clock=clock)
+        driver = _driver(storage, clock, backend, max_vms=4)
+        wave = _wave(submitted_at=clock.now(), deadline_s=100.0, requested_workers=4, max_workers=4)
+        driver._live = [wave]
+        clock.advance(100.0 + budgets.VM_BOOT_S + 1.0)
+        driver._census = WorkerCensus(
+            as_of=clock.now(),
+            total=4,
+            by_identity={wave.identity: 4},
+            identities=frozenset({wave.identity}),
+        )
+        before = (driver.intent_charge, driver.in_flight, driver.headroom)
+
+        driver._reap_stranded()
+
+        assert backend.reaped == [wave.identity]
+        assert (driver.intent_charge, driver.in_flight, driver.headroom) == before
+        assert not wave.discharged
+        assert driver._discharge_reason(wave, clock.now()) is None, (
+            "a census that still reports the identity discharges nothing"
+        )
+
+    def test_only_a_later_census_omitting_the_identity_gives_the_width_back(self, storage, clock):
+        backend = InMemoryFleetBackend(clock=clock)
+        driver = _driver(storage, clock, backend, max_vms=4)
+        wave = _wave(submitted_at=clock.now(), deadline_s=100.0, requested_workers=4, max_workers=4)
+        driver._live = [wave]
+        clock.advance(100.0 + budgets.VM_BOOT_S + 1.0)
+        driver._reap_stranded()
+
+        driver._census = WorkerCensus(
+            as_of=clock.now(), total=0, by_identity={}, identities=frozenset()
+        )
+        assert driver._discharge_reason(wave, clock.now()) == "census_absent"
+        driver._retire()
+
+        assert driver._live == []
+        assert wave.discharged_by == "census_absent"
+        assert driver.headroom == 4
+
+    def test_the_run_is_not_abandoned_inside_the_window_a_reap_can_still_answer(
+        self, storage, clock
+    ):
+        """The stall check has to wait for the ask it just made.
+
+        Ending the run on the same poll the reap went out would throw away the
+        recovery, which is what turned one hung unit into a whole lost run.
+        """
+        backend = InMemoryFleetBackend(clock=clock)
+        driver = _driver(storage, clock, backend, max_vms=4)
+        wave = _wave(submitted_at=clock.now(), deadline_s=100.0, requested_workers=4, max_workers=4)
+        driver._live = [wave]
+        clock.advance(100.0 + budgets.VM_BOOT_S + 1.0)
+        assert driver.headroom == 0
+        assert driver._stalled(), "the premise: with no ask outstanding this run is over"
+
+        driver._reap_stranded()
+        assert not driver._stalled()
+
+        clock.advance(budgets.VM_BOOT_S + 1.0)
+        assert driver._stalled(), (
+            "a substrate that never acts on a reap still ends the run, bounded"
+        )
 
 
 class TestACollidingSubmissionNameIsRefused:
