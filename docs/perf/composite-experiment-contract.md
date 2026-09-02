@@ -250,8 +250,9 @@ assert new["lst_p95"].dtype == np.float32 and new["qa_count"].dtype == np.uint8
 plus the encoded product, because that is what a user receives:
 
 ```python
-assert np.array_equal(encode_lst_uint16(new["lst_p95"]).values,
-                      encode_lst_uint16(truth_lst_da).values)
+assert np.array_equal(
+    encode_lst_uint16(new["lst_p95"]).values, encode_lst_uint16(truth_lst_da).values
+)
 ```
 
 **Why exact and not `allclose`.** `tests/unit/test_kernels.py` states the standing rule:

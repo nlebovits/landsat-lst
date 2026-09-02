@@ -84,9 +84,18 @@ data/ged_gap_mask.npz
 *.log
 digest.txt
 
-# Decision-run outputs (large COGs + icechunk repo)
-results/
+# Decision-run outputs (large COGs + icechunk repo).
+# ``results/*`` rather than ``results/``: git cannot re-include anything from a
+# directory it has excluded, so excluding the entries instead of the directory
+# is what lets a negation below actually reach a file.
+results/*
 # ...except small calibration artifacts that justify a shipped default.
 !results/decision/destripe_cap_calibration.json
 !results/decision/offset_subsampling_validation.json
 !results/decision/destripe_composite_comparison.json
+# ...and the pre-registered composite performance experiment's evidence, which
+# is the record of a decision rather than a run's output. The truth arrays it
+# compares against are ~90 MB apiece and stay out.
+!results/perf/
+!results/perf/**
+results/perf/truth-*.npz

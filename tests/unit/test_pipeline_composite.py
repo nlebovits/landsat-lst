@@ -271,6 +271,24 @@ class TestDaskComposite:
         assert qa.sizes["month"] == 12
         assert "lst_p50" not in result.data_vars
 
+    def test_dask_qa_count_keeps_month_first(self, dask_landsat_data):
+        """``qa_count`` ships as ``(month, y, x)``, and only the chunked path
+        can lose that.
+
+        ``_composite_graph`` moves time to the last axis before the
+        single-time-chunk rechunk, so the concatenate writes the layout the P95
+        kernel wants. ``groupby`` then puts its new dimension where the one it
+        reduced was and returns ``(y, x, month)``. ``cog.py`` writes this array
+        as 12 bands off axis 0, so a silent reorder here would export a raster
+        whose bands are image columns. The transposes are lazy and the dask path
+        is the only one that takes them, which is why this asserts on the
+        chunked fixture rather than the eager one.
+        """
+        qa = compute_annual_composite(dask_landsat_data)["qa_count"].compute()
+
+        assert qa.dims == ("month", "y", "x")
+        assert qa.shape[0] == 12
+
 
 class TestSceneSampling:
     """Sampling exists so a run exercises the pipeline in minutes, not hours."""

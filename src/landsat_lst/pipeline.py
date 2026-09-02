@@ -572,7 +572,17 @@ def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
     memory floor, since the P95 already forced it.
     """
     if lst.chunks is not None:
-        lst = lst.chunk({"time": -1})
+        # Time last *before* the rechunk, not after it. ``apply_ufunc`` with
+        # ``input_core_dims=[["time"]]`` requires the kernel's core dimension
+        # last, and it receives a C-contiguous block -- so with the stack left
+        # in ``(time, latitude, longitude)`` order the concatenate below writes
+        # one layout and a second full-block copy per in-flight block converts
+        # it, a strided gather with a ``chunk**2 * 4 B`` stride that is cache-
+        # and TLB-hostile. Transposing first makes the concatenate that this
+        # rechunk already requires write the layout the kernel wants; the
+        # reorders that replace it operate on ``TIME_CHUNK``-sized slabs. The
+        # transpose is lazy and adds no data movement of its own.
+        lst = lst.transpose(..., "time").chunk({"time": -1})
 
     # notnull() (not ~np.isnan) so the result stays a typed xarray DataArray.
     valid_mask = lst.notnull()
@@ -584,6 +594,12 @@ def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
         .sum()
         .reindex(month=range(1, 13), fill_value=0)
         .astype(np.uint8)
+        # ``groupby`` puts the new dimension where the one it reduced was, so
+        # with time last it returns ``(latitude, longitude, month)``. The
+        # shipped order is ``(month, latitude, longitude)`` -- what ``cog.py``
+        # writes as 12 bands and what every reader expects. A no-op when the
+        # stack was not transposed, and 12 x H x W uint8 when it was.
+        .transpose("month", ...)
     )
 
     # Total valid obs per pixel (across the whole window) gates the P95 fill.
