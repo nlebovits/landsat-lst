@@ -32,7 +32,7 @@ most questions the tile is not the cheapest artifact that can answer them.
 | Fixture stack | `landsat-lst fixture --tile T --factor 8` | 6.1 GB | STAC query + hundreds of GB of coarse reads | measured: sizes in CLAUDE.md |
 | Band slabs | `_shards/{run}/{tile}/bands/` | GB | the composite pass | inferred from `reexport_qa_count.py` |
 | GED gap mask | `data/ged_gap_mask.npz` | 2.8 MB | ASTER granule reads | measured |
-| Probe rates | `results/probe/*.json` | KB | I/O ladder runs | measured 2026-08-21/22 |
+| Probe rates | `results/probe/*.json` | KB | I/O ladder runs | user-reported 2026-08-21/22: absent from every commit, see Verification below |
 
 Two of these carry a caveat sharp enough to change conclusions, and both are
 already written down in CLAUDE.md:

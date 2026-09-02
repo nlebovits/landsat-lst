@@ -78,6 +78,11 @@
     "provisioning_composite_usd": 3056.0,
     "note": "Consolidation acts on the provisioning line alone. It amortizes provisioning across tiles and does not make one full tile faster."
   },
+  "measured_idle": {
+    "waves_with_timings": 0,
+    "idle_bucket": "assumed",
+    "note": "No wave record carries first_completion_at and last_completion_at. The idle term is assumed from the reference run's residue, not measured. INV-35 is unmet at f4d1e93: the record carries submitted_at and neither completion stamp."
+  },
   "projection": [
     {
       "scenario": "queues_surplus_false",

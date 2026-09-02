@@ -18,7 +18,33 @@ reduces to. Committing derived floats rather than depending on a 10 MB download
 is deliberate, because `results/probe/` is referenced throughout the code and
 exists in no commit.
 
-## 0. What this model describes, and when it goes stale
+## 0. Blocking premise, read this before any number below
+
+**`queues_surplus` is unverified, and every figure in this document rests on
+it.** ADR-017's backend contract requires that `coiled.batch_run`, given more
+units than workers, runs every unit on at most `max_workers` concurrent workers
+and hands a worker the next unit when it finishes one. ADR-017 says in its own
+words that this is read from documented Coiled semantics and has never been
+verified against real Coiled by this project. The independent design audit
+carries the same finding as GAP-Q.
+
+If it is false, three things follow at once.
+
+1. `max_workers` bounds nothing, so the cap invariants are unenforceable
+   however correct the driver's arithmetic is. A 10,500-unit first wave starts
+   10,500 VMs.
+2. Capture collapses to zero, which is the `queues_surplus_false` row in
+   section 5. Its cost equals doing no consolidation at all.
+3. Every cost figure that assumes a bounded fleet is wrong, including the upper
+   ends of the intervals below, which are computed against a 64-VM cap.
+
+**No capture figure and no all-in estimate in this document may be quoted as
+settled until the probe passes.** The probe is one wave, a handful of trivial
+units, more units than workers, counting the workers that start and how the
+units distribute. It costs about $0.50. It is not authorized and has not been
+run.
+
+## 0a. What this model describes, and when it goes stale
 
 **Every figure here describes the current source-grid 30 m pipeline.** Draft
 PR #121 delivers a nominal ~100 m grid, aggregating 3x3 source cells before the
@@ -70,6 +96,56 @@ mistyped figures would both have to land on independently recorded values by
 accident. That is corroboration. It is not measurement, and upgrading the label
 takes a retained billing artifact rather than a second retelling.
 
+## 1a. Coverage of issue #108's cost gates
+
+The independent design audit records INV-34, INV-35, and INV-36 as
+`not-implemented` against the driver candidate f4d1e93. Two of the three are
+this model's to answer, and the third is answered by a sibling document on this
+branch.
+
+| Invariant | #108 gate | Status here |
+|---|---|---|
+| INV-34 | a cost model separating compute, provisioning/idle, credits, retries, and storage, in ranges | met by `scripts/fleet_cost_model.py` |
+| INV-35 | per-wave `submitted_at`, `first_completion_at`, `last_completion_at`, and a derived idle | **unmet**, and the model is written to consume it |
+| INV-36 | a documented cached-iteration path submitting no production tile | met by `iteration_workflow.md` |
+
+**INV-34.** Section 4 separates compute from provisioning and idle, section 5
+reports both as intervals, credits are a separate currency reported as an
+interval, and retries, contingency, and storage are named terms with their own
+records in `quantities.json`.
+
+**INV-35, and the reason the idle term is `assumed` rather than `measured`.**
+`FleetDriver._record_wave` at f4d1e93 writes `run_id`, `stage`, `wave`,
+`units`, `tiles`, `max_workers`, `handle_name`, `submitted_at`, `deadline_s`,
+and `handle_id`. It writes neither completion stamp. Nothing in the run
+therefore records when a wave's first unit landed or when its last one did, so
+the idle term in section 2 is the reference run's residue rather than an
+observation. `scripts/fleet_cost_model.py` already reads the record INV-35
+describes, through `wave_envelope` and `measured_idle`, and
+`--wave-records` feeds them a real run's records.
+
+The stamps are necessary and they are not sufficient, which is worth stating
+before anyone implements them and expects a measured number.
+
+- They settle the **envelope**. A wave's workers start together and the last
+  one stops when the wave's last unit lands, so billed VM-seconds is
+  `workers x (last_completion_at - submitted_at)`. That is an observation, and
+  it replaces a transcribed wall clock.
+- They do not settle the **split**. Idle is billed time minus boot minus useful
+  compute, and no stamp says how long a unit ran. Three stamps bound idle above
+  and cannot separate a worker running its next unit from a worker waiting.
+
+So the idle term becomes `measured` only when per-unit durations exist
+alongside the wave stamps, which is the same observation `unresolved-inputs.md`
+asks for under U4. Until a real run writes both, the idle term is `assumed`,
+the model says so in its own output, and
+`test_idle_is_bounded_and_never_claimed_measured` stops it drifting.
+
+**INV-36.** `iteration_workflow.md` on this branch routes each question to its
+cheapest artifact and marks the cloud rows. Every row it marks "Cloud? no"
+reads a cached offset record, a fixture, band slabs, or a local graph, and none
+reaches `submit_shard_stage`.
+
 ## 2. Where the reference run's money went
 
 Boot comes from `budgets.VM_BOOT_S`. Offsets compute comes from ADR-016. The
@@ -88,6 +164,11 @@ shape.
 Only 44% of billed VM-time was useful compute. That number is what issue #108
 exists to move, and a model with no term for the other 56% could not price the
 thing being fixed.
+
+**The idle line is `assumed`, not measured.** It is what is left after boot and
+an assumed compute figure, so it absorbs the error in both. No wave record
+carries a completion stamp, so no run has observed it. Section 1a says what
+would change that and why the wave stamps alone are not enough.
 
 ## 3. Scaling to 700 tiles
 
@@ -157,24 +238,14 @@ Capture is not 0.994 all the same. A tail wave, stragglers in a final round, a
 composite stage competing for the same cap, and tiles that do not become ready
 together all survive. The `design_band` row reads 0.85 to 0.95 for that reason.
 
-**The premise under all of it is unverified.** ADR-017's backend contract
-requires `queues_surplus`: that `coiled.batch_run`, given more units than
-workers, runs every unit on at most `max_workers` concurrent workers and hands
-a worker the next unit when it finishes one. That is read from documented
-Coiled semantics and has never been checked against real Coiled by this
-project. No number anywhere in this repository measures it.
+**The premise under all of it is unverified.** Section 0 states it in full.
+`queues_surplus` has never been checked against real Coiled by this project, no
+number anywhere in this repository measures it, and if it is false capture
+collapses to zero.
 
-If it is false, the surplus either starts its own VMs, which breaks the cost
-cap, or is refused, or is dropped. Capture then collapses to zero, which is the
-`queues_surplus_false` row. **Read that row as the outcome if the premise
-fails, not as a pessimistic scenario.** Its cost equals no consolidation at
-all, and by then the driver, the deadlines, and the capacity model have all
-been changed.
-
-ADR-017 names the settling observation: one wave, a handful of trivial units,
-more units than workers, counting the workers that start and how the units
-distribute. It costs about $0.50, it is not authorized, and it has not been
-run.
+Read `queues_surplus_false` as the outcome if the premise fails, not as a
+pessimistic scenario. Its cost equals no consolidation at all, and by then the
+driver, the deadlines, and the capacity model have all been changed.
 
 ### 5b. The arithmetic, term by term
 

@@ -219,3 +219,71 @@ class TestRegime:
         names = {u["name"] for u in report["blocking_unknowns"]}
         assert "credit_unit_price_usd" in names
         assert all(u["settled_by"].strip() for u in report["blocking_unknowns"])
+
+
+class TestWaveTimings:
+    """INV-35: what the driver's wave record would let the model measure.
+
+    At f4d1e93 the record carries ``submitted_at`` and neither completion
+    stamp, so the idle term is assumed. These tests pin what happens when the
+    stamps arrive, and pin the limit: three stamps bound idle, and only
+    per-unit durations measure it.
+    """
+
+    def _stamped(self, **over):
+        record = {
+            "stage": "offsets",
+            "wave": 1,
+            "units": 120,
+            "max_workers": 60,
+            "submitted_at": 1000.0,
+            "first_completion_at": 1600.0,
+            "last_completion_at": 2200.0,
+        }
+        record.update(over)
+        return record
+
+    def test_a_record_without_the_stamps_yields_nothing(self):
+        # The f4d1e93 shape, which is what a run would write today.
+        bare = {"stage": "offsets", "wave": 1, "units": 120, "max_workers": 60}
+        bare["submitted_at"] = 1000.0
+        assert fcm.wave_envelope(bare, boot_s=300.0) is None
+
+    def test_billed_vm_time_comes_from_the_envelope(self):
+        e = fcm.wave_envelope(self._stamped(), boot_s=300.0)
+        # 60 workers x (2200 - 1000) seconds.
+        assert e["billed_vm_s"] == pytest.approx(72_000.0)
+        assert e["boot_vm_s"] == pytest.approx(18_000.0)
+        assert e["drain_tail_s"] == pytest.approx(600.0)
+
+    def test_queue_depth_is_reported_because_capture_turns_on_it(self):
+        assert fcm.wave_envelope(self._stamped(), boot_s=300.0)["queue_depth"] == 2
+
+    def test_idle_is_bounded_and_never_claimed_measured(self):
+        # Three stamps cannot separate a worker running its next unit from a
+        # worker waiting. Claiming a measured idle from them would be the
+        # model's own version of the mistake it is auditing.
+        e = fcm.wave_envelope(self._stamped(), boot_s=300.0)
+        assert e["idle_vm_s"] is None
+        assert e["idle_bucket"] == "assumed"
+        assert e["idle_upper_bound_vm_s"] == pytest.approx(54_000.0)
+
+    def test_a_malformed_envelope_is_refused_rather_than_guessed(self):
+        assert fcm.wave_envelope(self._stamped(max_workers=0), boot_s=300.0) is None
+        assert fcm.wave_envelope(self._stamped(last_completion_at=900.0), boot_s=300.0) is None
+
+    def test_the_rollup_says_assumed_when_no_run_has_written_stamps(self):
+        rollup = fcm.measured_idle([], boot_s=300.0)
+        assert rollup["waves_with_timings"] == 0
+        assert rollup["idle_bucket"] == "assumed"
+        assert "INV-35" in rollup["note"]
+
+    def test_the_rollup_consumes_stamped_records_when_they_exist(self):
+        rollup = fcm.measured_idle([self._stamped(), self._stamped(wave=2)], boot_s=300.0)
+        assert rollup["waves_with_timings"] == 2
+        assert rollup["billed_vm_s"] == pytest.approx(144_000.0)
+        assert rollup["idle_bucket"] == "assumed"
+
+    def test_the_report_carries_the_idle_bucket(self):
+        report = fcm.build_report(fcm.RESULTS / "scene_counts.json", fcm.RESULTS)
+        assert report["measured_idle"]["idle_bucket"] == "assumed"

@@ -343,6 +343,110 @@ SCALING_BASIS = q(
 LAND_FRACTION_CACHE = "land_fractions.json"
 
 
+# ---------------------------------------------------------------------------
+# INV-35: per-wave provisioning and idle, consumed from the driver's wave record.
+# ---------------------------------------------------------------------------
+
+#: The three stamps INV-35 asks the fleet driver to write into
+#: ``shards.fleet_submission_key(...)`` alongside what it already records.
+#: At f4d1e93 the record carries ``submitted_at`` and none of the other two, so
+#: every function below returns the assumed path until a real run writes them.
+WAVE_TIMING_FIELDS = ("submitted_at", "first_completion_at", "last_completion_at")
+
+
+def wave_envelope(record: dict[str, Any], *, boot_s: float) -> dict[str, Any] | None:
+    """One wave's billed VM-time and idle bound, or ``None`` if it lacks stamps.
+
+    What the three stamps settle and what they do not is worth being exact
+    about, because INV-35 is necessary for a measured idle term and is not
+    sufficient on its own.
+
+    They settle the **envelope**. A wave's workers start together and the last
+    one stops when the wave's last unit lands, so billed VM-seconds is
+    ``workers x (last_completion_at - submitted_at)``. That is an observation
+    rather than a model, and it replaces the reference run's transcribed wall
+    clock.
+
+    They do not settle the **split**. Idle is billed time minus boot minus
+    useful compute, and no stamp here says how long a unit ran. Without
+    per-unit durations the most that follows is an upper bound: everything
+    after boot could in principle be idle. So this returns a bound and says so,
+    and ``idle_vm_s`` stays ``None`` until ``unit_work_s`` is supplied from
+    per-unit timings.
+
+    Args:
+        record: One wave record, as written by ``FleetDriver._record_wave``.
+        boot_s: Cold start per worker.
+
+    Returns:
+        A dict of derived envelope terms, or ``None`` when any stamp is absent.
+    """
+    if not all(record.get(f) is not None for f in WAVE_TIMING_FIELDS):
+        return None
+    submitted = float(record["submitted_at"])
+    first = float(record["first_completion_at"])
+    last = float(record["last_completion_at"])
+    workers = float(record.get("max_workers") or 0)
+    units = int(record.get("units") or 0)
+    if workers <= 0 or last < submitted:
+        return None
+    billed = workers * (last - submitted)
+    boot = workers * boot_s
+    return {
+        "stage": record.get("stage"),
+        "wave": record.get("wave"),
+        "units": units,
+        "workers": workers,
+        "queue_depth": max(1, -(-units // int(workers))) if units else 1,
+        "billed_vm_s": round(billed, 1),
+        "boot_vm_s": round(boot, 1),
+        "time_to_first_completion_s": round(first - submitted, 1),
+        "drain_tail_s": round(last - first, 1),
+        "idle_upper_bound_vm_s": round(max(0.0, billed - boot), 1),
+        "idle_vm_s": None,
+        "idle_bucket": "assumed",
+        "note": (
+            "The stamps make billed VM-time an observation. Splitting it into "
+            "useful compute and idle needs per-unit durations, which no artifact "
+            "carries yet, so idle stays bounded rather than measured."
+        ),
+    }
+
+
+def measured_idle(records: list[dict[str, Any]], *, boot_s: float) -> dict[str, Any]:
+    """Roll up whatever the wave records can say about provisioning and idle.
+
+    Written to consume the record the driver will write once INV-35 lands, so
+    the model reads a real run rather than being rewritten to meet it. With no
+    stamped record it reports the assumed path, which is what the reference
+    run's decomposition already gives.
+    """
+    envelopes = [e for e in (wave_envelope(r, boot_s=boot_s) for r in records) if e]
+    if not envelopes:
+        return {
+            "waves_with_timings": 0,
+            "idle_bucket": "assumed",
+            "note": (
+                "No wave record carries first_completion_at and last_completion_at. "
+                "The idle term is assumed from the reference run's residue, not "
+                "measured. INV-35 is unmet at f4d1e93: the record carries "
+                "submitted_at and neither completion stamp."
+            ),
+        }
+    return {
+        "waves_with_timings": len(envelopes),
+        "billed_vm_s": round(sum(e["billed_vm_s"] for e in envelopes), 1),
+        "boot_vm_s": round(sum(e["boot_vm_s"] for e in envelopes), 1),
+        "idle_upper_bound_vm_s": round(sum(e["idle_upper_bound_vm_s"] for e in envelopes), 1),
+        "idle_bucket": "assumed",
+        "per_wave": envelopes,
+        "note": (
+            "Billed VM-time is now an observation. Idle stays bounded rather than "
+            "measured until per-unit durations exist, so the bucket does not move."
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class Interval:
     """A low and a high. The model reports these wherever an input is not measured."""
@@ -649,7 +753,12 @@ def ceiling_verdict(aws: Interval) -> str:
     )
 
 
-def build_report(scene_counts_path: Path, cache_dir: Path, ref: str = "S30W065") -> dict[str, Any]:
+def build_report(
+    scene_counts_path: Path,
+    cache_dir: Path,
+    ref: str = "S30W065",
+    wave_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     counts = load_scene_counts(scene_counts_path)
     cached = (cache_dir / LAND_FRACTION_CACHE).exists()
     lf = land_fractions(sorted(counts), cache_dir)
@@ -685,6 +794,7 @@ def build_report(scene_counts_path: Path, cache_dir: Path, ref: str = "S30W065")
         },
         "fleet_scale": equiv,
         "layers": layers(equiv),
+        "measured_idle": measured_idle(wave_records or [], boot_s=BOOT_MIN * 60.0),
         "projection": [project(equiv, scenario=s) for s in CAPTURE_BANDS],
         "blocking_unknowns": [
             {
@@ -886,10 +996,18 @@ def main() -> None:
     ap.add_argument("--json", action="store_true", help="emit pure JSON")
     ap.add_argument("--quantities", action="store_true", help="emit the provenance register")
     ap.add_argument("--scene-counts", type=Path, default=RESULTS / "scene_counts.json")
+    ap.add_argument(
+        "--wave-records",
+        type=Path,
+        default=None,
+        help="JSON list of fleet wave records (INV-35). Supplies the idle term "
+        "from a real run instead of the reference run's residue.",
+    )
     ap.add_argument("--cache-dir", type=Path, default=RESULTS)
     args = ap.parse_args()
 
-    report = build_report(args.scene_counts, args.cache_dir)
+    waves = json.loads(args.wave_records.read_text()) if args.wave_records else None
+    report = build_report(args.scene_counts, args.cache_dir, wave_records=waves)
 
     if args.quantities:
         print(
@@ -950,6 +1068,8 @@ def main() -> None:
     print("\nUNKNOWN and blocking:")
     for u in report["blocking_unknowns"]:
         print(f"  - {u['name']}")
+    mi = report["measured_idle"]
+    print(f"\nIdle term: {mi['idle_bucket'].upper()} -- {mi['note']}")
     print(f"\n{report['regime_note']}")
 
 

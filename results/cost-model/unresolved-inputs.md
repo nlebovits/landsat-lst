@@ -105,6 +105,28 @@ the on-demand total.
 that counts boots and idle VM-minutes directly, which is exactly the run issue
 #108's cloud gate describes.
 
+### U6a. Per-wave provisioning and idle (INV-35)
+
+**Status:** assumed. The idle term is the reference run's residue.
+
+**Why it matters.** Provisioning and idle is 52% of the on-demand total and is
+the only layer consolidation acts on. It is the quantity issue #108 exists to
+reduce, and no run has observed it. `FleetDriver._record_wave` at f4d1e93
+writes `submitted_at` and neither completion stamp, so #108's cloud gate,
+reconciling measured wall time and VM lifetimes against the model, cannot be
+met as the driver is built.
+
+**What would settle it, in two parts.** The wave record needs
+`first_completion_at` and `last_completion_at` beside `submitted_at`, which
+makes billed VM-time per wave an observation. That alone bounds idle rather
+than measuring it, because no stamp says how long a unit ran. Per-unit
+durations, which is U4, are the second half. Both together move the idle term
+from assumed to derived over measured inputs.
+
+The model already consumes the first half through `wave_envelope`,
+`measured_idle`, and `--wave-records`, so a run that writes the stamps needs no
+change here.
+
 ### U7. Compressed output size per tile
 
 **Status:** assumed at 1.5 GB.
