@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
+import time
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -683,8 +684,171 @@ def fleet_cluster_name(run_id: str, stage: str, wave: int) -> str:
     than spelled so the wave marker can never be truncated away, which is the
     mistake the per-tile name made once and paid for.
     """
+    return f"{fleet_cluster_prefix(run_id)}{stage[:5]}-w{wave}"[:_CLUSTER_NAME_MAX]
+
+
+def fleet_cluster_prefix(run_id: str) -> str:
+    """The name prefix every cluster of one run shares.
+
+    The listing key for a whole run, and a pure function of ``run_id``. It is
+    what makes ``enumerable_by_run`` true on Coiled: ``batch_run`` is handed
+    ``name=`` before it does anything, so a cluster created by a call whose
+    answer never came back is still sitting in ``list_clusters`` under a name
+    that can be recomputed from the run id alone.
+
+    Deliberately not derived from the wave record. A record is written by the
+    driver and can be lost with it; this is derived from the run id a caller
+    typed.
+    """
     digest = hashlib.sha256(run_id.encode()).hexdigest()[:8]
-    return f"lst-{digest}-fleet-{stage[:5]}-w{wave}"[:_CLUSTER_NAME_MAX]
+    return f"lst-{digest}-fleet-"
+
+
+#: Worker states that mean the substrate has stopped billing. Everything else
+#: -- including a string this client has never seen -- counts as **live**.
+#:
+#: The vocabulary is not pinned by the Coiled client source: it names
+#: ``pending``, ``assigned`` and ``error``, and substring-matches ``done``,
+#: while never enumerating the full set. So the allowlist is the conservative
+#: direction, and it is the same rule ``classify_failure`` already follows for
+#: an unrecognized error: guess the answer that cannot silently free capacity.
+#: ``stopping`` is deliberately absent -- a VM being torn down is a VM being
+#: billed.
+_TERMINAL_WORKER_STATES = frozenset({"stopped", "error", "terminated"})
+
+
+def _state_of(record: object) -> str:
+    if not isinstance(record, dict):
+        return ""
+    state = record.get("current_state")
+    if isinstance(state, dict):
+        return str(state.get("state") or "").strip().lower()
+    return str(state or "").strip().lower()
+
+
+def _live_workers(details: object) -> int:
+    """Workers of one cluster that the substrate has not stopped billing for.
+
+    A worker is counted unless *both* its own state and its instance's state
+    are on the verified-terminal allowlist. Either one still live means the
+    machine is still there, and an absent or unparseable state counts live:
+    :data:`_TERMINAL_WORKER_STATES` records why the unknown case has to lean
+    that way.
+    """
+    if not isinstance(details, dict):
+        return 0
+    workers = details.get("workers")
+    if not isinstance(workers, list):
+        return 0
+    live = 0
+    for worker in workers:
+        states = {_state_of(worker)}
+        # Only when the instance is actually projected. Coiled returns ``None``
+        # for a worker that has no instance, and reading that as an unknown
+        # state would count every torn-down worker as live forever.
+        if isinstance(worker, dict) and isinstance(worker.get("instance"), dict):
+            states.add(_state_of(worker["instance"]))
+        if not states.issubset(_TERMINAL_WORKER_STATES):
+            live += 1
+    return live
+
+
+def fleet_worker_census(run_id: str):
+    """Every VM Coiled is billing this run for, found from ``run_id`` alone.
+
+    Two steps, and the first is the one that matters. ``list_clusters`` filtered
+    on :func:`fleet_cluster_prefix` enumerates the run's clusters **by a name
+    the driver computed before it called anything**, so it finds a cluster whose
+    creation succeeded and whose answer was lost -- the one failure state that
+    costs money and that no handle, record or artifact can see. Then
+    ``cluster_details`` per match gives the server's own per-worker record.
+
+    Returns:
+        A :class:`~landsat_lst.fleet_backend.WorkerCensus`, or ``None`` when
+        Coiled **cannot be asked**: no credentials, or the listing raised. That
+        is "unknown", and the caller must not read it as "nothing is running".
+        Returning zero here on a control-plane blip would hand a driver its
+        whole cap as headroom at the moment it had lost sight of the bill.
+
+    A cluster listed under the prefix but not reachable for detail still counts:
+    it is charged one worker rather than none, because a cluster the substrate
+    admits exists is not evidence of an empty fleet.
+    """
+    from landsat_lst.fleet_backend import WorkerCensus  # noqa: PLC0415
+    from landsat_lst.shard_driver import _coiled_credentials_present  # noqa: PLC0415
+
+    if not _coiled_credentials_present():
+        # Same reason the probe skips: without a token the client blocks on an
+        # interactive auth flow rather than raising. No token, no answer.
+        log.warning("fleet_census_skipped", run_id=run_id, reason="no coiled credentials")
+        return None
+
+    prefix = fleet_cluster_prefix(run_id)
+    try:
+        import coiled  # noqa: PLC0415
+        from coiled.v2.core import Cloud  # noqa: PLC0415
+
+        matched = [
+            record
+            for record in coiled.list_clusters(just_mine=True)
+            if str(record.get("name") or "").startswith(prefix)
+        ]
+        by_identity: dict[str, int] = {}
+        with Cloud() as cloud:
+            for record in matched:
+                identity = str(record.get("name"))
+                if _state_of(record) in _TERMINAL_WORKER_STATES:
+                    continue
+                try:
+                    details = cloud.cluster_details(record.get("id"))
+                except Exception as e:
+                    log.warning(
+                        "fleet_census_partial", run_id=run_id, cluster=identity, error=str(e)
+                    )
+                    by_identity[identity] = by_identity.get(identity, 0) + 1
+                    continue
+                live = _live_workers(details)
+                if live:
+                    by_identity[identity] = by_identity.get(identity, 0) + live
+    except Exception as e:
+        log.warning("fleet_census_failed", run_id=run_id, error=str(e))
+        return None
+
+    census = WorkerCensus(
+        as_of=time.time(),
+        total=sum(by_identity.values()),
+        by_identity=by_identity,
+        identities=frozenset(by_identity),
+    )
+    log.info(
+        "fleet_census",
+        run_id=run_id,
+        total=census.total,
+        identities=len(census.identities),
+    )
+    return census
+
+
+def fleet_reap_identity(run_id: str, identity: str) -> None:
+    """Ask Coiled to terminate one of a run's clusters. A request, not a result.
+
+    ``delete_cluster`` is idempotent and returns ``None`` on anything that is
+    not a 4xx, so it reports nothing about whether the VMs are gone. The only
+    confirmation is a later :func:`fleet_worker_census` that omits the identity,
+    which is why this is safe to repeat and pointless to check.
+    """
+    from landsat_lst.shard_driver import _coiled_credentials_present  # noqa: PLC0415
+
+    if not _coiled_credentials_present():
+        log.warning("fleet_reap_skipped", run_id=run_id, identity=identity)
+        return
+    try:
+        import coiled  # noqa: PLC0415
+
+        coiled.delete_cluster(name=identity)
+        log.warning("fleet_reap_requested", run_id=run_id, identity=identity)
+    except Exception as e:  # pragma: no cover - reaping never fails a run
+        log.warning("fleet_reap_failed", run_id=run_id, identity=identity, error=str(e))
 
 
 def _fleet_task_command(*, stage: str, run_id: str, units: int | None = None) -> str:
