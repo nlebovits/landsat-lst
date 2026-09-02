@@ -757,6 +757,32 @@ class TestShardGroup:
         assert result.exit_code == 0
         assert resume.call_args.args == ("run-7", "N40W075")
 
+    def test_resume_formats_a_write_refusal_as_a_cli_error(self, runner):
+        from landsat_lst import quota
+
+        refusal = quota.WriteAccessRefused(
+            "ListObjectsV2 was refused", arn="arn:aws:iam::1:user/x", bucket="b", key="k"
+        )
+        with patch("landsat_lst.shard_driver.resume_tile", side_effect=refusal):
+            result = runner.invoke(main, ["shard", "resume", "run-7", "N40W075"])
+
+        assert result.exit_code != 0
+        assert "Error: ListObjectsV2 was refused" in result.output
+        assert result.exception is not refusal
+
+    def test_resume_fleet_formats_a_write_refusal_as_a_cli_error(self, runner):
+        from landsat_lst import quota
+
+        refusal = quota.WriteAccessRefused(
+            "PutObject was refused", arn="arn:aws:iam::1:user/x", bucket="b", key="k"
+        )
+        with patch("landsat_lst.fleet_driver.resume_fleet", side_effect=refusal):
+            result = runner.invoke(main, ["shard", "resume-fleet", "run-7"])
+
+        assert result.exit_code != 0
+        assert "Error: PutObject was refused" in result.output
+        assert result.exception is not refusal
+
     def test_a_stage_subcommand_forwards_its_index(self, runner):
         with patch("landsat_lst.shard_tasks.run_shard", return_value=[]) as run_shard:
             result = runner.invoke(

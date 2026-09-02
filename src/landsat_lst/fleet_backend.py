@@ -359,9 +359,9 @@ class CoiledFleetBackend:
       from a cluster create -- the credit quota, as it turned out -- killed the
       driver outright on 2026-08-22. So unknown maps to transient, and only the
       named markers map to terminal.
-    - **Cost is credits, and identity is AWS SSO.** The preflight is two gates
-      in that order, because a session that cannot call STS cannot read a
-      Coiled balance either.
+    - **Identity, write access, then cost.** A session that cannot call STS
+      cannot explain a denied S3 operation, and a fleet that cannot publish
+      must be refused before its credit balance matters.
     - **Workers always write S3.** A driver polling a local directory would
       wait forever on a barrier whose artifacts are in a bucket.
 
@@ -432,7 +432,7 @@ class CoiledFleetBackend:
         return coiled_cluster_probe(handle_id)
 
     def preflight(self, *, tiles: int) -> None:
-        """Identity, then credits, priced for many tiles.
+        """Identity, write access, then credits, priced for many tiles.
 
         The estimate is the per-tile one multiplied by the tile count, which
         ignores the boot amortization the consolidation buys and therefore
@@ -442,6 +442,7 @@ class CoiledFleetBackend:
         from landsat_lst import quota  # noqa: PLC0415
 
         quota.preflight_identity()
+        quota.preflight_write_access()
         estimate = quota.estimate_run_credits() * max(1, tiles)
         balance = quota.preflight_credits(estimate, balance_source=self.balance_source)
         log.info(

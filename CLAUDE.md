@@ -658,8 +658,9 @@ Rules worth keeping:
   creates rejected with an *empty* `ServerError`. `--ack-quota` is the escape when no
   balance can be read.
 - **A valid identity is not a permitted one, so `quota.preflight_write_access` probes.**
-  It writes one object under `{s3_prefix}/_preflight/`, reads it back, and deletes it. All
-  three: reading alone clears a read-only identity, which is the case that started this
+  It writes one object under `{s3_prefix}/_preflight/`, reads it back, lists that exact
+  key, and deletes it. All four: listing proves the bucket-level permission every barrier
+  needs, while reading alone clears a read-only identity, which is the case that started this
   (2026-09-02, `user/vercel-data-access` from the default chain — four profiles passed the
   identity gate, two could not run a tile), and a run that cannot delete leaves artifacts a
   later listing reads as finished work. It **probes, never infers** from IAM policy or

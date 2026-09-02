@@ -353,9 +353,10 @@ fleet that booted, staged nothing, and left the driver's barrier waiting on shar
 never published.
 
 `quota.preflight_write_access` writes one small object under
-`{s3_prefix}/_preflight/`, reads it back, and deletes it. Each of the three answers a
-question the others do not. Reading alone clears the very identity that prompted the gate.
-An object that will not read back means something between the shell and the bucket rewrote
+`{s3_prefix}/_preflight/`, reads it back, lists that exact key, and deletes it. Each of
+the four answers a question the others do not. Listing proves the bucket-level permission every stage barrier
+needs; object-level read and write permissions do not imply it. Reading alone clears the
+very identity that prompted the gate. An object that will not read back means something between the shell and the bucket rewrote
 it. A run that writes and cannot delete leaves artifacts behind, and a later listing reads
 leftovers as work that finished. The refusal names the operation, the ARN, where those
 credentials came from, and the bucket and prefix tried, because "access denied" on its own

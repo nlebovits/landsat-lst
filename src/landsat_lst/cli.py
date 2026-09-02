@@ -1920,6 +1920,7 @@ def shard_resume(run_id: str, tile: str, ack_quota: bool) -> None:
         ShardStageFailed,
         ShardBackendMismatch,
         quota.IdentityRefused,
+        quota.WriteAccessRefused,
         quota.QuotaRefused,
     ) as e:
         raise click.ClickException(str(e)) from e
@@ -2196,6 +2197,7 @@ def shard_resume_fleet(
         ShardBackendMismatch,
         FileNotFoundError,
         quota.IdentityRefused,
+        quota.WriteAccessRefused,
         quota.QuotaRefused,
     ) as e:
         raise click.ClickException(str(e)) from e

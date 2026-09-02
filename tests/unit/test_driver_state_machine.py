@@ -876,7 +876,7 @@ class TestWritePreflight:
         quota.preflight_write_access(writers=[_writer(s3)])
 
         assert s3.objects == {}
-        assert s3.operations == ["put_object", "get_object", "delete_object"]
+        assert s3.operations == ["put_object", "get_object", "list_objects_v2", "delete_object"]
 
     def test_reading_alone_would_clear_the_identity_that_started_this(self):
         """The failing identity of 2026-09-02 reads the bucket perfectly."""
@@ -886,6 +886,14 @@ class TestWritePreflight:
             quota.preflight_write_access(writers=[_writer(s3)])
 
         assert s3.operations == ["put_object"], "a denied write must not be probed further"
+
+    def test_a_denied_list_is_refused_and_cleaned_up(self):
+        s3 = _FakeS3(deny={"list_objects_v2"})
+
+        with pytest.raises(quota.WriteAccessRefused, match="ListObjectsV2"):
+            quota.preflight_write_access(writers=[_writer(s3)])
+
+        assert s3.objects == {}
 
     def test_a_denied_delete_is_refused(self):
         s3 = _FakeS3(deny={"delete_object"})
@@ -1240,6 +1248,12 @@ class _FakeS3:
         del Bucket
         self._check("get_object")
         return {"Body": SimpleNamespace(read=lambda: self.objects[Key])}
+
+    def list_objects_v2(self, *, Bucket, Prefix, MaxKeys) -> dict:
+        del Bucket
+        self._check("list_objects_v2")
+        keys = [key for key in self.objects if key.startswith(Prefix)][:MaxKeys]
+        return {"Contents": [{"Key": key} for key in keys]}
 
     def delete_object(self, *, Bucket, Key) -> dict:
         del Bucket

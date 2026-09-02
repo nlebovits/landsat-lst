@@ -2227,6 +2227,7 @@ class TestPreregisteredScenarios:
 
         seen: list[float] = []
         monkeypatch.setattr(quota, "preflight_identity", lambda: None)
+        monkeypatch.setattr(quota, "preflight_write_access", lambda: None)
         monkeypatch.setattr(quota, "estimate_run_credits", lambda: 100.0)
         monkeypatch.setattr(
             quota,
@@ -2239,6 +2240,25 @@ class TestPreregisteredScenarios:
         CoiledFleetBackend().preflight(tiles=7)
 
         assert seen == [700.0]
+
+    def test_write_access_precedes_the_credit_gate(self, monkeypatch):
+        from landsat_lst import quota
+
+        asked: list[str] = []
+        monkeypatch.setattr(quota, "preflight_identity", lambda: asked.append("identity"))
+        monkeypatch.setattr(quota, "preflight_write_access", lambda: asked.append("write"))
+        monkeypatch.setattr(quota, "estimate_run_credits", lambda: asked.append("estimate") or 1.0)
+        monkeypatch.setattr(
+            quota,
+            "preflight_credits",
+            lambda _estimate, **_kwargs: (
+                asked.append("credits") or SimpleNamespace(remaining=1.0, source="stub")
+            ),
+        )
+
+        CoiledFleetBackend().preflight(tiles=1)
+
+        assert asked == ["identity", "write", "estimate", "credits"]
 
     def test_each_wave_records_when_its_first_and_last_unit_landed(self, storage, clock):
         """Provisioning idle has to be attributable per wave, not per run.

@@ -380,9 +380,9 @@ def _delete_quietly(client: Any, bucket: str, key: str) -> None:
 
 
 def _probe_writer(writer: Writer, *, bucket: str, prefix: str) -> str:
-    """Write one small object, read it back, delete it. Returns the ARN.
+    """Write one small object, read and list it, then delete it. Returns the ARN.
 
-    All three, because each answers a question the others do not. A read-only
+    All four, because each answers a question the others do not. A read-only
     identity reads the bucket perfectly, so reading alone clears the very
     identity that prompted this gate. An object that will not read back means
     something between this shell and the bucket rewrote it. A run that writes
@@ -390,7 +390,7 @@ def _probe_writer(writer: Writer, *, bucket: str, prefix: str) -> str:
     leftovers as work that finished.
 
     Raises:
-        WriteAccessRefused: On any of the three, naming which one.
+        WriteAccessRefused: On any of the four, naming which one.
     """
     import json  # noqa: PLC0415
     import uuid  # noqa: PLC0415
@@ -442,6 +442,23 @@ def _probe_writer(writer: Writer, *, bucket: str, prefix: str) -> str:
         raise WriteAccessRefused(msg, arn=arn, bucket=bucket, key=key)
 
     try:
+        listed = client.list_objects_v2(Bucket=bucket, Prefix=key, MaxKeys=1)
+    except Exception as e:
+        # Barriers are bucket listings, and ListBucket is independent of the
+        # object-level permissions already proved above.
+        _delete_quietly(client, bucket, key)
+        raise refuse("ListObjectsV2", e) from e
+
+    if key not in {item.get("Key") for item in listed.get("Contents", [])}:
+        _delete_quietly(client, bucket, key)
+        msg = (
+            f"the probe object at s3://{bucket}/{key} was not visible to a scoped "
+            f"bucket listing as {arn} from {writer.origin}. Every stage barrier "
+            f"lists its artifacts, so the run cannot observe its own progress."
+        )
+        raise WriteAccessRefused(msg, arn=arn, bucket=bucket, key=key)
+
+    try:
         client.delete_object(Bucket=bucket, Key=key)
     except Exception as e:
         raise refuse("DeleteObject", e) from e
@@ -451,7 +468,7 @@ def _probe_writer(writer: Writer, *, bucket: str, prefix: str) -> str:
 
 
 def preflight_write_access(*, writers: Iterable[Writer] | None = None) -> list[str]:
-    """Verify the run can write, read back, and delete where it writes.
+    """Verify the run can write, read, list, and delete where it writes.
 
     Runs beside :func:`preflight_identity`, one level further in. STS passes for
     any valid identity, a read-only one included: on 2026-09-02 four profiles
@@ -472,7 +489,7 @@ def preflight_write_access(*, writers: Iterable[Writer] | None = None) -> list[s
         The ARN of each identity probed, for the driver to log.
 
     Raises:
-        WriteAccessRefused: If any writer cannot write, read back, or delete.
+        WriteAccessRefused: If any writer cannot write, read, list, or delete.
         IdentityRefused: If the workers' profile does not resolve to a session.
     """
     bucket = settings.s3_bucket
