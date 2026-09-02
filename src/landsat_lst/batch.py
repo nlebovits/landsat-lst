@@ -731,7 +731,7 @@ def _live_workers(details: object) -> int:
 
     A worker is counted unless *both* its own state and its instance's state
     are on the verified-terminal allowlist. Either one still live means the
-    machine is still there, and an absent or unparseable state counts live:
+    machine is still there, and an absent or unreadable state counts live:
     :data:`_TERMINAL_WORKER_STATES` records why the unknown case has to lean
     that way.
     """
