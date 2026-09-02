@@ -90,6 +90,10 @@ log = structlog.get_logger()
 #: submits nothing, which is why it is here rather than in ``shards.STAGES``.
 TILE_STAGES = ("offsets", "merge", "composite", "export")
 
+#: Keys one S3 list page returns. ``list_objects_v2`` caps a page at 1,000
+#: keys, so a listing's cost in *requests* is the number of pages it takes.
+LIST_PAGE_KEYS = 1000
+
 #: Stages a wave can carry. ``merge`` is local; everything else is a fleet.
 WAVE_STAGES = ("offsets", "composite", "export")
 
@@ -175,6 +179,12 @@ class PollIndex:
     here would be wrong, and it is the kind of wrong that only shows up at the
     scale nobody tests at.
 
+    Both numbers are published, because they are different numbers:
+    :attr:`listings` is calls and :attr:`requests` is pages, and only the
+    second is what S3 bills. A call over a prefix holding 24,000 keys is 24
+    requests, so a counter of calls reads flat while the charge climbs with the
+    keys a run has published.
+
     Bodies are cached against the modification time the listing already
     returns, which is exact rather than a guess: a key whose timestamp has not
     moved has not been rewritten, so its body can be reused. That takes the
@@ -190,23 +200,39 @@ class PollIndex:
         self._prefixes: list[str] = [f"{shards.SHARD_PREFIX}/{run_id}/"]
         self._listing: dict[str, _Listing] = {}
         self._bodies: dict[str, tuple[object, str | None]] = {}
-        #: Listings actually issued against the backend, for the test that pins
-        #: this staying flat in the tile count.
+        #: Listing *calls* issued against the backend, for the test that pins
+        #: this staying flat in the tile count. It is not the bill.
         self.listings = 0
+        #: Listing *requests*, which is the bill. One call over a prefix
+        #: holding more keys than :data:`LIST_PAGE_KEYS` costs several
+        #: requests, so a counter of calls reads flat while the charge grows
+        #: with the keys the run has published. Reporting calls as cost was an
+        #: accounting defect rather than a wrong claim: what sharing buys is a
+        #: change in the exponent on the tile count, and only a request count
+        #: can show that honestly.
+        self.requests = 0
 
     def watch(self, prefix: str) -> None:
         """Add a prefix to the set refreshed each cycle."""
         if prefix not in self._prefixes:
             self._prefixes.append(prefix)
 
+    def _charge(self, keys: int) -> None:
+        """Bill one listing call at the number of pages it took."""
+        self.listings += 1
+        self.requests += max(1, -(-keys // LIST_PAGE_KEYS))
+
     def refresh(self) -> None:
         for prefix in list(self._prefixes):
             try:
-                self.listings += 1
-                self._listing[prefix] = _Listing(dict(self._storage.list_prefix(prefix)))
+                listed = dict(self._storage.list_prefix(prefix))
             except Exception as e:
                 log.warning("fleet_index_listing_failed", prefix=prefix, error=str(e))
+                self._charge(0)
                 self._listing[prefix] = _Listing({})
+            else:
+                self._charge(len(listed))
+                self._listing[prefix] = _Listing(listed)
 
     def _covering(self, prefix: str) -> _Listing | None:
         for cached, listing in self._listing.items():
@@ -217,8 +243,9 @@ class PollIndex:
     def list_prefix(self, prefix: str) -> dict:
         listing = self._covering(prefix)
         if listing is None:
-            self.listings += 1
-            return self._storage.list_prefix(prefix)
+            listed = dict(self._storage.list_prefix(prefix))
+            self._charge(len(listed))
+            return listed
         return listing.slice(prefix)
 
     def read_text(self, key: str) -> str | None:

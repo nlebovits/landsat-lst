@@ -46,9 +46,11 @@ from landsat_lst.fleet_backend import (
     check_contract,
 )
 from landsat_lst.fleet_driver import (
+    LIST_PAGE_KEYS,
     Demand,
     FleetAborted,
     FleetDriver,
+    PollIndex,
     TileTrack,
     drive_fleet,
     read_manifest,
@@ -1776,6 +1778,26 @@ class TestListingCost:
             per_cycle[n] = driver.index.listings
 
         assert per_cycle[10] == per_cycle[2]
+
+    def test_requests_are_pages_and_listings_are_calls(self, tmp_path):
+        """The counter has to measure what S3 charges for.
+
+        A call over a prefix holding more keys than one page is several
+        requests, so counting calls reads flat while the bill climbs with the
+        keys a run has published. Reporting the flat number as the cost was an
+        accounting defect rather than a wrong claim: what sharing the listing
+        buys is a change in the exponent on the tile count, and only a request
+        count can say so honestly.
+        """
+        store = LocalStorage(tmp_path / "pages")
+        index = PollIndex(store, "pages")
+        for i in range(LIST_PAGE_KEYS + 1):
+            store.write_text(f"{shards.SHARD_PREFIX}/pages/k{i:06d}", "x")
+
+        index.refresh()
+
+        assert index.listings == 1
+        assert index.requests == 2
 
 
 class TestSpeed:
