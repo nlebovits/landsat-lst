@@ -595,6 +595,10 @@ class TileTrack:
     clock: Clock
     job: ProcessingJob | None = None
     dead_handles: set = field(default_factory=set)
+    #: Per stage, the unit indexes a wave the driver still counts as live is
+    #: carrying for this tile. Refreshed by the driver each poll, exactly as
+    #: ``dead_handles`` is, because a track cannot see a wave.
+    held_units: dict[str, set[int]] = field(default_factory=dict)
 
     stage: str = "offsets"
     plan: shards.TilePlan | None = None
@@ -631,14 +635,24 @@ class TileTrack:
         return self.terminal or stage in self.done_stages
 
     def _fail(self, reason: str) -> None:
-        # ``outstanding`` is deliberately *not* cleared. A tile that has given
-        # up is a tile the driver has stopped waiting for, which is not the
-        # same fact as a tile whose VMs have stopped: a barrier round expires
-        # because a record aged out, and the workers that record describes may
-        # still be billing. Releasing a wave's width on the strength of a
-        # tile's own despair is the clock defect wearing a different name. The
-        # width comes back when the artifacts land or the backend confirms the
-        # submission is gone, exactly as it does for a healthy tile.
+        """Record that this tile is over, and say why.
+
+        Capacity is deliberately untouched. A tile that has given up is a tile
+        the driver has stopped waiting for, which is not the same fact as a
+        tile whose VMs have stopped: a barrier round expires because a record
+        aged out, and the workers that record describes may still be billing.
+        Releasing a wave's width on the strength of a tile's own despair is the
+        clock defect wearing a different name.
+
+        Nothing here *can* touch capacity any more, which is the point. The
+        driver counts what a wave holds from :attr:`Wave.outstanding_units`,
+        refreshed from the bucket once a poll, so a tile failing between that
+        refresh and the flush in the same poll cannot move the number. It used
+        to: ``outstanding`` lived on the track, this method could clear it, and
+        the window between the two was one poll wide and invisible to every
+        test. The width comes back when the artifacts land or the backend
+        confirms the submission is gone, exactly as it does for a healthy tile.
+        """
         self.outcome.failed = True
         self.outcome.reason = reason
         self.outcome.stage = self.stage
@@ -661,7 +675,7 @@ class TileTrack:
 
     # -- evidence, for whatever a live wave is still holding ---------------
 
-    def refresh_outstanding(self, stage: str, indexes: Sequence[int]) -> None:
+    def refresh_outstanding(self, stage: str, indexes: Sequence[int]) -> set[int]:
         """Recompute, from the bucket, which of these units have not published.
 
         Called by the driver for every ``(tile, stage)`` a live wave references,
@@ -674,21 +688,29 @@ class TileTrack:
         Conservative where it cannot see: with no plan yet there is no way to
         name the artifacts, so every index in the wave counts as outstanding.
         Over-counting delays a submission; under-counting doubles a bill.
+
+        Returns:
+            The indexes still absent. Returned as well as stored because the
+            caller keeps the driver's capacity ledger on the *wave*, where a
+            track cannot reach it.
         """
         if self.plan is None:
             self.outstanding[stage] = set(indexes)
-            return
-        if stage == "export":
+        elif stage == "export":
             done = self.storage.cog_exists(self.plan.window, self.tile)
             self.outstanding[stage] = set() if done else set(indexes)
-            return
-        expected = _expected_keys(self.plan, stage, self.root)
-        present = set(self.storage.list_prefix(_stage_prefix(self.root, stage)))
-        # An index past the plan's clamped shard count has nothing to produce:
-        # the worker reads the plan, finds no slice of its own, and exits.
-        self.outstanding[stage] = {
-            index for index in indexes if any(key not in present for key in expected.get(index, ()))
-        }
+        else:
+            expected = _expected_keys(self.plan, stage, self.root)
+            present = set(self.storage.list_prefix(_stage_prefix(self.root, stage)))
+            # An index past the plan's clamped shard count has nothing to
+            # produce: the worker reads the plan, finds no slice of its own,
+            # and exits.
+            self.outstanding[stage] = {
+                index
+                for index in indexes
+                if any(key not in present for key in expected.get(index, ()))
+            }
+        return set(self.outstanding[stage])
 
     # -- the barrier decision, without the wait ---------------------------
 
@@ -841,7 +863,24 @@ class TileTrack:
         This is where the round budget is spent, and it is read from the bucket
         rather than from memory so a resumed driver cannot mint itself a fresh
         allowance.
+
+        A unit a live wave is still carrying is not re-demanded, and this is a
+        separate question from the round budget rather than a duplicate of it.
+        The record ages out on a horizon derived when the wave was submitted;
+        the wave is retired on evidence. When the first runs out before the
+        second, the tile asks for units that are running right now, and the
+        driver dispatches them a second time beside the first. The composite
+        wave demanded from inside the offsets barrier is where that bites --
+        its record is written long before the tile reaches the stage. Units are
+        idempotent at their artifact keys, so this was waste and a spent
+        barrier round rather than corruption, but a run that pays for the same
+        band twice while a cap is holding other tiles out is paying twice for
+        nothing. A *stranded* wave is excluded by the driver, because a wave
+        past its own budget is exactly the case a barrier round exists for.
         """
+        indexes = tuple(index for index in indexes if index not in self.held_units.get(stage, ()))
+        if not indexes:
+            return None
         records = _submission_records(self.storage, self.root, stage)
         latest = records[-1] if records else None
         if latest is not None and self._is_live(latest, deadline_s):
@@ -930,6 +969,73 @@ class Wave:
     #: Units observed as landed at the last refresh, so a rising edge is
     #: detectable without keeping a second copy of the evidence.
     landed: int = 0
+    #: Whether the backend acknowledged the submission. An unacknowledged wave
+    #: may still be running: the control-plane call can be made, start work,
+    #: and have its answer lost, so the width is held until the artifacts
+    #: settle it rather than released on the strength of a missing reply.
+    acknowledged: bool = False
+    #: Units whose artifacts were absent at the last evidence refresh, or
+    #: ``None`` when the driver has read no evidence at all. Owned by the wave,
+    #: never by the tracks it carries: capacity must not be a function of a
+    #: tile's own despair, and while this lived on the tracks a tile failing
+    #: between the refresh and the flush in the same poll moved the number.
+    outstanding_units: set[tuple[str, int]] | None = None
+
+    def stranded(self, now: float) -> bool:
+        """Past a whole budget and a boot since this wave last showed a sign of life.
+
+        The deadline says the wave is late. This says it has stopped producing:
+        a wave still landing units is alive by the only evidence there is, and
+        a late wave that is *working* must not be treated as a dead one. So the
+        clock runs from the last completion the driver observed, and from the
+        submission when there has never been one. Measured from submission
+        instead, a deep composite wave that overran its estimate while landing
+        units steadily was declared stranded and took ten tiles down with it.
+
+        The grace on top is one :data:`~landsat_lst.budgets.VM_BOOT_S`, the one
+        interval a wave can pass without producing anything and still be
+        healthy: a worker replaced late has to boot before it can work.
+        """
+        return now >= self.stranded_at()
+
+    def stranded_at(self) -> float:
+        """When this wave stops counting as alive, absent further evidence."""
+        since = self.submitted_at if self.last_completion_at is None else self.last_completion_at
+        return since + self.deadline_s + budgets.VM_BOOT_S
+
+    def held_at(self, now: float) -> int:
+        """Workers this wave is holding. Two regimes, and the boundary is its budget.
+
+        **Inside its budget it holds its full width.** A batch array keeps
+        every VM it started until the array itself finishes: the worker that
+        published this artifact takes the next unit off the queue, or waits in
+        a cluster that is still billing. Counting the width down per landed
+        artifact measures work rather than machines, and the difference is a
+        whole wave at the tail -- the driver freed slots the substrate had not,
+        the next wave booted on top, and a run capped at 64 peaked at 82.
+
+        **Past it the count degrades to one worker per absent unit.** A wave
+        that has overrun its derived deadline by a boot is either gone, in
+        which case it holds nothing at all, or alive with finished workers idle
+        in an array the substrate should have ended. Charging the full width
+        for either is charging for a wave that has already broken its contract,
+        and the price of doing so is a run that fails tiles whose own work
+        landed: one slow unit in a cap-wide wave would pin the whole cap for
+        the rest of the build. The exposure this admits is bounded by the
+        landed units of waves that are already overdue, and it cannot reach the
+        healthy tail the full-width rule exists to protect.
+
+        Zero once every unit has landed, because that is when the array ends.
+        With no evidence at all the wave holds its full requested width:
+        over-counting delays a submission, under-counting doubles a bill.
+        """
+        if self.outstanding_units is None:
+            return self.max_workers
+        if not self.outstanding_units:
+            return 0
+        if self.stranded(now):
+            return min(self.max_workers, len(self.outstanding_units))
+        return self.max_workers
 
     def expired(self, now: float) -> bool:
         return now >= self.submitted_at + self.deadline_s
@@ -974,6 +1080,7 @@ class Wave:
             "tiles": list(self.tiles),
             "max_workers": self.max_workers,
             "handle_name": self.handle_name,
+            "acknowledged": self.acknowledged,
             "first_completion_at": self.first_completion_at,
             "last_completion_at": self.last_completion_at,
             "provisioning_idle_s": self.provisioning_idle_s,
@@ -1094,10 +1201,12 @@ class FleetDriver:
         round.
 
         A wave that neither settles nor can be confirmed dead holds its width
-        until the poll ceiling ends the run. That is deliberate: a loud stall
-        costs less than a silent doubling of the bill, and :meth:`_probe` always
-        checks expired waves so the confirmation path does not depend on
-        ``probe_waves``.
+        until :meth:`_stalled` gives up on it and the run fails saying so. That
+        is deliberate: a loud stall costs less than a silent doubling of the
+        bill, and :meth:`_probe` always checks expired waves so the
+        confirmation path does not depend on ``probe_waves``. What is *not*
+        acceptable, and was the behaviour before, is holding it silently until
+        the poll ceiling and then returning as though the run had finished.
 
         There is deliberately no shortcut through a track's own state. An
         earlier draft also retired a wave once every tile it carried had
@@ -1126,6 +1235,91 @@ class FleetDriver:
             kept.append(wave)
         self._live = kept
 
+    def _publish_held_units(self) -> None:
+        """Tell each track which of its units a live wave is still carrying.
+
+        Read once per poll, after retirement, so a track only ever sees waves
+        the driver still believes hold workers. Stranded waves are left out:
+        past its own budget a wave is what the barrier round exists for.
+        """
+        held: dict[str, dict[str, set[int]]] = {}
+        now = self.clock.now()
+        for wave in self._live:
+            if wave.stranded(now):
+                continue
+            for tile, index in wave.units:
+                held.setdefault(tile, {}).setdefault(wave.stage, set()).add(index)
+        for track in self.tracks:
+            track.held_units = held.get(track.tile, {})
+
+    def _unobservable(self, wave: Wave) -> bool:
+        """A wave the bucket can never settle, because it names no units.
+
+        Only a record written before ``unit_tokens`` existed, and whose tiles
+        left no per-tile records and are not on this driver's roster, gets
+        here. Nothing in the bucket refers to it, so evidence cannot retire it
+        and only the backend could -- which has been asked, at adoption and on
+        every poll since.
+        """
+        return not wave.units
+
+    def _stalled(self) -> bool:
+        """Whether waiting can still change anything.
+
+        True when there is no headroom and every wave holding it is either
+        stranded or unobservable: no artifact is coming, so no wave retires, so
+        no headroom returns, so nothing can be submitted. Without this the
+        driver polls to its ceiling and returns *normally* with every tile in
+        neither the completed nor the failed list, which is the one answer a
+        build must never give. A wave preempted 1200 s into its first stage
+        produced exactly that: 19,440 polls, no completions, no failures, ten
+        tiles unaccounted for.
+
+        Deliberately narrow. Waves in either state that leave headroom behind
+        them are not a stall: the tiles they carried re-demand when their own
+        records age out and either run or exhaust their barrier rounds, which
+        is the ordinary bounded-failure path and already correct.
+        """
+        now = self.clock.now()
+        return (
+            bool(self._live)
+            and self.headroom <= 0
+            and all(wave.stranded(now) or self._unobservable(wave) for wave in self._live)
+        )
+
+    def _settle_stragglers(self, reason: str) -> None:
+        """Fail every tile the run is about to abandon, so none is left unstated.
+
+        The invariant this exists for: :meth:`run` never returns with a tile in
+        neither list. A tile that ends a run neither built nor failed is worse
+        than a failed one, because a caller reconciling the manifest cannot
+        tell it from a tile that was never asked for.
+        """
+        for track in self.tracks:
+            if not track.terminal:
+                track._fail(reason)
+
+    def _abandon_stranded(self) -> None:
+        """End the run on the waves that will never answer, naming them."""
+        waves = ", ".join(
+            f"{wave.stage} wave {wave.wave} "
+            f"({wave.handle_name or 'unnamed'}, {wave.max_workers} workers, "
+            f"{'acknowledged' if wave.acknowledged else 'unacknowledged'})"
+            for wave in self._live
+        )
+        reason = (
+            "the run holds no headroom and no live wave can still be settled -- each has "
+            f"either overrun its budget or names no units the bucket can answer for: {waves}"
+        )
+        log.error(
+            "fleet_run_stranded",
+            run_id=self.run_id,
+            waves=len(self._live),
+            in_flight=self.in_flight,
+            reason=reason,
+        )
+        self._settle_stragglers(reason)
+
     def _refresh_wave_evidence(self, *, stamp: bool = True) -> None:
         """Re-read the bucket for every ``(tile, stage)`` a live wave references.
 
@@ -1141,10 +1335,24 @@ class FleetDriver:
         for wave in self._live:
             for tile, index in wave.units:
                 wanted.setdefault((tile, wave.stage), set()).add(index)
+        absent: dict[tuple[str, str], set[int]] = {}
         for (tile, stage), indexes in wanted.items():
             track = self._by_tile.get(tile)
-            if track is not None:
+            # A wave may name a tile this driver is not driving, which is what
+            # a roster that shrank between runs looks like. Nothing can be read
+            # for it, so every unit of it stays counted.
+            absent[tile, stage] = (
                 track.refresh_outstanding(stage, sorted(indexes))
+                if track is not None
+                else set(indexes)
+            )
+        for wave in self._live:
+            if wave.units:
+                wave.outstanding_units = {
+                    (tile, index)
+                    for tile, index in wave.units
+                    if index in absent.get((tile, wave.stage), set())
+                }
         now = self.clock.now()
         for wave in self._live:
             if not wave.units:
@@ -1163,42 +1371,63 @@ class FleetDriver:
                 self._record_wave(wave)
 
     def wave_held(self, wave: Wave) -> int:
-        """Workers this wave can still have running, counted from evidence.
+        """Workers this wave can still have running. See :meth:`Wave.held_at`.
 
-        Not its requested width for the life of the wave. A worker that has
-        published its unit's artifact has finished and taken the next unit or
-        exited, so a 60-unit wave with 45 artifacts on the ground can be
-        holding at most 15 workers. Counting the full width until the whole
-        wave settles is not conservative, it is wrong in a way that deadlocks:
-        a first wave wider than the cap would never return any headroom and
-        the run would stall with most of its work already done.
-
-        Bounded above by the requested width because the substrate never runs
-        more than that, and by the outstanding unit count because it cannot run
-        more workers than there is work left.
+        A wave's own evidence, never a track's: nothing a tile does to itself
+        may move the cap.
         """
-        # A wave adopted from a driver that predates ``unit_tokens`` carries no
-        # unit list. There is no evidence to shrink it with, so it holds its
-        # full requested width until it is confirmed dead. Conservative on
-        # purpose: over-counting delays a submission, under-counting doubles a
-        # bill, and this is the one place the driver has nothing to read.
-        if not wave.units:
-            return wave.max_workers
-        return min(wave.max_workers, self.wave_outstanding(wave))
+        return wave.held_at(self.clock.now())
 
     def wave_outstanding(self, wave: Wave) -> int:
-        """Units of this wave whose artifacts were absent at the last refresh."""
-        outstanding = 0
-        for tile, index in wave.units:
-            track = self._by_tile.get(tile)
-            if track is None or index in track.outstanding.get(wave.stage, set()):
-                outstanding += 1
-        return outstanding
+        """Units of this wave whose artifacts were absent at the last refresh.
+
+        A wave with no evidence read yet counts every unit it carries, and one
+        adopted with no unit list at all counts nothing -- there is no unit to
+        count. Its width is held through :attr:`Wave.held`, which does not go
+        through this number.
+        """
+        if wave.outstanding_units is None:
+            return len(wave.units)
+        return len(wave.outstanding_units)
 
     @property
     def in_flight(self) -> int:
         """Workers this driver believes are up, across every live wave."""
         return sum(self.wave_held(wave) for wave in self._live)
+
+    def capacity_ledger(self) -> dict:
+        """Every worker the driver is counting, by the identity that holds it.
+
+        The cap is only as good as the arithmetic behind it, and arithmetic
+        that can only be checked against itself is not checked. So the driver
+        publishes the *identities* it counts -- which wave, which units, and
+        whether the backend ever acknowledged the submission -- and an
+        independent ledger of potentially-live workers can be reconciled
+        against it without sharing a line of this module's counting.
+        """
+        return {
+            "run_id": self.run_id,
+            "max_vms": self.max_vms,
+            "in_flight": self.in_flight,
+            "headroom": self.headroom,
+            "waves": [
+                {
+                    "stage": wave.stage,
+                    "wave": wave.wave,
+                    "handle_name": wave.handle_name,
+                    "acknowledged": wave.acknowledged,
+                    "max_workers": wave.max_workers,
+                    "held": self.wave_held(wave),
+                    "outstanding": sorted(
+                        shards.fleet_unit_token(tile, index)
+                        for tile, index in (wave.outstanding_units or ())
+                    )
+                    if wave.outstanding_units is not None
+                    else None,
+                }
+                for wave in self._live
+            ],
+        }
 
     @property
     def headroom(self) -> int:
@@ -1276,57 +1505,70 @@ class FleetDriver:
         for demand in demands:
             self._record(demand, wave_no, name, submitted_at, handle_id=None, deadline_s=deadline_s)
 
-        handle = self._submit_with_retries(stage, units, wave_no, workers)
-        if handle is not None:
-            for demand in demands:
-                self._record(
-                    demand,
-                    wave_no,
-                    handle.name or name,
-                    submitted_at,
-                    handle_id=handle.id,
-                    deadline_s=deadline_s,
-                )
-
         wave = Wave(
             stage=stage,
             wave=wave_no,
             units=units,
             tiles=tuple(dict.fromkeys(demand.tile for demand in demands)),
-            max_workers=handle.max_workers if handle is not None else workers,
+            max_workers=workers,
             submitted_at=submitted_at,
             deadline_s=deadline_s,
-            handle_id=handle.id if handle is not None else None,
-            handle_name=handle.name if handle is not None else name,
+            handle_name=name,
+            # Seed the evidence for what is about to be submitted. A demand
+            # only ever carries indexes whose artifacts are absent, so at the
+            # moment of submission the wave holds its full width, and saying so
+            # here removes an ordering dependency between stepping tracks and
+            # flushing stages.
+            outstanding_units=set(units),
         )
-        # Seed the evidence for what was just submitted. A demand only ever
-        # carries indexes whose artifacts are absent, so at the moment of
-        # submission the wave is holding its full width, and saying so here
-        # rather than relying on some later step to notice removes an ordering
-        # dependency between stepping tracks and flushing stages.
         for demand in demands:
             track = self._by_tile.get(demand.tile)
             if track is not None:
                 track.outstanding.setdefault(stage, set()).update(demand.indexes)
 
+        # Live, recorded, and counted against the cap *before* the call that
+        # starts it. A submission is not an event the driver witnesses: the
+        # control plane can accept the request, boot the workers, and lose the
+        # answer on the way back, and a driver that only counts what it was
+        # told about then reports full headroom while ninety VMs run. The same
+        # ordering is what makes recovery idempotent -- the record is at a key
+        # that is a pure function of ``(run_id, stage, wave)``, so a restart or
+        # a duplicate driver adopts the wave rather than minting a second one.
+        self._live.append(wave)
+        self.summary.waves.append(wave)
         self._record_wave(wave)
+
+        handle = self._submit_with_retries(stage, units, wave_no, workers)
         if handle is not None:
-            self._live.append(wave)
+            wave.handle_id = handle.id
+            wave.handle_name = handle.name or name
+            wave.max_workers = handle.max_workers
+            wave.acknowledged = True
+            for demand in demands:
+                self._record(
+                    demand,
+                    wave_no,
+                    wave.handle_name,
+                    submitted_at,
+                    handle_id=handle.id,
+                    deadline_s=deadline_s,
+                )
+            self._record_wave(wave)
         else:
-            # A submission that never started holds nothing, and counting it
-            # would be the mirror of the clock defect: capacity spoken for by a
-            # wave whose artifacts can never land and whose handle can never be
-            # probed, which is a deadlock rather than an over-run. The per-tile
-            # records are already written, so every tile in it watches, expires,
-            # and spends a round.
-            log.warning(
-                "fleet_wave_not_started",
+            # Retries exhausted on transient errors, which is exactly the case
+            # that cannot be read as "nothing started". The wave keeps its
+            # width and stays unacknowledged until its artifacts settle it or
+            # the run gives up on it loudly. There is no handle to probe, so
+            # this is the one wave the backend can never confirm, and holding
+            # it is why :meth:`_stalled` exists.
+            log.error(
+                "fleet_wave_unacknowledged",
                 run_id=self.run_id,
                 stage=stage,
                 wave=wave_no,
-                note="submission failed; no capacity is held for it",
+                max_workers=workers,
+                note="submission unconfirmed; its width is held until the artifacts settle it",
             )
-        self.summary.waves.append(wave)
         self._buffer[stage] = {}
         self._buffered_since.pop(stage, None)
         log.info(
@@ -1336,7 +1578,8 @@ class FleetDriver:
             wave=wave_no,
             tiles=len(wave.tiles),
             units=len(units),
-            max_workers=workers,
+            max_workers=wave.max_workers,
+            acknowledged=wave.acknowledged,
             in_flight=self.in_flight,
         )
 
@@ -1451,9 +1694,12 @@ class FleetDriver:
         the first poll by a backend that answers and holds capacity loudly by
         one that cannot.
 
-        A record written before ``unit_tokens`` existed carries no unit list.
-        There is no evidence to read for it, so it holds its full requested
-        width until the probe settles it.
+        A record written before ``unit_tokens`` existed carries no unit list of
+        its own, but the per-tile submission records do: each names its wave and
+        the indexes that tile contributed. Rebuilding from those is what lets an
+        adopted wave be *observed* to have settled. Without it the wave held its
+        requested width for the whole life of the resumed driver, since the only
+        thing that could ever release it was a probe that may not answer.
         """
         for stage in WAVE_STAGES:
             try:
@@ -1474,16 +1720,23 @@ class FleetDriver:
                     continue
                 number = int(body.get("wave", 0))
                 self._wave_no[stage] = max(self._wave_no[stage], number)
+                tiles = tuple(body.get("tiles") or ())
+                units = _unit_tokens(body.get("unit_tokens")) or self._units_from_tile_records(
+                    stage, number, tiles
+                )
                 wave = Wave(
                     stage=stage,
                     wave=number,
-                    units=_unit_tokens(body.get("unit_tokens")),
-                    tiles=tuple(body.get("tiles") or ()),
+                    units=units,
+                    tiles=tiles,
                     max_workers=int(body.get("max_workers") or 0),
                     submitted_at=float(body.get("submitted_at") or 0.0),
                     deadline_s=float(body.get("deadline_s") or 0.0),
                     handle_id=body.get("handle_id"),
                     handle_name=str(body.get("handle_name") or ""),
+                    # A record written before this field existed describes a
+                    # wave that was submitted, so absence reads as acknowledged.
+                    acknowledged=bool(body.get("acknowledged", True)),
                     first_completion_at=_opt_float(body.get("first_completion_at")),
                     last_completion_at=_opt_float(body.get("last_completion_at")),
                 )
@@ -1499,8 +1752,55 @@ class FleetDriver:
         # Take the evidence without stamping a completion time, then retire
         # whatever the bucket already settles, so a resume into a finished run
         # starts with its whole cap rather than with a roster of ghosts.
+        # The one forced probe of the run. A wave this process never submitted
+        # is a wave it has confirmed nothing about, and its record's horizon is
+        # the previous driver's arithmetic rather than this one's.
+        self._probe(force=True)
         self._refresh_wave_evidence(stamp=False)
         self._retire()
+        for wave in self._live:
+            if self._unobservable(wave):
+                log.warning(
+                    "fleet_wave_unobservable",
+                    run_id=self.run_id,
+                    stage=wave.stage,
+                    wave=wave.wave,
+                    max_workers=wave.max_workers,
+                    note="record names no units; its width is held until the backend settles it",
+                )
+
+    def _units_from_tile_records(
+        self, stage: str, wave_no: int, tiles: Sequence[str]
+    ) -> tuple[tuple[str, int], ...]:
+        """One wave's units, rebuilt from the per-tile records it wrote first.
+
+        Every wave writes one submission record per tile before it submits, and
+        that record carries the wave number and the indexes the tile
+        contributed. So the evidence a pre-``unit_tokens`` wave record lacks is
+        already in the bucket, one object per tile. Best-effort like everything
+        read back for bookkeeping: what cannot be read yields fewer units, and
+        a wave with none holds its full width.
+        """
+        units: list[tuple[str, int]] = []
+        for tile in tiles:
+            root = shards.shard_root(self.run_id, tile)
+            matched = [
+                (tile, int(index))
+                for record in _submission_records(self.storage, root, stage)
+                if int(record.get("wave", 0)) == wave_no
+                for index in record.get("indexes") or ()
+            ]
+            if matched:
+                units.extend(matched)
+                continue
+            # Nothing named the tile's indexes, but the plan does: a tile this
+            # driver is already driving has one, and its stage's index set is
+            # the widest a wave for it could have carried. Over-counting the
+            # units delays a retirement rather than permitting an over-run.
+            track = self._by_tile.get(tile)
+            if track is not None and track.plan is not None:
+                units.extend((tile, index) for index in _expected_keys(track.plan, stage, root))
+        return tuple(dict.fromkeys(units))
 
     def _record(
         self,
@@ -1547,13 +1847,20 @@ class FleetDriver:
 
     # -- liveness ---------------------------------------------------------
 
-    def _probe(self) -> None:
+    def _probe(self, *, force: bool = False) -> None:
         """Ask the backend whether any live wave's submission is gone.
 
         Advisory by contract (``probe_is_advisory``): it may only end a barrier
         *sooner*, never declare success, and the tracks re-check the bucket
         before they act on it -- so a fleet whose last task uploaded and then
         stopped reads as a finished stage rather than a killed one.
+
+        Args:
+            force: Ask about every live wave whatever its deadline says. Used
+                once at adoption: a wave inherited from another driver is the
+                one case where this process has confirmed nothing itself, and
+                a long horizon in the record would otherwise postpone the only
+                question that can release it.
         """
         now = self.clock.now()
         for wave in self._live:
@@ -1563,7 +1870,7 @@ class FleetDriver:
             # since expiry no longer releases its width, confirmation is the
             # only way that capacity comes back, and a run that cannot ask
             # would stall holding VMs that are already gone.
-            if not self.probe_waves and not wave.expired(now):
+            if not force and not self.probe_waves and not wave.expired(now):
                 continue
             try:
                 probed = self.backend.probe(wave.handle_id)
@@ -1593,7 +1900,8 @@ class FleetDriver:
         self.adopt_live_waves()
         # Bounded so a clock that stops advancing is loud rather than infinite.
         ceiling = self._poll_ceiling()
-        for _ in range(ceiling):
+        finished = False
+        while self.summary.polls < ceiling:
             self.summary.polls += 1
             # One listing per shared prefix, before any tile looks at anything.
             self.index.refresh()
@@ -1601,6 +1909,13 @@ class FleetDriver:
             for track in self.tracks:
                 track.dead_handles = self._dead_handles
             self._retire()
+            self._publish_held_units()
+            if self._stalled():
+                # Loud already, through ``fleet_run_stranded`` and one failure
+                # per tile. The ceiling did not end this run.
+                self._abandon_stranded()
+                finished = True
+                break
 
             for track in self.tracks:
                 for demand in track.step():
@@ -1611,11 +1926,19 @@ class FleetDriver:
                     self._flush(stage)
 
             if all(track.terminal for track in self.tracks):
+                finished = True
                 break
             self.clock.sleep(settings.fleet_poll_s)
-        else:
-            log.error("fleet_poll_ceiling_reached", run_id=self.run_id, polls=ceiling)
+            ceiling = max(ceiling, self._live_wave_ceiling())
+        if not finished:
+            log.error("fleet_poll_ceiling_reached", run_id=self.run_id, polls=self.summary.polls)
 
+        # Whatever ended the loop, no tile leaves it unstated. A run that
+        # breaks on every track being terminal passes through here untouched.
+        self._settle_stragglers(
+            f"the driver stopped after {self.summary.polls} polls with this tile still in "
+            "neither state; nothing it was waiting on ever settled"
+        )
         self.summary.tiles = [track.outcome for track in self.tracks]
         self.summary.wall_s = self.clock.now() - started
         log.info(
@@ -1634,6 +1957,23 @@ class FleetDriver:
         rounds = settings.shard_barrier_rounds * len(TILE_STAGES) + 4
         per_round = max(1, int(_bootstrap_deadline_s() / max(settings.fleet_poll_s, 1e-6)) + 2)
         return rounds * per_round * max(1, len(self.tracks))
+
+    def _live_wave_ceiling(self) -> int:
+        """Polls the deepest live wave may still legitimately take.
+
+        The base ceiling counts barrier rounds, not queue depth. A cap narrow
+        against the work admits few workers at a time, which turns one wave
+        into as many serial rounds as it has units: at a cap of one, four
+        tiles' offsets is sixty rounds in a single wave, and the run was cut
+        off with its one worker still working. So the bound follows the
+        deadlines the waves were actually given, and it extends only while a
+        wave is live and producing. With nothing live it does not move, which
+        is the case a ceiling exists for.
+        """
+        if not self._live:
+            return 0
+        remaining = max(wave.stranded_at() for wave in self._live) - self.clock.now()
+        return self.summary.polls + int(max(0.0, remaining) / max(settings.fleet_poll_s, 1e-6)) + 2
 
 
 # --------------------------------------------------------------------------

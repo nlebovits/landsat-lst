@@ -180,19 +180,24 @@ class FakeWaveFleet:
     def observe(self) -> int:
         """Workers that could be running right now, across every wave started.
 
-        A wave holds at most its requested width, and at most one worker per
-        unit whose artifact is still absent. Sampled at every submission and
-        every tick, so the recorded peak covers the interleavings where a
-        resubmission overlaps a wave that has not finished.
+        A batch array holds every VM it started until the array finishes, so a
+        wave holds its full requested width for as long as any of its units is
+        still absent, and nothing once they have all landed. Measuring it as
+        one worker per outstanding unit measures work rather than machines, and
+        an over-admission at the tail then reads as being inside the cap: the
+        driver freed slots the substrate had not, the next wave booted on top,
+        and the real concurrency was the sum of both.
+
+        Sampled at every submission and every tick, so the recorded peak covers
+        the interleavings where a resubmission overlaps a wave that has not
+        finished.
         """
         total = 0
         for call in self.calls:
-            outstanding = sum(
-                1
-                for tile, index in call["units"]
-                if not self._unit_done(call["stage"], tile, index)
+            outstanding = any(
+                not self._unit_done(call["stage"], tile, index) for tile, index in call["units"]
             )
-            total += min(call["max_workers"], outstanding)
+            total += call["max_workers"] if outstanding else 0
         self.peak_in_flight = max(self.peak_in_flight, total)
         #: Every sample, so a test can ask whether the fleet was ever left idle
         #: with work still queued rather than only how high it got.
@@ -633,18 +638,19 @@ class TestConcurrencyCap:
         driver._buffer_demand(_demand(TILES[0], "composite", (0,)))
         assert driver._ready_to_flush("composite") is False
 
-    def test_held_capacity_falls_as_units_land(self, storage, clock):
-        """Workers are counted from published artifacts, not from memory.
+    def test_held_capacity_is_the_arrays_width_until_the_array_ends(self, storage, clock):
+        """A landed artifact is a finished unit, not a released VM.
 
-        A worker that has published its unit's artifact has moved on. Holding a
-        wave's full width until the *whole* wave settles is not conservative --
-        it deadlocks any run whose first wave is wider than the cap, which is
-        every run at 700 tiles. Reproduced before the fix: 60 offsets units and
-        4 composite units against a cap of 64 left zero headroom for the rest
-        of the build, and the tile that needed a resubmission never got one.
+        A batch array keeps every VM it started until the array itself
+        finishes: the worker that published this artifact takes the next unit
+        off the queue, or waits in a cluster that is still billing. Counting
+        the width down per landed artifact measures work rather than machines,
+        and the difference is a whole wave at the tail -- the driver freed
+        slots the substrate had not, the next wave booted on top, and a run
+        capped at 64 peaked at 82.
 
-        The evidence is written to the bucket rather than assigned to the
-        track, because the bucket is what the driver is required to believe.
+        The evidence is read from the bucket rather than from the track,
+        because the bucket is what the driver is required to believe.
         """
         driver, _track, fleet = self._bare_driver(
             storage, clock, max_vms=8, never={(TILES[0], "offsets", 0), (TILES[0], "offsets", 1)}
@@ -659,7 +665,10 @@ class TestConcurrencyCap:
         fleet.writers[TILES[0]]._write("offsets", 0)
         driver.index.refresh()
         driver._retire()
-        assert driver.in_flight == 1
+        assert driver.in_flight == 2, "half a wave's artifacts is not half a wave's VMs"
+        assert driver.capacity_ledger()["waves"][0]["outstanding"] == [
+            shards.fleet_unit_token(TILES[0], 1)
+        ]
 
         fleet.writers[TILES[0]]._write("offsets", 1)
         driver.index.refresh()
@@ -1168,8 +1177,24 @@ class TestWaveRecords:
         assert driver.in_flight == 6
         assert driver.headroom == 2
 
-        driver._probe()
+        driver._dead_handles.add(5)
         driver._retire()
+
+        assert driver.in_flight == 0
+        assert driver.headroom == 8
+
+    def test_an_adopted_wave_is_probed_once_whatever_its_record_claims(self, storage, clock):
+        """The horizon in the record is the previous driver's arithmetic.
+
+        A wave this process never submitted is one it has confirmed nothing
+        about, and a long deadline would otherwise postpone the only question
+        that can release it -- for as long as that deadline says. So adoption
+        asks once, whatever ``probe_waves`` and the record's horizon say.
+        """
+        tokens = [f"{TILES[0]}:{i}" for i in range(6)]
+        self._write_wave_record(storage, clock, workers=6, tokens=tokens, deadline_s=1_000_000.0)
+        driver = self._adopting_driver(storage, clock, dead={5})
+        driver.adopt_live_waves()
 
         assert driver.in_flight == 0
         assert driver.headroom == 8
@@ -1206,14 +1231,65 @@ class TestWaveRecords:
         assert driver.headroom == 8
 
     def test_a_record_without_a_unit_list_holds_its_requested_width(self, storage, clock):
-        """A wave written before ``unit_tokens`` existed has no evidence to read."""
+        """A wave written before ``unit_tokens`` existed, whose tiles left nothing.
+
+        Neither a unit list nor a per-tile record nor a track with a plan, so
+        nothing in the bucket refers to it and no artifact can ever retire it.
+        Holding its width is the conservative answer and the only safe one:
+        releasing it is exactly the over-admission the resume path exists to
+        avoid. What it must not be is silent, so the driver says so and
+        :meth:`FleetDriver._stalled` ends the run rather than polling out.
+        """
         self._write_wave_record(storage, clock, workers=6, tokens=None)
         driver = self._adopting_driver(storage, clock)
         driver.adopt_live_waves()
 
         assert driver.in_flight == 6
+        assert driver._unobservable(driver._live[0])
 
-    def _write_wave_record(self, storage, clock, *, workers, tokens):
+    def test_a_legacy_record_recovers_its_units_from_the_per_tile_records(self, storage, clock):
+        """The unit list a pre-``unit_tokens`` wave lacks is already in the bucket.
+
+        Every wave writes one submission record per tile before it submits, and
+        that record carries the wave number and the tile's indexes. Rebuilding
+        from those is what lets an adopted wave be *observed* to have settled,
+        rather than holding its requested width for the life of the resumed
+        driver because only a probe could ever release it.
+        """
+        plan = _plans(TILES[:1])[0]
+        fleet = FakeWaveFleet(storage, [plan], clock=clock)
+        fleet.writers[TILES[0]]._write("offsets", 0)
+        storage.write_text(
+            shards.stage_submission_key(shards.shard_root(RUN_ID, TILES[0]), "offsets", 1),
+            json.dumps({"stage": "offsets", "round": 1, "wave": 1, "indexes": [0]}),
+        )
+        self._write_wave_record(storage, clock, workers=6, tokens=None)
+        driver = FleetDriver(
+            run_id=RUN_ID,
+            tracks=[
+                TileTrack(
+                    tile=TILES[0],
+                    run_id=RUN_ID,
+                    root=shards.shard_root(RUN_ID, TILES[0]),
+                    storage=storage,
+                    units=2,
+                    clock=clock,
+                    plan=plan,
+                )
+            ],
+            storage=storage,
+            backend=fleet,
+            clock=clock,
+            units=2,
+            max_vms=8,
+        )
+        driver.index.refresh()
+        driver.adopt_live_waves()
+
+        assert driver.in_flight == 0
+        assert driver.headroom == 8
+
+    def _write_wave_record(self, storage, clock, *, workers, tokens, deadline_s=100.0):
         body = {
             "run_id": RUN_ID,
             "stage": "offsets",
@@ -1221,7 +1297,7 @@ class TestWaveRecords:
             "tiles": [TILES[0]],
             "max_workers": workers,
             "submitted_at": clock.now() - 10_000_000,
-            "deadline_s": 100.0,
+            "deadline_s": deadline_s,
             "handle_id": 5,
             "handle_name": "old",
         }
@@ -1229,12 +1305,19 @@ class TestWaveRecords:
             body["unit_tokens"] = tokens
         storage.write_text(shards.fleet_submission_key(RUN_ID, "offsets", 1), json.dumps(body))
 
-    def _adopting_driver(self, storage, clock):
+    def _adopting_driver(self, storage, clock, *, dead=()):
+        """A driver with no tracks, for adoption arithmetic.
+
+        The backend's probe answers ``None`` -- unknown -- unless a handle is
+        named dead, because adoption forces one probe of every inherited wave
+        and a backend that confirms death on sight would settle every one of
+        them before the arithmetic under test could be read.
+        """
         return FleetDriver(
             run_id=RUN_ID,
             tracks=[],
             storage=storage,
-            backend=FakeWaveFleet(storage, [], clock=clock, dead_handles={5}),
+            backend=FakeWaveFleet(storage, [], clock=clock, dead_handles=set(dead)),
             clock=clock,
             units=2,
             max_vms=8,
@@ -1850,13 +1933,14 @@ class TestCapacityIsReleasedOnlyOnEvidence:
         driver._retire()
         assert driver.in_flight == 0
 
-    def test_a_submission_that_never_started_holds_no_capacity(self, storage, clock):
-        """The mirror failure, which deadlocks rather than over-runs.
+    def test_a_submission_that_may_have_started_holds_its_capacity(self, storage, clock):
+        """An unanswered submission is not an unstarted one.
 
-        A wave whose submission raised through every retry has no workers, no
-        handle to probe, and artifacts that will never land. Counting it against
-        the cap would spend that width for the rest of the run with nothing to
-        release it.
+        The control plane can accept the request, boot the workers, and lose
+        the answer on the way back. A driver that counts only what it was told
+        about then reports its whole cap free while the workers run, and the
+        next wave boots on top of them. So the width is held, and only the
+        artifacts or a confirmed death release it.
         """
         fleet = FakeWaveFleet(
             storage, _plans(TILES[:1]), clock=clock, raise_always=RuntimeError("control plane")
@@ -1866,19 +1950,55 @@ class TestCapacityIsReleasedOnlyOnEvidence:
         driver._flush("offsets")
 
         assert driver.summary.submissions == 1
-        assert driver.in_flight == 0
-        assert driver.headroom == 4
+        assert driver.in_flight == 2
+        assert driver.headroom == 2
+        wave = driver.summary.waves[0]
+        assert wave.acknowledged is False
+        assert wave.handle_id is None
         # The per-tile record is still written, so the tile watches and spends
         # the round rather than resubmitting into the same failure at once.
         assert _submission_records(storage, shards.shard_root(RUN_ID, TILES[0]), "offsets")
 
-    def test_an_overlapped_composite_wave_gives_width_back_as_its_bands_land(self, storage, clock):
+    def test_an_unacknowledged_wave_is_recorded_before_the_call_that_starts_it(
+        self, storage, clock
+    ):
+        """Recovery is idempotent because the record precedes the submission.
+
+        A driver that dies inside the control-plane call leaves workers nothing
+        mentions. The wave record is written first, at a key that is a pure
+        function of ``(run_id, stage, wave)``, so the next driver -- or a
+        duplicate of this one -- adopts that wave rather than minting a second
+        one beside it.
+        """
+        fleet = FakeWaveFleet(
+            storage, _plans(TILES[:1]), clock=clock, raise_always=RuntimeError("control plane")
+        )
+        driver = self._driver_with(storage, clock, fleet, max_vms=4)
+        driver._buffer_demand(_demand(TILES[0], "offsets", (0, 1)))
+        driver._flush("offsets")
+
+        body = json.loads(storage.read_text(shards.fleet_submission_key(RUN_ID, "offsets", 1)))
+        assert body["acknowledged"] is False
+        assert body["max_workers"] == 2
+
+        resumed = self._driver_with(storage, clock, fleet, max_vms=4)
+        resumed.adopt_live_waves()
+        assert resumed.in_flight == 2
+        assert len(resumed._live) == 1
+        # And again: adoption is a read, so a third driver counts the same two.
+        again = self._driver_with(storage, clock, fleet, max_vms=4)
+        again.adopt_live_waves()
+        assert again.in_flight == 2
+
+    def test_an_overlapped_composite_wave_gives_width_back_when_its_bands_land(
+        self, storage, clock
+    ):
         """A stage the track has stopped looking at still has to be measured.
 
-        The composite fleet is demanded from inside the offsets barrier, and the
-        track will not revisit the composite stage until it has merged its
-        offsets. Read from the track's memory, that wave holds its full width
-        for the whole of the offsets stage however many bands have landed.
+        The composite fleet is demanded from inside the offsets barrier, and
+        the track will not revisit the composite stage until it has merged its
+        offsets. Read from the track's memory that wave would hold its width
+        for the whole run, because nothing would ever look at it again.
         """
         driver, _track, fleet = self._one_tile(storage, clock, max_vms=8)
         driver._buffer_demand(_demand(TILES[0], "composite", (0, 1)))
@@ -1890,9 +2010,13 @@ class TestCapacityIsReleasedOnlyOnEvidence:
         fleet.writers[TILES[0]]._write("composite", 0)
         driver.index.refresh()
         driver._retire()
+        assert driver.in_flight == 2, "one band of two is not the end of the array"
 
-        assert driver.in_flight == 1
-        assert driver.headroom == 7
+        fleet.writers[TILES[0]]._write("composite", 1)
+        driver.index.refresh()
+        driver._retire()
+        assert driver.in_flight == 0
+        assert driver.headroom == 8
 
     def _one_tile(self, storage, clock, *, max_vms):
         """One planned track whose units never land unless a test writes them."""
