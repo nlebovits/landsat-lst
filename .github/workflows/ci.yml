@@ -41,6 +41,9 @@ jobs:
       - name: Check performance evidence safeguards
         run: uv run python scripts/check_evidence_policy.py
 
+      - name: Check pull request evidence declaration
+        run: uv run python scripts/check_performance_pr.py
+
       - name: Type check
         run: uv run ty check src/
 

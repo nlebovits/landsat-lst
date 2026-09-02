@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
 import sys
@@ -16,7 +17,14 @@ from landsat_lst.cli import main
 if TYPE_CHECKING:
     from pathlib import Path
 
-from landsat_lst.evidence import _coiled_cluster, _safe, capture_frisky, collect_evidence
+from landsat_lst.evidence import (
+    _coiled_cluster,
+    _safe,
+    capture_frisky,
+    collect_evidence,
+    validate_evidence_bundle,
+)
+from landsat_lst.evidence_contract import ContractError
 
 
 class StubStorage:
@@ -63,6 +71,12 @@ def contract(tmp_path: Path) -> Path:
             "launch_command": "landsat-lst shard process --tile N40W075",
             "baseline_revision": "c84448bbac2c95af408ba523521b712b43ba58e8",
             "treatment_revision": "83957932f3e1a72484246c421cbab1d91d4ba234",
+            "real_data": {
+                "kind": "real",
+                "identity": "N40W075/2021-2025/band-1/scene-digest",
+                "production_relationship": "Exact production shard.",
+                "known_differences": ["One shard instead of a fleet."],
+            },
         },
         "baseline": {
             "metric": "wall_s",
@@ -72,9 +86,24 @@ def contract(tmp_path: Path) -> Path:
             "artifact": str(baseline),
         },
         "target_metric": "wall_s",
+        "measurement_plan": {
+            "target_environment": "production-representative",
+            "phases": ["remote read", "reduction", "store"],
+            "metrics": ["wall_s", "cpu_s", "bytes_read"],
+            "raw_artifacts": ["baseline and treatment run JSON"],
+            "profiling": {
+                "method": "Dask task profile",
+                "artifact": "profile.json",
+                "observer_effect_control": "Same profiler in both arms.",
+            },
+            "baseline_repetitions": 1,
+            "treatment_repetitions": 1,
+            "aggregation": "single",
+        },
         "minimum_effect": {"direction": "decrease", "fraction": 0.1},
         "production_discriminator": "One production shard.",
         "stop_rule": "Stop below ten percent.",
+        "result_artifact": "result.json",
         "max_cloud_cost_usd": 1,
         "max_coiled_credits": 20,
         "code_identity_required": True,
@@ -87,6 +116,43 @@ def contract(tmp_path: Path) -> Path:
     }
     path = tmp_path / "contract.json"
     path.write_text(json.dumps(payload))
+    baseline_observation = tmp_path / "baseline-observation.json"
+    treatment_observation = tmp_path / "treatment-observation.json"
+    profile = tmp_path / "profile.json"
+    baseline_observation.write_text('{"wall_s": 840}\n')
+    treatment_observation.write_text('{"wall_s": 756}\n')
+    profile.write_text('{"tasks": {"open_rasterio": 10}}\n')
+    result = {
+        "schema_version": 1,
+        "contract_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "environment": "production-representative",
+        "input_identity": "N40W075/2021-2025/band-1/scene-digest",
+        "baseline_revision": payload["inputs"]["baseline_revision"],
+        "treatment_revision": payload["inputs"]["treatment_revision"],
+        "baseline_observations": [
+            {
+                "metric": "wall_s",
+                "value": 840,
+                "unit": "seconds",
+                "artifact": baseline_observation.name,
+            }
+        ],
+        "treatment_observations": [
+            {
+                "metric": "wall_s",
+                "value": 756,
+                "unit": "seconds",
+                "artifact": treatment_observation.name,
+            }
+        ],
+        "profiling_artifact": profile.name,
+        "observed_effect_fraction": 0.1,
+        "minimum_effect_met": True,
+        "output_equivalence_passed": True,
+        "decision": "proceed",
+        "limitations": ["Single production-shaped shard."],
+    }
+    (tmp_path / "result.json").write_text(json.dumps(result))
     return path
 
 
@@ -157,12 +223,69 @@ def test_collect_evidence_refuses_to_overwrite_bundle(tmp_path: Path) -> None:
         collect_evidence(output_dir=output, contract_path=contract(tmp_path))
 
 
-def test_collect_evidence_rejects_failed_output_equivalence(tmp_path: Path) -> None:
+def test_collect_evidence_rejects_equivalence_disagreement(tmp_path: Path) -> None:
     contract_path = contract(tmp_path)
     (tmp_path / "equivalence.json").write_text('{"passed": false}\n')
 
-    with pytest.raises(ValueError, match="passed=true"):
+    with pytest.raises(ValueError, match="does not match"):
         collect_evidence(output_dir=tmp_path / "bundle", contract_path=contract_path)
+
+
+def test_failed_equivalence_is_publishable_only_as_stop(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("landsat_lst.evidence.importlib.metadata.version", lambda _: "0.1-test")
+    contract_path = contract(tmp_path)
+    (tmp_path / "equivalence.json").write_text('{"passed": false}\n')
+    result_path = tmp_path / "result.json"
+    result = json.loads(result_path.read_text())
+    result["output_equivalence_passed"] = False
+    result["decision"] = "stop"
+    result_path.write_text(json.dumps(result))
+
+    destination = collect_evidence(
+        output_dir=tmp_path / "bundle",
+        contract_path=contract_path,
+    )
+    assert validate_evidence_bundle(destination)["decision"]["decision"] == "stop"
+    with pytest.raises(ContractError, match="requires decision=proceed"):
+        validate_evidence_bundle(destination, require_proceed=True)
+
+
+def test_bundle_validation_detects_a_modified_retained_artifact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("landsat_lst.evidence.importlib.metadata.version", lambda _: "0.1-test")
+    destination = collect_evidence(
+        output_dir=tmp_path / "bundle",
+        contract_path=contract(tmp_path),
+    )
+    bundle = json.loads(destination.read_text())
+    retained = destination.parent / bundle["contract_artifacts"]["profiling"]["path"]
+    retained.write_text('{"tampered": true}\n')
+
+    with pytest.raises(ContractError, match=r"byte count|digest"):
+        validate_evidence_bundle(destination)
+
+
+def test_stop_result_is_publishable_but_cannot_authorize_optimization(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("landsat_lst.evidence.importlib.metadata.version", lambda _: "0.1-test")
+    contract_path = contract(tmp_path)
+    result_path = tmp_path / "result.json"
+    result = json.loads(result_path.read_text())
+    result["treatment_observations"][0]["value"] = 820
+    result["observed_effect_fraction"] = (840 - 820) / 840
+    result["minimum_effect_met"] = False
+    result["decision"] = "stop"
+    result_path.write_text(json.dumps(result))
+
+    destination = collect_evidence(
+        output_dir=tmp_path / "bundle",
+        contract_path=contract_path,
+    )
+    assert validate_evidence_bundle(destination)["decision"]["decision"] == "stop"
+    with pytest.raises(ContractError, match="requires decision=proceed"):
+        validate_evidence_bundle(destination, require_proceed=True)
 
 
 def test_safe_redacts_secrets_embedded_in_log_text(monkeypatch) -> None:

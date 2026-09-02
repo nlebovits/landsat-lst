@@ -12,11 +12,14 @@ def main() -> None:
         print("{}")
         return
     summary = (
-        "MANDATORY PERFORMANCE POLICY: read docs/performance-evidence-policy.md "
-        "before performance or cost work. Validate the premise and retained "
-        "production baseline first; pre-register the cheapest production "
-        "discriminator and stop rule; do not extrapolate local results. A valid "
-        "LST_EVIDENCE_CONTRACT constrains cloud experiments but never authorizes one."
+        "MANDATORY PERFORMANCE POLICY: read docs/performance-evidence-policy.md. "
+        "A plausible mechanism, synthetic or local benchmark, model, test, estimate, "
+        "or user report permits only a pre-registered bounded discriminator and its "
+        "smallest experimental treatment. Do not productionize, harden, or claim an "
+        "optimization until a validated representative real-data evidence bundle "
+        "records decision=proceed. Never invent or relabel measurements, omit "
+        "contrary runs, or extrapolate local results. A valid LST_EVIDENCE_CONTRACT "
+        "constrains cloud experiments but never authorizes one."
     )
     print(
         json.dumps(

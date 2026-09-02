@@ -1,92 +1,157 @@
 # Performance evidence policy
 
-Performance work in this repository is evidence work. A plausible mechanism, a
-green local benchmark, or a detailed cost model is not enough to justify an
-implementation effort or a production claim.
+Performance work in this repository is evidence work. This policy applies to any
+claim or change involving runtime, latency, throughput, memory, I/O, concurrency,
+scaling, cloud cost, or resource efficiency.
 
-This rule exists because two expensive investigations validated implementations
-before validating their premises. Issue #124 found a 4.4x local composite
-improvement that became a null result on one representative Coiled shard. Issue
-#108 initially attributed 52% of cost to fleet idle from modeled inputs; retained
-Coiled logs put the addressable share near 9%. In both cases the cheap production
-discriminator was available before the long review.
+A plausible mechanism, detailed model, synthetic benchmark, local microbenchmark,
+green test suite, or user-reported number may justify only a pre-registered
+bounded discriminator and the smallest experimental treatment needed to run it.
+None may justify production implementation, broad hardening, or a performance
+claim.
 
-## Required order
+This rule exists because expensive investigations repeatedly validated
+implementations before validating their premises. Issue #124 found a 4.4x local
+composite improvement that became a null result on one representative Coiled
+shard. Issue #108 initially attributed 52% of cost to fleet idle from modeled
+inputs; retained Coiled logs put the addressable share near 9%. In both cases the
+cheap representative discriminator was available before the long review.
 
-Before implementing or substantially reviewing a performance change:
+## Required lifecycle
+
+### 1. Premise and instrumentation
+
+Before changing optimization behavior:
 
 1. Classify every load-bearing input as `measured`, `derived`, `assumed`,
-   `user_reported`, or `unknown`, with an artifact for every measured value.
-2. State the production baseline, target metric, minimum worthwhile effect, and
-   Amdahl ceiling. If the production fraction is unknown, say so; do not convert
-   a component benchmark into a pipeline speedup.
-3. Pre-register the cheapest representative discriminator and a stop rule in a
-   contract based on `docs/templates/performance-experiment-contract.json`.
-4. Run only the minimum correctness check needed to make that discriminator
-   interpretable, then run the discriminator immediately.
-5. Stop when the stop rule fires. Adversarial hardening, broad test matrices, and
-   production implementation follow only after transfer to the target environment
-   is demonstrated.
+   `user_reported`, or `unknown`. Every measured value must point to a retained
+   machine-readable artifact.
+2. State the baseline, target metric, minimum worthwhile effect, Amdahl ceiling,
+   and uncertainty. Unknown production fractions must remain unknown.
+3. Pre-register a contract based on
+   `docs/templates/performance-experiment-contract.json`.
+4. Name the exact representative real input, target environment, phases, metrics,
+   raw artifacts, profiling method, repetitions, aggregation, output comparison,
+   cheapest discriminator, and stop rule.
+5. Add only the instrumentation, minimum correctness support, and smallest
+   reversible experimental treatment needed to run that discriminator. Do not
+   broaden or harden the treatment before the result.
 
-For cloud work, the contract must also cap AWS dollars and Coiled credits, name
-the exact workload and launch command, require a retained baseline artifact and
-full Git revisions, require code-identity evidence, and define output equivalence.
-Experiment contracts are limited to $100 and 400 Coiled credits; smaller limits
-should be used whenever the discriminator allows them.
-The contract must name the output comparison method, its exact acceptance
-criterion, and the path where the post-run result will be retained. Evidence
-collection copies and hashes that result and the baseline artifact into the bundle.
-Collection refuses an equivalence report unless it explicitly records `passed: true`.
-The contract is a prerequisite, **not authorization**: the operator must still
-explicitly approve every cloud launch.
+Synthetic and modeled work is useful for graph shape, lower bounds, rejection of
+impossible designs, and instrumentation development. It cannot satisfy the
+real-data or target-environment gate.
 
-## Evidence that every measured run must retain
+### 2. Representative measurement
 
-- Git commit and package identity seen by the worker.
-- Exact command, configuration, input/run identity, instance type, and timestamps.
-- Wall and process CPU time, peak RSS, I/O bytes, phase timings, and task/profile
-  summaries when the relevant execution path exposes them.
-- Output-content checksums or a stronger scientific-equivalence comparison.
-- Coiled cluster lifecycle, worker census/status, and cluster-scoped billing.
-- Any console metric exports or screenshots, copied and hashed as attachments.
-- Measurement limitations and all quantities still assumed or unknown.
+Run the discriminator before implementing or hardening the optimization.
 
-Use `landsat-lst evidence collect` to create the canonical JSON bundle. Frisky is
-the preferred optional lens for bounded diagnostic runs: its agent-readable spans
-separate execution, scheduling, serialization, disk, and network work that ordinary
-phase timing collapses together. `frisky.hijack(cluster.get_client())` works with a
-live Coiled Dask cluster. The production pipeline currently uses Coiled Batch tasks,
-however, and those plain processes do not register their work with a Dask scheduler;
-Frisky therefore requires an explicit diagnostic Dask execution path and is not a
-drop-in observer for the current production path.
+The input must be real and immutably identified. The environment must be
+production or explicitly production-representative. Record every known difference
+from production. Profiling must address the claimed mechanism, and its overhead
+must either be measured or held identical between baseline and treatment.
 
-Capture Frisky spans before the diagnostic cluster stops, then retain them with
-`landsat-lst evidence capture-frisky`. Historical Coiled lifecycle logs, billing,
-and host CPU/memory/network series are downloadable with `evidence collect`, but
-they cannot be converted retroactively into Frisky task and transfer spans. Old
-clusters that emitted no spans remain span-less. Frisky is not the production
-scheduler, and its measurements must pass the same production-transfer gate.
+Write a result based on `docs/templates/performance-result.json`. It must retain:
 
-## Review and reporting rules
+- raw baseline and treatment observations;
+- full baseline and treatment revisions;
+- exact input and environment identity;
+- the pre-registered profiling or phase-timing artifact;
+- the recomputed effect and minimum-effect comparison;
+- scientific output equivalence;
+- limitations and contrary observations;
+- an unambiguous `stop` or `proceed` decision.
 
-- Report local, synthetic, sampled, and production measurements separately.
-- Never describe a modeled value as measured or quote an all-in cost when any
-  price term is unknown.
-- Compare treatment with the exact retained baseline; interleave noisy local A/B
-  runs and run cloud arms sequentially with identical inputs.
-- Prefer one implementer and one independent reviewer. Permit one bounded
-  correction round; unresolved findings become explicit follow-up work rather
-  than an expanding investigation.
-- A passing unit suite proves correctness only for what the tests observe. It is
-  not performance evidence.
+Use `landsat-lst evidence collect` to copy and hash the contract, result, raw
+observations, profile, baseline, equivalence report, worker records, and requested
+Coiled telemetry into a self-contained bundle.
 
-## Enforcement
+### 3. Decision
 
-`AGENTS.md` and `CLAUDE.md` carry the mandatory summary. Claude receives the same
-policy at session start, and its Bash hook denies recognized cloud experiment
-launches without a valid `LST_EVIDENCE_CONTRACT`. The hook does not approve the
-launch. CI runs `scripts/check_evidence_policy.py` so removing this guidance,
-hook registration, contract template, or composite profiling fails visibly.
+Optimization implementation and implementation-focused adversarial review may
+begin only after a validated evidence bundle records `decision: proceed`.
 
-The Cloud/Coiled evidence collector is read-only. Actual launches remain subject
-to the repository's normal operator confirmation and quota controls.
+When the bundle records `decision: stop`, stop the optimization. Preserve and
+merge the negative result as measurement evidence; do not rescue the idea by
+changing the metric, threshold, input, or explanation after seeing the result.
+A different claim requires a new contract.
+
+A passing unit suite proves only the behavior observed by those tests. It is
+never performance evidence.
+
+## Truth and provenance rules
+
+- Never enter a value from memory when a retained artifact is required.
+- Never relabel modeled, derived, synthetic, or user-reported data as measured.
+- Never report a selected successful run while omitting failed or contrary runs.
+- Never convert a component result into an end-to-end claim without a measured
+  production fraction and stated Amdahl ceiling.
+- Report local, synthetic, sampled, production-representative, and production
+  measurements separately.
+- Baseline and treatment must use the same immutable inputs and measurement
+  method. Interleave noisy local arms; run cloud arms sequentially.
+- A result manifest is validated arithmetically against its retained observations.
+  The evidence bundle hashes every supporting file so later edits fail validation.
+
+## Cloud boundary
+
+For cloud work, the contract must cap AWS dollars and Coiled credits, name the
+exact launch command, retain a measured baseline, use full Git revisions, require
+worker code identity, and define output equivalence. Contracts are limited to
+$100 and 400 Coiled credits; use smaller limits whenever possible.
+
+A contract is a prerequisite, **not authorization**. The operator must explicitly
+approve every cloud launch.
+
+The Claude Bash hook denies recognized direct, wrapped, subshell, and nested-shell
+cloud launches without a valid `LST_EVIDENCE_CONTRACT`. Launch validation binds
+the treatment revision to a clean tracked checkout. Workers emit the bound
+revision, installed package version, and instrumentation-module digest. Evidence
+collection rejects missing or mismatched worker revisions.
+
+## Profiling boundary
+
+Profiling is experiment-controlled because instrumentation can perturb the system
+being measured. Production Batch submissions do not enable Dask profiling by
+default. A contract or explicit diagnostic command must request it and state how
+observer effects are controlled.
+
+Frisky can inspect a live Coiled Dask cluster through
+`frisky.hijack(cluster.get_client())`. The production pipeline uses Coiled Batch
+plain processes, so Frisky is not a drop-in observer for that path. Capture spans
+before shutdown. Historical lifecycle logs and host metrics cannot be converted
+retroactively into task spans.
+
+## Pull request gate
+
+Every human-authored PR must retain this declaration from the repository template:
+
+```text
+<!-- performance-evidence
+stage: none
+contract: n/a
+evidence: n/a
+-->
+```
+
+Valid stages are:
+
+- `none`: no performance or cost claim;
+- `governance`: evidence policy or tooling only;
+- `instrumentation`: measurement-only work with a valid committed contract;
+- `measurement`: a valid contract and evidence bundle, including negative results;
+- `optimization`: implementation backed by a bundle whose validated decision is
+  `proceed`.
+
+CI rejects missing declarations, performance language declared as `none`,
+invalid contracts, altered or incomplete bundles, and optimization PRs backed by
+a `stop` decision.
+
+## Agent enforcement
+
+`AGENTS.override.md` is the durable Codex instruction surface and coexists with
+the untracked `claude-mem` `AGENTS.md`. `CLAUDE.md` and the Claude SessionStart
+hook carry the same mandatory gate for Claude/Fable. CI verifies these surfaces,
+the PR template, validators, templates, and hooks remain wired.
+
+No instruction or contract grants spending authority. The Coiled collector is
+read-only; normal operator confirmation and quota controls still apply.

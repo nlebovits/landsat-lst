@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from landsat_lst.evidence_contract import ContractError, load_contract, validate_contract
+from landsat_lst.evidence_contract import (
+    ContractError,
+    load_contract,
+    load_result,
+    sha256_file,
+    validate_contract,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_COMMAND = "python scripts/probe_x.py --launch"
@@ -30,6 +36,12 @@ def valid_contract(tmp_path: Path, command: str = DEFAULT_COMMAND) -> dict:
             "launch_command": command,
             "baseline_revision": "c84448bbac2c95af408ba523521b712b43ba58e8",
             "treatment_revision": CURRENT_REVISION,
+            "real_data": {
+                "kind": "real",
+                "identity": "S30W065/2021-2025/composite-band-1/scenes-sha256",
+                "production_relationship": "Exact production shard and immutable scene set.",
+                "known_differences": ["Single shard rather than the fleet."],
+            },
         },
         "baseline": {
             "metric": "wall_s",
@@ -39,9 +51,24 @@ def valid_contract(tmp_path: Path, command: str = DEFAULT_COMMAND) -> dict:
             "artifact": str(artifact),
         },
         "target_metric": "wall_s",
+        "measurement_plan": {
+            "target_environment": "production",
+            "phases": ["remote read", "reduction", "compression and store"],
+            "metrics": ["wall_s", "cpu_s", "peak_rss_mb", "bytes_read"],
+            "raw_artifacts": ["heartbeat JSON", "Coiled CPU and network series"],
+            "profiling": {
+                "method": "Dask task-prefix and host-resource profile",
+                "artifact": "profile.json",
+                "observer_effect_control": "Identical profiler configuration in both arms.",
+            },
+            "baseline_repetitions": 1,
+            "treatment_repetitions": 1,
+            "aggregation": "single",
+        },
         "minimum_effect": {"direction": "decrease", "fraction": 0.1},
         "production_discriminator": "One sequential production-shard A/B.",
         "stop_rule": "Reject below ten percent.",
+        "result_artifact": "result.json",
         "max_cloud_cost_usd": 1,
         "max_coiled_credits": 20,
         "code_identity_required": True,
@@ -51,6 +78,45 @@ def valid_contract(tmp_path: Path, command: str = DEFAULT_COMMAND) -> dict:
             "acceptance_criterion": "both output checksums match",
             "result_artifact": str(equivalence),
         },
+    }
+
+
+def valid_result(tmp_path: Path, contract_path: Path) -> dict:
+    baseline_raw = tmp_path / "baseline-observation.json"
+    treatment_raw = tmp_path / "treatment-observation.json"
+    profile = tmp_path / "profile.json"
+    baseline_raw.write_text('{"wall_s": 840}\n')
+    treatment_raw.write_text('{"wall_s": 756}\n')
+    profile.write_text('{"tasks": {"open_rasterio": 200}}\n')
+    return {
+        "schema_version": 1,
+        "contract_sha256": sha256_file(contract_path),
+        "environment": "production",
+        "input_identity": "S30W065/2021-2025/composite-band-1/scenes-sha256",
+        "baseline_revision": "c84448bbac2c95af408ba523521b712b43ba58e8",
+        "treatment_revision": CURRENT_REVISION,
+        "baseline_observations": [
+            {
+                "metric": "wall_s",
+                "value": 840,
+                "unit": "seconds",
+                "artifact": baseline_raw.name,
+            }
+        ],
+        "treatment_observations": [
+            {
+                "metric": "wall_s",
+                "value": 756,
+                "unit": "seconds",
+                "artifact": treatment_raw.name,
+            }
+        ],
+        "profiling_artifact": profile.name,
+        "observed_effect_fraction": 0.1,
+        "minimum_effect_met": True,
+        "output_equivalence_passed": True,
+        "decision": "proceed",
+        "limitations": ["One production shard; fleet-level variance remains unknown."],
     }
 
 
@@ -225,3 +291,39 @@ def test_policy_wiring_check() -> None:
         [sys.executable, str(ROOT / "scripts/check_evidence_policy.py")], cwd=ROOT, check=False
     )
     assert result.returncode == 0
+
+
+def test_result_recomputes_the_decision_from_retained_observations(tmp_path: Path) -> None:
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(valid_contract(tmp_path)))
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps(valid_result(tmp_path, contract_path)))
+
+    assert load_result(result_path, contract_path)["decision"] == "proceed"
+
+    payload = json.loads(result_path.read_text())
+    payload["observed_effect_fraction"] = 0.5
+    result_path.write_text(json.dumps(payload))
+    with pytest.raises(ContractError, match="does not match retained observations"):
+        load_result(result_path, contract_path)
+
+
+def test_result_cannot_override_a_failed_stop_rule(tmp_path: Path) -> None:
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(valid_contract(tmp_path)))
+    payload = valid_result(tmp_path, contract_path)
+    payload["treatment_observations"][0]["value"] = 820
+    payload["observed_effect_fraction"] = (840 - 820) / 840
+    payload["minimum_effect_met"] = False
+    payload["decision"] = "proceed"
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ContractError, match="decision must be stop"):
+        load_result(result_path, contract_path)
+
+
+def test_contract_rejects_synthetic_gate_data(tmp_path: Path) -> None:
+    payload = valid_contract(tmp_path)
+    payload["inputs"]["real_data"]["kind"] = "synthetic"
+    assert any("synthetic data cannot gate" in error for error in validate_contract(payload))

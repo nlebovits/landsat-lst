@@ -5,15 +5,17 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import shutil
+import statistics
 import subprocess  # nosec B404
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from landsat_lst.evidence_contract import load_contract
+from landsat_lst.evidence_contract import ContractError, load_contract, load_result
 
 _SECRET_PARTS = ("token", "secret", "password", "credential", "access_key", "session_key")
 _SECRET_ASSIGNMENT = re.compile(
@@ -120,16 +122,17 @@ def _resolve_artifact(contract_path: Path, value: str) -> Path:
     return source if source.is_absolute() else contract_path.parent / source
 
 
-def _validate_equivalence_result(source: Path) -> None:
-    """Require an explicit passing post-run scientific comparison result."""
+def _validate_equivalence_result(source: Path) -> bool:
+    """Return an explicit post-run scientific comparison result."""
     try:
         result = json.loads(source.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read output-equivalence result {source}: {exc}") from exc
-    if not isinstance(result, dict) or result.get("passed") is not True:
+    if not isinstance(result, dict) or not isinstance(result.get("passed"), bool):
         raise ValueError(
-            f"output-equivalence result must be a JSON object with passed=true: {source}"
+            f"output-equivalence result must be a JSON object with boolean passed: {source}"
         )
+    return result["passed"]
 
 
 def _retain_artifact(source: Path, output_dir: Path, stem: str) -> dict[str, Any]:
@@ -144,6 +147,32 @@ def _retain_artifact(source: Path, output_dir: Path, stem: str) -> dict[str, Any
         "bytes": destination.stat().st_size,
         "sha256": sha256_file(destination),
     }
+
+
+def _decision_artifacts(
+    result: dict[str, Any],
+    result_path: Path,
+    contract_path: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Copy every file supporting the measured decision into the immutable bundle."""
+    retained = {
+        "contract": _retain_artifact(contract_path, output_dir, "contract"),
+        "result": _retain_artifact(result_path, output_dir, "decision"),
+        "profiling": _retain_artifact(
+            _resolve_artifact(result_path, result["profiling_artifact"]),
+            output_dir,
+            "profiling",
+        ),
+    }
+    for arm in ("baseline", "treatment"):
+        for index, observation in enumerate(result[f"{arm}_observations"], start=1):
+            retained[f"{arm}_observation_{index}"] = _retain_artifact(
+                _resolve_artifact(result_path, observation["artifact"]),
+                output_dir,
+                f"{arm}-observation-{index}",
+            )
+    return retained
 
 
 def _worker_code_verification(
@@ -243,6 +272,8 @@ def collect_evidence(
 ) -> Path:
     """Write one canonical evidence bundle and return its manifest path."""
     contract = load_contract(contract_path)
+    result_source = _resolve_artifact(contract_path, contract["result_artifact"])
+    result = load_result(result_source, contract_path)
     destination = output_dir / "evidence.json"
     if destination.exists():
         raise FileExistsError(f"refusing to overwrite existing evidence bundle: {destination}")
@@ -254,20 +285,28 @@ def collect_evidence(
     equivalence_source = _resolve_artifact(
         contract_path, contract["output_equivalence"]["result_artifact"]
     )
-    _validate_equivalence_result(equivalence_source)
+    equivalence_passed = _validate_equivalence_result(equivalence_source)
+    if result["output_equivalence_passed"] is not equivalence_passed:
+        raise ValueError(
+            "decision output_equivalence_passed does not match the retained equivalence result"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
-    contract_artifacts = {
-        "baseline": _retain_artifact(
-            _resolve_artifact(contract_path, contract["baseline"]["artifact"]),
-            output_dir,
-            "baseline",
-        ),
-        "output_equivalence": _retain_artifact(
-            equivalence_source,
-            output_dir,
-            "output-equivalence",
-        ),
-    }
+    contract_artifacts = _decision_artifacts(
+        result,
+        result_source,
+        contract_path,
+        output_dir,
+    )
+    contract_artifacts["baseline_contract"] = _retain_artifact(
+        _resolve_artifact(contract_path, contract["baseline"]["artifact"]),
+        output_dir,
+        "baseline-contract",
+    )
+    contract_artifacts["output_equivalence"] = _retain_artifact(
+        equivalence_source,
+        output_dir,
+        "output-equivalence",
+    )
     attachment_dir = output_dir / "attachments"
     attachment_records = []
     for source in attachments:
@@ -290,6 +329,7 @@ def collect_evidence(
         "schema_version": 1,
         "collected_at": datetime.now(UTC).isoformat(),
         "contract": contract,
+        "decision": result,
         "contract_artifacts": contract_artifacts,
         "code": {
             **_git_identity(),
@@ -325,7 +365,200 @@ def collect_evidence(
         ]
 
     destination.write_text(json.dumps(_safe(bundle), indent=2, sort_keys=True) + "\n")
+    validate_evidence_bundle(destination)
     return destination
+
+
+def _load_evidence_bundle(source: Path) -> dict[str, Any]:
+    try:
+        bundle = json.loads(source.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ContractError(f"cannot read evidence bundle {source}: {exc}") from exc
+    if not isinstance(bundle, dict) or bundle.get("schema_version") != 1:
+        raise ContractError("evidence bundle must be a schema-version 1 JSON object")
+    return bundle
+
+
+def _decision_observation_counts(decision: Any) -> dict[str, int]:
+    if not isinstance(decision, dict) or decision.get("decision") not in {
+        "proceed",
+        "stop",
+    }:
+        raise ContractError("evidence bundle has no validated stop/proceed decision")
+    counts: dict[str, int] = {}
+    for arm in ("baseline", "treatment"):
+        observations = decision.get(f"{arm}_observations")
+        if not isinstance(observations, list) or not observations:
+            raise ContractError(f"evidence decision has no {arm} observations")
+        counts[arm] = len(observations)
+    return counts
+
+
+def _required_artifact_names(observation_counts: dict[str, int]) -> set[str]:
+    required = {
+        "contract",
+        "result",
+        "profiling",
+        "baseline_contract",
+        "output_equivalence",
+    }
+    for arm, count in observation_counts.items():
+        required.update(f"{arm}_observation_{index}" for index in range(1, count + 1))
+    return required
+
+
+def _validate_retained_artifact(name: str, record: Any, source: Path, root: Path) -> Path:
+    if not isinstance(record, dict):
+        raise ContractError(f"evidence artifact {name} must be an object")
+    relative = record.get("path")
+    if not isinstance(relative, str):
+        raise ContractError(f"evidence artifact {name} has no path")
+    retained = (source.parent / relative).resolve()
+    if not retained.is_relative_to(root) or not retained.is_file():
+        raise ContractError(f"evidence artifact {name} is missing or escapes the bundle")
+    if retained.stat().st_size != record.get("bytes"):
+        raise ContractError(f"evidence artifact {name} byte count does not match")
+    if sha256_file(retained) != record.get("sha256"):
+        raise ContractError(f"evidence artifact {name} digest does not match")
+    return retained
+
+
+def _retained_artifact_paths(source: Path, artifacts: Any, required: set[str]) -> dict[str, Path]:
+    if not isinstance(artifacts, dict) or not required.issubset(artifacts):
+        available = set(artifacts) if isinstance(artifacts, dict) else set()
+        missing = sorted(required - available)
+        raise ContractError("evidence bundle is missing retained artifacts: " + ", ".join(missing))
+    root = source.parent.resolve()
+    return {
+        name: _validate_retained_artifact(name, record, source, root)
+        for name, record in artifacts.items()
+    }
+
+
+def _load_retained_json(retained_paths: dict[str, Path]) -> tuple[Any, Any, Any]:
+    try:
+        return (
+            json.loads(retained_paths["contract"].read_text()),
+            json.loads(retained_paths["result"].read_text()),
+            json.loads(retained_paths["output_equivalence"].read_text()),
+        )
+    except json.JSONDecodeError as exc:
+        raise ContractError(f"retained evidence JSON is invalid: {exc}") from exc
+
+
+def _validate_embedded_evidence(
+    bundle: dict[str, Any],
+    artifacts: dict[str, Any],
+    retained_contract: Any,
+    retained_result: Any,
+    retained_equivalence: Any,
+) -> bool:
+    if retained_contract != bundle.get("contract"):
+        raise ContractError("embedded contract does not match retained contract")
+    if retained_result != bundle.get("decision"):
+        raise ContractError("embedded decision does not match retained result")
+    if retained_result.get("contract_sha256") != artifacts["contract"]["sha256"]:
+        raise ContractError("retained result is not bound to the retained contract")
+    if not isinstance(retained_equivalence, dict) or not isinstance(
+        retained_equivalence.get("passed"), bool
+    ):
+        raise ContractError("retained output-equivalence result has no boolean passed value")
+    return retained_equivalence["passed"]
+
+
+def _observation_values(decision: dict[str, Any], arm: str) -> list[float]:
+    try:
+        return [float(observation["value"]) for observation in decision[f"{arm}_observations"]]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ContractError(f"evidence decision {arm} observations are malformed: {exc}") from exc
+
+
+def _aggregate_evidence_values(values: list[float], aggregation: str) -> float:
+    if aggregation == "single":
+        return values[0]
+    if aggregation == "mean":
+        return statistics.fmean(values)
+    return float(statistics.median(values))
+
+
+def _validate_observation_minimums(
+    plan: dict[str, Any], baseline_values: list[float], treatment_values: list[float]
+) -> None:
+    if (
+        len(baseline_values) < plan["baseline_repetitions"]
+        or len(treatment_values) < plan["treatment_repetitions"]
+    ):
+        raise ContractError("evidence decision has fewer observations than pre-registered")
+
+
+def _validate_bundle_decision(
+    decision: dict[str, Any],
+    contract: dict[str, Any],
+    retained_equivalence_passed: bool,
+    *,
+    require_proceed: bool,
+) -> None:
+    plan = contract["measurement_plan"]
+    baseline_values = _observation_values(decision, "baseline")
+    treatment_values = _observation_values(decision, "treatment")
+    _validate_observation_minimums(plan, baseline_values, treatment_values)
+    baseline_value = _aggregate_evidence_values(baseline_values, plan["aggregation"])
+    treatment_value = _aggregate_evidence_values(treatment_values, plan["aggregation"])
+    direction = contract["minimum_effect"]["direction"]
+    effect = (
+        (baseline_value - treatment_value) / baseline_value
+        if direction == "decrease"
+        else (treatment_value - baseline_value) / baseline_value
+    )
+    worthwhile = effect >= contract["minimum_effect"]["fraction"]
+    recorded_effect = float(decision.get("observed_effect_fraction", float("nan")))
+    if not math.isclose(effect, recorded_effect, rel_tol=1e-9, abs_tol=1e-9):
+        raise ContractError("evidence decision effect does not match retained observations")
+    if decision.get("minimum_effect_met") is not worthwhile:
+        raise ContractError("evidence decision minimum_effect_met does not match observations")
+    equivalence_passed = decision.get("output_equivalence_passed")
+    if retained_equivalence_passed is not equivalence_passed:
+        raise ContractError("evidence decision disagrees with retained output equivalence")
+    expected_decision = "proceed" if worthwhile and equivalence_passed is True else "stop"
+    if decision["decision"] != expected_decision:
+        raise ContractError(f"evidence decision must be {expected_decision}")
+    if require_proceed and decision["decision"] != "proceed":
+        raise ContractError("optimization implementation requires decision=proceed")
+
+
+def _validate_production_worker_identity(bundle: dict[str, Any], decision: dict[str, Any]) -> None:
+    if decision.get("environment") != "production":
+        return
+    verification = bundle.get("worker_code_verification")
+    if not isinstance(verification, dict) or verification.get("status") != "verified":
+        raise ContractError("production evidence requires verified worker code identity")
+
+
+def validate_evidence_bundle(
+    path: str | Path,
+    *,
+    require_proceed: bool = False,
+) -> dict[str, Any]:
+    """Reject incomplete, altered, or non-proceed evidence bundles."""
+    source = Path(path)
+    bundle = _load_evidence_bundle(source)
+    decision = bundle["decision"]
+    counts = _decision_observation_counts(decision)
+    required = _required_artifact_names(counts)
+    artifacts = bundle.get("contract_artifacts")
+    if not isinstance(artifacts, dict):
+        raise ContractError("evidence bundle contract_artifacts must be an object")
+    retained_paths = _retained_artifact_paths(source, artifacts, required)
+    retained = _load_retained_json(retained_paths)
+    equivalence_passed = _validate_embedded_evidence(bundle, artifacts, *retained)
+    _validate_bundle_decision(
+        decision,
+        bundle["contract"],
+        equivalence_passed,
+        require_proceed=require_proceed,
+    )
+    _validate_production_worker_identity(bundle, decision)
+    return bundle
 
 
 def _run_frisky(args: list[str]) -> subprocess.CompletedProcess[bytes]:

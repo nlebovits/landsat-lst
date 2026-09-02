@@ -1,10 +1,20 @@
 # landsat-lst Project Instructions
 
-## Mandatory performance-evidence policy
+## Mandatory performance-evidence gate
 
-Read and follow the canonical policy in `docs/performance-evidence-policy.md`
-before any performance or cost work. A contract constrains cloud launches but
-never authorizes spending.
+Read and follow `docs/performance-evidence-policy.md` before investigating,
+implementing, reviewing, or reporting work involving runtime, throughput, memory,
+I/O, concurrency, scaling, cloud cost, or resource efficiency.
+
+A plausible mechanism, synthetic result, local microbenchmark, model, estimate,
+or user-reported number may justify only a pre-registered bounded discriminator
+and its smallest reversible experimental treatment. Production implementation or
+implementation-focused hardening requires a validated representative real-data
+evidence bundle whose decision is `proceed`. Never
+invent measurements, relabel non-measured values, omit contrary runs, or use tests
+as performance evidence. Retain the pull request template evidence declaration.
+
+A contract constrains cloud launches but never authorizes spending.
 
 ## CRITICAL: STAC Endpoint Rules
 

@@ -643,16 +643,9 @@ def _stage_vm_overrides(stage: str, environ: dict[str, str]) -> dict[str, Any]:
       COG being translated out of it, all at once.
     """
     if stage == "composite":
-        composite_env = {
-            **environ,
-            "LST_LOAD_CHUNK_SIZE": str(settings.shard_composite_chunk),
-        }
-        # Composite profiling is the evidence feature this stage promises.
-        # Keep an explicit operator opt-out forwarded by _worker_environ.
-        composite_env.setdefault("LST_PROFILE_DASK", "1")
         return {
             "vm_type": [settings.shard_composite_vm_type],
-            "env": composite_env,
+            "env": {**environ, "LST_LOAD_CHUNK_SIZE": str(settings.shard_composite_chunk)},
         }
     if stage == "export":
         return {"disk_size": settings.shard_export_disk_gb}
