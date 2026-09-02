@@ -302,7 +302,9 @@ first, because a fleet whose last task uploaded and then stopped is a finished s
 endpoint `coiled login` itself reads (`has_quota` is authoritative for exhausted-or-not);
 an operator-supplied limit minus the billing-activity debits in a recent window (Coiled
 publishes no limit through any API, so the preflight asks for it); and, if
-neither answers, a refusal that prints the team page and demands `--ack-quota`. The run's
+neither answers, a refusal that prints the team page and demands `--ack-quota`. The legacy
+`LST_COILED_CREDIT_QUOTA` setting is accepted so old `.env` files still load, but it is
+deliberately ignored: a stored limit may be stale. The run's
 credit estimate comes from the same budget model, so geometry moves it.
 
 The fallback's approximation is documented rather than hidden: nothing observable says

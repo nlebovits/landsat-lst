@@ -700,6 +700,7 @@ class TestShardGroup:
         assert result.exit_code == 0
         assert "shard resume" in result.output
         assert drive.call_args.kwargs["run_id"] in result.output
+        assert drive.call_args.kwargs["balance_source"]().remaining == 10_000.0
 
     def test_a_stage_that_never_finished_fails_the_command(self, runner, s3_backend):
         from landsat_lst.shard_driver import ShardStageFailed

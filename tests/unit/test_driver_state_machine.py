@@ -689,6 +689,68 @@ class TestPreflightCredits:
         assert balance.has_quota is True
         assert balance.source == "usage_endpoint+billing_activity"
 
+    def test_0l_unknown_spend_never_turns_a_limit_into_remaining_credits(self):
+        """A total limit says nothing affordable when the debits are unavailable."""
+        asked = []
+
+        with pytest.raises(quota.QuotaRefused, match="billing activity could not be read"):
+            quota.preflight_credits(
+                400.0,
+                balance_source=lambda: quota.CreditBalance(
+                    remaining=None, source="usage_endpoint", has_quota=True, spent=None
+                ),
+                ask_limit=lambda *_: asked.append(True) or 1000.0,
+            )
+
+        assert asked == []
+
+    @pytest.mark.parametrize("limit", [float("nan"), float("inf"), float("-inf")])
+    def test_0m_a_non_finite_operator_limit_never_passes(self, limit):
+        with pytest.raises(quota.QuotaRefused):
+            quota.preflight_credits(
+                10.0,
+                balance_source=lambda: quota.CreditBalance(
+                    remaining=None, source="billing_activity", spent=1.0
+                ),
+                ask_limit=lambda *_: limit,
+            )
+
+    def test_0n_an_acknowledgement_never_prompts_again(self):
+        asked = []
+
+        balance = quota.preflight_credits(
+            10.0,
+            balance_source=lambda: quota.CreditBalance(
+                remaining=None, source="billing_activity", spent=1.0
+            ),
+            acknowledged=True,
+            ask_limit=lambda *_: asked.append(True) or 1000.0,
+        )
+
+        assert asked == []
+        assert balance.remaining is None
+
+    def test_0o_composition_preserves_an_endpoint_remaining_figure(self, monkeypatch):
+        monkeypatch.setattr(
+            quota,
+            "_usage_endpoint_balance",
+            lambda: quota.CreditBalance(
+                remaining=250.0, source="usage_endpoint", has_quota=True, detail="ws"
+            ),
+        )
+        monkeypatch.setattr(
+            quota,
+            "_billing_balance",
+            lambda: quota.CreditBalance(
+                remaining=None, source="billing_activity", spent=50.0, detail="sum"
+            ),
+        )
+
+        balance = quota.read_balance()
+
+        assert balance.remaining == 250.0
+        assert balance.spent == 50.0
+
     def test_0f_the_driver_submits_nothing_when_the_preflight_refuses(
         self, storage, plan, job, clock, monkeypatch
     ):

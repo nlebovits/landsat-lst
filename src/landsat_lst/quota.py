@@ -52,6 +52,7 @@ catches that case.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -295,12 +296,14 @@ def _first_number(payload: dict, keys: tuple[str, ...]) -> float | None:
     for key in keys:
         value = payload.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
+            number = float(value)
+            if isfinite(number):
+                return number
     return None
 
 
 def _billing_balance() -> CreditBalance | None:
-    """Source 2: the configured quota minus the debits in the recent window.
+    """Source 2: debits in the recent window, without inventing a limit.
 
     See the module docstring for what "recent window" approximates and which
     way it is wrong.
@@ -322,7 +325,10 @@ def _billing_balance() -> CreditBalance | None:
                 amount = event.get("amount_credits")
                 if amount is None:
                     continue
-                spent += abs(float(amount))
+                debit = float(amount)
+                if not isfinite(debit):
+                    raise ValueError(f"billing activity returned a non-finite debit: {amount!r}")
+                spent += abs(debit)
             if not activity.get("next") or page >= settings.coiled_billing_max_pages:
                 break
             page += 1
@@ -363,10 +369,11 @@ def read_balance() -> CreditBalance:
 
     billing = _billing_balance()
     if billing is not None and billing.spent is not None:
-        if endpoint is None or endpoint.has_quota is None:
+        if endpoint is None or not endpoint.known:
             return billing
         return replace(
             billing,
+            remaining=endpoint.remaining,
             has_quota=endpoint.has_quota,
             source=f"{endpoint.source}+{billing.source}",
             detail=f"{endpoint.detail}; {billing.detail}",
@@ -466,7 +473,7 @@ def _prompt_for_limit(balance: CreditBalance, estimated: float, needed: float) -
     """
     import sys  # noqa: PLC0415
 
-    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+    if balance.spent is None or not (sys.stdin.isatty() and sys.stderr.isatty()):
         return None
 
     spent = balance.spent
@@ -499,10 +506,47 @@ def _prompt_for_limit(balance: CreditBalance, estimated: float, needed: float) -
     except ValueError:
         log.warning("quota_limit_unparseable", answer=answer)
         return None
-    if limit <= 0:
+    if not isfinite(limit) or limit <= 0:
         log.warning("quota_limit_not_positive", answer=answer)
         return None
     return limit
+
+
+def _without_non_finite_values(balance: CreditBalance) -> CreditBalance:
+    """Turn invalid numeric source data back into unknown data."""
+    remaining = balance.remaining
+    spent = balance.spent
+    if remaining is not None and not isfinite(remaining):
+        log.warning("quota_remaining_not_finite", remaining=remaining)
+        remaining = None
+    if spent is not None and not isfinite(spent):
+        log.warning("quota_spent_not_finite", spent=spent)
+        spent = None
+    return replace(balance, remaining=remaining, spent=spent)
+
+
+def _with_operator_limit(
+    balance: CreditBalance,
+    estimated: float,
+    needed: float,
+    ask_limit: Callable[[CreditBalance, float, float], float | None] | None,
+) -> CreditBalance:
+    """Close known-spend arithmetic with a finite operator-supplied limit."""
+    if balance.remaining is not None or balance.has_quota is False or balance.spent is None:
+        return balance
+    limit = (ask_limit or _prompt_for_limit)(balance, estimated, needed)
+    if limit is None or not isfinite(limit) or limit <= 0:
+        return balance
+    return replace(
+        balance,
+        remaining=limit - balance.spent,
+        source=f"{balance.source}+operator",
+        detail=(
+            f"{balance.detail}; operator gave a {limit:.0f} credit limit"
+            if balance.detail
+            else f"operator gave a {limit:.0f} credit limit"
+        ),
+    )
 
 
 def preflight_credits(
@@ -527,6 +571,8 @@ def preflight_credits(
             definition let a unit test reach the real billing API.
         acknowledged: Whether a human has checked the balance by eye.
             ``None`` reads ``settings.ack_quota``.
+        ask_limit: Interactive source for a current total limit. Called only
+            when billing supplied the spend needed to derive a remainder.
 
     Returns:
         The balance that was read, for the caller to log.
@@ -540,21 +586,12 @@ def preflight_credits(
     balance = (balance_source or read_balance)()
     needed = estimated_credits * settings.coiled_credit_safety
 
-    # Coiled exposes no limit, so if nothing supplied a remaining, ask the
-    # operator now -- before a run id is printed and before a VM boots.
-    if balance.remaining is None and balance.has_quota is not False:
-        limit = (ask_limit or _prompt_for_limit)(balance, estimated_credits, needed)
-        if limit is not None:
-            balance = replace(
-                balance,
-                remaining=limit - (balance.spent or 0.0),
-                source=f"{balance.source}+operator",
-                detail=(
-                    f"{balance.detail}; operator gave a {limit:.0f} credit limit"
-                    if balance.detail
-                    else f"operator gave a {limit:.0f} credit limit"
-                ),
-            )
+    balance = _without_non_finite_values(balance)
+
+    # An acknowledgement already says an operator checked the balance, so it
+    # must not prompt again. Otherwise close only known-spend arithmetic.
+    if not acked:
+        balance = _with_operator_limit(balance, estimated_credits, needed, ask_limit)
 
     if balance.has_quota is False:
         raise QuotaRefused(
@@ -585,11 +622,17 @@ def preflight_credits(
         return balance
 
     if not acked:
+        manual_path = (
+            "run this from a terminal and answer the prompt, or "
+            if balance.spent is not None
+            else "billing activity could not be read, so the limit cannot be converted "
+            "to a remaining balance; "
+        )
         raise QuotaRefused(
             "the Coiled credit limit is unknown, and a run that hits the quota "
             "is killed mid-stage. Coiled publishes no limit through its API, so "
-            "it has to come from a person: run this from a terminal and answer "
-            f"the prompt, or check {TEAM_URL} and re-run with --ack-quota (or "
+            f"it has to come from a person: {manual_path}check {TEAM_URL} and re-run "
+            "with --ack-quota (or "
             f"LST_ACK_QUOTA=1). This run needs about {estimated_credits:.0f} "
             f"credits x {settings.coiled_credit_safety:.1f} = {needed:.0f}."
             + (f" Coiled shows {balance.spent:.1f} debited recently." if balance.spent else ""),

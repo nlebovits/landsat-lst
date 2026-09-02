@@ -536,6 +536,14 @@ class Settings(BaseSettings):
         "start; too long over-counts and refuses an affordable one. 30 days is "
         "the conservative reading of a monthly quota.",
     )
+    coiled_credit_quota: float | None = Field(
+        default=None,
+        gt=0,
+        exclude=True,
+        description="Deprecated compatibility setting. It is accepted so an existing "
+        ".env does not make Settings fail to load, but quota preflight never trusts or "
+        "uses this stored value; the current limit must be confirmed by an operator.",
+    )
     coiled_billing_max_pages: int = Field(
         default=20,
         ge=1,

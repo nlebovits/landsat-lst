@@ -1882,7 +1882,9 @@ def shard_process(
     console.print(f"  resume with: landsat-lst shard resume {run_id} {tile}")
 
     try:
-        summary = drive_tile(job, run_id=run_id)
+        # The CLI already checked this exact balance before printing the run id.
+        # Reuse it so the driver's defensive preflight does not ask twice.
+        summary = drive_tile(job, run_id=run_id, balance_source=lambda: balance)
     except (ShardStageFailed, ShardBackendMismatch) as e:
         raise click.ClickException(str(e)) from e
 
