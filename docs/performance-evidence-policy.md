@@ -33,6 +33,10 @@ the exact workload and launch command, require a retained baseline artifact and
 full Git revisions, require code-identity evidence, and define output equivalence.
 Experiment contracts are limited to $100 and 400 Coiled credits; smaller limits
 should be used whenever the discriminator allows them.
+The contract must name the output comparison method, its exact acceptance
+criterion, and the path where the post-run result will be retained. Evidence
+collection copies and hashes that result and the baseline artifact into the bundle.
+Collection refuses an equivalence report unless it explicitly records `passed: true`.
 The contract is a prerequisite, **not authorization**: the operator must still
 explicitly approve every cloud launch.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess  # nosec B404
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,49 @@ def _validate_limits(data: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _validate_output_equivalence(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return ["output_equivalence must be an object"]
+    return _required_strings(
+        value,
+        ("method", "acceptance_criterion", "result_artifact"),
+        "output_equivalence.",
+    )
+
+
+def repository_identity(root: Path) -> dict[str, Any]:
+    """Return the exact tracked checkout identity used to submit worker code."""
+
+    def git(*args: str) -> str:
+        result = subprocess.run(  # nosec B603 B607
+            ["git", *args], cwd=root, check=True, capture_output=True, text=True
+        )
+        return result.stdout.strip()
+
+    try:
+        return {
+            "revision": git("rev-parse", "HEAD"),
+            "dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
+        }
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ContractError(f"cannot resolve launch code identity in {root}: {exc}") from exc
+
+
+def bind_contract_to_repository(data: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Require the treatment revision to identify the tracked launch checkout."""
+    identity = repository_identity(root)
+    if identity["dirty"]:
+        raise ContractError(
+            "launch checkout has tracked changes; commit them before the experiment"
+        )
+    treatment = data["inputs"]["treatment_revision"]
+    if treatment != identity["revision"]:
+        raise ContractError(
+            f"inputs.treatment_revision does not match launch checkout {identity['revision']}"
+        )
+    return identity
+
+
 def normalize_launch_command(command: str) -> str:
     """Canonical command form stored in a contract (excluding its own path)."""
     return " ".join(_CONTRACT_ASSIGNMENT.sub("", command).split())
@@ -131,6 +175,7 @@ def validate_contract(
     errors.extend(_validate_baseline(data.get("baseline"), base_dir or Path.cwd()))
     errors.extend(_validate_effect(data.get("minimum_effect")))
     errors.extend(_validate_limits(data))
+    errors.extend(_validate_output_equivalence(data.get("output_equivalence")))
     placeholders = (
         "exact tile",
         "full git SHA",

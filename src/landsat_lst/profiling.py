@@ -1152,6 +1152,7 @@ def _dump_profile(
             "wall_s": round(wall_s, 2),
             "run_id": heartbeat.run_id if heartbeat else None,
             "tile": heartbeat.tile if heartbeat else None,
+            "code_identity": heartbeat.code_identity() if heartbeat else None,
             "tasks": _task_summary(task_prof.results),
             "resource": _resource_summary(resource_prof.results, interval_s),
         }

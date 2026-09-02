@@ -31,6 +31,7 @@ from landsat_lst.progress import (
     report_failed,
     report_phase,
     rss_mb,
+    worker_code_identity,
     write_final_state,
 )
 from landsat_lst.storage import LocalStorage
@@ -803,3 +804,16 @@ class TestTimedSection:
             with pytest.raises(RuntimeError), timed_section("destriping"):
                 raise RuntimeError("boom")
             assert heartbeat.payload()["phase"] == "destriping"
+
+
+def test_heartbeat_records_identity_observed_by_worker_process(storage, monkeypatch) -> None:
+    revision = "d" * 40
+    monkeypatch.setenv("LST_CODE_REVISION", revision)
+    worker_code_identity.cache_clear()
+    try:
+        identity = _beat(storage).payload()["code_identity"]
+        assert identity["revision"] == revision
+        assert identity["package_version"]
+        assert identity["progress_module_sha256"]
+    finally:
+        worker_code_identity.cache_clear()

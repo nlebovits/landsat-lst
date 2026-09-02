@@ -87,8 +87,17 @@ def _git_identity() -> dict[str, Any]:
 
 
 def _run_artifacts(run_id: str, storage: Any) -> list[dict[str, Any]]:
+    """Collect whole-tile plus shard state/profile/log evidence, never intermediates."""
+    keys: dict[str, Any] = dict(storage.list_prefix(storage.run_prefix(run_id)))
+    shard_prefix = f"_shards/{run_id}/"
+    for key, modified in storage.list_prefix(shard_prefix).items():
+        if "/state/" in key or key == f"{shard_prefix}fleet.json":
+            keys[key] = modified
+    timing_prefix = f"_shards/timings/{run_id}/"
+    keys.update(storage.list_prefix(timing_prefix))
+
     artifacts = []
-    for key, modified in sorted(storage.list_prefix(storage.run_prefix(run_id)).items()):
+    for key, modified in sorted(keys.items()):
         text = storage.read_text(key)
         raw = text.encode() if text is not None else b""
         item: dict[str, Any] = {
@@ -104,6 +113,72 @@ def _run_artifacts(run_id: str, storage: Any) -> list[dict[str, Any]]:
                 item["parse_error"] = "invalid JSON"
         artifacts.append(item)
     return artifacts
+
+
+def _resolve_artifact(contract_path: Path, value: str) -> Path:
+    source = Path(value)
+    return source if source.is_absolute() else contract_path.parent / source
+
+
+def _validate_equivalence_result(source: Path) -> None:
+    """Require an explicit passing post-run scientific comparison result."""
+    try:
+        result = json.loads(source.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read output-equivalence result {source}: {exc}") from exc
+    if not isinstance(result, dict) or result.get("passed") is not True:
+        raise ValueError(
+            f"output-equivalence result must be a JSON object with passed=true: {source}"
+        )
+
+
+def _retain_artifact(source: Path, output_dir: Path, stem: str) -> dict[str, Any]:
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    destination_dir = output_dir / "contract-artifacts"
+    destination_dir.mkdir(exist_ok=True)
+    destination = destination_dir / f"{stem}{source.suffix}"
+    shutil.copy2(source, destination)
+    return {
+        "path": str(destination.relative_to(output_dir)),
+        "bytes": destination.stat().st_size,
+        "sha256": sha256_file(destination),
+    }
+
+
+def _worker_code_verification(
+    artifacts: list[dict[str, Any]], expected_revision: str
+) -> dict[str, Any]:
+    """Verify identities emitted by worker processes against the contract."""
+    identities: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for artifact in artifacts:
+        content = artifact.get("content")
+        identity = content.get("code_identity") if isinstance(content, dict) else None
+        if not isinstance(identity, dict):
+            continue
+        marker = json.dumps(identity, sort_keys=True)
+        if marker not in seen:
+            seen.add(marker)
+            identities.append(identity)
+    revisions: set[str] = set()
+    for identity in identities:
+        revision = identity.get("revision")
+        if isinstance(revision, str):
+            revisions.add(revision)
+    if not revisions:
+        raise ValueError("worker code identity is unavailable in retained run artifacts")
+    mismatches = sorted(revision for revision in revisions if revision != expected_revision)
+    if mismatches:
+        raise ValueError(
+            "worker code revision does not match contract treatment revision: "
+            + ", ".join(mismatches)
+        )
+    return {
+        "expected_revision": expected_revision,
+        "status": "verified",
+        "identities": identities,
+    }
 
 
 def _coiled_cluster(
@@ -127,7 +202,7 @@ def _coiled_cluster(
         cluster_name = details["name"]
         pages = []
         for page in range(1, 101):
-            result = coiled.get_billing_activity(cluster=cluster_name, page=page)
+            result = coiled.get_billing_activity(account=workspace, cluster=cluster_name, page=page)
             pages.append(_safe(result))
             if not isinstance(result, dict) or not result.get("next"):
                 break
@@ -168,20 +243,46 @@ def collect_evidence(
 ) -> Path:
     """Write one canonical evidence bundle and return its manifest path."""
     contract = load_contract(contract_path)
+    destination = output_dir / "evidence.json"
+    if destination.exists():
+        raise FileExistsError(f"refusing to overwrite existing evidence bundle: {destination}")
+    names = [source.name for source in attachments]
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        raise ValueError("attachment basenames must be unique: " + ", ".join(duplicate_names))
+
+    equivalence_source = _resolve_artifact(
+        contract_path, contract["output_equivalence"]["result_artifact"]
+    )
+    _validate_equivalence_result(equivalence_source)
     output_dir.mkdir(parents=True, exist_ok=True)
+    contract_artifacts = {
+        "baseline": _retain_artifact(
+            _resolve_artifact(contract_path, contract["baseline"]["artifact"]),
+            output_dir,
+            "baseline",
+        ),
+        "output_equivalence": _retain_artifact(
+            equivalence_source,
+            output_dir,
+            "output-equivalence",
+        ),
+    }
     attachment_dir = output_dir / "attachments"
     attachment_records = []
     for source in attachments:
         if not source.is_file():
             raise FileNotFoundError(source)
         attachment_dir.mkdir(exist_ok=True)
-        destination = attachment_dir / source.name
-        shutil.copy2(source, destination)
+        retained = attachment_dir / source.name
+        if retained.exists():
+            raise FileExistsError(f"refusing to overwrite attachment: {retained}")
+        shutil.copy2(source, retained)
         attachment_records.append(
             {
-                "path": str(destination.relative_to(output_dir)),
-                "bytes": destination.stat().st_size,
-                "sha256": sha256_file(destination),
+                "path": str(retained.relative_to(output_dir)),
+                "bytes": retained.stat().st_size,
+                "sha256": sha256_file(retained),
             }
         )
 
@@ -189,6 +290,7 @@ def collect_evidence(
         "schema_version": 1,
         "collected_at": datetime.now(UTC).isoformat(),
         "contract": contract,
+        "contract_artifacts": contract_artifacts,
         "code": {
             **_git_identity(),
             "package_version": importlib.metadata.version("landsat-lst"),
@@ -208,7 +310,13 @@ def collect_evidence(
 
             storage = get_storage()
         bundle["run_id"] = run_id
-        bundle["run_artifacts"] = _run_artifacts(run_id, storage)
+        run_artifacts = _run_artifacts(run_id, storage)
+        bundle["run_artifacts"] = run_artifacts
+        bundle["worker_code_verification"] = _worker_code_verification(
+            run_artifacts, contract["inputs"]["treatment_revision"]
+        )
+    else:
+        bundle["worker_code_verification"] = {"status": "not_collected", "identities": []}
     if cluster_ids:
         if not workspace:
             raise ValueError("workspace is required with cluster IDs")
@@ -216,7 +324,6 @@ def collect_evidence(
             _coiled_cluster(cid, workspace, metric_queries) for cid in cluster_ids
         ]
 
-    destination = output_dir / "evidence.json"
     destination.write_text(json.dumps(_safe(bundle), indent=2, sort_keys=True) + "\n")
     return destination
 

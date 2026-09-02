@@ -20,21 +20,41 @@ from landsat_lst.evidence import _coiled_cluster, _safe, capture_frisky, collect
 
 
 class StubStorage:
+    def __init__(self, revision: str | None = "83957932f3e1a72484246c421cbab1d91d4ba234"):
+        self.revision = revision
+
     def run_prefix(self, run_id: str) -> str:
         return f"_runs/{run_id}/"
 
     def list_prefix(self, prefix: str) -> dict[str, datetime]:
-        assert prefix == "_runs/run-1/"
-        return {"_runs/run-1/N40W075.1.json": datetime(2026, 1, 1, tzinfo=UTC)}
+        modified = datetime(2026, 1, 1, tzinfo=UTC)
+        if prefix == "_runs/run-1/":
+            return {"_runs/run-1/N40W075.1.json": modified}
+        if prefix == "_shards/run-1/":
+            return {
+                "_shards/run-1/N40W075/state/composite.0003.1.composite.profile.json": modified,
+                "_shards/run-1/N40W075/composite/lst_p95/band003.tif": modified,
+            }
+        if prefix == "_shards/timings/run-1/":
+            return {}
+        raise AssertionError(prefix)
 
     def read_text(self, key: str) -> str:
-        assert key.endswith("N40W075.1.json")
-        return '{"status": "completed", "access_token": "do-not-retain"}'
+        assert key.endswith(".json")
+        return json.dumps(
+            {
+                "status": "completed",
+                "access_token": "do-not-retain",
+                "code_identity": {"revision": self.revision, "package_version": "0.1-test"},
+            }
+        )
 
 
 def contract(tmp_path: Path) -> Path:
     baseline = tmp_path / "baseline.json"
     baseline.write_text('{"wall_s": 840}\n')
+    equivalence = tmp_path / "equivalence.json"
+    equivalence.write_text('{"passed": true}\n')
     payload = {
         "schema_version": 1,
         "claim": "Treatment reduces wall time.",
@@ -59,6 +79,11 @@ def contract(tmp_path: Path) -> Path:
         "max_coiled_credits": 20,
         "code_identity_required": True,
         "output_equivalence_required": True,
+        "output_equivalence": {
+            "method": "SHA-256",
+            "acceptance_criterion": "both output checksums match",
+            "result_artifact": str(equivalence),
+        },
     }
     path = tmp_path / "contract.json"
     path.write_text(json.dumps(payload))
@@ -78,6 +103,66 @@ def test_collect_evidence_with_injected_storage(tmp_path: Path, monkeypatch) -> 
     assert bundle["run_artifacts"][0]["content"]["access_token"] == "<redacted>"
     assert bundle["run_artifacts"][0]["sha256"]
     assert bundle["code"]["package_version"] == "0.1-test"
+    keys = {artifact["key"] for artifact in bundle["run_artifacts"]}
+    assert "_shards/run-1/N40W075/state/composite.0003.1.composite.profile.json" in keys
+    assert not any(key.endswith(".tif") for key in keys)
+    assert bundle["worker_code_verification"]["status"] == "verified"
+    for artifact in bundle["contract_artifacts"].values():
+        retained = destination.parent / artifact["path"]
+        assert retained.is_file()
+        assert artifact["sha256"]
+
+
+def test_collect_evidence_rejects_duplicate_attachment_basenames(tmp_path: Path) -> None:
+    left = tmp_path / "left" / "same.txt"
+    right = tmp_path / "right" / "same.txt"
+    left.parent.mkdir()
+    right.parent.mkdir()
+    left.write_text("left")
+    right.write_text("right")
+
+    with pytest.raises(ValueError, match="basenames must be unique"):
+        collect_evidence(
+            output_dir=tmp_path / "bundle",
+            contract_path=contract(tmp_path),
+            attachments=(left, right),
+        )
+
+
+def test_collect_evidence_rejects_worker_revision_mismatch(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="worker code revision"):
+        collect_evidence(
+            output_dir=tmp_path / "bundle",
+            contract_path=contract(tmp_path),
+            run_id="run-1",
+            storage=StubStorage(revision="c" * 40),
+        )
+
+
+def test_collect_evidence_rejects_missing_worker_identity(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="identity is unavailable"):
+        collect_evidence(
+            output_dir=tmp_path / "bundle",
+            contract_path=contract(tmp_path),
+            run_id="run-1",
+            storage=StubStorage(revision=None),
+        )
+
+
+def test_collect_evidence_refuses_to_overwrite_bundle(tmp_path: Path) -> None:
+    output = tmp_path / "bundle"
+    output.mkdir()
+    (output / "evidence.json").write_text("original")
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        collect_evidence(output_dir=output, contract_path=contract(tmp_path))
+
+
+def test_collect_evidence_rejects_failed_output_equivalence(tmp_path: Path) -> None:
+    contract_path = contract(tmp_path)
+    (tmp_path / "equivalence.json").write_text('{"passed": false}\n')
+
+    with pytest.raises(ValueError, match="passed=true"):
+        collect_evidence(output_dir=tmp_path / "bundle", contract_path=contract_path)
 
 
 def test_safe_redacts_secrets_embedded_in_log_text(monkeypatch) -> None:
@@ -130,10 +215,16 @@ class FakeCloud:
 
 
 def test_coiled_135_private_api_contract_and_log_redaction(monkeypatch) -> None:
+    billing_calls = []
+
+    def billing(**kwargs):
+        billing_calls.append(kwargs)
+        return {"next": None, "api_token": "billing-secret"}
+
     fake = SimpleNamespace(
         Cloud=FakeCloud,
         __version__="1.135.2",
-        get_billing_activity=lambda **_kwargs: {"next": None, "api_token": "billing-secret"},
+        get_billing_activity=billing,
     )
     monkeypatch.setitem(sys.modules, "coiled", fake)
     result = _coiled_cluster(123, "workspace", ("cpu",))
@@ -141,6 +232,7 @@ def test_coiled_135_private_api_contract_and_log_redaction(monkeypatch) -> None:
     assert result["metrics"]["cpu"] == {"series": [1, 2]}
     assert "session-value" not in result["logs"]["worker"]
     assert result["billing_pages"][0]["api_token"] == "<redacted>"
+    assert billing_calls == [{"account": "workspace", "cluster": "cluster-name", "page": 1}]
 
 
 def test_coiled_details_shape_has_an_operator_error(monkeypatch) -> None:

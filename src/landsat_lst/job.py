@@ -214,8 +214,28 @@ def _worker_environ() -> dict[str, str]:
 
     environ = {**creds, "AWS_REQUEST_PAYER": "requester", "LST_STORAGE_BACKEND": "s3"}
     for key, val in os.environ.items():
-        if key.startswith("LST_") and key not in ("LST_STORAGE_BACKEND", "LST_STAC_URL"):
+        if key.startswith("LST_") and key not in (
+            "LST_CODE_REVISION",
+            "LST_STORAGE_BACKEND",
+            "LST_STAC_URL",
+        ):
             environ[key] = val
+    contract_name = os.environ.get("LST_EVIDENCE_CONTRACT")
+    if contract_name:
+        from landsat_lst.evidence_contract import (  # noqa: PLC0415
+            bind_contract_to_repository,
+            load_contract,
+        )
+
+        root = Path(__file__).resolve().parents[2]
+        contract_path = Path(contract_name)
+        if not contract_path.is_absolute():
+            contract_path = root / contract_path
+        contract = load_contract(contract_path)
+        identity = bind_contract_to_repository(contract, root)
+        # The VM records this value after startup together with the installed
+        # package version and a hash of its actual instrumentation module.
+        environ["LST_CODE_REVISION"] = identity["revision"]
     return environ
 
 
