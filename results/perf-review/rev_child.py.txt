@@ -1,0 +1,217 @@
+"""Adversarial re-measurement harness. Written from the contract, not from
+scripts/perf/composite_experiment.py.
+
+Arm selection is by PYTHONPATH (two isolated source trees), never by editing a
+file in place -- which is the exact race that mislabelled a row in the
+implementer's precorrection log. The sha of pipeline.py is read from the module
+object the interpreter ACTUALLY imported, at import time, not from a path on
+disk after a 74-second compute.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import resource
+import sys
+import time
+from pathlib import Path
+
+
+def peak_mb() -> float:
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def loadavg():
+    return [float(x) for x in Path("/proc/loadavg").read_text().split()[:3]]
+
+
+def main() -> int:  # noqa: PLR0915 -- one straight-line measurement
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fixture", required=True)
+    ap.add_argument("--chunk", type=int, default=512)
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--arm", required=True)
+    ap.add_argument("--truth", default=None)
+    ap.add_argument("--write-truth", action="store_true")
+    ap.add_argument("--mode", default="full", choices=["full", "graph", "phases"])
+    a = ap.parse_args()
+
+    import dask  # noqa: PLC0415 -- deferred: settings/dask config must be set first
+    import numpy as np  # noqa: PLC0415 -- deferred: settings/dask config must be set first
+    import xarray as xr  # noqa: PLC0415 -- deferred: settings/dask config must be set first
+
+    from landsat_lst.config import (  # noqa: PLC0415 -- deferred: settings/dask config must be set before import
+        settings,
+    )
+
+    settings.load_chunk_size = a.chunk
+    dask.config.set(scheduler="threads", num_workers=a.threads)
+
+    import landsat_lst.pipeline as P  # noqa: PLC0415 -- deferred: settings/dask config must be set first
+    from landsat_lst.encoding import (  # noqa: PLC0415 -- deferred: settings/dask config must be set before import
+        encode_lst_uint16,
+    )
+    from landsat_lst.fixture import (  # noqa: PLC0415 -- deferred: settings/dask config must be set first
+        FixtureSpec,
+        load_fixture,
+    )
+    from landsat_lst.normalization import (  # noqa: PLC0415 -- deferred: settings/dask config must be set before import
+        debias_with_offsets,
+    )
+    from landsat_lst.profiling import (  # noqa: PLC0415 -- deferred: settings/dask config must be set before import
+        graph_stats,
+    )
+    from landsat_lst.qa import (  # noqa: PLC0415 -- deferred: settings/dask config must be set first
+        apply_qa_mask,
+        convert_to_celsius,
+    )
+
+    # The sha of the module the interpreter really loaded, taken now.
+    imported_path = Path(P.__file__)
+    pipeline_sha = hashlib.sha256(imported_path.read_bytes()).hexdigest()
+    assert P.TIME_CHUNK == 10, P.TIME_CHUNK
+
+    tile, window, ns, fs = a.fixture.split("_", 3)
+    y0, y1 = window.split("-")
+    spec = FixtureSpec(
+        tile=tile,
+        year=int(y0),
+        end_year=int(y1),
+        max_scenes=int(ns.removeprefix("n")),
+        factor=int(fs.removeprefix("f")),
+    )
+    data = load_fixture(spec)
+    scenes, height, width = (int(n) for n in data["lwir11"].shape)
+
+    # Independent block tally. Counts every execution of a source block.
+    reads = []
+
+    def tally(block):
+        reads.append(1)
+        return block
+
+    counted = data["lwir11"].data.map_blocks(
+        tally, dtype=data["lwir11"].dtype, meta=np.array((), dtype=data["lwir11"].dtype)
+    )
+    source_blocks = int(counted.npartitions)
+    data["lwir11"] = (data["lwir11"].dims, counted)
+
+    lst = convert_to_celsius(apply_qa_mask(data)["lwir11"])
+
+    # Pinned offsets, read from the implementer's file but re-verified: we assert
+    # the time axis matches, same as they do.
+    payload = json.loads(Path(f"results/perf/offsets-{tile}.json").read_text())
+    stored = np.asarray(payload["times_ns"], dtype="int64")
+    actual = np.asarray(lst.time.values).astype("datetime64[ns]").astype("int64")
+    assert np.array_equal(stored, actual), "pinned offsets time axis mismatch"
+    offset = xr.DataArray(
+        np.array([np.nan if v is None else v for v in payload["offset"]], dtype="float64"),
+        dims=["time"],
+        coords={"time": lst.time},
+    )
+    n_valid = xr.DataArray(
+        np.asarray(payload["n_valid"], dtype="int64"), dims=["time"], coords={"time": lst.time}
+    )
+    lst, _, keep = debias_with_offsets(
+        lst,
+        offset,
+        n_valid,
+        max_offset_c=settings.destripe_max_offset_c,
+        min_scene_pixels=settings.destripe_min_scene_pixels,
+        min_offset_samples=settings.destripe_min_offset_samples,
+        offset_source_given=True,
+    )
+
+    t = time.monotonic()
+    composite = P._composite_graph(lst)
+    graph_build_s = time.monotonic() - t
+
+    t = time.monotonic()
+    tasks_fused = graph_stats(composite, optimize=True).tasks
+    optimize_s = time.monotonic() - t
+    tasks_raw = graph_stats(composite, optimize=False).tasks
+
+    row = {
+        "arm": a.arm,
+        "fixture": a.fixture,
+        "chunk": a.chunk,
+        "threads": a.threads,
+        "scenes": scenes,
+        "height": height,
+        "width": width,
+        "scenes_kept": int(np.asarray(keep.values).sum()),
+        "graph_build_s": graph_build_s,
+        "optimize_s": optimize_s,
+        "composite_tasks": tasks_fused,
+        "composite_tasks_raw": tasks_raw,
+        "source_blocks": source_blocks,
+        "lst_p95_dims": list(composite["lst_p95"].dims),
+        "qa_count_dims": list(composite["qa_count"].dims),
+        "pipeline_sha256_imported": pipeline_sha,
+        "pipeline_path": str(imported_path),
+        "python": sys.version.split()[0],
+        "numpy": np.__version__,
+        "dask": dask.__version__,
+        "xarray": xr.__version__,
+    }
+
+    if a.mode == "graph":
+        print(json.dumps(row))
+        return 0
+
+    row["loadavg_before"] = loadavg()
+    t0 = time.monotonic()
+    (result,) = dask.compute(composite)
+    row["wall_s"] = time.monotonic() - t0
+    row["loadavg_after"] = loadavg()
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    row["cpu_s"] = ru.ru_utime + ru.ru_stime
+    row["utime_s"] = ru.ru_utime
+    row["stime_s"] = ru.ru_stime
+    row["minflt"] = ru.ru_minflt
+    row["majflt"] = ru.ru_majflt
+    row["cores_busy"] = row["cpu_s"] / row["wall_s"]
+    row["peak_rss_mb"] = peak_mb()
+    row["source_reads"] = len(reads)
+    row["native_passes"] = len(reads) / source_blocks
+
+    lp, qc = result["lst_p95"], result["qa_count"]
+    row["out_lst_dims"] = list(lp.dims)
+    row["out_qa_dims"] = list(qc.dims)
+    row["out_lst_dtype"] = str(lp.dtype)
+    row["out_qa_dtype"] = str(qc.dtype)
+    lst_arr = np.ascontiguousarray(lp.values)
+    qa_arr = np.ascontiguousarray(qc.values)
+    enc_arr = np.ascontiguousarray(encode_lst_uint16(lp).values)
+    row["lst_sha256"] = hashlib.sha256(lst_arr.tobytes()).hexdigest()
+    row["qa_sha256"] = hashlib.sha256(qa_arr.tobytes()).hexdigest()
+    row["encoded_sha256"] = hashlib.sha256(enc_arr.tobytes()).hexdigest()
+    row["n_nan_lst"] = int(np.isnan(lst_arr).sum())
+    row["qa_sum"] = int(qa_arr.sum(dtype=np.int64))
+
+    if a.truth:
+        tp = Path(a.truth)
+        if a.write_truth:
+            tp.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(tp, lst_p95=lst_arr, qa_count=qa_arr, encoded=enc_arr)
+            row["truth_written"] = str(tp)
+        elif tp.exists():
+            ref = np.load(tp)
+            row["equal_lst"] = bool(np.array_equal(lst_arr, ref["lst_p95"], equal_nan=True))
+            row["equal_qa"] = bool(np.array_equal(qa_arr, ref["qa_count"]))
+            row["equal_encoded"] = bool(np.array_equal(enc_arr, ref["encoded"]))
+            row["bit_identical"] = row["equal_lst"] and row["equal_qa"] and row["equal_encoded"]
+    print(json.dumps(row))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

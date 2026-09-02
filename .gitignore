@@ -99,3 +99,6 @@ results/*
 !results/perf/
 !results/perf/**
 results/perf/truth-*.npz
+# ...and the independent adversarial re-measurement of the same change.
+!results/perf-review/
+!results/perf-review/**

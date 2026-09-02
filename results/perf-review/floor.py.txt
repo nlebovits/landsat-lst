@@ -1,0 +1,68 @@
+"""Bound the shared prefix inside the timed section: read (memmap) + QA mask +
+celsius + debias, with a trivial per-block reduction instead of the composite.
+This is work BOTH arms do identically, so it is the harness floor."""
+
+import json
+import resource
+import sys
+import time
+from pathlib import Path
+
+import dask
+import numpy as np
+import xarray as xr
+
+from landsat_lst.config import (
+    settings,
+)
+
+settings.load_chunk_size = 512
+dask.config.set(scheduler="threads", num_workers=4)
+from landsat_lst.fixture import (  # noqa: E402 -- deferred: settings must be set before import
+    FixtureSpec,
+    load_fixture,
+)
+from landsat_lst.normalization import (  # noqa: E402 -- deferred: settings must be set before import
+    debias_with_offsets,
+)
+from landsat_lst.qa import (  # noqa: E402 -- deferred: settings must be set before import
+    apply_qa_mask,
+    convert_to_celsius,
+)
+
+fx = sys.argv[1]
+tile = fx.split("_")[0]
+t, w, n, f = fx.split("_", 3)
+y0, y1 = w.split("-")
+spec = FixtureSpec(
+    tile=t,
+    year=int(y0),
+    end_year=int(y1),
+    max_scenes=int(n.removeprefix("n")),
+    factor=int(f.removeprefix("f")),
+)
+data = load_fixture(spec)
+lst = convert_to_celsius(apply_qa_mask(data)["lwir11"])
+p = json.loads(Path(f"results/perf/offsets-{tile}.json").read_text())
+off = xr.DataArray(
+    np.array([np.nan if v is None else v for v in p["offset"]], dtype="float64"),
+    dims=["time"],
+    coords={"time": lst.time},
+)
+nv = xr.DataArray(np.asarray(p["n_valid"], dtype="int64"), dims=["time"], coords={"time": lst.time})
+lst, _, _ = debias_with_offsets(
+    lst,
+    off,
+    nv,
+    max_offset_c=settings.destripe_max_offset_c,
+    min_scene_pixels=settings.destripe_min_scene_pixels,
+    min_offset_samples=settings.destripe_min_offset_samples,
+    offset_source_given=True,
+)
+# One full native pass, negligible per-block compute, no time rechunk.
+cheap = lst.max(dim="time")
+t0 = time.monotonic()
+cheap.compute()
+wall = time.monotonic() - t0
+ru = resource.getrusage(resource.RUSAGE_SELF)
+print(json.dumps({"fixture": fx, "floor_wall_s": wall, "floor_cpu_s": ru.ru_utime + ru.ru_stime}))

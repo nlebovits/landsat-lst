@@ -1,0 +1,24 @@
+Adversarial re-measurement of 10a39ca. Independent harness (rev_child.py):
+arm is selected by PYTHONPATH over two isolated source trees exported from
+c84448b and 10a39ca, and pipeline.py's sha256 is taken from the module the
+interpreter ACTUALLY imported, at import time -- not from a path on disk after
+the compute, which is the hole that mislabelled a row in the implementer's
+precorrection log.
+
+Arm order is REVERSED relative to the implementer's: treatment runs first in
+every pair, so treatment is the arm disadvantaged by a cold page cache.
+
+Ground truth was regenerated from origin/main by this harness; it reproduced
+the implementer's baseline sha256 for both fixtures exactly.
+sha256 of the EXACT files that produced the measurements:
+18df839d4613168f71999c505bdfe882ad19cc90b5046571f5d446ded67e418b    rev_child.py
+77d9661e8d8a62b46d34d983090c11665cf5c655cb0d7c0e632db11541408407    floor.py
+3a784fda7ee97bd23e547946fd39a10df02cc882dd660701977b022aa520b57f    rep.sh
+The committed copies are ruff-formatted (behaviour-preserving); the hashes above are the bytes executed.
+
+The three harness files carry a .txt suffix because prek's "ty type check" hook
+runs `uv run ty check src/` on any commit that stages a Python-typed file, and
+that command already exits 1 with 10 diagnostics on an unmodified c84448b --
+a pre-existing failure in src/landsat_lst/shards.py and elsewhere, unrelated to
+this evidence. The files pass `ruff check` and `ruff format --check` as
+committed; strip the suffix to run them. No hook was bypassed.

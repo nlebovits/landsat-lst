@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -u
+SP="$1"; REP="$2"; OUT="$SP/adv-t4.jsonl"
+for fx in S30W065_2021-2025_n300_f8 N40W075_2021-2025_n300_f8; do
+  for arm in treat base; do
+    avail=$(awk '/MemAvailable/{print int($2/1024/1024)}' /proc/meminfo)
+    if [ "$avail" -lt 16 ]; then echo "ABORT MemAvailable=${avail}GB"; exit 1; fi
+    tile="${fx%%_*}"
+    PYTHONPATH="$SP/src_$arm" .venv/bin/python "$SP/rev_child.py" \
+      --fixture "$fx" --arm "$arm" --threads 4 --truth "$SP/rev-truth-$tile.npz" 2>/dev/null \
+      | tail -1 | OUT="$OUT" REP="$REP" python3 -c "
+import sys,json,os
+d=json.loads(sys.stdin.read()); d['rep']=int(os.environ['REP'])
+open(os.environ['OUT'],'a').write(json.dumps(d)+'\n')
+print(f\"rep{d['rep']} {d['arm']:<6}{d['fixture'][:7]} wall={d['wall_s']:7.2f} peak={d['peak_rss_mb']:8.0f} cpu={d['cpu_s']:7.1f} busy={d['cores_busy']:.2f} pass={d['native_passes']:.2f} majflt={d['majflt']} bitid={d.get('bit_identical')} load={d['loadavg_before'][0]}\")"
+  done
+done

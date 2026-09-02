@@ -1,0 +1,130 @@
+{
+  "verdict": "PASS",
+  "method": "independent truths from origin/main vs 10a39ca, destripe off, chunk 512, 3 threads",
+  "arrays": {
+    "N40W075": {
+      "lst": {
+        "array_equal": true,
+        "dtype_ok": true,
+        "dtype": "float32",
+        "shape": [
+          2250,
+          2250
+        ],
+        "shape_ok": true,
+        "sha_main": "6d712995670f2b8c22936fddd9ecc25c649d409219c4f0054dfe5fe7ddaa4130",
+        "sha_cand": "6d712995670f2b8c22936fddd9ecc25c649d409219c4f0054dfe5fe7ddaa4130",
+        "sha_match": true
+      },
+      "qa": {
+        "array_equal": true,
+        "dtype_ok": true,
+        "dtype": "uint8",
+        "shape": [
+          12,
+          2250,
+          2250
+        ],
+        "shape_ok": true,
+        "sha_main": "35cd878dc6b12125acf827a5f8401f2882a602babc349685924d470a341d73c2",
+        "sha_cand": "35cd878dc6b12125acf827a5f8401f2882a602babc349685924d470a341d73c2",
+        "sha_match": true
+      },
+      "enc": {
+        "array_equal": true,
+        "dtype_ok": true,
+        "dtype": "uint16",
+        "shape": [
+          2250,
+          2250
+        ],
+        "shape_ok": true,
+        "sha_main": "f641dc3271a02bf74b27ab7cc9684c4e90d3b1712e93959cd3cc53143f0fa3f1",
+        "sha_cand": "f641dc3271a02bf74b27ab7cc9684c4e90d3b1712e93959cd3cc53143f0fa3f1",
+        "sha_match": true
+      },
+      "nan_mask_identical": true,
+      "nodata_mask_identical": true,
+      "nodata_px": 2070053,
+      "qa_zero_mask_identical": true,
+      "qa_dims_main": [
+        "month",
+        "latitude",
+        "longitude"
+      ],
+      "qa_dims_cand": [
+        "month",
+        "latitude",
+        "longitude"
+      ],
+      "qa_dims_ok": true,
+      "lst_dims_ok": true,
+      "month_coord_ok": true,
+      "lat_sha_match": true,
+      "lon_sha_match": true,
+      "time_sha_match": true
+    },
+    "S30W065": {
+      "lst": {
+        "array_equal": true,
+        "dtype_ok": true,
+        "dtype": "float32",
+        "shape": [
+          2250,
+          2250
+        ],
+        "shape_ok": true,
+        "sha_main": "37a7f48ec231e3453b369c382ab0550a4f78fda87cdb4657165459d3fe8dc09e",
+        "sha_cand": "37a7f48ec231e3453b369c382ab0550a4f78fda87cdb4657165459d3fe8dc09e",
+        "sha_match": true
+      },
+      "qa": {
+        "array_equal": true,
+        "dtype_ok": true,
+        "dtype": "uint8",
+        "shape": [
+          12,
+          2250,
+          2250
+        ],
+        "shape_ok": true,
+        "sha_main": "2c3a68d8ce178adb4ce2ede963fb29386446fd156fb95d79de72d21116813c61",
+        "sha_cand": "2c3a68d8ce178adb4ce2ede963fb29386446fd156fb95d79de72d21116813c61",
+        "sha_match": true
+      },
+      "enc": {
+        "array_equal": true,
+        "dtype_ok": true,
+        "dtype": "uint16",
+        "shape": [
+          2250,
+          2250
+        ],
+        "shape_ok": true,
+        "sha_main": "4742aabd775f6457ada2dbce8f39f3be37721314775dd21e59638ff1f88d6d52",
+        "sha_cand": "4742aabd775f6457ada2dbce8f39f3be37721314775dd21e59638ff1f88d6d52",
+        "sha_match": true
+      },
+      "nan_mask_identical": true,
+      "nodata_mask_identical": true,
+      "nodata_px": 296,
+      "qa_zero_mask_identical": true,
+      "qa_dims_main": [
+        "month",
+        "latitude",
+        "longitude"
+      ],
+      "qa_dims_cand": [
+        "month",
+        "latitude",
+        "longitude"
+      ],
+      "qa_dims_ok": true,
+      "lst_dims_ok": true,
+      "month_coord_ok": true,
+      "lat_sha_match": true,
+      "lon_sha_match": true,
+      "time_sha_match": true
+    }
+  }
+}
