@@ -514,10 +514,13 @@ def submit_shard_stage(
     poll loop and not anything Coiled knows about (ADR-016).
 
     ``max_workers`` is the shard count rather than
-    ``settings.coiled_max_workers``. That setting is the cost ceiling on a
-    700-tile fleet, where queueing is the point; here the whole reason to shard
-    is that the pieces run at once, and a stage held to four VMs would take the
-    wall clock straight back to the single-VM figure.
+    ``settings.coiled_max_workers``. That setting is the *concurrency* ceiling
+    on a 700-tile fleet, where queueing is the point. It bounds how many VMs
+    run at once and never what the run spends, because spend is the integral of
+    live workers over time and nothing server-side remembers the cap (ADR-018,
+    SAFETY-C against SAFETY-$). Here the whole reason to shard is that the
+    pieces run at once, and a stage held to four VMs would take the wall clock
+    straight back to the single-VM figure.
 
     Per-stage overrides, and only these:
 
