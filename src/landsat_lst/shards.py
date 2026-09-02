@@ -202,6 +202,105 @@ def stage_submission_prefix(root: str, stage: str) -> str:
     return f"{root}/state/{stage}.submission."
 
 
+def fleet_root(run_id: str) -> str:
+    """Everything a *multi-tile* run publishes that is not about one tile.
+
+    A sibling of every :func:`shard_root`, never a parent of one: the per-tile
+    roots stay exactly where they were so nothing about a tile's artifacts
+    changes when it is driven as part of a fleet. Still under
+    :data:`SHARD_PREFIX`, so ``runs.classify`` never sees it.
+    """
+    return f"{SHARD_PREFIX}/{run_id}"
+
+
+def fleet_manifest_key(run_id: str) -> str:
+    """The tiles in this run, and each one's job parameters.
+
+    The one piece of a fleet run that cannot be recovered by listing. A
+    listing shows the tiles that got far enough to write something, which is
+    precisely not the set a resume has to drive -- a tile whose first wave was
+    preempted before it booted has published nothing at all and would silently
+    drop out of the run. So the roster is written once, before anything is
+    submitted, and read back by ``resume_fleet``.
+
+    The VMs read it too: a task's token names its tile, and the window and
+    scene cap for that tile come from here rather than from the command line.
+    That is what lets one array carry tiles whose windows differ, instead of
+    forbidding the case.
+    """
+    return f"{fleet_root(run_id)}/fleet.json"
+
+
+def fleet_submission_key(run_id: str, stage: str, wave: int) -> str:
+    """One wave's record: which units one array carried, across tiles.
+
+    Distinct from :func:`stage_submission_key`, which stays per tile and keeps
+    doing its per-tile jobs (adoption, and a round budget counted across
+    drivers). This one answers a question only the fleet asks: how many VMs are
+    still in flight, and against which deadline.
+    """
+    return f"{fleet_root(run_id)}/state/{stage}.wave.{wave:04d}.json"
+
+
+def fleet_submission_prefix(run_id: str, stage: str) -> str:
+    """Every wave one stage has run in this fleet."""
+    return f"{fleet_root(run_id)}/state/{stage}.wave."
+
+
+def unit_timing_prefix(run_id: str) -> str:
+    """Where one run's per-unit timings live.
+
+    Under :data:`SHARD_PREFIX` so ``runs.classify`` never reads one as a tile
+    attempt, and deliberately **outside** ``fleet_root(run_id)``: the driver
+    lists that prefix on every poll, and a per-unit object per unit would put
+    tens of thousands of keys into a listing whose only job is to answer a
+    question about barriers. Nothing in the barrier path reads these; the cost
+    model does, once, afterwards.
+    """
+    return f"{SHARD_PREFIX}/timings/{run_id}/"
+
+
+def unit_timing_key(run_id: str, stage: str, tile: str, index: int) -> str:
+    """One work unit's start and end, as the VM that ran it saw them.
+
+    Per-wave stamps bound billed VM time from above, and that is all they do: a
+    worker between units and a worker running one look identical from the
+    bucket. Idle is billed time minus boot minus what the units actually ran
+    for, so the durations have to come from the units.
+    """
+    return f"{unit_timing_prefix(run_id)}{stage}.{tile}.{index:04d}.json"
+
+
+def fleet_unit_token(tile: str, index: int) -> str:
+    """One task's whole input: which tile, and which shard of it.
+
+    ``coiled.batch_run`` maps over a list of strings, and in the single-tile
+    path that string is the shard index alone because the tile is baked into
+    the command. A consolidated array carries units from many tiles through one
+    command, so the tile has to travel in the value.
+
+    A colon separates them because a tile name never contains one
+    (:func:`landsat_lst.tiling.parse_tile_name`) and neither does a decimal
+    index, which makes the split unambiguous rather than merely conventional.
+    """
+    return f"{tile}:{index}"
+
+
+def parse_fleet_unit(token: str) -> tuple[str, int]:
+    """``"N40W075:3"`` back into ``("N40W075", 3)``.
+
+    Raises:
+        ValueError: If the token is not exactly one tile and one integer. A
+            token that parsed loosely would let a task compute the wrong slab
+            of the wrong tile and publish it under a key that looks correct.
+    """
+    tile, _, raw = token.strip().partition(":")
+    if not tile or not raw.isdigit():
+        msg = f"malformed fleet unit token {token!r}; expected '<tile>:<index>'"
+        raise ValueError(msg)
+    return tile, int(raw)
+
+
 def shard_attempt_prefix(root: str, stage: str, index: int) -> str:
     """Everything one shard of one stage has published across its attempts.
 

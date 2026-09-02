@@ -27,6 +27,7 @@ inside a 45-minute barrier because nothing was checking.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 from typing import TYPE_CHECKING
 
 from landsat_lst.config import settings
@@ -214,6 +215,84 @@ def export_stage_budget(plan: shards.TilePlan) -> StageBudget:
         stage="export",
         phases=(("boot", VM_BOOT_S), ("merge_and_translate", export_s)),
     )
+
+
+def wave_deadline_s(*, boot_s: float, unit_work_s: float, units: int, workers: int) -> float:
+    """How long a *consolidated* wave may run before the driver acts.
+
+    A per-tile stage budget describes one shard, because ADR-016 starts one VM
+    per shard and they all run at once. A wave (ADR-018) deliberately does not:
+    its whole saving is queue depth, ``R = ceil(units / workers)``, with each
+    worker taking the next unit when it finishes one. So a wave runs about *R*
+    serial rounds of unit work, and budgeting it as one round is not a
+    conservative approximation -- it is a guarantee that any wave deep enough
+    to save a boot expires before it can finish.
+
+    That defect is worth spelling out because the failure it produces is not
+    local: an expired wave lets every tile in it re-demand, ``shard_barrier_rounds``
+    is 2, and a 700-tile first wave (R of the order of 100) would exhaust both
+    rounds at roughly one percent of its runtime and fail the build wholesale.
+
+    Three named terms, because a wave's wall clock has three distinct sources
+    and lumping them hides which one a late wave overran:
+
+    - **provisioning**, ``boot_s``, paid once per worker rather than once per
+      unit -- the workers start together and the queue drains through them;
+    - **queued execution**, ``R x unit_work_s``, where ``R = ceil(units /
+      workers)`` is queue depth. A unit that has not started yet cannot be
+      overrunning its own execution budget, so the wave's budget has to cover
+      the units ahead of it in the queue as well as its own;
+    - **tail**, one further ``unit_work_s``. Units are not equal in practice,
+      and a greedy queue's makespan exceeds the ideal ``R`` rounds by at most
+      one unit's duration (the standard list-scheduling bound). Budgeting the
+      ideal exactly would make the last straggler in every wave look late.
+
+    ::
+
+        deadline = (boot + (R + 1) x unit_work) x safety
+
+    At ``R = 1`` this is one boot and two units' work rather than
+    :attr:`StageBudget.deadline_s`'s one -- the tail term is new, and it is the
+    honest reading of a queue even one deep.
+
+    Args:
+        boot_s: Cold start, paid once per worker.
+        unit_work_s: One unit's work, boot excluded.
+        units: Units the wave carries.
+        workers: Concurrent workers the wave was given.
+
+    Returns:
+        Seconds. An explicit ``settings.shard_barrier_timeout_s`` overrides it
+        entirely, as everywhere else.
+    """
+    if settings.shard_barrier_timeout_s is not None:
+        return float(settings.shard_barrier_timeout_s)
+    rounds = queue_depth(units=units, workers=workers)
+    work = max(0.0, unit_work_s)
+    return (boot_s + (rounds + 1) * work) * settings.shard_budget_safety
+
+
+def queue_depth(*, units: int, workers: int) -> int:
+    """``ceil(units / workers)``: how many serial rounds a wave runs.
+
+    Named because it is the number the whole consolidation turns on. Capture --
+    the fraction of provisioning cost the wave avoids -- is ``1 - 1/R``, so a
+    wave with ``R = 1`` saves nothing at all and is a per-tile submission
+    wearing a different name.
+    """
+    return max(1, ceil(max(1, units) / max(1, workers)))
+
+
+def split_boot(budget: StageBudget) -> tuple[float, float]:
+    """``(boot_s, unit_work_s)`` for one stage budget.
+
+    Every stage budget names its cold start ``"boot"`` precisely so this can
+    take it out again: boot is per worker, everything else is per unit, and
+    :func:`wave_deadline_s` has to scale only the second.
+    """
+    phases = dict(budget.phases)
+    boot = float(phases.get("boot", 0.0))
+    return boot, max(0.0, budget.work_s - boot)
 
 
 def merge_budget() -> StageBudget:

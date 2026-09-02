@@ -20,6 +20,9 @@ ADRs are kept for history and link to their replacement.
 | [012](012-cached-scene-offsets.md) | Input-keyed scene-offset cache and a standalone offset phase | Accepted |
 | [013](013-single-native-pass.md) | One pass over the native stack per tile: shared rechunk, fused export writes, coverage from the raster | Accepted |
 | [014](014-run-self-explanation.md) | One state object per attempt, priced runs, and a watch UI that keeps its history | Accepted |
+| [015](015-bounded-work-unit-offsets.md) | Bounded work units for the offset pass, replacing one graph over the window | Accepted |
+| [016](016-sharded-tile-execution.md) | One tile across many VMs, sequenced by S3 barriers | Accepted |
+| [018](018-fleet-consolidation.md) | One work array per stage per wave, carrying many tiles | Proposed |
 
 ## Adding an ADR
 

@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from landsat_lst import budgets, quota, shard_tasks, shards
-from landsat_lst.batch import stage_cluster_name, submit_shard_stage
+from landsat_lst.batch import stage_cluster_name, submit_fleet_stage, submit_shard_stage
 from landsat_lst.config import settings
 from landsat_lst.storage import PRODUCTS, S3Storage, get_storage
 
@@ -65,6 +65,14 @@ log = structlog.get_logger()
 #: Signature of the stage submitter, so a test can pass one that writes the
 #: artifacts synchronously instead of starting a cluster.
 Submitter = Callable[..., object]
+
+#: The submitters that actually start Coiled work. Membership in this tuple is
+#: what the backend guard and the two preflight gates key off, so a caller that
+#: injects its own submitter is exempt from all three -- it starts no clusters,
+#: spends no credits, and writes nowhere but a temporary directory. Both the
+#: per-tile array (ADR-016) and the consolidated wave (ADR-018) belong here; a
+#: new submitter that is missing from it would slip past the gates silently.
+COILED_SUBMITTERS = (submit_shard_stage, submit_fleet_stage)
 
 #: What a cluster probe returns: ``(state, reason)`` for one cluster, or
 #: ``None`` when nothing is known about it.
@@ -330,7 +338,7 @@ def require_shared_storage(storage: StorageBackend, submit: Submitter | None) ->
         ShardBackendMismatch: If Coiled work is about to be submitted against
             a non-S3 backend.
     """
-    coiled_bound = submit is None or submit is submit_shard_stage
+    coiled_bound = submit is None or submit in COILED_SUBMITTERS
     if not coiled_bound or isinstance(storage, S3Storage):
         return
 

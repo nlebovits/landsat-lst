@@ -1,0 +1,188 @@
+{
+  "pipeline_regime": "source-grid 30 m, pre-#121",
+  "regime_note": "Draft PR #121 delivers a nominal ~100 m grid, aggregating 3x3 source cells before the percentile. The source read is deliberately unchanged, so the composite stage's bytes stand, but its working set, its task count, and its output size all move, and PR #121 gate 4 leaves R_COMPOSITE_MB_S unrevised. Recalibrate against a 100 m run before quoting any figure here after #121 lands.",
+  "reference_run": {
+    "tile": "S30W065",
+    "date": "2026-08-23",
+    "anchor_bucket": "user_reported",
+    "totals": {
+      "vm_hours": 22.82,
+      "vcpu_hours": 279.66,
+      "vm_hours_if_all_lived_the_wall_clock": 30.99,
+      "scheduler_vm_hours_unpriced": 1.36,
+      "usd_on_demand": 14.71,
+      "usd_billed_spot": 7.28,
+      "implied_spot_factor": 0.495,
+      "credits_billed": 268.1063,
+      "implied_credits_per_vcpu_hour": 0.959,
+      "corroboration": "The spot factor this run implies divides a user-reported dollar figure by a measured fleet shape, so it is reported as a point inside the band and never as the band's replacement."
+    },
+    "decomposition": {
+      "boot_vm_min": 304.0,
+      "useful_vm_min": 592.0,
+      "idle_vm_min": 473.0,
+      "useful_fraction_of_vm_time": 0.432,
+      "boot_usd_on_demand": 3.33,
+      "useful_usd_on_demand": 6.95,
+      "idle_usd_on_demand": 4.43,
+      "per_cluster": [
+        {
+          "cluster": "offsets_round_1",
+          "cluster_id": "1954303",
+          "vms": 15.0,
+          "wall_min": 35.19,
+          "vm_min_total": 506.9,
+          "vm_min_if_all_lived_the_wall_clock": 527.8,
+          "vm_min_boot": 75.0,
+          "vm_min_useful": 90.0,
+          "vm_min_idle": 341.9,
+          "usd_on_demand": 4.26
+        },
+        {
+          "cluster": "offsets_round_2",
+          "cluster_id": "1954376",
+          "vms": 14.0,
+          "wall_min": 14.54,
+          "vm_min_total": 134.3,
+          "vm_min_if_all_lived_the_wall_clock": 203.6,
+          "vm_min_boot": 54.5,
+          "vm_min_useful": 54.0,
+          "vm_min_idle": 25.8,
+          "usd_on_demand": 1.13
+        },
+        {
+          "cluster": "composite_round_1",
+          "cluster_id": "1954375",
+          "vms": 35.0,
+          "wall_min": 32.23,
+          "vm_min_total": 728.1,
+          "vm_min_if_all_lived_the_wall_clock": 1128.0,
+          "vm_min_boot": 175.0,
+          "vm_min_useful": 448.1,
+          "vm_min_idle": 105.0,
+          "usd_on_demand": 9.32
+        }
+      ]
+    }
+  },
+  "fleet_scale": {
+    "offsets_equivalents": 559.9,
+    "composite_equivalents": 620.2,
+    "reference_scenes": 4138,
+    "reference_land_fraction": 1.0,
+    "total_scenes": 2566229,
+    "tiles": 700,
+    "scaling_basis": "items",
+    "land_fraction_source": "land_fractions.json (committed; derived from NE 10m, 25 km buffer)",
+    "mean_land_fraction": 0.757
+  },
+  "layers": {
+    "compute_usd_on_demand": 4235.0,
+    "compute_offsets_usd": 677.0,
+    "compute_composite_usd": 3558.0,
+    "compute_composite_share": 0.84,
+    "provisioning_usd_on_demand": 4561.0,
+    "provisioning_offsets_usd": 2338.0,
+    "provisioning_composite_usd": 2223.0,
+    "note": "Consolidation acts on the provisioning line alone. It amortizes provisioning across tiles and does not make one full tile faster."
+  },
+  "measured_idle": {
+    "waves_with_timings": 0,
+    "idle_bucket": "assumed",
+    "note": "No wave record carries first_completion_at and last_completion_at. The idle term is assumed from the reference run's residue, not measured. INV-35 is unmet at f4d1e93: the record carries submitted_at and neither completion stamp."
+  },
+  "projection": [
+    {
+      "scenario": "queues_surplus_false",
+      "capture_band": {
+        "low": 0.0,
+        "high": 0.0
+      },
+      "retry_uplift": 0.15,
+      "contingency": 0.25,
+      "aws_usd_on_demand_basis": {
+        "low": 12644.0,
+        "high": 12644.0
+      },
+      "aws_usd_spot": {
+        "low": 3817.0,
+        "high": 9507.0
+      },
+      "storage_usd_month": 24.0,
+      "coiled_credits": {
+        "low": 218207.0,
+        "high": 242641.0
+      },
+      "coiled_usd": null,
+      "all_in_usd_formula": "$3,817-$9,507 AWS + 218,207-242,641 credits x P_credit",
+      "vs_approval_ceiling": "the AWS term alone lies above the ceiling across the whole interval. The all-in figure adds an unpriced credit term, so no scenario here demonstrates that the build fits $3,000, and none is offered as one. The ceiling is an approval constraint, not a target."
+    },
+    {
+      "scenario": "conservative",
+      "capture_band": {
+        "low": 0.5,
+        "high": 0.8
+      },
+      "retry_uplift": 0.15,
+      "contingency": 0.25,
+      "aws_usd_on_demand_basis": {
+        "low": 7399.0,
+        "high": 9366.0
+      },
+      "aws_usd_spot": {
+        "low": 2244.0,
+        "high": 7049.0
+      },
+      "storage_usd_month": 24.0,
+      "coiled_credits": {
+        "low": 127690.0,
+        "high": 179732.0
+      },
+      "coiled_usd": null,
+      "all_in_usd_formula": "$2,244-$7,049 AWS + 127,690-179,732 credits x P_credit",
+      "vs_approval_ceiling": "the AWS interval straddles the ceiling. The all-in figure adds an unpriced credit term, so no scenario here demonstrates that the build fits $3,000, and none is offered as one. The ceiling is an approval constraint, not a target."
+    },
+    {
+      "scenario": "design_band",
+      "capture_band": {
+        "low": 0.85,
+        "high": 0.95
+      },
+      "retry_uplift": 0.05,
+      "contingency": 0.15,
+      "aws_usd_on_demand_basis": {
+        "low": 5389.0,
+        "high": 5940.0
+      },
+      "aws_usd_spot": {
+        "low": 1641.0,
+        "high": 4479.0
+      },
+      "storage_usd_month": 24.0,
+      "coiled_credits": {
+        "low": 93003.0,
+        "high": 113985.0
+      },
+      "coiled_usd": null,
+      "all_in_usd_formula": "$1,641-$4,479 AWS + 93,003-113,985 credits x P_credit",
+      "vs_approval_ceiling": "the AWS interval straddles the ceiling. The all-in figure adds an unpriced credit term, so no scenario here demonstrates that the build fits $3,000, and none is offered as one. The ceiling is an approval constraint, not a target."
+    }
+  ],
+  "blocking_unknowns": [
+    {
+      "name": "queues_surplus_holds",
+      "source": "ADR-017 backend contract: read from documented Coiled semantics and never verified against real Coiled by this project",
+      "settled_by": "The ~$0.50 one-wave probe: more units than workers, count the workers that start and how units distribute. Until it passes, every capture figure is an assumption resting on an unverified premise."
+    },
+    {
+      "name": "credit_unit_price_usd",
+      "source": "no marginal credit price is recorded for this account anywhere in the repository",
+      "settled_by": "One question to the account owner, or one invoice line."
+    },
+    {
+      "name": "usable_credit_quota",
+      "source": "settings.coiled_credit_quota is 400, transcribed from the kill message of 2026-08-22. That is the quota that was hit on one day, not a statement of what this workspace can be granted, and the period boundary is not observable either",
+      "settled_by": "Read the workspace usage endpoint, or ask the account owner for the quota and its reset period."
+    }
+  ]
+}

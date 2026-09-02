@@ -425,8 +425,9 @@ class Settings(BaseSettings):
     coiled_max_workers: int = Field(
         default=4,
         description="Ceiling on VMs running batch tasks at once. Coiled gives "
-        "each task its own VM and queues the rest, so this is the cost cap: a "
-        "700-tile job never runs 700 machines.",
+        "each task its own VM and queues the rest, so a 700-tile job never runs "
+        "700 machines. A CONCURRENCY ceiling, not a cost cap: spend is "
+        "concurrency integrated over time and nothing here bounds the time.",
     )
     coiled_job_timeout: str = Field(
         default="24 hours",
@@ -657,6 +658,57 @@ class Settings(BaseSettings):
         "the resubmission of only the missing indexes; after that the tile "
         "fails, naming the keys that never appeared. Unbounded retries would "
         "bill all night against a shard that is failing deterministically.",
+    )
+
+    # Fleet consolidation: many tiles through one work array per stage per
+    # wave (ADR-018). A wave with more units than workers has Coiled queue the
+    # surplus onto VMs that already booted, which is the whole saving.
+    fleet_max_vms: int = Field(
+        default=64,
+        ge=1,
+        description="Ceiling on CONCURRENT VMs across the whole consolidated "
+        "run: the driver never submits a wave wider than the headroom left, so "
+        "two stages cannot race each other past it. It is NOT a spending cap. "
+        "Spend is the integral of concurrency over time, and nothing here "
+        "bounds the time: a run at half this cap for twice as long costs the "
+        "same, and a fleet that replaces reclaimed spot VMs churns instance "
+        "launches at flat concurrency. The census measures what is running and "
+        "so enforces this cap; it yields only a LOWER bound on the bill, "
+        "because the substrate reports when a worker started and not when it "
+        "stopped. See ADR-018.",
+    )
+    fleet_ghost_ttl_s: float = Field(
+        default=300.0,
+        ge=0.0,
+        description="How long width released without an authoritative worker "
+        "census keeps counting against the concurrency cap. Reached only in "
+        "degraded mode -- no credentials, control plane down, or a backend that "
+        "cannot be asked -- where the driver cannot tell a wave with a hung "
+        "unit from a wave that was preempted. Holding forever is safe and "
+        "deadlocks the run; releasing at once is live and doubles the bill. "
+        "Charging the released width for a bounded interval is both, at a "
+        "ceiling of twice the cap. One VM boot is the default because that is "
+        "the interval a fleet can plausibly still be tearing down in.",
+    )
+    fleet_wave_window_s: float = Field(
+        default=120.0,
+        ge=0.0,
+        description="How long buffered units wait for more tiles to join "
+        "before a wave is submitted anyway. The batching window is what keeps "
+        "the submission count independent of the tile count: without it, a "
+        "stage whose tiles become ready one at a time would submit one array "
+        "per tile and buy nothing. Paid at most once per wave, and skipped "
+        "entirely when no other tile could still join.",
+    )
+    fleet_poll_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Seconds between fleet driver polls. One listing per "
+        "shared prefix per poll serves every tile, so this is a request-rate "
+        "knob rather than a latency one; the per-tile barriers are minutes "
+        "wide. It also bounds the resolution of the per-wave completion "
+        "timestamps, which are observations of the bucket rather than reports "
+        "from a worker.",
     )
 
     # Live observability for batch tiles. A batch task is a plain process that

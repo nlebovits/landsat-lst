@@ -1091,3 +1091,105 @@ class TestSubmitShardStage:
 
         with pytest.raises(ValueError, match="no shards to submit"):
             submit_shard_stage(stage="climatology", run_id="r1", tile="N40W075", indexes=[])
+
+
+class TestSubmitFleetStage:
+    """One array per stage per wave, carrying many tiles. See ADR-018."""
+
+    def test_maps_over_tile_qualified_tokens(self, fake_coiled):
+        from landsat_lst.batch import submit_fleet_stage
+
+        submission = submit_fleet_stage(
+            stage="composite",
+            run_id="r1",
+            units=[("N40W075", 0), ("N40W075", 1), ("N35W080", 0)],
+            wave=2,
+        )
+
+        assert fake_coiled["map_over_values"] == ["N40W075:0", "N40W075:1", "N35W080:0"]
+        assert fake_coiled["tag"]["wave"] == "2"
+        assert fake_coiled["tag"]["fleet"] == "1"
+        assert submission.tiles == ["N40W075", "N35W080"]
+
+    def test_the_cap_bounds_workers_and_never_the_unit_list(self, fake_coiled):
+        """Where the boot saving comes from: surplus units queue onto booted VMs.
+
+        Splitting the unit list to fit the cap would instead write a submission
+        record for a partial index set and cost the remainder a barrier round.
+        """
+        from landsat_lst.batch import submit_fleet_stage
+
+        units = [(f"N{30 + i}W075", 0) for i in range(10)]
+        submit_fleet_stage(stage="offsets", run_id="r1", units=units, max_workers=3)
+
+        assert fake_coiled["max_workers"] == 3
+        assert len(fake_coiled["map_over_values"]) == 10
+
+    def test_a_consolidated_wave_never_falls_back_to_on_demand(self, fake_coiled):
+        """The one failure mode that converts a spot build into the on-demand bill.
+
+        The consolidated path must not acquire a fallback the per-tile path does
+        not have, which is why neither submitter spells the policy itself.
+        """
+        from landsat_lst.batch import submit_fleet_stage
+
+        submit_fleet_stage(stage="offsets", run_id="r1", units=[("N40W075", 0)])
+
+        assert fake_coiled["spot_policy"] == settings.shard_spot_policy
+        assert settings.shard_spot_policy == "spot"
+
+    def test_the_composite_stage_keeps_its_vm_and_chunk(self, fake_coiled):
+        from landsat_lst.batch import submit_fleet_stage
+
+        submit_fleet_stage(stage="composite", run_id="r1", units=[("N40W075", 0)])
+
+        assert fake_coiled["vm_type"] == [settings.shard_composite_vm_type]
+        assert fake_coiled["env"]["LST_LOAD_CHUNK_SIZE"] == str(settings.shard_composite_chunk)
+
+    def test_the_export_stage_keeps_its_scratch_disk(self, fake_coiled):
+        from landsat_lst.batch import submit_fleet_stage
+
+        submit_fleet_stage(stage="export", run_id="r1", units=[("N40W075", 0)])
+
+        assert fake_coiled["disk_size"] == settings.shard_export_disk_gb
+
+    def test_a_later_wave_cannot_collide_with_a_live_cluster(self, fake_coiled):
+        from landsat_lst.batch import _CLUSTER_NAME_MAX, fleet_cluster_name
+
+        first = fleet_cluster_name("fleet-20260901T120000Z", "composite", 1)
+        second = fleet_cluster_name("fleet-20260901T120000Z", "composite", 2)
+
+        assert first != second
+        assert second.endswith("-w2")
+        assert len(second) < _CLUSTER_NAME_MAX
+
+    def test_the_command_carries_no_window_because_the_roster_does(self, fake_coiled):
+        """One command serves every tile, so per-tile parameters cannot ride on it."""
+        from landsat_lst.batch import _fleet_task_command
+
+        command = _fleet_task_command(stage="offsets", run_id="r1", units=8)
+
+        assert "shard unit" in command
+        assert "--units 8" in command
+        assert "--year" not in command
+        assert "COILED_BATCH_TASK_INPUT" in command
+
+    def test_a_malformed_token_is_refused_rather_than_parsed_loosely(self):
+        """A loose parse computes the wrong slab and publishes it under a good key."""
+        from landsat_lst.shards import parse_fleet_unit
+
+        for bad in ("N40W075", "N40W075:", ":3", "N40W075:x", ""):
+            with pytest.raises(ValueError, match="malformed fleet unit token"):
+                parse_fleet_unit(bad)
+
+    def test_an_empty_wave_is_refused(self, fake_coiled):
+        from landsat_lst.batch import submit_fleet_stage
+
+        with pytest.raises(ValueError, match="no units to submit"):
+            submit_fleet_stage(stage="offsets", run_id="r1", units=[])
+
+    def test_an_unknown_stage_is_refused(self, fake_coiled):
+        from landsat_lst.batch import submit_fleet_stage
+
+        with pytest.raises(ValueError, match="unknown shard stage"):
+            submit_fleet_stage(stage="polish", run_id="r1", units=[("N40W075", 0)])

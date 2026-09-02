@@ -2036,5 +2036,184 @@ def shard_export(*, run_id: str, tile: str, index: int) -> None:
     console.print(f"{tile} export: {len(written)} COG(s)")
 
 
+@shard.command("unit")
+@click.option("--run-id", required=True, help="Fleet run token")
+@click.option("--stage", required=True, help="Which stage this unit belongs to")
+@click.option("--token", required=True, help="'<tile>:<index>', from the task input")
+@click.option("--units", type=int, default=None, help="Fused offsets fleet width")
+def shard_unit(*, run_id: str, stage: str, token: str, units: int | None) -> None:
+    """One unit of a consolidated wave: the task a fleet VM actually runs.
+
+    The only thing that differs from the per-tile stage commands is where the
+    arguments come from. A wave carries units from many tiles through one
+    command, so the tile travels in the task input and the window travels in
+    the fleet manifest. The body underneath is the same ``run_shard`` every
+    other path calls -- see ADR-018.
+    """
+    from landsat_lst.fleet_driver import run_unit
+
+    try:
+        result = run_unit(run_id, stage, token, units=units)
+    except (ValueError, FileNotFoundError, KeyError) as e:
+        raise click.ClickException(str(e)) from e
+
+    console.print(f"{stage} unit {token}: {result if result is not None else 'nothing'}")
+
+
+@shard.command("fleet")
+@click.option("-t", "--tile", "tiles", multiple=True, help="Tile to build; repeatable")
+@click.option("-y", "--year", type=int, default=None, help="Start year; omit for the window")
+@click.option("--end-year", type=int, default=None, help="End year (inclusive)")
+@click.option("--max-scenes", type=int, default=None, help="Sample at most N scenes")
+@click.option("--run-id", default=None, help="Run token; generated when omitted")
+@click.option(
+    "--max-vms",
+    type=int,
+    default=None,
+    help="Ceiling on CONCURRENT VMs across the whole run (not a spend cap)",
+)
+@click.option(
+    "--wave-window",
+    type=float,
+    default=None,
+    help="Seconds a wave waits for more tiles before submitting anyway",
+)
+@click.option(
+    "--ack-quota",
+    is_flag=True,
+    help="Proceed when the Coiled credit balance cannot be read, on your own check",
+)
+def shard_fleet(
+    *,
+    tiles: tuple[str, ...],
+    year: int | None,
+    end_year: int | None,
+    max_scenes: int | None,
+    run_id: str | None,
+    max_vms: int | None,
+    wave_window: float | None,
+    ack_quota: bool,
+) -> None:
+    """Build many tiles through one work array per stage per wave.
+
+    Consolidation, not a different pipeline: the same work units, the same
+    keys, the same offset record. What it removes is the fleet boot paid once
+    per stage per tile. This shell has to stay open for the same reason
+    ``shard process`` does, and holds no state for the same reason --
+    ``landsat-lst shard resume-fleet <run-id>`` picks up from the bucket.
+    """
+    from landsat_lst import quota
+    from landsat_lst.config import settings
+    from landsat_lst.fleet_backend import CoiledFleetBackend
+    from landsat_lst.fleet_driver import FleetAborted, drive_fleet, fleet_run_id
+    from landsat_lst.shard_driver import ShardBackendMismatch, require_shared_storage
+    from landsat_lst.storage import get_storage
+
+    if not tiles:
+        msg = "name at least one tile with -t/--tile"
+        raise click.ClickException(msg)
+    jobs = [_shard_job(tile, year, end_year, max_scenes) for tile in tiles]
+
+    if ack_quota:
+        settings.ack_quota = True
+    # Before the run id is printed, exactly as the single-tile path does it: a
+    # resume hint for a run that never started leads nowhere.
+    try:
+        require_shared_storage(get_storage(), None)
+        quota.preflight_identity()
+        estimate = quota.estimate_run_credits() * len(jobs)
+        balance = quota.preflight_credits(estimate)
+    except (ShardBackendMismatch, quota.IdentityRefused, quota.QuotaRefused) as e:
+        raise click.ClickException(str(e)) from e
+    console.print(
+        f"  credits: ~{estimate:.0f} needed for {len(jobs)} tile(s), "
+        f"{'unknown' if balance.remaining is None else f'{balance.remaining:.0f}'} "
+        f"remaining ({balance.source})"
+    )
+    run_id = run_id or fleet_run_id()
+    console.print(
+        f"[bold]Fleet of {len(jobs)} tile(s)[/bold] {jobs[0].window_label}  "
+        f"run-id [cyan]{run_id}[/cyan]"
+    )
+    console.print(f"  resume with: landsat-lst shard resume-fleet {run_id}")
+
+    try:
+        # Named rather than defaulted: this is the one place the build chooses
+        # a submission substrate, and where a ``--backend`` flag would land if
+        # AWS Batch or ECS ever earns one (ADR-018).
+        summary = drive_fleet(
+            jobs,
+            run_id=run_id,
+            backend=CoiledFleetBackend(),
+            max_vms=max_vms,
+            wave_window_s=wave_window,
+        )
+    except (FleetAborted, ShardBackendMismatch) as e:
+        raise click.ClickException(str(e)) from e
+
+    _print_fleet_summary(summary)
+
+
+@shard.command("resume-fleet")
+@click.argument("run_id")
+@click.option("--max-vms", type=int, default=None, help="Hard ceiling on VMs in flight")
+@click.option("--wave-window", type=float, default=None, help="Wave batching window, seconds")
+@click.option(
+    "--ack-quota",
+    is_flag=True,
+    help="Proceed when the Coiled credit balance cannot be read, on your own check",
+)
+def shard_resume_fleet(
+    run_id: str, max_vms: int | None, wave_window: float | None, ack_quota: bool
+) -> None:
+    """Continue a killed fleet driver, reading the roster and every position from S3."""
+    from landsat_lst import quota
+    from landsat_lst.config import settings
+    from landsat_lst.fleet_driver import FleetAborted, resume_fleet
+    from landsat_lst.shard_driver import ShardBackendMismatch
+
+    if ack_quota:
+        settings.ack_quota = True
+    console.print(f"[bold]Resuming fleet[/bold] [cyan]{run_id}[/cyan]")
+    try:
+        summary = resume_fleet(run_id, max_vms=max_vms, wave_window_s=wave_window)
+    except (
+        FleetAborted,
+        ShardBackendMismatch,
+        FileNotFoundError,
+        quota.IdentityRefused,
+        quota.QuotaRefused,
+    ) as e:
+        raise click.ClickException(str(e)) from e
+
+    _print_fleet_summary(summary)
+
+
+def _print_fleet_summary(summary) -> None:
+    """Waves first, then tiles: the submission count is the headline number."""
+    from rich.table import Table
+
+    waves = Table(title=f"waves: {summary.run_id}")
+    for column in ("stage", "wave", "tiles", "units", "max VMs"):
+        waves.add_column(column, justify="right" if column != "stage" else "left")
+    for wave in summary.waves:
+        waves.add_row(
+            wave.stage,
+            str(wave.wave),
+            str(len(wave.tiles)),
+            str(len(wave.units)),
+            str(wave.max_workers),
+        )
+    console.print(waves)
+
+    console.print(
+        f"  {len(summary.completed)} complete, {len(summary.failed)} failed, "
+        f"{summary.submissions} submission(s), {summary.wall_s / 60:.0f} min"
+    )
+    for tile in summary.tiles:
+        if tile.failed:
+            console.print(f"  [red]{tile.tile}[/red] ({tile.stage}): {tile.reason}")
+
+
 if __name__ == "__main__":
     main()
