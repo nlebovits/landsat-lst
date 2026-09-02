@@ -22,27 +22,40 @@ otherwise is how a preflight becomes a rubber stamp:
    is what ``coiled login`` itself reads to print "You have reached your quota
    of Coiled credits for this account"; ``coiled.utils.has_program_quota``
    checks its ``has_quota`` flag. That flag is authoritative for *exhausted or
-   not*. If the payload also carries a remaining-credit figure, it is used.
-2. **Quota minus billing activity.** ``coiled.get_billing_activity`` pages
-   per-event debits (``amount_credits``, e.g. ``"-2.7823"``) but exposes no
-   balance, so a remaining figure has to be reconstructed:
-   ``coiled_credit_quota`` minus the debits since the period began.
-3. **A human.** If neither source answers, the driver refuses and prints the
-   team page rather than guessing.
+   not*, and it is the only authoritative thing in this module. It carries no
+   number.
+2. **Billing activity.** ``coiled.get_billing_activity`` pages per-event debits
+   (``amount_credits``, e.g. ``"-2.7823"``). Real numbers, and the only ones
+   available. It exposes no balance and no limit.
+3. **A person.** The workspace *limit* is published by no Coiled API --
+   not the usage endpoint, not ``get_billing_activity``, not
+   ``list_core_usage``. So it cannot be derived, and it is asked for at
+   preflight time instead.
 
-**The approximation in source 2, stated plainly.** Nothing in the billing data
-says when the quota period resets, so "since the period began" is taken as the
-last N days (``coiled_credit_period_days``). If the real period is a calendar
-month and the run happens on the 3rd, this over-counts debits and refuses a run
-that would have fit -- conservative, and the direction to be wrong in. If the
-real period is longer than the window, it under-counts and the preflight passes
-a run that will be killed. Source 1's ``has_quota`` flag is what catches that
-case, which is why source 2 is never used alone when source 1 answered.
+**Why the limit is not stored.** It was, at 400, taken from a kill message. The
+operator raises it in the console as work advances, and no stored copy follows.
+A stale copy is not merely untidy: it is wrong silently, and when it is too high
+it lets an unaffordable run start and be killed mid-stage, which is the exact
+failure the preflight exists to prevent. A configuration key would have the same
+defect one file further away. So the number lives nowhere, and
+:func:`preflight_credits` asks for it on a terminal before anything is
+submitted. Without a terminal the run refuses unless ``--ack-quota`` says a
+person already checked.
+
+**The approximation in the debit window, stated plainly.** Nothing in the
+billing data says when the quota period resets, so "since the period began" is
+taken as the last N days (``coiled_credit_period_days``). If the real period is
+a calendar month and the run happens on the 3rd, this over-counts debits and
+refuses a run that would have fit -- conservative, and the direction to be wrong
+in. If the real period is longer than the window, it under-counts and the
+preflight passes a run that will be killed. The ``has_quota`` flag is what
+catches that case.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -512,13 +525,17 @@ class QuotaRefused(RuntimeError):
 class CreditBalance:
     """What is known about the workspace's remaining credits, and how well."""
 
-    #: Credits believed to remain, or ``None`` when nothing could be read.
+    #: Credits remaining, which only an operator can supply. Coiled publishes
+    #: no limit through any API, so nothing here can derive it.
     remaining: float | None
-    #: Which of the three sources answered.
+    #: Which of the sources answered.
     source: str
     #: The endpoint's own exhausted-or-not flag, when it answered at all. This
-    #: is the only field that is authoritative rather than reconstructed.
+    #: is the only field that is authoritative rather than supplied.
     has_quota: bool | None = None
+    #: Credits debited over ``coiled_credit_period_days``, summed from Coiled's
+    #: own billing events. Real, and the half of the arithmetic that is.
+    spent: float | None = None
     detail: str = ""
 
     @property
@@ -586,12 +603,14 @@ def _first_number(payload: dict, keys: tuple[str, ...]) -> float | None:
     for key in keys:
         value = payload.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
+            number = float(value)
+            if isfinite(number):
+                return number
     return None
 
 
 def _billing_balance() -> CreditBalance | None:
-    """Source 2: the configured quota minus the debits in the recent window.
+    """Source 2: debits in the recent window, without inventing a limit.
 
     See the module docstring for what "recent window" approximates and which
     way it is wrong.
@@ -613,7 +632,10 @@ def _billing_balance() -> CreditBalance | None:
                 amount = event.get("amount_credits")
                 if amount is None:
                     continue
-                spent += abs(float(amount))
+                debit = float(amount)
+                if not isfinite(debit):
+                    raise ValueError(f"billing activity returned a non-finite debit: {amount!r}")
+                spent += abs(debit)
             if not activity.get("next") or page >= settings.coiled_billing_max_pages:
                 break
             page += 1
@@ -621,23 +643,51 @@ def _billing_balance() -> CreditBalance | None:
         log.info("quota_billing_unavailable", error=str(e))
         return None
 
-    remaining = settings.coiled_credit_quota - spent
     return CreditBalance(
-        remaining=remaining,
+        remaining=None,
         source="billing_activity",
+        spent=spent,
         detail=(
-            f"{spent:.1f} of {settings.coiled_credit_quota:.0f} credits spent in the "
-            f"last {settings.coiled_credit_period_days} days (period reset not observable)"
+            f"{spent:.1f} credits spent in the last "
+            f"{settings.coiled_credit_period_days} days (period reset not observable)"
         ),
     )
 
 
 def read_balance() -> CreditBalance:
-    """Ask each source in turn, and say which one answered."""
-    for source in (_usage_endpoint_balance, _billing_balance):
-        balance = source()
-        if balance is not None and balance.known:
-            return balance
+    """Compose what Coiled will actually tell us, which is never a limit.
+
+    Two facts are available and they live in different places. The usage
+    endpoint carries ``has_quota``, a boolean, and is the only authoritative
+    field anywhere in this module. Billing activity carries the debits, which
+    are real numbers. Coiled publishes the workspace's *limit* through no API
+    at all -- not ``get_billing_activity``, not ``list_core_usage``, not the
+    usage endpoint -- so ``remaining`` stays ``None`` here and only an operator
+    can close the arithmetic.
+
+    Taking the first source that answers would discard the debits whenever the
+    endpoint is reachable, since ``known`` is satisfied by ``has_quota`` alone.
+    So ask both and keep each half.
+    """
+    endpoint = _usage_endpoint_balance()
+    if endpoint is not None and endpoint.has_quota is False:
+        # Authoritative and terminal. No arithmetic argues with it.
+        return endpoint
+
+    billing = _billing_balance()
+    if billing is not None and billing.spent is not None:
+        if endpoint is None or not endpoint.known:
+            return billing
+        return replace(
+            billing,
+            remaining=endpoint.remaining,
+            has_quota=endpoint.has_quota,
+            source=f"{endpoint.source}+{billing.source}",
+            detail=f"{endpoint.detail}; {billing.detail}",
+        )
+
+    if endpoint is not None and endpoint.known:
+        return endpoint
     return CreditBalance(remaining=None, source="unavailable")
 
 
@@ -720,11 +770,98 @@ def estimate_run_credits(plan: TilePlan | None = None, *, units: int | None = No
     return credits_for_fleets(run_fleets(plan, units=units))
 
 
+def _prompt_for_limit(balance: CreditBalance, estimated: float, needed: float) -> float | None:
+    """Ask the operator for the workspace limit, because Coiled will not say.
+
+    Returns the limit in credits, or ``None`` when nobody could be asked or
+    nobody answered with a number. A stored limit was tried and rejected: it
+    goes stale the moment the console changes, silently, and in the direction
+    that lets an unaffordable run start.
+    """
+    import sys  # noqa: PLC0415
+
+    if balance.spent is None or not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return None
+
+    spent = balance.spent
+    lines = [
+        "",
+        "  Coiled credit check -- Coiled publishes no limit through its API,",
+        f"  so read it from {TEAM_URL} and type it below.",
+        f"    workspace reports has_quota : {balance.has_quota}",
+    ]
+    if spent is not None:
+        lines.append(
+            f"    debited in the last {settings.coiled_credit_period_days} days"
+            f"  : {spent:.1f} credits"
+        )
+    lines += [
+        f"    this run is estimated at     : {estimated:.0f} credits",
+        f"    required with the {settings.coiled_credit_safety:.1f}x safety : {needed:.0f} credits",
+        "",
+    ]
+    print("\n".join(lines), file=sys.stderr)
+
+    try:
+        answer = input("  Current workspace credit limit (blank to abort): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not answer:
+        return None
+    try:
+        limit = float(answer.replace(",", "").replace("_", ""))
+    except ValueError:
+        log.warning("quota_limit_unparseable", answer=answer)
+        return None
+    if not isfinite(limit) or limit <= 0:
+        log.warning("quota_limit_not_positive", answer=answer)
+        return None
+    return limit
+
+
+def _without_non_finite_values(balance: CreditBalance) -> CreditBalance:
+    """Turn invalid numeric source data back into unknown data."""
+    remaining = balance.remaining
+    spent = balance.spent
+    if remaining is not None and not isfinite(remaining):
+        log.warning("quota_remaining_not_finite", remaining=remaining)
+        remaining = None
+    if spent is not None and not isfinite(spent):
+        log.warning("quota_spent_not_finite", spent=spent)
+        spent = None
+    return replace(balance, remaining=remaining, spent=spent)
+
+
+def _with_operator_limit(
+    balance: CreditBalance,
+    estimated: float,
+    needed: float,
+    ask_limit: Callable[[CreditBalance, float, float], float | None] | None,
+) -> CreditBalance:
+    """Close known-spend arithmetic with a finite operator-supplied limit."""
+    if balance.remaining is not None or balance.has_quota is False or balance.spent is None:
+        return balance
+    limit = (ask_limit or _prompt_for_limit)(balance, estimated, needed)
+    if limit is None or not isfinite(limit) or limit <= 0:
+        return balance
+    return replace(
+        balance,
+        remaining=limit - balance.spent,
+        source=f"{balance.source}+operator",
+        detail=(
+            f"{balance.detail}; operator gave a {limit:.0f} credit limit"
+            if balance.detail
+            else f"operator gave a {limit:.0f} credit limit"
+        ),
+    )
+
+
 def preflight_credits(
     estimated_credits: float,
     *,
     balance_source: Callable[[], CreditBalance] | None = None,
     acknowledged: bool | None = None,
+    ask_limit: Callable[[CreditBalance, float, float], float | None] | None = None,
 ) -> CreditBalance:
     """Refuse to start a run the workspace cannot pay for. Scenario zero.
 
@@ -741,6 +878,8 @@ def preflight_credits(
             definition let a unit test reach the real billing API.
         acknowledged: Whether a human has checked the balance by eye.
             ``None`` reads ``settings.ack_quota``.
+        ask_limit: Interactive source for a current total limit. Called only
+            when billing supplied the spend needed to derive a remainder.
 
     Returns:
         The balance that was read, for the caller to log.
@@ -753,6 +892,13 @@ def preflight_credits(
     acked = settings.ack_quota if acknowledged is None else acknowledged
     balance = (balance_source or read_balance)()
     needed = estimated_credits * settings.coiled_credit_safety
+
+    balance = _without_non_finite_values(balance)
+
+    # An acknowledgement already says an operator checked the balance, so it
+    # must not prompt again. Otherwise close only known-spend arithmetic.
+    if not acked:
+        balance = _with_operator_limit(balance, estimated_credits, needed, ask_limit)
 
     if balance.has_quota is False:
         raise QuotaRefused(
@@ -783,11 +929,20 @@ def preflight_credits(
         return balance
 
     if not acked:
+        manual_path = (
+            "run this from a terminal and answer the prompt, or "
+            if balance.spent is not None
+            else "billing activity could not be read, so the limit cannot be converted "
+            "to a remaining balance; "
+        )
         raise QuotaRefused(
-            "could not read the Coiled credit balance, and a run that hits the "
-            f"quota is killed mid-stage. This run needs about "
-            f"{estimated_credits:.0f} credits. Check {TEAM_URL} and re-run with "
-            "--ack-quota (or LST_ACK_QUOTA=1) to proceed on your own check.",
+            "the Coiled credit limit is unknown, and a run that hits the quota "
+            "is killed mid-stage. Coiled publishes no limit through its API, so "
+            f"it has to come from a person: {manual_path}check {TEAM_URL} and re-run "
+            "with --ack-quota (or "
+            f"LST_ACK_QUOTA=1). This run needs about {estimated_credits:.0f} "
+            f"credits x {settings.coiled_credit_safety:.1f} = {needed:.0f}."
+            + (f" Coiled shows {balance.spent:.1f} debited recently." if balance.spent else ""),
             estimate=estimated_credits,
             remaining=None,
         )

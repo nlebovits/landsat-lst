@@ -66,3 +66,13 @@ class TestSettings:
         monkeypatch.setenv("LST_DESTRIPE_MAX_OFFSET_C", "8.5")
         settings = Settings()
         assert settings.destripe_max_offset_c == 8.5
+
+    def test_legacy_credit_quota_does_not_break_an_existing_dotenv(self, tmp_path):
+        """The removed setting is tolerated for migration, but never trusted."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("LST_COILED_CREDIT_QUOTA=1000\n")
+
+        settings = Settings(_env_file=env_file)
+
+        assert settings.coiled_credit_quota == 1000.0
+        assert "coiled_credit_quota" not in settings.model_dump()

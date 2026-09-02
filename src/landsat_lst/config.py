@@ -528,14 +528,6 @@ class Settings(BaseSettings):
         "window, the fleet width, or a measured rate moves. Set it only to "
         "reach for a stopwatch during an incident.",
     )
-    coiled_credit_quota: float = Field(
-        default=400.0,
-        gt=0,
-        description="Credits the workspace is allowed per period. Provenance: "
-        "the kill message of 2026-08-22, 'You have reached the workspace quota "
-        "of 400 Coiled credits'. Used only when the usage endpoint gives no "
-        "remaining figure, as the base a run's debits are subtracted from.",
-    )
     coiled_credit_period_days: int = Field(
         default=30,
         ge=1,
@@ -544,6 +536,14 @@ class Settings(BaseSettings):
         "resets. Too short under-counts spend and lets an unaffordable run "
         "start; too long over-counts and refuses an affordable one. 30 days is "
         "the conservative reading of a monthly quota.",
+    )
+    coiled_credit_quota: float | None = Field(
+        default=None,
+        gt=0,
+        exclude=True,
+        description="Deprecated compatibility setting. It is accepted so an existing "
+        ".env does not make Settings fail to load, but quota preflight never trusts or "
+        "uses this stored value; the current limit must be confirmed by an operator.",
     )
     coiled_billing_max_pages: int = Field(
         default=20,
