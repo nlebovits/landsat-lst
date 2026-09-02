@@ -162,9 +162,13 @@ budget, and drops to zero when its last unit lands. That cannot exceed the cap,
 because a wave is never submitted wider than the headroom left.
 
 Past the budget the count degrades to **one worker per absent unit**. A wave
-that has overrun its derived deadline by a further `budgets.VM_BOOT_S` is
-either gone, in which case it holds nothing at all, or alive with finished
-workers idle in an array the substrate should have ended. Charging the full
+is past it when a whole derived deadline and a further `budgets.VM_BOOT_S` have
+run since it last landed anything, which is the only evidence of life there is:
+a late wave that is still producing is not a dead one, and measuring from the
+submission instead declared a deep composite wave stranded while it worked and
+took ten tiles down with it. A wave that has stopped is either gone, in which
+case it holds nothing at all, or alive with finished workers idle in an array
+the substrate should have ended. Charging the full
 width for either case charges for a wave that has already broken its contract,
 and the price of the strict rule is a run that fails tiles whose own work
 landed: one slow unit in a cap-wide wave would pin the whole cap for the rest
