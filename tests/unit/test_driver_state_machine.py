@@ -598,13 +598,15 @@ class TestPreflightCredits:
         import landsat_lst.shard_driver as driver
 
         monkeypatch.setattr(settings, "ack_quota", False)
-        # The backend guard and the identity check both run before the credit
-        # gate, and standing the fleet where the real submitter stands trips
-        # both. Neither is what this scenario is about, and the identity one
-        # would reach a real STS call -- passing on a laptop with a session and
-        # refusing on a credential-less CI runner.
+        # The backend guard, the identity check, and the write probe all run
+        # before the credit gate, and standing the fleet where the real
+        # submitter stands trips all three. None is what this scenario is
+        # about, and the last two would reach real STS and S3 calls -- passing
+        # on a laptop with a session and refusing on a credential-less CI
+        # runner, which reads the machine rather than the code.
         monkeypatch.setattr(driver, "require_shared_storage", _allow_any_backend)
         monkeypatch.setattr(quota, "preflight_identity", _healthy_identity)
+        monkeypatch.setattr(quota, "preflight_write_access", _healthy_write_access)
         fleet = ScriptedFleet(storage, plan, clock=clock)
 
         def broke() -> quota.CreditBalance:
@@ -818,6 +820,262 @@ class TestIdentityPreflight:
         assert fleet.calls == []
 
 
+class TestWritePreflight:
+    """A valid identity that cannot write, caught before a fleet boots.
+
+    On 2026-09-02 the default chain resolved a read-only user and every profile
+    on the machine cleared the identity gate. Two of the four could not run a
+    tile. The failure the identity gate misses looks like a fleet that booted,
+    staged nothing, and left the barrier waiting on shards that never
+    published, at one wasted boot per worker.
+    """
+
+    def test_a_read_only_identity_is_refused_naming_arn_bucket_and_prefix(self, monkeypatch):
+        monkeypatch.setattr(settings, "s3_bucket", "us-west-2.opendata.source.coop")
+        monkeypatch.setattr(settings, "s3_prefix", "nlebovits/landsat-lst")
+        arn = "arn:aws:iam::392361759182:user/vercel-data-access"
+        s3 = _FakeS3(deny={"put_object"})
+
+        with pytest.raises(quota.WriteAccessRefused) as excinfo:
+            quota.preflight_write_access(writers=[_writer(s3, arn=arn)])
+
+        message = str(excinfo.value)
+        assert "PutObject" in message, "the refusal must name the operation that failed"
+        assert "AccessDenied" in message
+        assert arn in message, "an access denial without the ARN sends people to a console"
+        assert "us-west-2.opendata.source.coop" in message
+        assert "nlebovits/landsat-lst" in message
+        assert excinfo.value.arn == arn
+        assert excinfo.value.bucket == "us-west-2.opendata.source.coop"
+
+    def test_the_refusal_names_where_the_credentials_came_from(self):
+        """Which identity, and which knob produced it. Both, or it is unactionable."""
+        s3 = _FakeS3(deny={"put_object"})
+        writer = quota.Writer(
+            role="every worker",
+            origin="profile 'radiant-earth' (settings.aws_profile)",
+            session=_FakeSession(s3, arn="arn:aws:iam::1:user/ro"),
+        )
+
+        with pytest.raises(quota.WriteAccessRefused) as excinfo:
+            quota.preflight_write_access(writers=[writer])
+
+        assert "every worker" in str(excinfo.value)
+        assert "radiant-earth" in str(excinfo.value)
+
+    def test_a_write_capable_identity_proceeds_and_returns_the_arn(self):
+        s3 = _FakeS3()
+        arn = "arn:aws:iam::392361759182:user/radiant-earth"
+
+        assert quota.preflight_write_access(writers=[_writer(s3, arn=arn)]) == [arn]
+
+    def test_the_probe_leaves_nothing_behind_on_success(self):
+        """A run that writes and cannot clean up leaves listings to misread."""
+        s3 = _FakeS3()
+
+        quota.preflight_write_access(writers=[_writer(s3)])
+
+        assert s3.objects == {}
+        assert s3.operations == ["put_object", "get_object", "delete_object"]
+
+    def test_reading_alone_would_clear_the_identity_that_started_this(self):
+        """The failing identity of 2026-09-02 reads the bucket perfectly."""
+        s3 = _FakeS3(deny={"put_object"})
+
+        with pytest.raises(quota.WriteAccessRefused):
+            quota.preflight_write_access(writers=[_writer(s3)])
+
+        assert s3.operations == ["put_object"], "a denied write must not be probed further"
+
+    def test_a_denied_delete_is_refused(self):
+        s3 = _FakeS3(deny={"delete_object"})
+
+        with pytest.raises(quota.WriteAccessRefused, match="DeleteObject"):
+            quota.preflight_write_access(writers=[_writer(s3)])
+
+    def test_an_object_that_reads_back_changed_is_refused_and_cleaned_up(self):
+        """Something rewriting objects means the run cannot trust its artifacts."""
+        s3 = _FakeS3(rewrite=b"not what was written")
+
+        with pytest.raises(quota.WriteAccessRefused, match="read back"):
+            quota.preflight_write_access(writers=[_writer(s3)])
+
+        assert s3.objects == {}, "a refused probe still tidies up after itself"
+
+    def test_a_failed_read_back_is_cleaned_up(self):
+        s3 = _FakeS3(deny={"get_object"})
+
+        with pytest.raises(quota.WriteAccessRefused, match="GetObject"):
+            quota.preflight_write_access(writers=[_writer(s3)])
+
+        assert s3.objects == {}
+
+    def test_the_probe_key_sits_under_the_configured_prefix(self, monkeypatch):
+        """And nowhere ``runs.classify`` or the shard grammar will read it.
+
+        ``_runs/`` is read key by key as tile attempts and ``_shards/`` as shard
+        artifacts. A probe is neither, so it gets its own prefix, exactly as
+        those two are disjoint from each other.
+        """
+        monkeypatch.setattr(settings, "s3_prefix", "nlebovits/landsat-lst")
+        s3 = _FakeS3()
+
+        quota.preflight_write_access(writers=[_writer(s3)])
+
+        (key,) = s3.written
+        assert key.startswith("nlebovits/landsat-lst/_preflight/")
+        assert "/_runs/" not in key
+        assert "/_shards/" not in key
+
+    def test_exported_credentials_make_the_two_writers_one(self, monkeypatch):
+        """``_worker_environ`` forwards them and the default chain prefers them."""
+        monkeypatch.setattr(settings, "aws_profile", "radiant-earth")
+
+        specs = quota.writer_specs({"AWS_ACCESS_KEY_ID": "AKIA", "AWS_PROFILE": "anything"})
+
+        assert len(specs) == 1
+        assert specs[0].profile is None
+        assert "AWS_ACCESS_KEY_ID" in specs[0].origin
+
+    def test_one_profile_named_twice_is_one_writer(self, monkeypatch):
+        """Collapsed on the *source*, never on the resolved key.
+
+        An SSO profile hands each session its own temporary access key, so
+        comparing keys reports two identities where there is one and probes the
+        bucket twice for no answer.
+        """
+        monkeypatch.setattr(settings, "aws_profile", "radiant-earth")
+
+        specs = quota.writer_specs({"AWS_PROFILE": "radiant-earth"})
+
+        assert len(specs) == 1
+        assert "radiant-earth" in specs[0].origin
+
+    def test_an_unset_aws_profile_leaves_two_writers(self, monkeypatch):
+        """The shape of 2026-09-02: the driver and the workers diverge here.
+
+        The driver takes the default chain and the workers take
+        ``settings.aws_profile``. Probing one of them clears a run the other
+        cannot finish.
+        """
+        monkeypatch.setattr(settings, "aws_profile", "radiant-earth")
+
+        specs = quota.writer_specs({})
+
+        assert [spec.role for spec in specs] == ["the driver", "every worker"]
+        assert specs[0].profile is None
+        assert specs[1].profile == "radiant-earth"
+        assert "AWS_PROFILE is unset" in specs[0].origin
+
+    def test_a_worker_identity_that_cannot_write_refuses_a_passing_driver(self):
+        """A run whose driver can write and whose workers cannot fails late.
+
+        It boots a fleet, stages nothing, and every artifact after that is a
+        shard that never published.
+        """
+        good = _FakeS3()
+        bad = _FakeS3(deny={"put_object"})
+        writers = [
+            quota.Writer(
+                role="the driver",
+                origin="the default credential chain",
+                session=_FakeSession(good, arn="arn:aws:iam::1:user/writer"),
+            ),
+            quota.Writer(
+                role="every worker",
+                origin="profile 'read-only' (settings.aws_profile)",
+                session=_FakeSession(bad, arn="arn:aws:iam::1:user/reader"),
+            ),
+        ]
+
+        with pytest.raises(quota.WriteAccessRefused, match="every worker"):
+            quota.preflight_write_access(writers=writers)
+
+        assert good.objects == {}, "the writer that passed still cleaned up"
+
+    def test_a_nameless_identity_is_still_probed(self):
+        """STS failing costs the message an ARN, never the run its gate."""
+        s3 = _FakeS3(deny={"put_object"})
+        writer = quota.Writer(role="the driver", origin="x", session=_FakeSession(s3, arn=None))
+
+        with pytest.raises(quota.WriteAccessRefused, match="unknown"):
+            quota.preflight_write_access(writers=[writer])
+
+    def test_a_workers_profile_that_does_not_resolve_is_refused_here(self, monkeypatch):
+        """It would fail in ``job._worker_environ`` later. Here is cheaper.
+
+        Constructing the session is the whole test: no network, and botocore
+        raises ``ProfileNotFound`` before any credential lookup.
+        """
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        monkeypatch.setattr(settings, "aws_profile", "definitely-not-a-profile-xyz")
+
+        with pytest.raises(quota.IdentityRefused) as excinfo:
+            quota.preflight_write_access()
+
+        assert "definitely-not-a-profile-xyz" in str(excinfo.value)
+        assert "no instance role" in str(excinfo.value)
+
+    def test_an_injected_submitter_skips_the_write_probe(
+        self, storage, plan, job, clock, monkeypatch
+    ):
+        """The same exemption the backend, identity, and credit gates take.
+
+        A locally-driven run writes nowhere but a temporary directory. If it
+        reached this probe, every scenario in this file would pass on a laptop
+        with a live session and refuse on a credential-less runner.
+        """
+
+        def explode(**_kwargs) -> list[str]:
+            raise AssertionError("a locally-driven run must not probe S3")
+
+        monkeypatch.setattr(quota, "preflight_write_access", explode)
+        fleet = ScriptedFleet(storage, plan, clock=clock)
+
+        assert _drive(job, storage, fleet, clock).completed
+
+    def test_the_gates_run_identity_then_write_then_credits(
+        self, storage, plan, job, clock, monkeypatch
+    ):
+        """Order is the message. A dead session explains a denied write."""
+        import landsat_lst.shard_driver as driver
+
+        monkeypatch.setattr(driver, "require_shared_storage", _allow_any_backend)
+        fleet = ScriptedFleet(storage, plan, clock=clock)
+        asked: list[str] = []
+
+        def identity(**_kwargs) -> str:
+            asked.append("identity")
+            return "arn:aws:iam::1:user/x"
+
+        def write(**_kwargs) -> list[str]:
+            asked.append("write")
+            raise quota.WriteAccessRefused(
+                "PutObject was refused", arn="arn:aws:iam::1:user/x", bucket="b", key="k"
+            )
+
+        def balance() -> quota.CreditBalance:
+            asked.append("credits")
+            return quota.CreditBalance(remaining=10_000.0, source="fake")
+
+        monkeypatch.setattr(quota, "preflight_identity", identity)
+        monkeypatch.setattr(quota, "preflight_write_access", write)
+
+        with pytest.raises(quota.WriteAccessRefused):
+            drive_tile(
+                job,
+                run_id=RUN_ID,
+                storage=storage,
+                submit=_as_real_submitter(fleet, monkeypatch),
+                clock=clock,
+                cluster_probe=None,
+                balance_source=balance,
+            )
+
+        assert asked == ["identity", "write"], "credits must not be read after write failed"
+        assert fleet.calls == []
+
+
 class TestErrorTaxonomy:
     @pytest.mark.parametrize(
         "message",
@@ -921,6 +1179,16 @@ def _healthy_identity(**_kwargs) -> str:
     return "arn:aws:sts::123456789012:assumed-role/test/runner"
 
 
+def _healthy_write_access(**_kwargs) -> list[str]:
+    """A bucket this identity can write, for scenarios that are not about that.
+
+    Same rule as :func:`_healthy_identity`: a test that reaches the real probe
+    puts a real object in the publication bucket, and reads the machine it ran
+    on rather than the code under test.
+    """
+    return ["arn:aws:sts::123456789012:assumed-role/test/runner"]
+
+
 def _named_error(name: str, message: str) -> Exception:
     """An exception standing in for a botocore class, by name.
 
@@ -936,6 +1204,73 @@ def _raises(error: Exception):
         raise error
 
     return caller
+
+
+class _FakeS3:
+    """The three calls the write probe makes, and a record of them.
+
+    Denials arrive as ``ClientError``-shaped exceptions rather than the real
+    class, for the reason ``_named_error`` exists: ``quota`` reads the error
+    code off the response and never imports botocore to decide.
+    """
+
+    def __init__(self, *, deny: set[str] | None = None, rewrite: bytes | None = None) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.deny = deny or set()
+        self.rewrite = rewrite
+        self.operations: list[str] = []
+        #: Every key ever written, so a test can assert where the probe lands.
+        self.written: list[str] = []
+
+    def _check(self, operation: str) -> None:
+        self.operations.append(operation)
+        if operation in self.deny:
+            error = _named_error("ClientError", f"An error occurred (AccessDenied) on {operation}")
+            error.response = {"Error": {"Code": "AccessDenied"}}
+            raise error
+
+    def put_object(self, *, Bucket, Key, Body, ContentType=None) -> dict:
+        del Bucket, ContentType
+        self._check("put_object")
+        self.objects[Key] = self.rewrite if self.rewrite is not None else Body
+        self.written.append(Key)
+        return {}
+
+    def get_object(self, *, Bucket, Key) -> dict:
+        del Bucket
+        self._check("get_object")
+        return {"Body": SimpleNamespace(read=lambda: self.objects[Key])}
+
+    def delete_object(self, *, Bucket, Key) -> dict:
+        del Bucket
+        self._check("delete_object")
+        self.objects.pop(Key, None)
+        return {}
+
+
+class _FakeSession:
+    """A ``boto3.Session`` stand-in serving one STS answer and one S3 client."""
+
+    def __init__(
+        self, s3: _FakeS3, *, arn: str | None = "arn:aws:iam::123456789012:user/test"
+    ) -> None:
+        self.s3 = s3
+        self.arn = arn
+
+    def client(self, name: str, **_kwargs):
+        if name == "sts":
+            if self.arn is None:
+                raise _named_error("ClientError", "no identity")
+            return SimpleNamespace(get_caller_identity=lambda: {"Arn": self.arn})
+        return self.s3
+
+
+def _writer(s3: _FakeS3, *, arn: str = "arn:aws:iam::123456789012:user/test") -> quota.Writer:
+    return quota.Writer(
+        role="the driver",
+        origin="the default credential chain (AWS_PROFILE is unset)",
+        session=_FakeSession(s3, arn=arn),
+    )
 
 
 def _allow_any_backend(*_args, **_kwargs) -> None:

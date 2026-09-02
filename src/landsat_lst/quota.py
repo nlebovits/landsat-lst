@@ -8,11 +8,14 @@ and in both cases the driver learned it the expensive way: once as a silent
 kill misread as slow shards, once as an error with no message.
 
 A quota is knowable *before* a submission, and this module makes the driver ask.
-Two gates run here, in this order. **Identity first**: an AWS SSO session
+Three gates run here, in this order. **Identity first**: an AWS SSO session
 expires within hours, which is less than a tile takes, and a driver whose
 credentials are stale cannot write an artifact or read a barrier -- it used to
-spend its whole startup before finding out. **Then credits**, from three
-sources, best first, because the answer's quality varies and pretending
+spend its whole startup before finding out. **Then write access**, because a
+valid identity is not a permitted one: on 2026-09-02 the default chain resolved
+a read-only user, and all four profiles on the machine cleared the identity gate
+while two of them could not write the publication bucket. **Then credits**, from
+three sources, best first, because the answer's quality varies and pretending
 otherwise is how a preflight becomes a rubber stamp:
 
 1. **The workspace usage endpoint.** ``/api/v2/user/account/{workspace}/usage``
@@ -47,7 +50,7 @@ import structlog
 from landsat_lst.config import settings
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
 
     from landsat_lst.shards import TilePlan
 
@@ -189,6 +192,293 @@ def preflight_identity(*, caller: Callable[[], dict] | None = None) -> str:
     arn = str(identity.get("Arn", "")) if isinstance(identity, dict) else ""
     log.info("identity_preflight_ok", arn=arn or "unknown")
     return arn
+
+
+#: Where a probe object is written. Deliberately disjoint from
+#: :data:`landsat_lst.storage.RUN_RECORD_PREFIX` and
+#: :data:`landsat_lst.shards.SHARD_PREFIX`, for the reason those two are
+#: disjoint from each other: ``runs.classify`` reads every key under the run
+#: prefix as a tile attempt, and a probe is not a tile.
+PREFLIGHT_PREFIX = "_preflight"
+
+
+class WriteAccessRefused(RuntimeError):
+    """The run's identity cannot write where the run writes, so it cannot start.
+
+    Distinct from :class:`IdentityRefused`, which means there is no usable
+    session at all. Here the session is fine and the permission is not. On
+    2026-09-02 the default chain resolved ``user/vercel-data-access``, which
+    reads the publication bucket and cannot write it. STS passed. Four profiles
+    passed; two of them could not run a tile. Every write would have failed,
+    one wasted boot per worker, presenting as shards that never published
+    rather than as a credentials problem.
+    """
+
+    def __init__(self, reason: str, *, arn: str, bucket: str, key: str) -> None:
+        self.reason = reason
+        self.arn = arn
+        self.bucket = bucket
+        self.key = key
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class Writer:
+    """One identity that writes during a run, and where its credentials came from.
+
+    A run has two writers and they are not always the same one. The driver's
+    :class:`~landsat_lst.storage.S3Storage` builds its client from the default
+    chain. Every worker writes as whatever ``job._worker_environ`` froze, which
+    is this shell's ``AWS_*`` variables when they are set and
+    ``settings.aws_profile`` when they are not. With no ``AWS_ACCESS_KEY_ID`` in
+    the environment those two resolve to different identities, so probing one
+    of them would clear a run the other cannot finish.
+    """
+
+    #: What this identity does during the run, for the refusal message.
+    role: str
+    #: Where its credentials came from, in words a person can act on.
+    origin: str
+    #: A ``boto3.Session``. Injectable, so the probe is testable without AWS.
+    session: Any
+
+
+@dataclass(frozen=True)
+class WriterSpec:
+    """A writer decided but not yet built: which role, from which profile.
+
+    Separate from :class:`Writer` so the decision is testable on its own. Which
+    identities a run writes as follows from two environment facts and one
+    setting, and none of that needs a session -- while building a session for a
+    named profile needs that profile to exist, which a CI runner has no reason
+    to satisfy.
+    """
+
+    role: str
+    origin: str
+    #: Profile to build the session from. ``None`` means the default chain.
+    profile: str | None
+
+
+def writer_specs(environ: Mapping[str, str]) -> list[WriterSpec]:
+    """The identities this shell will write as, collapsed where they coincide.
+
+    Mirrors ``job._worker_environ`` rather than re-deciding. If that function
+    changes which credentials it freezes, this has to change with it or the
+    probe stops describing the run.
+
+    Two writers are collapsed on the *source* of their credentials rather than
+    on the credentials themselves. An SSO profile hands each session its own
+    temporary access key, so comparing resolved keys reports two identities
+    where there is one, and probes the same bucket twice for no answer. Where
+    the source is provably shared the answer is exact:
+
+    - ``AWS_ACCESS_KEY_ID`` set: ``_worker_environ`` forwards it verbatim and
+      the default chain prefers it. One identity.
+    - ``AWS_PROFILE`` equal to ``settings.aws_profile``: both resolve the same
+      profile. One identity.
+    - Otherwise: the driver takes the default chain and the workers take
+      ``settings.aws_profile``. Two, and the case that started this.
+    """
+    profile = environ.get("AWS_PROFILE")
+    if environ.get("AWS_ACCESS_KEY_ID"):
+        return [
+            WriterSpec(
+                role="the driver and every worker",
+                origin="the AWS_ACCESS_KEY_ID in this shell's environment",
+                profile=None,
+            )
+        ]
+    if profile and profile == settings.aws_profile:
+        return [
+            WriterSpec(
+                role="the driver and every worker",
+                origin=f"profile {profile!r} (AWS_PROFILE, and settings.aws_profile)",
+                profile=None,
+            )
+        ]
+    return [
+        WriterSpec(
+            role="the driver",
+            origin=(
+                f"the default credential chain (AWS_PROFILE={profile})"
+                if profile
+                else "the default credential chain (AWS_PROFILE is unset)"
+            ),
+            profile=None,
+        ),
+        WriterSpec(
+            role="every worker",
+            origin=f"profile {settings.aws_profile!r} (settings.aws_profile)",
+            profile=settings.aws_profile,
+        ),
+    ]
+
+
+def _writers() -> list[Writer]:
+    """Build a session for each spec. Terminal if the workers' profile is gone."""
+    import os  # noqa: PLC0415
+
+    import boto3  # noqa: PLC0415
+
+    built: list[Writer] = []
+    for spec in writer_specs(os.environ):
+        try:
+            session = (
+                boto3.Session()
+                if spec.profile is None
+                else boto3.Session(profile_name=spec.profile)
+            )
+        except Exception as e:
+            # It would fail in ``job._worker_environ`` later. Here is cheaper,
+            # and here it can name the setting that chose the profile.
+            raise IdentityRefused(
+                f"the AWS profile {spec.profile!r} (settings.aws_profile) does not "
+                f"resolve ({type(e).__name__}: {e}). Workers hold no instance role, "
+                f"so every S3 write a shard performs runs as that profile. "
+                f"Run: {_sso_login_hint()}"
+            ) from e
+        built.append(Writer(role=spec.role, origin=spec.origin, session=session))
+    return built
+
+
+def _writer_arn(writer: Writer) -> str:
+    """The writer's ARN, best effort. Only the refusal message depends on it."""
+    from botocore.config import Config  # noqa: PLC0415
+
+    try:
+        client = writer.session.client(
+            "sts",
+            config=Config(
+                connect_timeout=5, read_timeout=5, retries={"max_attempts": 1, "mode": "standard"}
+            ),
+        )
+        identity = client.get_caller_identity()
+    except Exception:
+        return "unknown"
+    return str(identity.get("Arn", "unknown")) if isinstance(identity, dict) else "unknown"
+
+
+def _error_code(error: Exception) -> str:
+    """The AWS error code, read off the response rather than off the class.
+
+    Classified the way :func:`preflight_identity` classifies its failures, and
+    for the same reason: this module never imports botocore to decide.
+    """
+    response = getattr(error, "response", None)
+    if isinstance(response, dict):
+        return str(response.get("Error", {}).get("Code", ""))
+    return ""
+
+
+def _delete_quietly(client: Any, bucket: str, key: str) -> None:
+    """Clean up after a failed probe. A failure here is not the run's problem."""
+    try:
+        client.delete_object(Bucket=bucket, Key=key)
+    except Exception as e:
+        log.info("write_preflight_cleanup_failed", key=key, error=str(e))
+
+
+def _probe_writer(writer: Writer, *, bucket: str, prefix: str) -> str:
+    """Write one small object, read it back, delete it. Returns the ARN.
+
+    All three, because each answers a question the others do not. A read-only
+    identity reads the bucket perfectly, so reading alone clears the very
+    identity that prompted this gate. An object that will not read back means
+    something between this shell and the bucket rewrote it. A run that writes
+    and cannot delete leaves artifacts behind, and a later listing reads
+    leftovers as work that finished.
+
+    Raises:
+        WriteAccessRefused: On any of the three, naming which one.
+    """
+    import json  # noqa: PLC0415
+    import uuid  # noqa: PLC0415
+
+    from botocore.config import Config  # noqa: PLC0415
+
+    key = f"{prefix}/{PREFLIGHT_PREFIX}/probe-{uuid.uuid4().hex}.json"
+    body = json.dumps({"landsat_lst": "write-preflight", "probe": key}).encode()
+    arn = _writer_arn(writer)
+    client = writer.session.client(
+        "s3",
+        region_name=settings.s3_region,
+        config=Config(connect_timeout=5, read_timeout=15, retries={"max_attempts": 3}),
+    )
+
+    def refuse(operation: str, error: Exception) -> WriteAccessRefused:
+        code = _error_code(error) or type(error).__name__
+        return WriteAccessRefused(
+            f"{operation} was refused ({code}) for {writer.role}, which runs as "
+            f"{arn} from {writer.origin}. The target is s3://{bucket}/{prefix}/ "
+            f"and the probe key was {key}. Every artifact this run writes goes "
+            f"there, so it cannot start. Re-run under a profile that can write "
+            f"the bucket, or grant that identity write access to the prefix.",
+            arn=arn,
+            bucket=bucket,
+            key=key,
+        )
+
+    try:
+        client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+    except Exception as e:
+        raise refuse("PutObject", e) from e
+
+    try:
+        read_back = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except Exception as e:
+        # The object may well be there; a probe that refuses still tidies up.
+        _delete_quietly(client, bucket, key)
+        raise refuse("GetObject", e) from e
+
+    if read_back != body:
+        _delete_quietly(client, bucket, key)
+        msg = (
+            f"the probe object at s3://{bucket}/{key} read back as {len(read_back)} "
+            f"bytes rather than the {len(body)} written, as {arn} from "
+            f"{writer.origin}. Something between this shell and the bucket is "
+            f"rewriting objects, and a run cannot trust its own artifacts through it."
+        )
+        raise WriteAccessRefused(msg, arn=arn, bucket=bucket, key=key)
+
+    try:
+        client.delete_object(Bucket=bucket, Key=key)
+    except Exception as e:
+        raise refuse("DeleteObject", e) from e
+
+    log.info("write_preflight_ok", role=writer.role, arn=arn, bucket=bucket, prefix=prefix)
+    return arn
+
+
+def preflight_write_access(*, writers: Iterable[Writer] | None = None) -> list[str]:
+    """Verify the run can write, read back, and delete where it writes.
+
+    Runs beside :func:`preflight_identity`, one level further in. STS passes for
+    any valid identity, a read-only one included: on 2026-09-02 four profiles
+    all satisfied the identity gate and two of them could not run a tile.
+    Without this, such a run boots its VMs, stages nothing, and fails on the
+    first write. That is a wasted boot per worker, and on a sharded tile the
+    driver's barrier reads it as shards that never published.
+
+    Probed, never inferred. IAM policy and bucket ACLs do not compose into an
+    answer a caller can act on, and a wrong inference is worse than no gate.
+
+    Args:
+        writers: The identities to probe. Defaults to the ones this shell
+            actually writes as. Injectable so every refusal path is testable
+            without reaching AWS.
+
+    Returns:
+        The ARN of each identity probed, for the driver to log.
+
+    Raises:
+        WriteAccessRefused: If any writer cannot write, read back, or delete.
+        IdentityRefused: If the workers' profile does not resolve to a session.
+    """
+    bucket = settings.s3_bucket
+    prefix = settings.s3_prefix
+    chosen = list(writers) if writers is not None else _writers()
+    return [_probe_writer(writer, bucket=bucket, prefix=prefix) for writer in chosen]
 
 
 class QuotaRefused(RuntimeError):

@@ -647,16 +647,35 @@ Rules worth keeping:
   used to collide: `Unable to add batch jobs to existing cluster '...-climato'`. Cluster
   names now carry the round (`stage_cluster_name`, run id hashed so truncation cannot eat
   the marker).
-- **Two gates before anything submits, in this order: identity, then credits.**
+- **Three gates before anything submits, in this order: identity, write access, credits.**
   `quota.preflight_identity` calls STS with a 5s timeout and refuses on an expired or
   missing session, naming `aws sso login --profile <profile>`. The SSO session expires
   within hours — less than a tile — and this has bitten three times, each time after the
   driver had already spent a STAC query, a plan, and a fleet's boot. It runs first because
   a session that cannot call STS cannot read a Coiled balance either.
-  `quota.preflight_credits` then refuses rather than guessing: a workspace at its quota
+  `quota.preflight_credits` refuses rather than guessing: a workspace at its quota
   gets its healthy fleet killed mid-stage (2026-08-22, 400 credits) and its cluster
   creates rejected with an *empty* `ServerError`. `--ack-quota` is the escape when no
   balance can be read.
+- **A valid identity is not a permitted one, so `quota.preflight_write_access` probes.**
+  It writes one object under `{s3_prefix}/_preflight/`, reads it back, and deletes it. All
+  three: reading alone clears a read-only identity, which is the case that started this
+  (2026-09-02, `user/vercel-data-access` from the default chain — four profiles passed the
+  identity gate, two could not run a tile), and a run that cannot delete leaves artifacts a
+  later listing reads as finished work. It **probes, never infers** from IAM policy or
+  bucket ACLs, and the refusal names the operation, the ARN, the credential origin, the
+  bucket, and the prefix. Missing this costs a boot per worker and presents as shards that
+  never published.
+- **A run has two writers.** Workers hold no instance role: every shard's S3 write runs as
+  the credentials `job._worker_environ` freezes — this shell's `AWS_*` variables if set,
+  else `settings.aws_profile` — while the driver's `S3Storage` uses the default chain.
+  `forward_aws_credentials=False` on `batch_run` turns off *Coiled's* forwarding and does
+  not change this. With no `AWS_ACCESS_KEY_ID` exported the two are different identities,
+  which is why the probe runs against both. `writer_specs` collapses them only where the
+  **source** is provably shared (`AWS_ACCESS_KEY_ID` exported, or `AWS_PROFILE` equal to
+  `settings.aws_profile`), never by comparing resolved credentials: an SSO profile hands
+  each session its own temporary access key, so key comparison sees two identities where
+  there is one and probes the bucket twice for no answer.
 - **Credits are billed per vCPU-hour, not per VM-hour.** S30W065 billed **268.11** where
   the old per-VM-hour model said 75 — 3.6x low, the direction that lets an unaffordable
   run start, because it could not see that a 16-vCPU composite VM costs twice an 8-vCPU

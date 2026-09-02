@@ -343,6 +343,41 @@ It runs *first*, before the credit check, because a session that cannot call STS
 read a Coiled balance either, and "log in again" is a better message than "the balance
 could not be read".
 
+### Then permission, which STS does not answer
+
+A valid identity is not a permitted one. On 2026-09-02 the default chain on the submitting
+machine resolved `arn:aws:iam::392361759182:user/vercel-data-access`, which reads the
+publication bucket and cannot write it. All four profiles on that machine cleared the
+identity gate; two of them could not run a tile. The failure that gate misses looks like a
+fleet that booted, staged nothing, and left the driver's barrier waiting on shards that
+never published.
+
+`quota.preflight_write_access` writes one small object under
+`{s3_prefix}/_preflight/`, reads it back, and deletes it. Each of the three answers a
+question the others do not. Reading alone clears the very identity that prompted the gate.
+An object that will not read back means something between the shell and the bucket rewrote
+it. A run that writes and cannot delete leaves artifacts behind, and a later listing reads
+leftovers as work that finished. The refusal names the operation, the ARN, where those
+credentials came from, and the bucket and prefix tried, because "access denied" on its own
+sends people to the wrong console.
+
+It probes, and never infers from IAM policy or bucket ACLs. Those do not compose into an
+answer a caller can act on, and a wrong inference is worse than no gate.
+
+**A run has two writers, and they are not always one identity.** The driver's `S3Storage`
+builds its client from the default chain. Workers hold no instance role, so every write a
+shard performs runs as the credentials `job._worker_environ` freezes: this shell's `AWS_*`
+variables when they are set, and `settings.aws_profile` when they are not. The
+`forward_aws_credentials=False` on the `batch_run` call turns off Coiled's own forwarding
+and does not change this. With no `AWS_ACCESS_KEY_ID` exported, the two resolve to
+different identities, so the probe runs against both.
+
+`writer_specs` collapses them where the *source* is provably shared: `AWS_ACCESS_KEY_ID`
+exported, or `AWS_PROFILE` equal to `settings.aws_profile`. Never by comparing resolved
+credentials, because an SSO profile hands each session its own temporary access key and
+key comparison then reports two identities where there is one, probing the bucket twice
+for no answer.
+
 ### A clock seam, and what it bought
 
 Every wait, poll, deadline, and backoff goes through an injectable `Clock`. That is not

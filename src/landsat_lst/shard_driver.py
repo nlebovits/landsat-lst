@@ -353,15 +353,21 @@ def require_shared_storage(storage: StorageBackend, submit: Submitter | None) ->
 
 
 def _preflight(submit: Submitter, balance_source: Callable[[], quota.CreditBalance] | None) -> None:
-    """State zero: two gates, before a single cluster is created.
+    """State zero: three gates, before a single cluster is created.
 
-    **Identity, then credits.** An AWS SSO session expires within hours, which
-    is less than a tile takes, and this has bitten three times: the driver
-    spends its whole startup -- a STAC query, a plan, a fleet's boot -- before
-    discovering that nothing it writes can reach S3. It also has to come first,
-    because a session that cannot call STS cannot read a Coiled balance either,
-    and "log in again" is a better message than "the balance could not be
-    read".
+    **Identity, then write access, then credits.** An AWS SSO session expires
+    within hours, which is less than a tile takes, and this has bitten three
+    times: the driver spends its whole startup -- a STAC query, a plan, a
+    fleet's boot -- before discovering that nothing it writes can reach S3. It
+    also has to come first, because a session that cannot call STS cannot read
+    a Coiled balance either, and "log in again" is a better message than "the
+    balance could not be read".
+
+    Then write access, because STS passing says nothing about permission. On
+    2026-09-02 the default chain resolved a read-only user and all four
+    profiles on the machine cleared the identity gate; two of them could not
+    write the publication bucket. That run would have booted a fleet, staged
+    nothing, and shown up here as shards that never published.
 
     Then the quota. That one is knowable before a cluster is created too, and
     on 2026-08-22 it cost a night to learn afterwards -- once as an empty
@@ -374,12 +380,15 @@ def _preflight(submit: Submitter, balance_source: Callable[[], quota.CreditBalan
 
     Raises:
         IdentityRefused: If AWS credentials are missing or expired.
+        WriteAccessRefused: If an identity the run writes as cannot write, read
+            back, and delete under the configured bucket and prefix.
         QuotaRefused: If the workspace cannot afford the run, or if the balance
             could not be read and nobody acknowledged a manual check.
     """
     if submit is not submit_shard_stage:
         return
     quota.preflight_identity()
+    quota.preflight_write_access()
     estimate = quota.estimate_run_credits()
     balance = quota.preflight_credits(estimate, balance_source=balance_source)
     log.info(

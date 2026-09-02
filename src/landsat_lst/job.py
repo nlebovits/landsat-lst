@@ -181,6 +181,15 @@ def _worker_environ() -> dict[str, str]:
     ``LST_STAC_URL`` is deliberately not forwarded: a local Planetary Computer
     override must not leak onto AWS workers, where the config default (Earth
     Search) is the same-region endpoint.
+
+    **Workers hold no instance role.** Every S3 write a shard performs runs as
+    the credentials frozen here, which is surprising next to the
+    ``forward_aws_credentials=False`` on the ``batch_run`` call: that flag turns
+    off Coiled's own forwarding and does not stop this one. So a worker writes
+    as this shell's ``AWS_*`` variables when they are set, and as
+    ``settings.aws_profile`` when they are not -- which is a different identity
+    from the default chain the driver's own :class:`~landsat_lst.storage.S3Storage`
+    resolves. ``quota.preflight_write_access`` probes both before a fleet boots.
     """
     creds = {
         key: val
