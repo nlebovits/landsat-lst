@@ -146,21 +146,94 @@ returned to the cap — only when its units' artifacts are listed, or when the
 backend confirms the submission dead. An expired wave whose units have not
 landed keeps its capacity and is logged as overdue.
 
-Held width is counted **per unit, not per wave**: a worker that has published
-its unit's artifact has moved on, so a 60-unit wave with 45 artifacts on the
-ground holds at most 15. Counting the requested width until the whole wave
-settles is not conservative but wrong in a way that deadlocks — a first wave
-wider than the cap would never return any headroom, and a run would stall with
-most of its work done. That was reproduced too, and is what
-`FleetDriver.wave_held` exists to prevent.
+### Held width has two regimes, and the boundary is the wave's own budget
+
+An earlier draft counted held width **per unit**: a 60-unit wave with 45
+artifacts on the ground held 15. That reads a landed artifact as a released VM,
+and a batch array does not work that way. It keeps every worker it started
+until the array itself finishes, so the worker that published this artifact
+takes the next unit off the queue or waits in a cluster that is still billing.
+Measured against an independent model of the substrate, a 50-tile run capped at
+64 peaked at **82**: the driver freed slots the array had not, the next wave
+booted on top, and the real concurrency was the sum of both.
+
+So `Wave.held_at` holds the **full requested width** while a wave is inside its
+budget, and drops to zero when its last unit lands. That cannot exceed the cap,
+because a wave is never submitted wider than the headroom left.
+
+Past the budget the count degrades to **one worker per absent unit**. A wave
+that has overrun its derived deadline by a further `budgets.VM_BOOT_S` is
+either gone, in which case it holds nothing at all, or alive with finished
+workers idle in an array the substrate should have ended. Charging the full
+width for either case charges for a wave that has already broken its contract,
+and the price of the strict rule is a run that fails tiles whose own work
+landed: one slow unit in a cap-wide wave would pin the whole cap for the rest
+of the build, which was reproduced as nine healthy tiles completing zero. The
+exposure the degradation admits is bounded by the landed units of waves that
+are already overdue, and it cannot reach the healthy tail the full-width rule
+exists to protect.
 
 The barrier remains a separate question and still expires on time: a tile
 re-demands when *its record* ages out, whether or not the wave holding its
 capacity has been released. Expiry therefore delays a resubmission rather than
-permitting an over-run, which is the safe way round. A wave that neither
-settles nor can be confirmed dead holds its width until the poll ceiling ends
-the run — deliberately, because a loud stall costs less than a silent doubling
-of the bill.
+permitting an over-run, which is the safe way round.
+
+What a tile may not do is re-demand a unit a live wave is carrying **right
+now**. The record ages out on a horizon derived when the wave was submitted.
+The wave is retired on evidence, and when the first runs out before the second
+the driver dispatches the same unit a second time beside the first. The
+composite wave demanded from inside the offsets barrier is where that bites,
+because its record is written long before the tile reaches the stage: 48 units
+dispatched twice over 30 tiles. Units are idempotent at their artifact keys, so
+this was waste and a spent barrier round rather than corruption, but a run that
+pays for the same band twice while a cap holds other tiles out is paying twice
+for nothing. `FleetDriver._publish_held_units` tells each track once a poll
+which of its units a live wave still carries, and `TileTrack._demand` drops
+them. Stranded waves are excluded, because a wave past its own budget is
+exactly what a barrier round is for.
+
+### A held wave nothing can settle ends the run, loudly
+
+A wave that neither settles nor can be confirmed dead keeps its width. That is
+the right trade, because a loud stall costs less than a silent doubling of the
+bill, but the first draft made it neither loud nor a stall. A wave preempted 1,200 s
+into the first stage, with a backend that would not confirm it, produced
+**19,440 polls, no completions, no failures, and ten tiles in neither list**,
+after which `drive_fleet` returned as though the run had finished. A probe that
+*raises* rather than answering produced the same shape.
+
+Two rules close it:
+
+- `FleetDriver._stalled` ends the run when there is no headroom and every wave
+  holding it has either overrun its budget or names no units the bucket can
+  answer for. Nothing further can be listed, retired, or submitted, so waiting
+  buys nothing. Every tile is failed with a reason naming the waves, their
+  widths, and whether the submission was ever acknowledged.
+- `FleetDriver._settle_stragglers` runs on every exit from the loop, so **no
+  tile ever leaves a run in neither list**. A tile that ends a build neither
+  produced nor failed is worse than a failed one: a caller reconciling the
+  manifest cannot tell it from a tile that was never asked for.
+
+The same run that used to poll out silently now fails in 591 polls with all ten
+tiles named.
+
+### An unanswered submission is not an unstarted one
+
+The first draft held no capacity for a wave whose submission raised through
+every retry, reasoning that it had no workers and no artifacts. But a control
+plane can accept the request, boot the workers, and lose the answer on the way
+back: reproduced as **90 VMs up, `driver_in_flight` 0, and the full cap of 64
+offered to the next wave**. A submission that *may* have started counts against
+capacity until something positively reconciles it.
+
+So the wave is constructed, counted, and recorded **before** the call that
+starts it, and marked `acknowledged` only when a handle comes back. The
+ordering is also what makes recovery idempotent: the wave record's key is a
+pure function of `(run_id, stage, wave)`, so a driver that dies inside the call,
+a restart, and a duplicate driver all adopt that one wave rather than minting a
+second beside it. An unacknowledged wave has no handle to probe, so it is the
+one wave the backend can never confirm, which is why `_stalled` exists rather
+than being an alternative to it.
 
 The rule is easy to state and easy to breach, because there are several facts
 about the *driver* that look like facts about a VM. Three were found in review
@@ -177,21 +250,47 @@ and each is pinned by a test that fails when the shortcut is put back:
   not revisit the composite stage until it has merged. So the driver refreshes
   the evidence for every `(tile, stage)` a live wave references, once per poll,
   whether or not that track would have looked.
-- **A wave that never started must not be counted.** A submission that raised
-  through every retry has no workers, no handle to probe, and artifacts that
-  can never land. Counting it is the mirror failure: not an over-run but a
-  deadlock, capacity spent for the rest of the run with nothing able to release
-  it.
+- **A tile that gave up is not a worker that stopped, and this must not be
+  merely intended.** `TileTrack._fail` leaves capacity alone, and for a while
+  that was the whole mechanism: the outstanding set lived on the track, `_fail`
+  could clear it, and the window between the driver's evidence refresh and its
+  flush in the same poll was one poll wide and invisible to every test.
+  Deleting the rule changed no test's verdict. The evidence now lives on the
+  `Wave`, written only by `_refresh_wave_evidence` from the bucket, so nothing
+  a tile does to itself can reach the cap at all. `FleetDriver.capacity_ledger`
+  publishes the identities being counted, so the arithmetic can be reconciled
+  against an independent ledger of potentially-live workers rather than only
+  against itself.
 
 Adoption follows the same rule, and this is where the first draft put the
 defect back one process later. It adopted only waves whose deadline had not
 passed, so a resumed driver ignored a merely late wave and submitted into
 headroom that existed only on paper. The wave record therefore carries its unit
 tokens, a resumed driver adopts every recorded wave, and `_retire` settles them
-on the ordinary terms. That terminates because an overdue wave is always probed
-regardless of the `probe_waves` setting: a backend that answers retires an
-ancient record on the first poll, and one that cannot answer holds the capacity
-loudly.
+on the ordinary terms.
+
+An adopted wave is the one case where this process has confirmed nothing
+itself, and the horizon in the record is the *previous* driver's arithmetic. So
+adoption forces exactly one probe of every inherited wave, whatever
+`probe_waves` and that horizon say. Without it a record claiming a
+million-second deadline postponed the only question that could release its
+width, for as long as it liked.
+
+A record written before `unit_tokens` existed names no units, and a wave with
+no units cannot be observed to have settled at all: it held its requested width
+for the life of the resumed driver, so a resume could start nothing until a
+probe happened to answer. The unit list it lacks is already in the bucket
+twice. Each wave writes one per-tile submission record carrying its wave
+number and that tile's indexes, and a tile on this driver's roster has a plan
+whose stage index set bounds what the wave could have carried.
+`_units_from_tile_records` reads both, in that order.
+
+What remains, and it is not a defect to fix: a wave record with no unit tokens,
+whose tiles left no per-tile record and are not on the roster, refers to nothing
+the bucket can answer for. Holding its width is the conservative answer and the
+only safe one, because releasing it is the over-admission the resume path
+exists to prevent. It must not be *silent*, so adoption logs it and `_stalled` ends the
+run rather than polling out.
 
 ## The poll loop's request rate
 
@@ -210,6 +309,13 @@ listing returns 1,000 keys a request. At 700 tiles and roughly 50 keys a tile
 that is about 35 requests a poll against 1,400. The exponent on the tile count
 is what changed, not the presence of one, and calling it a constant would be
 the kind of wrong that only appears at the scale nobody tests at.
+
+The counter has to say the same thing the prose does. `PollIndex.listings`
+counts *calls*, and a call over a prefix holding 24,000 keys is 24 requests, so
+a run whose real cost went 1, 4, 24 requests a poll at 10, 100 and 700 tiles
+reported a flat 1. `PollIndex.requests` counts pages and is the number to quote:
+the claim being made is about the exponent on the tile count, and only a
+request count can carry it.
 
 Sharing the request is only half of it. A cached listing that every tile filters
 end to end is still `O(tiles × keys)` of CPU per poll, which at 700 tiles is
@@ -303,6 +409,22 @@ re-measure.
   costs real headroom for as long as it really runs. That is the deliberate
   trade: an earlier draft retired on the deadline instead, which returned the
   tail's width on paper while its workers were still billing.
+- A cap-wide first wave makes the stages that follow it serial until it ends.
+  That is what a hard concurrency cap means once held width is the array's
+  rather than the landed units', and it is the cost of the fix rather than a
+  defect in it. The budget-boundary degradation bounds how long a *broken* wave
+  can impose it. A healthy one imposes it for exactly as long as it runs.
+- A run can now end with every tile failed and no tile silent. Failing loudly
+  on a wave nothing can settle is the intended outcome, not a fallback: the
+  alternative on offer was returning normally with the tiles unaccounted for.
+- The poll ceiling counts barrier rounds, and queue depth is not a barrier
+  round. A cap narrow against the work admits few workers at a time, so one
+  wave becomes as many serial rounds as it has units: at a cap of one, four
+  tiles' offsets is sixty rounds inside a single wave, and the run was cut off
+  with its one worker still working. That was survivable while the ceiling only
+  logged. It is not now that every tile left over is failed, so the ceiling
+  extends while a wave is live, to the horizon that wave was given, and does
+  not move when nothing is live -- which is the stuck clock it exists for.
 - **The cap invariants rest on an unverified external premise.** Every
   statement here about peak concurrency assumes `coiled.batch_run` runs an
   over-subscribed array on at most `max_workers` VMs. If that is false,
