@@ -73,7 +73,7 @@ def _reports_stopped(handle_id, backend):
     return ("stopped", "preempted")
 
 
-def _no_probe(self) -> None:
+def _no_probe(self, *args, **kwargs) -> None:
     """The mutation: nothing is ever confirmed dead."""
     del self
 
