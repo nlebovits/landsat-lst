@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from landsat_lst import budgets, quota, shard_tasks, shards
-from landsat_lst.batch import stage_cluster_name, submit_shard_stage
+from landsat_lst.batch import stage_cluster_name, submit_fleet_stage, submit_shard_stage
 from landsat_lst.config import settings
 from landsat_lst.storage import PRODUCTS, S3Storage, get_storage
 
@@ -65,6 +65,14 @@ log = structlog.get_logger()
 #: Signature of the stage submitter, so a test can pass one that writes the
 #: artifacts synchronously instead of starting a cluster.
 Submitter = Callable[..., object]
+
+#: The submitters that actually start Coiled work. Membership in this tuple is
+#: what the backend guard and the two preflight gates key off, so a caller that
+#: injects its own submitter is exempt from all three -- it starts no clusters,
+#: spends no credits, and writes nowhere but a temporary directory. Both the
+#: per-tile array (ADR-016) and the consolidated wave (ADR-018) belong here; a
+#: new submitter that is missing from it would slip past the gates silently.
+COILED_SUBMITTERS = (submit_shard_stage, submit_fleet_stage)
 
 #: What a cluster probe returns: ``(state, reason)`` for one cluster, or
 #: ``None`` when nothing is known about it.
@@ -330,7 +338,7 @@ def require_shared_storage(storage: StorageBackend, submit: Submitter | None) ->
         ShardBackendMismatch: If Coiled work is about to be submitted against
             a non-S3 backend.
     """
-    coiled_bound = submit is None or submit is submit_shard_stage
+    coiled_bound = submit is None or submit in COILED_SUBMITTERS
     if not coiled_bound or isinstance(storage, S3Storage):
         return
 
@@ -345,15 +353,21 @@ def require_shared_storage(storage: StorageBackend, submit: Submitter | None) ->
 
 
 def _preflight(submit: Submitter, balance_source: Callable[[], quota.CreditBalance] | None) -> None:
-    """State zero: two gates, before a single cluster is created.
+    """State zero: three gates, before a single cluster is created.
 
-    **Identity, then credits.** An AWS SSO session expires within hours, which
-    is less than a tile takes, and this has bitten three times: the driver
-    spends its whole startup -- a STAC query, a plan, a fleet's boot -- before
-    discovering that nothing it writes can reach S3. It also has to come first,
-    because a session that cannot call STS cannot read a Coiled balance either,
-    and "log in again" is a better message than "the balance could not be
-    read".
+    **Identity, then write access, then credits.** An AWS SSO session expires
+    within hours, which is less than a tile takes, and this has bitten three
+    times: the driver spends its whole startup -- a STAC query, a plan, a
+    fleet's boot -- before discovering that nothing it writes can reach S3. It
+    also has to come first, because a session that cannot call STS cannot read
+    a Coiled balance either, and "log in again" is a better message than "the
+    balance could not be read".
+
+    Then write access, because STS passing says nothing about permission. On
+    2026-09-02 the default chain resolved a read-only user and all four
+    profiles on the machine cleared the identity gate; two of them could not
+    write the publication bucket. That run would have booted a fleet, staged
+    nothing, and shown up here as shards that never published.
 
     Then the quota. That one is knowable before a cluster is created too, and
     on 2026-08-22 it cost a night to learn afterwards -- once as an empty
@@ -366,12 +380,15 @@ def _preflight(submit: Submitter, balance_source: Callable[[], quota.CreditBalan
 
     Raises:
         IdentityRefused: If AWS credentials are missing or expired.
+        WriteAccessRefused: If an identity the run writes as cannot write, read
+            back, and delete under the configured bucket and prefix.
         QuotaRefused: If the workspace cannot afford the run, or if the balance
             could not be read and nobody acknowledged a manual check.
     """
     if submit is not submit_shard_stage:
         return
     quota.preflight_identity()
+    quota.preflight_write_access()
     estimate = quota.estimate_run_credits()
     balance = quota.preflight_credits(estimate, balance_source=balance_source)
     log.info(

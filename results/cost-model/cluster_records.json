@@ -1,0 +1,152 @@
+{
+  "run": "S30W065 sharded tile, 2026-08-23",
+  "timezone": "Europe/Amsterdam",
+  "provenance": "Coiled cluster event log exports, one CSV per cluster, retrieved 2026-09-02. The CSVs carry private VPC instance addresses, so they are not committed. Their SHA-256 digests, byte counts, row counts, and retrieval date are recorded here so the derivation stays checkable against the originals.",
+  "derivation": "A worker's billed window runs from its 'Instance starting' event to its last event. Workers appear as an ascending list of lifetimes and no address appears anywhere in this file. Every cluster also runs a scheduler instance, counted separately and left unpriced because the export does not give its type.",
+  "credits": "Coiled billing activity for the three cluster ids, read alongside the exports on 2026-09-02. The per-cluster split is the observation, and the total 268.1063 reproduces the figure quota.py already carried.",
+  "boot_caveat": "infrastructure_boot_min spans 'Queued for launch' to 'Successfully phoned home', which is provisioning and dask registration. It stops before the software environment starts and before the first task runs, so it is a component of vm_boot_minutes and not a replacement for it.",
+  "clusters": [
+    {
+      "cluster_id": "1954303",
+      "stage": "offsets_round_1",
+      "instance_type": "r6i.2xlarge",
+      "vcpus_each": 8,
+      "on_demand_usd_hour": 0.504,
+      "credits": 67.8106,
+      "workers": 15,
+      "cluster_lifetime_min": 35.19,
+      "scheduler_lifetime_min": 34.86,
+      "worker_lifetimes_min": [
+        31.91,
+        33.25,
+        33.42,
+        33.42,
+        33.42,
+        33.58,
+        33.84,
+        33.84,
+        33.84,
+        34.08,
+        34.25,
+        34.42,
+        34.42,
+        34.42,
+        34.75
+      ],
+      "worker_vm_minutes": 506.86,
+      "infrastructure_boot_min": {
+        "min": 0.75,
+        "median": 0.75,
+        "max": 0.83
+      },
+      "source_export": {
+        "sha256": "81f2e06b98a8f600a9399d984eb9f347227293957a60ec2f472b18432fbecf61",
+        "bytes": 13269,
+        "rows": 201,
+        "retrieved": "2026-09-02",
+        "retained_in_repo": false
+      }
+    },
+    {
+      "cluster_id": "1954376",
+      "stage": "offsets_round_2",
+      "instance_type": "r6i.2xlarge",
+      "vcpus_each": 8,
+      "on_demand_usd_hour": 0.504,
+      "credits": 16.145,
+      "workers": 14,
+      "cluster_lifetime_min": 14.54,
+      "scheduler_lifetime_min": 14.54,
+      "worker_lifetimes_min": [
+        1.89,
+        1.89,
+        1.89,
+        1.89,
+        1.89,
+        13.76,
+        13.76,
+        13.76,
+        13.76,
+        13.76,
+        13.99,
+        13.99,
+        14.02,
+        14.02
+      ],
+      "worker_vm_minutes": 134.27,
+      "infrastructure_boot_min": {
+        "min": 0.83,
+        "median": 0.92,
+        "max": 0.92
+      },
+      "source_export": {
+        "sha256": "3b3c6c9190b85c12f6f990ac6aabda8801912ddf2d2a7e34042906842f3617f1",
+        "bytes": 39279,
+        "rows": 201,
+        "retrieved": "2026-09-02",
+        "retained_in_repo": false
+      }
+    },
+    {
+      "cluster_id": "1954375",
+      "stage": "composite_round_1",
+      "instance_type": "m6i.4xlarge",
+      "vcpus_each": 16,
+      "on_demand_usd_hour": 0.768,
+      "credits": 184.1507,
+      "workers": 35,
+      "cluster_lifetime_min": 32.23,
+      "scheduler_lifetime_min": 32.23,
+      "worker_lifetimes_min": [
+        13.92,
+        14.18,
+        14.18,
+        14.18,
+        14.18,
+        14.42,
+        14.42,
+        14.42,
+        14.67,
+        14.92,
+        14.92,
+        15.68,
+        15.93,
+        15.93,
+        17.19,
+        20.28,
+        22.62,
+        23.7,
+        23.97,
+        24.71,
+        24.71,
+        24.98,
+        24.98,
+        25.22,
+        25.22,
+        25.47,
+        25.47,
+        25.47,
+        25.72,
+        25.72,
+        25.72,
+        25.88,
+        26.72,
+        26.88,
+        31.57
+      ],
+      "worker_vm_minutes": 728.15,
+      "infrastructure_boot_min": {
+        "min": 0.83,
+        "median": 0.83,
+        "max": 0.92
+      },
+      "source_export": {
+        "sha256": "8ccc360e37355f15dcd4da01f06c096eba216196105e0b61104588cabceb39b2",
+        "bytes": 81447,
+        "rows": 463,
+        "retrieved": "2026-09-02",
+        "retained_in_repo": false
+      }
+    }
+  ]
+}
