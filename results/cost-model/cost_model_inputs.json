@@ -6,53 +6,61 @@
     "date": "2026-08-23",
     "anchor_bucket": "user_reported",
     "totals": {
-      "vm_hours": 24.55,
-      "vcpu_hours": 317.73,
-      "usd_on_demand": 16.38,
+      "vm_hours": 22.82,
+      "vcpu_hours": 279.66,
+      "vm_hours_if_all_lived_the_wall_clock": 30.99,
+      "scheduler_vm_hours_unpriced": 1.36,
+      "usd_on_demand": 14.71,
       "usd_billed_spot": 7.28,
-      "implied_spot_factor": 0.445,
-      "credits_billed": 268.11,
-      "implied_credits_per_vcpu_hour": 0.844,
-      "corroboration": "The 0.445 this run implies is derived from two user-reported figures and is reported as a point inside the band, never as the band's replacement."
+      "implied_spot_factor": 0.495,
+      "credits_billed": 268.1063,
+      "implied_credits_per_vcpu_hour": 0.959,
+      "corroboration": "The spot factor this run implies divides a user-reported dollar figure by a measured fleet shape, so it is reported as a point inside the band and never as the band's replacement."
     },
     "decomposition": {
-      "boot_vm_min": 320.0,
-      "useful_vm_min": 643.0,
-      "idle_vm_min": 510.0,
-      "useful_fraction_of_vm_time": 0.437,
-      "boot_usd_on_demand": 3.46,
-      "useful_usd_on_demand": 7.71,
-      "idle_usd_on_demand": 5.21,
+      "boot_vm_min": 304.0,
+      "useful_vm_min": 592.0,
+      "idle_vm_min": 473.0,
+      "useful_fraction_of_vm_time": 0.432,
+      "boot_usd_on_demand": 3.33,
+      "useful_usd_on_demand": 6.95,
+      "idle_usd_on_demand": 4.43,
       "per_cluster": [
         {
           "cluster": "offsets_round_1",
+          "cluster_id": "1954303",
           "vms": 15.0,
-          "wall_min": 31.0,
-          "vm_min_total": 465.0,
+          "wall_min": 35.19,
+          "vm_min_total": 506.9,
+          "vm_min_if_all_lived_the_wall_clock": 527.8,
           "vm_min_boot": 75.0,
           "vm_min_useful": 90.0,
-          "vm_min_idle": 300.0,
-          "usd_on_demand": 3.91
+          "vm_min_idle": 341.9,
+          "usd_on_demand": 4.26
         },
         {
           "cluster": "offsets_round_2",
+          "cluster_id": "1954376",
           "vms": 14.0,
-          "wall_min": 7.0,
-          "vm_min_total": 98.0,
-          "vm_min_boot": 70.0,
-          "vm_min_useful": 28.0,
-          "vm_min_idle": 0.0,
-          "usd_on_demand": 0.82
+          "wall_min": 14.54,
+          "vm_min_total": 134.3,
+          "vm_min_if_all_lived_the_wall_clock": 203.6,
+          "vm_min_boot": 54.5,
+          "vm_min_useful": 54.0,
+          "vm_min_idle": 25.8,
+          "usd_on_demand": 1.13
         },
         {
           "cluster": "composite_round_1",
+          "cluster_id": "1954375",
           "vms": 35.0,
-          "wall_min": 26.0,
-          "vm_min_total": 910.0,
+          "wall_min": 32.23,
+          "vm_min_total": 728.1,
+          "vm_min_if_all_lived_the_wall_clock": 1128.0,
           "vm_min_boot": 175.0,
-          "vm_min_useful": 525.0,
-          "vm_min_idle": 210.0,
-          "usd_on_demand": 11.65
+          "vm_min_useful": 448.1,
+          "vm_min_idle": 105.0,
+          "usd_on_demand": 9.32
         }
       ]
     }
@@ -69,13 +77,13 @@
     "mean_land_fraction": 0.757
   },
   "layers": {
-    "compute_usd_on_demand": 4723.0,
-    "compute_offsets_usd": 555.0,
-    "compute_composite_usd": 4168.0,
-    "compute_composite_share": 0.882,
-    "provisioning_usd_on_demand": 5149.0,
-    "provisioning_offsets_usd": 2093.0,
-    "provisioning_composite_usd": 3056.0,
+    "compute_usd_on_demand": 4235.0,
+    "compute_offsets_usd": 677.0,
+    "compute_composite_usd": 3558.0,
+    "compute_composite_share": 0.84,
+    "provisioning_usd_on_demand": 4561.0,
+    "provisioning_offsets_usd": 2338.0,
+    "provisioning_composite_usd": 2223.0,
     "note": "Consolidation acts on the provisioning line alone. It amortizes provisioning across tiles and does not make one full tile faster."
   },
   "measured_idle": {
@@ -93,20 +101,20 @@
       "retry_uplift": 0.15,
       "contingency": 0.25,
       "aws_usd_on_demand_basis": {
-        "low": 14191.0,
-        "high": 14191.0
+        "low": 12644.0,
+        "high": 12644.0
       },
       "aws_usd_spot": {
-        "low": 4281.0,
-        "high": 10667.0
+        "low": 3817.0,
+        "high": 9507.0
       },
       "storage_usd_month": 24.0,
       "coiled_credits": {
-        "low": 166059.0,
-        "high": 345955.0
+        "low": 218207.0,
+        "high": 242641.0
       },
       "coiled_usd": null,
-      "all_in_usd_formula": "$4,281-$10,667 AWS + 166,059-345,955 credits x P_credit",
+      "all_in_usd_formula": "$3,817-$9,507 AWS + 218,207-242,641 credits x P_credit",
       "vs_approval_ceiling": "the AWS term alone lies above the ceiling across the whole interval. The all-in figure adds an unpriced credit term, so no scenario here demonstrates that the build fits $3,000, and none is offered as one. The ceiling is an approval constraint, not a target."
     },
     {
@@ -118,20 +126,20 @@
       "retry_uplift": 0.15,
       "contingency": 0.25,
       "aws_usd_on_demand_basis": {
-        "low": 8270.0,
-        "high": 10490.0
+        "low": 7399.0,
+        "high": 9366.0
       },
       "aws_usd_spot": {
-        "low": 2505.0,
-        "high": 7892.0
+        "low": 2244.0,
+        "high": 7049.0
       },
       "storage_usd_month": 24.0,
       "coiled_credits": {
-        "low": 96769.0,
-        "high": 255734.0
+        "low": 127690.0,
+        "high": 179732.0
       },
       "coiled_usd": null,
-      "all_in_usd_formula": "$2,505-$7,892 AWS + 96,769-255,734 credits x P_credit",
+      "all_in_usd_formula": "$2,244-$7,049 AWS + 127,690-179,732 credits x P_credit",
       "vs_approval_ceiling": "the AWS interval straddles the ceiling. The all-in figure adds an unpriced credit term, so no scenario here demonstrates that the build fits $3,000, and none is offered as one. The ceiling is an approval constraint, not a target."
     },
     {
@@ -143,20 +151,20 @@
       "retry_uplift": 0.05,
       "contingency": 0.15,
       "aws_usd_on_demand_basis": {
-        "low": 6014.0,
-        "high": 6636.0
+        "low": 5389.0,
+        "high": 5940.0
       },
       "aws_usd_spot": {
-        "low": 1828.0,
-        "high": 5001.0
+        "low": 1641.0,
+        "high": 4479.0
       },
       "storage_usd_month": 24.0,
       "coiled_credits": {
-        "low": 70373.0,
-        "high": 161767.0
+        "low": 93003.0,
+        "high": 113985.0
       },
       "coiled_usd": null,
-      "all_in_usd_formula": "$1,828-$5,001 AWS + 70,373-161,767 credits x P_credit",
+      "all_in_usd_formula": "$1,641-$4,479 AWS + 93,003-113,985 credits x P_credit",
       "vs_approval_ceiling": "the AWS interval straddles the ceiling. The all-in figure adds an unpriced credit term, so no scenario here demonstrates that the build fits $3,000, and none is offered as one. The ceiling is an approval constraint, not a target."
     }
   ],

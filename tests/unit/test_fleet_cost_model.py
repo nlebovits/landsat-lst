@@ -2,17 +2,19 @@
 
 Three things are pinned here and each has already been got wrong once.
 
-**The anchor's reconciliation.** The model is usable because three figures from
-one run agree: the fleet shape prices to $16.38 on-demand against $7.28
-reported (0.445, matching the 0.44 sample in ``pricing.json``), and the same
-shape is 317.73 vCPU-hours against 268.11 credits reported (0.844, inside the
-0.6-1.25 band in ``quota.py``). Editing the shape without editing the anchors
-breaks that agreement silently and turns every projection into arithmetic about
-nothing.
+**The anchor's reconciliation.** The model is usable because figures from one
+run agree. The measured fleet shape prices to $14.71 on-demand against $7.28
+reported, a spot factor of 0.495 inside the 0.30-0.75 band, and it is 279.7
+vCPU-hours against 268.1063 credits billed, a rate of 0.959. Editing the shape
+without editing the anchors breaks that agreement silently and turns every
+projection into arithmetic about nothing.
 
-**The buckets.** No billing export for that run exists in any commit of this
-repository, so the anchor is ``user_reported`` and a test says so. An earlier
-draft labelled it measured, which reads as an invoice nobody can produce.
+**The buckets.** The three Coiled cluster event log exports were recovered on
+2026-09-02 and are retained by digest in ``cluster_records.json``, so the fleet
+shape and the credit total are ``measured`` and read per worker rather than per
+cluster. No AWS invoice or cost export exists in any commit, so the dollar
+anchor stays ``user_reported`` and a test says so. Promoting it would read as an
+invoice nobody can produce.
 
 **The ranges.** Capture and the credit price are unmeasured, so the model emits
 intervals and a formula. A scalar would price an unverified premise as settled.
@@ -24,6 +26,8 @@ test that fails on rounding gets disabled within a month.
 from __future__ import annotations
 
 import importlib.util
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -48,13 +52,31 @@ class TestReconciliation:
         assert lo <= t["implied_spot_factor"] <= hi
 
     def test_the_implied_spot_factor_matches_the_pricing_json_sample(self):
-        # pricing.json samples r6i.4xlarge at 0.44 on the same day; the run
-        # implies 0.445. Agreement within 0.05 is the corroboration.
-        assert abs(fcm.reference_totals()["implied_spot_factor"] - 0.44) < 0.05
+        # pricing.json samples 0.35 / 0.44 / 0.71 on the same day. The measured
+        # shape implies 0.495, which is the 0.44 sample within 0.1 and no
+        # tighter: the numerator is still a spoken figure.
+        assert abs(fcm.reference_totals()["implied_spot_factor"] - 0.44) < 0.1
 
     def test_the_implied_credit_rate_sits_inside_the_observed_band(self):
         lo, hi = fcm.CREDITS_PER_VCPU_HOUR_BAND
         assert lo <= fcm.reference_totals()["implied_credits_per_vcpu_hour"] <= hi
+
+    def test_the_credit_rate_band_is_derived_from_the_three_clusters(self):
+        # quota.py's 0.6-1.25 divided credits by vms x cluster lifetime, which
+        # charges every worker the wall clock of the slowest. Per worker the
+        # three clusters agree to about a tenth of a credit, which is why
+        # CREDITS_PER_VCPU_HOUR = 1.0 is usable rather than a coin flip.
+        lo, hi = fcm.CREDITS_PER_VCPU_HOUR_BAND
+        assert hi - lo < 0.2
+        assert lo > 0.6
+
+    def test_one_credit_per_vcpu_hour_stays_conservative(self):
+        # quota.py prices a run at 1.0 credits per vCPU-hour. It has to sit at
+        # or above what the run billed, because a rate that understates lets an
+        # unaffordable run start.
+        t = fcm.reference_totals()
+        assert t["vcpu_hours"] * 1.0 >= t["credits_billed"]
+        assert t["vcpu_hours"] * 1.0 / t["credits_billed"] < 1.10
 
 
 class TestDecomposition:
@@ -71,13 +93,26 @@ class TestDecomposition:
         d = fcm.decompose_reference_run()
         assert min(d.boot_vm_min, d.useful_vm_min, d.idle_vm_min) >= 0.0
 
-    def test_a_recovery_round_is_mostly_boot(self):
-        # offsets_round_2 lived 7 minutes against a 5-minute boot. A model that
-        # let a short round claim the full compute budget would understate what
-        # retries cost.
+    def test_a_recovery_round_spends_the_most_of_itself_booting(self):
+        # Five of offsets_round_2's fourteen workers lived 1.89 minutes and
+        # never reached compute, so 41% of its billed VM-time is boot against
+        # 24% for the composite round. A model that let a short round claim the
+        # full compute budget would understate what retries cost.
         d = fcm.decompose_reference_run()
-        r2 = next(c for c in d.per_cluster if c["cluster"] == "offsets_round_2")
-        assert r2["vm_min_boot"] > r2["vm_min_useful"]
+        by_stage = {c["cluster"]: c for c in d.per_cluster}
+        share = {k: v["vm_min_boot"] / v["vm_min_total"] for k, v in by_stage.items()}
+        assert share["offsets_round_2"] > share["composite_round_1"]
+        assert share["offsets_round_2"] > share["offsets_round_1"]
+
+    def test_billed_vm_time_is_read_per_worker_not_per_cluster(self):
+        # The whole point of the recovered records. Charging every worker its
+        # cluster's wall clock overstates the run by a third, and it overstates
+        # the composite fleet most, which is the fleet carrying the cost.
+        d = fcm.decompose_reference_run()
+        for c in d.per_cluster:
+            assert c["vm_min_total"] <= c["vm_min_if_all_lived_the_wall_clock"]
+        comp = next(c for c in d.per_cluster if c["cluster"] == "composite_round_1")
+        assert comp["vm_min_total"] < 0.7 * comp["vm_min_if_all_lived_the_wall_clock"]
 
 
 class TestProvenance:
@@ -86,13 +121,35 @@ class TestProvenance:
     def test_every_registered_quantity_carries_a_known_bucket(self):
         assert {q.bucket for q in fcm.REGISTER} <= set(fcm.BUCKETS)
 
-    def test_the_billing_anchors_are_user_reported_not_measured(self):
-        # No invoice, no cost export, no billing artifact exists in any commit.
-        # Labelling these measured claims an artifact nobody can produce.
+    def test_the_aws_dollar_anchor_stays_user_reported(self):
+        # The recovered records are Coiled event logs and Coiled billing
+        # activity. Neither carries an AWS dollar figure, and no invoice or cost
+        # export exists in any commit. Promoting this claims an artifact nobody
+        # can produce.
         buckets = {q.name: q.bucket for q in fcm.REGISTER}
         assert buckets["reference_billed_aws_usd"] == "user_reported"
-        assert buckets["reference_billed_credits"] == "user_reported"
-        assert buckets["reference_fleet_shape"] == "user_reported"
+
+    def test_the_recovered_records_are_measured(self):
+        buckets = {q.name: q.bucket for q in fcm.REGISTER}
+        assert buckets["reference_fleet_shape"] == "measured"
+        assert buckets["reference_billed_credits"] == "measured"
+        assert buckets["reference_worker_lifetimes"] == "measured"
+
+    def test_the_retained_artifact_carries_no_instance_address(self):
+        # The exports the records come from carry private VPC addresses. They
+        # are not in the repository and neither is any address they held.
+        text = fcm.CLUSTER_RECORDS_FILE.read_text()
+        assert not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text)
+
+    def test_the_retained_artifact_carries_the_export_digests(self):
+        # Provenance without publication: the CSVs stay private and the model
+        # stays checkable against them.
+        doc = json.loads(fcm.CLUSTER_RECORDS_FILE.read_text())
+        for cluster in doc["clusters"]:
+            src = cluster["source_export"]
+            assert len(src["sha256"]) == 64
+            assert src["bytes"] > 0
+            assert src["retained_in_repo"] is False
 
     def test_unknown_quantities_carry_no_value(self):
         # An unknown given a value is an unknown priced at that value.
@@ -146,8 +203,10 @@ class TestLayers:
         return fcm.tile_equivalents({"S30W065": 4138, "A": 4138, "B": 2000}, {}, "S30W065")
 
     def test_the_composite_dominates_compute(self):
-        # 88% on the reference shape. Every further saving after consolidation
-        # has to come from that pass rather than from scheduling.
+        # 84% on the measured shape, down from 88% on the transcribed one
+        # because the composite fleet is where the staggered exits were. Every
+        # further saving after consolidation still has to come from that pass
+        # rather than from scheduling.
         assert fcm.layers(self._equiv())["compute_composite_share"] > 0.8
 
     def test_consolidation_touches_provisioning_only(self):

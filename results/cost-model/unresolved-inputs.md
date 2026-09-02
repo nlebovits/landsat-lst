@@ -1,8 +1,9 @@
 # Unresolved inputs
 
 Three are `unknown` and block a conclusion. Four more are `assumed` and each
-carries enough weight to move the answer. For every one, the observation that
-would settle it.
+carries enough weight to move the answer. One is `user_reported` and survived
+the 2026-09-02 recovery of the cluster records. For every one, the observation
+that would settle it.
 
 ---
 
@@ -26,7 +27,7 @@ trivial units, more units than workers. Count the workers that start and record
 how the units distribute across them. Cost is about $0.50. It is not
 authorized and has not been run.
 
-**What it moves.** Everything. The AWS interval spans $1,828 to $10,667 across
+**What it moves.** Everything. The AWS interval spans $1,641 to $9,507 across
 the capture range, so this one boolean is worth more than a factor of five on
 the term that has a price at all.
 
@@ -37,9 +38,12 @@ the term that has a price at all.
 **Why it blocks.** All-in cost is `AWS + credits x P_credit`. Nothing in this
 repository records a marginal credit price for this account. Collapsing the
 formula to a scalar prices the unknown term at zero, and the term is large: at
-$0.01 per credit the `conservative` scenario adds $968 to $2,557, and at $0.05
-it adds $4,838 to $12,787, which exceeds the AWS bill. The all-in figure is
-unbounded above until the price is known.
+$0.01 per credit the `conservative` scenario adds $1,277 to $1,797, and at $0.05
+it adds $6,385 to $8,987, which exceeds the AWS bill. The all-in figure is
+unbounded above until the price is known. The measured credit rate narrowed the
+credit interval from a factor of 2.1 wide to 1.1, which sharpens this question
+rather than answering it: the quantity is now well bounded and its price is
+still not.
 
 **What would settle it.** One question to the account owner, or one invoice
 line showing dollars against credits for a known period.
@@ -69,10 +73,13 @@ owner for the quota and its reset period.
 
 **Status:** assumed at 15 minutes, from the fastest VM's 20 minus one boot.
 
-**Why it matters.** The composite carries 88% of compute. The fleet's spread
-was 20 to 32 minutes and the model attributes all of it to straggler and
-barrier time rather than to work. If half the spread is work, the composite
-term rises about 40% and the whole build's compute floor rises with it.
+**Why it matters.** The composite carries 84% of compute. The recovered cluster
+records give the spread exactly, 13.9 to 31.6 minutes across 35 workers, and the
+model still attributes all of it to straggler and barrier time rather than to
+work. If half the spread is work, the composite term rises about 40% and the
+whole build's compute floor rises with it. The records make the denominator
+exact and leave this numerator where it was, so the assumption now stands out
+rather than hiding inside a transcribed shape.
 
 **What would settle it.** Publish per-unit start and finish stamps from each
 shard's own state objects. The driver already writes state per attempt, so this
@@ -92,7 +99,23 @@ direction and the model cannot bound it.
 
 **What would settle it.** A per-tile solar-day group count for all 700 tiles.
 It is a STAC metadata job rather than a compute job, it needs no cloud run, and
-it removes the largest uncertainty in the term carrying 88% of compute.
+it removes the largest uncertainty in the term carrying 84% of compute.
+
+### U5a. The AWS dollar anchor
+
+**Status:** `user_reported`, at $7.28 for the reference tile.
+
+**Why it matters.** It is the only billing figure the 2026-09-02 recovery did
+not settle. The three recovered exports are Coiled cluster event logs and Coiled
+billing activity, and neither carries an AWS dollar figure. `$2.19 + $4.55 +
+$0.54` appears in no commit of this repository. Every AWS interval in section 5
+runs the measured fleet shape through the `pricing.json` spot band rather than
+through this number, so nothing depends on it arithmetically. What depends on it
+is the corroboration: `7.28 / 14.71 = 0.495` against the 0.44 spot sample of the
+same day is the check that the shape and the bill describe one run.
+
+**What would settle it.** The AWS Cost Explorer export or the invoice line for
+2026-08-23, filtered to the run's account and region.
 
 ### U6. The capture band itself
 

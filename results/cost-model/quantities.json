@@ -16,44 +16,139 @@
           "offsets_round_1",
           15.0,
           8,
-          31.0,
+          35.19,
           0.504
         ],
         [
           "offsets_round_2",
           14.0,
           8,
-          7.0,
+          14.54,
           0.504
         ],
         [
           "composite_round_1",
           35.0,
           16,
-          26.0,
+          32.23,
           0.768
         ]
       ],
-      "unit": "(vms, vcpus, minutes, usd/h) per cluster",
-      "bucket": "user_reported",
-      "source": "S30W065 2026-08-23, transcribed into quota.py and test_driver_state_machine.py; no billing export retained",
-      "upgrade": "Attach the Coiled billing activity export for that run under results/."
+      "unit": "(vms, vcpus, cluster minutes, usd/h) per cluster",
+      "bucket": "measured",
+      "source": "S30W065 2026-08-23, clusters 1954303 / 1954376 / 1954375, from the Coiled cluster event log exports retained by SHA-256 digest in cluster_records.json",
+      "upgrade": "Nothing for the shape itself. The exports carry no instance type for the scheduler each cluster also runs, so that VM-time is counted and left unpriced."
+    },
+    {
+      "name": "reference_worker_lifetimes",
+      "value": {
+        "1954303": [
+          31.91,
+          33.25,
+          33.42,
+          33.42,
+          33.42,
+          33.58,
+          33.84,
+          33.84,
+          33.84,
+          34.08,
+          34.25,
+          34.42,
+          34.42,
+          34.42,
+          34.75
+        ],
+        "1954376": [
+          1.89,
+          1.89,
+          1.89,
+          1.89,
+          1.89,
+          13.76,
+          13.76,
+          13.76,
+          13.76,
+          13.76,
+          13.99,
+          13.99,
+          14.02,
+          14.02
+        ],
+        "1954375": [
+          13.92,
+          14.18,
+          14.18,
+          14.18,
+          14.18,
+          14.42,
+          14.42,
+          14.42,
+          14.67,
+          14.92,
+          14.92,
+          15.68,
+          15.93,
+          15.93,
+          17.19,
+          20.28,
+          22.62,
+          23.7,
+          23.97,
+          24.71,
+          24.71,
+          24.98,
+          24.98,
+          25.22,
+          25.22,
+          25.47,
+          25.47,
+          25.47,
+          25.72,
+          25.72,
+          25.72,
+          25.88,
+          26.72,
+          26.88,
+          31.57
+        ]
+      },
+      "unit": "minutes per worker, per cluster",
+      "bucket": "measured",
+      "source": "'Instance starting' to each worker's last event, summing to 1369.3 worker VM-minutes against 1859.5 for vms x cluster lifetime. Five of the recovery round's fourteen workers lived 1.89 minutes and never reached compute",
+      "upgrade": "Nothing. It is the billed window the event log records."
+    },
+    {
+      "name": "reference_scheduler_vm_hours",
+      "value": 1.36,
+      "unit": "VM-hours",
+      "bucket": "measured",
+      "source": "every cluster runs a scheduler instance beside its workers and the event log times all three. The fleet shape counts workers only, so this VM-time sits outside every figure below",
+      "upgrade": "The export gives no instance type for the scheduler, so the model reports this VM-time and declines to price it."
+    },
+    {
+      "name": "vm_infrastructure_boot_minutes",
+      "value": 0.92,
+      "unit": "minutes",
+      "bucket": "measured",
+      "source": "worst per-cluster median of 'Queued for launch' to 'Successfully phoned home' across the three clusters: 0.75 / 0.92 / 0.83",
+      "upgrade": "Nothing, and it does not replace vm_boot_minutes. It stops when dask registers, before the software environment starts and before the first task runs, so it is a component of the 5-minute figure rather than a contradiction of it."
     },
     {
       "name": "reference_billed_aws_usd",
       "value": 7.28,
       "unit": "USD",
       "bucket": "user_reported",
-      "source": "$2.19 + $4.55 + $0.54 spot, spoken; appears in no commit of this repository",
+      "source": "$2.19 + $4.55 + $0.54 spot, spoken; appears in no commit of this repository. The cluster records recovered on 2026-09-02 are Coiled event logs and Coiled billing activity, neither of which carries an AWS dollar figure",
       "upgrade": "Attach the AWS Cost Explorer export or invoice line for 2026-08-23."
     },
     {
       "name": "reference_billed_credits",
-      "value": 268.11,
+      "value": 268.1063,
       "unit": "Coiled credits",
-      "bucket": "user_reported",
-      "source": "quota.py docstring, per cluster 67.81 / 16.15 / 184.15; no billing export retained",
-      "upgrade": "Attach the Coiled billing activity export for that run under results/."
+      "bucket": "measured",
+      "source": "Coiled billing activity per cluster, 67.8106 / 16.1450 / 184.1507, retained per cluster in cluster_records.json. The total reproduces the 268.11 quota.py already carried, so what the record changes is the denominator, not this",
+      "upgrade": "Nothing. The per-cluster split is the observation."
     },
     {
       "name": "vm_boot_minutes",
@@ -85,7 +180,7 @@
       "unit": "minutes",
       "bucket": "assumed",
       "source": "the fastest VM's wall clock minus one boot, treating the 20-32 spread as straggler and barrier time rather than work",
-      "upgrade": "Per-unit timings would make this derived. If half the spread is work, the composite term rises about 40% and it already carries 88% of compute."
+      "upgrade": "Per-unit timings would make this derived. If half the spread is work, the composite term rises about 40% and it already carries 84% of compute."
     },
     {
       "name": "spot_fraction_band",
@@ -101,13 +196,13 @@
     {
       "name": "credits_per_vcpu_hour_band",
       "value": [
-        0.6,
-        1.25
+        0.902,
+        1.003
       ],
       "unit": "credits per vCPU-hour",
-      "bucket": "assumed",
-      "source": "quota.py observed band across the run's three clusters; the spread is staggered VM lifetimes rather than a different rate",
-      "upgrade": "A billing export with per-VM lifetimes would make this derived and narrow."
+      "bucket": "derived",
+      "source": "per-cluster credits over per-cluster measured worker vCPU-hours: 0.902 / 0.948 / 1.003. quota.py's 0.6-1.25 ran the same division against vms x cluster lifetime, which charges every worker for the wall clock of the slowest. Its width was the staggered exits, exactly as its own note guessed, and not a varying rate",
+      "upgrade": "Nothing from this run. A second billed run would say whether the rate moves between workspaces or over time."
     },
     {
       "name": "s3_standard_usd_per_gb_month",
@@ -208,54 +303,54 @@
       "unit": "basis",
       "bucket": "assumed",
       "source": "scene_counts.json counts STAC items; budgets._scene_count uses solar-day time steps, and the reference run's observed composite matches the solar-day basis within 7% against 3.7x off the item basis. The model scales by a ratio against the same reference, so a constant items-per-group factor cancels exactly",
-      "upgrade": "A per-tile solar-day count for all 700 tiles. It is a STAC metadata job, not a compute job, and it removes the largest uncertainty in the term carrying 88% of compute. What does not cancel is the variation: WRS-2 path overlap grows toward the poles, so item-scaling overstates high-latitude tiles. The residual bias is conservative and the model cannot bound it."
+      "upgrade": "A per-tile solar-day count for all 700 tiles. It is a STAC metadata job, not a compute job, and it removes the largest uncertainty in the term carrying 84% of compute. What does not cancel is the variation: WRS-2 path overlap grows toward the poles, so item-scaling overstates high-latitude tiles. The residual bias is conservative and the model cannot bound it."
     },
     {
       "name": "reference_vm_hours",
-      "value": 24.55,
+      "value": 22.82,
       "unit": "VM-hours",
       "bucket": "derived",
-      "source": "sum(vms x minutes) / 60 over the fleet shape: (15x31 + 14x7 + 35x26) / 60. Inherits user_reported.",
+      "source": "sum of every worker's own billed window / 60, from the cluster event logs. The transcribed shape gave 24.55 by charging all 64 workers the wall clock of their cluster; vms x cluster lifetime on the measured lifetimes gives 30.68. Inherits measured.",
       "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
     },
     {
       "name": "reference_vcpu_hours",
-      "value": 317.73,
+      "value": 279.66,
       "unit": "vCPU-hours",
       "bucket": "derived",
-      "source": "sum(vms x vcpus x minutes) / 60: (15x8x31 + 14x8x7 + 35x16x26) / 60. Inherits user_reported.",
+      "source": "sum over workers of lifetime x that cluster's vcpus / 60. The transcribed shape gave 317.73, 12 percent higher, because the 16-vCPU composite fleet was the one whose workers exited most unevenly. Inherits measured.",
       "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
     },
     {
       "name": "reference_usd_on_demand",
-      "value": 16.38,
+      "value": 14.71,
       "unit": "USD",
       "bucket": "derived",
-      "source": "VM-hours per cluster x the pricing.json list rate. Inherits measured prices and a user_reported shape.",
+      "source": "measured worker VM-hours per cluster x the pricing.json list rate. Both inputs are measured, so this one is not weakened by its shape any more.",
       "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
     },
     {
       "name": "implied_spot_factor",
-      "value": 0.445,
+      "value": 0.495,
       "unit": "fraction of on-demand",
       "bucket": "derived",
-      "source": "7.28 / 16.38. Both inputs user_reported, so this corroborates the anchor against pricing.json's 0.44 sample rather than measuring a spot rate.",
+      "source": "7.28 / 14.71. The denominator is measured and the numerator is not, so this corroborates the AWS anchor against pricing.json's 0.44 sample rather than measuring a spot rate. It sits inside the 0.30-0.75 band either way.",
       "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
     },
     {
       "name": "implied_credits_per_vcpu_hour",
-      "value": 0.844,
+      "value": 0.959,
       "unit": "credits per vCPU-hour",
       "bucket": "derived",
-      "source": "268.11 / 317.73. Inherits user_reported, and sits inside quota.py's 0.6-1.25 band.",
+      "source": "268.1063 / 279.66. Both inputs measured. Against the transcribed shape this read 0.844, which understated the rate by charging vCPU-hours the fleet never billed.",
       "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
     },
     {
       "name": "reference_useful_fraction_of_vm_time",
-      "value": 0.437,
+      "value": 0.432,
       "unit": "fraction",
       "bucket": "derived",
-      "source": "643 useful VM-min / 1473 total. Idle is the residue after boot and compute, so it carries the error in both compute assumptions.",
+      "source": "592 useful VM-min / 1369 total. The denominator is measured and the numerator is not: idle is the residue after boot and compute, so it carries the error in both compute assumptions. offsets_round_1 shows the strain, booking 342 of its 507 VM-minutes as idle because a 6-minute per-unit figure is applied to VMs that lived 34 minutes processing many units.",
       "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
     },
     {
@@ -292,7 +387,7 @@
     },
     {
       "name": "compute_usd_on_demand",
-      "value": 4723.0,
+      "value": 4235.0,
       "unit": "USD on-demand",
       "bucket": "derived",
       "source": "per-stage useful dollars x that stage's equivalents. Work the pipeline must do whatever schedules it, so consolidation cannot touch it.",
@@ -300,7 +395,7 @@
     },
     {
       "name": "provisioning_usd_on_demand",
-      "value": 5149.0,
+      "value": 4561.0,
       "unit": "USD on-demand",
       "bucket": "derived",
       "source": "per-stage (boot + idle) dollars x that stage's equivalents. The only layer consolidation acts on.",
@@ -308,7 +403,7 @@
     },
     {
       "name": "compute_composite_share",
-      "value": 0.882,
+      "value": 0.84,
       "unit": "fraction",
       "bucket": "derived",
       "source": "composite compute / total compute. After consolidation every further dollar has to come from this pass rather than from scheduling.",
@@ -317,8 +412,8 @@
     {
       "name": "aws_usd_spot_queues_surplus_false",
       "value": {
-        "low": 4281.0,
-        "high": 10667.0
+        "low": 3817.0,
+        "high": 9507.0
       },
       "unit": "USD interval",
       "bucket": "derived",
@@ -328,19 +423,19 @@
     {
       "name": "coiled_credits_queues_surplus_false",
       "value": {
-        "low": 166059.0,
-        "high": 345955.0
+        "low": 218207.0,
+        "high": 242641.0
       },
       "unit": "credit interval",
       "bucket": "derived",
-      "source": "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the 0.6-1.25 credit rate band. Never multiplied by a dollar price.",
+      "source": "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the 0.902-1.003 measured credit rate band. Never multiplied by a dollar price.",
       "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
     },
     {
       "name": "aws_usd_spot_conservative",
       "value": {
-        "low": 2505.0,
-        "high": 7892.0
+        "low": 2244.0,
+        "high": 7049.0
       },
       "unit": "USD interval",
       "bucket": "derived",
@@ -350,19 +445,19 @@
     {
       "name": "coiled_credits_conservative",
       "value": {
-        "low": 96769.0,
-        "high": 255734.0
+        "low": 127690.0,
+        "high": 179732.0
       },
       "unit": "credit interval",
       "bucket": "derived",
-      "source": "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the 0.6-1.25 credit rate band. Never multiplied by a dollar price.",
+      "source": "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the 0.902-1.003 measured credit rate band. Never multiplied by a dollar price.",
       "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
     },
     {
       "name": "aws_usd_spot_design_band",
       "value": {
-        "low": 1828.0,
-        "high": 5001.0
+        "low": 1641.0,
+        "high": 4479.0
       },
       "unit": "USD interval",
       "bucket": "derived",
@@ -372,12 +467,12 @@
     {
       "name": "coiled_credits_design_band",
       "value": {
-        "low": 70373.0,
-        "high": 161767.0
+        "low": 93003.0,
+        "high": 113985.0
       },
       "unit": "credit interval",
       "bucket": "derived",
-      "source": "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the 0.6-1.25 credit rate band. Never multiplied by a dollar price.",
+      "source": "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the 0.902-1.003 measured credit rate band. Never multiplied by a dollar price.",
       "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
     }
   ]

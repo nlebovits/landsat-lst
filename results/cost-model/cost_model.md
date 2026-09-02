@@ -61,7 +61,7 @@ percentile. Three things follow.
   pixel-count ratio. Gate 5 says the 100 m wall time, AWS cost, and Coiled
   credits are unmeasured.
 
-The composite term carries 88% of this model's compute. A cost number carried
+The composite term carries 84% of this model's compute. A cost number carried
 across #121 without recalibration is stale, and the model stamps
 `pipeline_regime` into every output so a reader cannot miss which pipeline a
 figure belongs to.
@@ -74,27 +74,68 @@ stronger bucket.
 
 | Bucket | Meaning | Count |
 |---|---|---|
-| `measured` | A retained artifact in this repository is the observation itself | 3 |
-| `derived` | Arithmetic over other quantities, never stronger than its weakest input | 18 |
-| `assumed` | A modelling choice, with a value, a range, and a sensitivity | 8 |
-| `user_reported` | Transcribed from an external system, no export retained | 6 |
-| `unknown` | Cannot be settled from this repository, never given a value | 3 |
+| Bucket | Was | Now |
+|---|---|---|
+| `measured` | 3 | 8 |
+| `derived` | 18 | 19 |
+| `assumed` | 8 | 7 |
+| `user_reported` | 6 | 4 |
+| `unknown` | 3 | 3 |
 
-**The billing anchor is `user_reported`, and an earlier draft of this model
-called parts of it measured.** A search of every commit in this repository
-finds no invoice, no cost export, and no billing artifact. `$7.28` and `268.11`
-survive as prose in `quota.py` and as class constants in
-`tests/unit/test_driver_state_machine.py`, which retain a transcription rather
-than an observation. The fleet shape is in the same bucket for the same reason,
-and so are `budgets.VM_BOOT_S` and ADR-016's six-minute offsets shard.
+**Half the billing anchor stopped being a transcription on 2026-09-02.** The
+three Coiled cluster event log exports for the reference run were recovered and
+are retained by SHA-256 digest in `cluster_records.json`. The exports carry
+private VPC instance addresses, so they stay out of the repository and their
+digests, byte counts, row counts, and retrieval date stand in for them. What the
+records settle is the fleet shape, every worker's own billed window, the
+scheduler instance beside each fleet, and the per-cluster credit split. Those
+move to `measured`, along with three quantities the records make visible for the
+first time: `reference_worker_lifetimes`, `reference_scheduler_vm_hours`, and
+`vm_infrastructure_boot_minutes`.
 
-What keeps the anchor usable is that it is over-determined. The fleet shape
-prices to $16.38 on-demand, and 7.28 / 16.38 = 0.445 lands on the 0.44 sample
-already in `pricing.json`. The same shape is 317.73 vCPU-hours, and
-268.11 / 317.73 = 0.844 sits inside the 0.6 to 1.25 band in `quota.py`. Two
-mistyped figures would both have to land on independently recorded values by
-accident. That is corroboration. It is not measurement, and upgrading the label
-takes a retained billing artifact rather than a second retelling.
+**The AWS dollar anchor did not move.** The recovered records are Coiled event
+logs and Coiled billing activity, and neither carries an AWS dollar figure. A
+search of every commit in this repository still finds no invoice and no cost
+export, so `$7.28` stays `user_reported` and `budgets.VM_BOOT_S` and ADR-016's
+six-minute offsets shard stay there with it.
+
+### What reading the shape per worker changed
+
+The transcribed shape charged all 64 workers the wall clock of their cluster.
+The event logs show workers exiting as they finish, so the fleet's billed time
+is smaller and unevenly so.
+
+| Basis | VM-hours | vCPU-hours | On-demand | Credits per vCPU-h |
+|---|---|---|---|---|
+| Transcribed shape | 24.55 | 317.73 | $16.38 | 0.844 |
+| Workers charged the cluster wall clock | 30.99 | 394.76 | $20.39 | 0.679 |
+| **Measured, per worker** | **22.82** | **279.66** | **$14.71** | **0.959** |
+
+The composite fleet is where the divergence lives: 35 workers over 32.2 minutes
+of wall clock billed 728 VM-minutes rather than 1,128, because its exits spread
+from 13.9 to 31.6 minutes. The recovery round is the other extreme, with five of
+its fourteen workers living 1.89 minutes.
+
+The two implied factors part company as a result. `268.1063 / 279.66 = 0.959`
+divides a measured numerator by a measured denominator, so it measures the
+credit rate. `7.28 / 14.71 = 0.495` still divides a spoken figure by that
+denominator, so it corroborates the AWS anchor against the 0.44 sample in
+`pricing.json` and does not measure a spot rate.
+
+### The credit rate band collapsed, and the total is why it could
+
+The billed total 268.1063 reproduces what `quota.py` already carried, so the
+total settles nothing on its own. The shape does. `quota.py` divided each
+cluster's credits by `vms x cluster lifetime` and got 0.977, 0.605, and 0.617,
+which is where the 0.6 to 1.25 band came from. Per worker the same three
+clusters give **1.003, 0.948, and 0.902**, a spread of a tenth of a credit
+rather than a factor of two. `quota.py`'s own note guessed the cause correctly
+and could not act on it: the width was the staggered exits, not a varying rate.
+
+`CREDITS_PER_VCPU_HOUR = 1.0` therefore holds, and holds better than it did.
+It prices this run at 279.66 credits against 268.1063 billed, **4.3% high**
+where the transcribed shape made it 18.5% high. High is the safe direction: a
+rate that understates lets an unaffordable run start.
 
 ## 1a. Coverage of issue #108's cost gates
 
@@ -154,21 +195,41 @@ boot, treating the fleet's 20 to 32 minute spread as straggler and barrier time
 rather than work. Idle is the residue, so the three terms sum to the reported
 shape.
 
+The split runs worker by worker, which is what the measured lifetimes buy: a
+worker that lived 1.89 minutes is charged 1.89 minutes of boot and no compute,
+where a fleet-wide wall clock would have charged it the full round.
+
 | Term | VM-min | On-demand USD | Share of VM-time |
 |---|---|---|---|
-| Boot | 320 | $3.46 | 22% |
-| Useful compute | 643 | $7.71 | **44%** |
-| Idle, barrier, straggler | 510 | $5.21 | 35% |
-| Total | 1,473 | $16.38 | 100% |
+| Boot | 304 | $3.33 | 22% |
+| Useful compute | 592 | $6.95 | **43%** |
+| Idle, barrier, straggler | 473 | $4.43 | 35% |
+| Total | 1,369 | $14.71 | 100% |
 
-Only 44% of billed VM-time was useful compute. That number is what issue #108
-exists to move, and a model with no term for the other 56% could not price the
-thing being fixed.
+Only 43% of billed VM-time was useful compute. That number is what issue #108
+exists to move, and a model with no term for the other 57% could not price the
+thing being fixed. Every term fell against the transcribed shape and the split
+between them barely moved, which is the useful result: the case for
+consolidation rested on a proportion, and the proportion survived measurement.
 
-**The idle line is `assumed`, not measured.** It is what is left after boot and
-an assumed compute figure, so it absorbs the error in both. No wave record
-carries a completion stamp, so no run has observed it. Section 1a says what
-would change that and why the wave stamps alone are not enough.
+| Cluster | Workers | Wall clock | Billed VM-min | If all lived the wall clock | Boot | Useful | Idle |
+|---|---|---|---|---|---|---|---|
+| 1954303 offsets round 1 | 15 | 35.2 min | 506.9 | 527.8 | 75.0 | 90.0 | 341.9 |
+| 1954376 offsets round 2 | 14 | 14.5 min | 134.3 | 203.6 | 54.5 | 54.0 | 25.8 |
+| 1954375 composite round 1 | 35 | 32.2 min | 728.1 | 1,128.0 | 175.0 | 448.1 | 105.0 |
+
+Each cluster also ran a scheduler instance, 1.36 VM-hours across the three. The
+exports give no instance type for it, so the model counts that VM-time and
+declines to price it.
+
+**The idle line is `assumed`, not measured, and the measurement sharpened why.**
+It is what is left after boot and an assumed compute figure, so it absorbs the
+error in both, and the denominator it is subtracted from is now exact. The
+strain shows in offsets round 1, which books 342 of its 507 VM-minutes as idle
+because ADR-016's six-minute per-unit figure is applied to VMs that lived 34
+minutes processing many units each. That is a claim about the numerator, not
+about the fleet. Section 1a says what would settle it and why the wave stamps
+alone are not enough.
 
 ## 3. Scaling to 700 tiles
 
@@ -195,11 +256,13 @@ offsets-only discount to the stage that dominates the bill.
 
 | Layer | On-demand USD | What it is |
 |---|---|---|
-| Compute | 4,723 | Work the pipeline must do whatever schedules it |
-| Provisioning and idle | 5,149 | Boot, barrier wait, stragglers |
+| Compute | 4,235 | Work the pipeline must do whatever schedules it |
+| Provisioning and idle | 4,561 | Boot, barrier wait, stragglers |
 | Approval | uplifts, storage, ceiling | Retry variance, contingency, the #108 constraint |
 
-Compute splits 88% composite ($4,168) and 12% offsets ($555).
+Compute splits 84% composite ($3,558) and 16% offsets ($677). Both layers fell
+about 10% against the transcribed shape, and the composite share fell from 88%
+to 84% because the composite fleet is the one whose exits were most staggered.
 
 **Consolidation acts on the provisioning layer alone.** It amortizes
 provisioning across many tiles. It does not make one full tile faster, and
@@ -212,13 +275,26 @@ There is no all-in dollar scalar, and there cannot be one while the credit
 price is unknown. Collapsing the formula to a number requires pricing the
 unknown term at zero.
 
-| Scenario | Capture | AWS term (spot 0.30-0.75) | Credits (0.6-1.25 per vCPU-h) |
+| Scenario | Capture | AWS term (spot 0.30-0.75) | Credits (0.902-1.003 per vCPU-h) |
 |---|---|---|---|
-| `queues_surplus_false` | 0.00 | **$4,281 - $10,667** | 166,059 - 345,955 |
-| `conservative` | 0.50 - 0.80 | **$2,505 - $7,892** | 96,769 - 255,734 |
-| `design_band` | 0.85 - 0.95 | **$1,828 - $5,001** | 70,373 - 161,767 |
+| `queues_surplus_false` | 0.00 | **$3,817 - $9,507** | 218,207 - 242,641 |
+| `conservative` | 0.50 - 0.80 | **$2,244 - $7,049** | 127,690 - 179,732 |
+| `design_band` | 0.85 - 0.95 | **$1,641 - $4,479** | 93,003 - 113,985 |
 
 All-in cost is `AWS + credits x P_credit`, and `P_credit` is unknown.
+
+The measured records moved both columns, and moved them in opposite ways. The
+AWS intervals fell about 11% at both ends, because the fleet billed less VM-time
+than the transcribed shape claimed. The credit intervals narrowed from a factor
+of 2.1 wide to a factor of 1.1, and their floors rose by about a third: the
+`design_band` credit floor went from 70,373 to 93,003. Better evidence is not
+the same as a cheaper answer, and here it raised the credit floor while lowering
+the AWS one.
+
+No scenario demonstrates that the build fits the $3,000 approval ceiling. Only
+`design_band` puts the AWS term below it at the bottom of the spot band, the
+other two straddle it or clear it, and every row carries a credit term that
+cannot be converted to dollars while `credit_unit_price_usd` is unknown.
 
 Each interval spans both unmeasured inputs at once: capture at its band's ends,
 and the spot fraction at its band's ends. The spot band 0.30 to 0.75 is valid
@@ -254,18 +330,18 @@ The `conservative` scenario's high end, in order, each factor named. Rates are
 
 | Step | Operation | Result (USD, on-demand) |
 |---|---|---|
-| Compute | offsets useful + composite useful, at their equivalents | 4,723 |
-| Provisioning | boot + idle, at their equivalents | 5,149 |
-| Consolidation | provisioning x (1 - 0.50 capture) | 2,574 |
-| Subtotal | 4,723 + 2,574 | 7,297 |
-| Excess retries | x 1.15 | 8,392 |
-| Contingency | x 1.25 | 10,490 |
-| Spot, high end of band | x 0.75 | 7,868 |
-| Storage | + 1.05 TB x $0.023/GB-month | **7,892** |
+| Compute | offsets useful + composite useful, at their equivalents | 4,235 |
+| Provisioning | boot + idle, at their equivalents | 4,561 |
+| Consolidation | provisioning x (1 - 0.50 capture) | 2,281 |
+| Subtotal | 4,235 + 2,281 | 6,516 |
+| Excess retries | x 1.15 | 7,493 |
+| Contingency | x 1.25 | 9,366 |
+| Spot, high end of band | x 0.75 | 7,025 |
+| Storage | + 1.05 TB x $0.023/GB-month | **7,049** |
 
 The low end of the same row takes capture 0.80 and spot 0.30. Credits follow
-the same VM-time through the 0.6 to 1.25 rate band, and are never multiplied by
-a dollar price.
+the same VM-time through the 0.902 to 1.003 measured rate band, and are never
+multiplied by a dollar price.
 
 The retry uplift is deliberately small. The reference run already contains a
 recovery round, `offsets_round_2`, and a spot reclaim, so the base rate of
@@ -299,8 +375,8 @@ as a target with the sign flipped. It has been removed, and
 - **The saving is bounded by the provisioning layer, which is 52% of the
   on-demand total.** Compute is the other 48% and is the floor no scheduling
   reaches. Comparing at identical uplifts, capture 0.50 takes the AWS term down
-  26%, and capture 0.85 to 0.95 takes it down 44% to 50%.
-- **After consolidation the composite native pass dominates.** 88% of compute
+  26%, and capture 0.85 to 0.95 takes it down 44% to 49%.
+- **After consolidation the composite native pass dominates.** 84% of compute
   is that pass. Every further dollar has to come from the pass rather than from
   scheduling, which is what makes #121's aggregation the next cost question and
   not a separate one.
@@ -339,7 +415,7 @@ cannot bound it.
 
 Producing a per-tile solar-day count is a STAC metadata job rather than a
 compute job, and it would remove the largest uncertainty in the term carrying
-88% of compute.
+84% of compute.
 
 Worth flagging alongside it: `projection.tile_projection(scenes=2930)` is
 documented against N40W075's 2,912 *items*, while `budgets._scene_count` uses

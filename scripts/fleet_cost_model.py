@@ -31,8 +31,10 @@ Five provenance buckets, and a number never carries two:
     A modelling choice. Carries a value, a range, and a sensitivity.
 ``user_reported``
     A person transcribed it from an external system and no export was kept.
-    Every billing anchor in this model is in this bucket, including the fleet
-    shape, because the Coiled billing activity it came from was not retained.
+    The AWS dollar anchor is the one billing figure still in this bucket: no
+    invoice and no cost export for that run exists in any commit. The fleet
+    shape and the credit total left it on 2026-09-02, when the three Coiled
+    cluster event log exports were recovered.
 ``unknown``
     Cannot be settled from this repository. Never given a value, never
     defaulted to zero, and never multiplied into a headline.
@@ -110,26 +112,124 @@ def q(name: str, value: Any, unit: str, *, bucket: str, source: str, upgrade: st
 
 # --- The reference run ------------------------------------------------------
 
-#: (name, vms, vcpus_each, wall_minutes, on_demand_usd_hour)
+CLUSTER_RECORDS_FILE = RESULTS / "cluster_records.json"
+
+
+@dataclass(frozen=True)
+class ClusterRecord:
+    """One Coiled cluster of the reference run, as its own event log describes it."""
+
+    cluster_id: str
+    stage: str
+    instance_type: str
+    vcpus_each: int
+    on_demand_usd_hour: float
+    credits: float
+    workers: int
+    cluster_lifetime_min: float
+    scheduler_lifetime_min: float
+    worker_lifetimes_min: tuple[float, ...]
+
+    @property
+    def vm_minutes(self) -> float:
+        """Billed worker VM-minutes, over the workers that ran rather than the clock."""
+        return sum(self.worker_lifetimes_min)
+
+    @property
+    def vcpu_hours(self) -> float:
+        return self.vm_minutes * self.vcpus_each / 60.0
+
+    @property
+    def usd_per_min(self) -> float:
+        return self.on_demand_usd_hour / 60.0
+
+    @property
+    def is_composite(self) -> bool:
+        return self.stage.startswith("composite")
+
+
+def load_cluster_records(path: Path = CLUSTER_RECORDS_FILE) -> list[ClusterRecord]:
+    """Read the retained artifact. Every arithmetic path in this model starts here."""
+    doc = json.loads(path.read_text())
+    return [
+        ClusterRecord(
+            cluster_id=c["cluster_id"],
+            stage=c["stage"],
+            instance_type=c["instance_type"],
+            vcpus_each=int(c["vcpus_each"]),
+            on_demand_usd_hour=float(c["on_demand_usd_hour"]),
+            credits=float(c["credits"]),
+            workers=int(c["workers"]),
+            cluster_lifetime_min=float(c["cluster_lifetime_min"]),
+            scheduler_lifetime_min=float(c["scheduler_lifetime_min"]),
+            worker_lifetimes_min=tuple(float(x) for x in c["worker_lifetimes_min"]),
+        )
+        for c in doc["clusters"]
+    ]
+
+
+CLUSTERS: list[ClusterRecord] = load_cluster_records()
+
+_NAIVE_VM_MIN = sum(c.workers * c.cluster_lifetime_min for c in CLUSTERS)
+_MEASURED_VM_MIN = sum(c.vm_minutes for c in CLUSTERS)
+
+#: MEASURED, and the promotion is the point of this revision.
 #:
-#: USER-REPORTED, not measured, and the demotion is deliberate. This shape came
-#: from Coiled billing activity that nobody exported. It survives as prose in
-#: ``quota.py`` and as class constants in
-#: ``tests/unit/test_driver_state_machine.py``, both of which retain the
-#: transcription rather than the observation. A search of every commit in this
-#: repository finds no invoice, no cost export, and no billing artifact.
+#: ``results/cost-model/cluster_records.json`` is a retained artifact derived from
+#: the three Coiled cluster event log exports for that run, recovered 2026-09-02.
+#: It carries every worker's own billed window instead of one wall clock applied
+#: to the whole fleet, and the two are not close: workers exit as they finish, so
+#: the composite cluster billed 728 worker VM-minutes across 32 minutes of wall
+#: clock rather than 35 x 32 = 1,120. The exports stay out of the repository
+#: because they carry private instance addresses. Their digests do not.
 FLEET_SHAPE: list[tuple[str, float, int, float, float]] = q(
     "reference_fleet_shape",
     [
-        ("offsets_round_1", 15.0, 8, 31.0, 0.504),  # r6i.2xlarge
-        ("offsets_round_2", 14.0, 8, 7.0, 0.504),  # r6i.2xlarge, a recovery round
-        ("composite_round_1", 35.0, 16, 26.0, 0.768),  # m6i.4xlarge
+        (c.stage, float(c.workers), c.vcpus_each, c.cluster_lifetime_min, c.on_demand_usd_hour)
+        for c in CLUSTERS
     ],
-    "(vms, vcpus, minutes, usd/h) per cluster",
-    bucket="user_reported",
-    source="S30W065 2026-08-23, transcribed into quota.py and test_driver_state_machine.py; "
-    "no billing export retained",
-    upgrade="Attach the Coiled billing activity export for that run under results/.",
+    "(vms, vcpus, cluster minutes, usd/h) per cluster",
+    bucket="measured",
+    source="S30W065 2026-08-23, clusters 1954303 / 1954376 / 1954375, from the Coiled "
+    "cluster event log exports retained by SHA-256 digest in cluster_records.json",
+    upgrade="Nothing for the shape itself. The exports carry no instance type for the "
+    "scheduler each cluster also runs, so that VM-time is counted and left unpriced.",
+)
+
+WORKER_LIFETIMES: dict[str, list[float]] = q(
+    "reference_worker_lifetimes",
+    {c.cluster_id: list(c.worker_lifetimes_min) for c in CLUSTERS},
+    "minutes per worker, per cluster",
+    bucket="measured",
+    source=f"'Instance starting' to each worker's last event, summing to "
+    f"{_MEASURED_VM_MIN:.1f} worker VM-minutes against {_NAIVE_VM_MIN:.1f} for "
+    f"vms x cluster lifetime. Five of the recovery round's fourteen workers lived "
+    f"1.89 minutes and never reached compute",
+    upgrade="Nothing. It is the billed window the event log records.",
+)
+
+SCHEDULER_VM_HOURS = q(
+    "reference_scheduler_vm_hours",
+    round(sum(c.scheduler_lifetime_min for c in CLUSTERS) / 60.0, 2),
+    "VM-hours",
+    bucket="measured",
+    source="every cluster runs a scheduler instance beside its workers and the event "
+    "log times all three. The fleet shape counts workers only, so this VM-time sits "
+    "outside every figure below",
+    upgrade="The export gives no instance type for the scheduler, so the model reports "
+    "this VM-time and declines to price it.",
+)
+
+INFRASTRUCTURE_BOOT_MIN = q(
+    "vm_infrastructure_boot_minutes",
+    0.92,
+    "minutes",
+    bucket="measured",
+    source="worst per-cluster median of 'Queued for launch' to 'Successfully phoned "
+    "home' across the three clusters: 0.75 / 0.92 / 0.83",
+    upgrade="Nothing, and it does not replace vm_boot_minutes. It stops when dask "
+    "registers, before the software environment starts and before the first task runs, "
+    "so it is a component of the 5-minute figure rather than a contradiction of it.",
 )
 
 BILLED_AWS_USD = q(
@@ -137,17 +237,21 @@ BILLED_AWS_USD = q(
     7.28,
     "USD",
     bucket="user_reported",
-    source="$2.19 + $4.55 + $0.54 spot, spoken; appears in no commit of this repository",
+    source="$2.19 + $4.55 + $0.54 spot, spoken; appears in no commit of this repository. "
+    "The cluster records recovered on 2026-09-02 are Coiled event logs and Coiled "
+    "billing activity, neither of which carries an AWS dollar figure",
     upgrade="Attach the AWS Cost Explorer export or invoice line for 2026-08-23.",
 )
 
 BILLED_CREDITS = q(
     "reference_billed_credits",
-    268.11,
+    round(sum(c.credits for c in CLUSTERS), 4),
     "Coiled credits",
-    bucket="user_reported",
-    source="quota.py docstring, per cluster 67.81 / 16.15 / 184.15; no billing export retained",
-    upgrade="Attach the Coiled billing activity export for that run under results/.",
+    bucket="measured",
+    source="Coiled billing activity per cluster, 67.8106 / 16.1450 / 184.1507, retained "
+    "per cluster in cluster_records.json. The total reproduces the 268.11 quota.py "
+    "already carried, so what the record changes is the denominator, not this",
+    upgrade="Nothing. The per-cluster split is the observation.",
 )
 
 BOOT_MIN = q(
@@ -185,7 +289,7 @@ COMPOSITE_COMPUTE_MIN = q(
     source="the fastest VM's wall clock minus one boot, treating the 20-32 spread as "
     "straggler and barrier time rather than work",
     upgrade="Per-unit timings would make this derived. If half the spread is work, the "
-    "composite term rises about 40% and it already carries 88% of compute.",
+    "composite term rises about 40% and it already carries 84% of compute.",
 )
 
 # --- Prices and bands -------------------------------------------------------
@@ -203,18 +307,26 @@ SPOT_BAND = q(
 )
 
 IMPLIED_SPOT_NOTE = (
-    "The 0.445 this run implies is derived from two user-reported figures and is "
-    "reported as a point inside the band, never as the band's replacement."
+    "The spot factor this run implies divides a user-reported dollar figure by a "
+    "measured fleet shape, so it is reported as a point inside the band and never "
+    "as the band's replacement."
 )
+
+#: Credits over measured worker vCPU-hours, one rate per cluster.
+_CREDIT_RATES: tuple[float, ...] = tuple(sorted(c.credits / c.vcpu_hours for c in CLUSTERS))
 
 CREDITS_PER_VCPU_HOUR_BAND = q(
     "credits_per_vcpu_hour_band",
-    (0.6, 1.25),
+    (round(_CREDIT_RATES[0], 3), round(_CREDIT_RATES[-1], 3)),
     "credits per vCPU-hour",
-    bucket="assumed",
-    source="quota.py observed band across the run's three clusters; the spread is staggered "
-    "VM lifetimes rather than a different rate",
-    upgrade="A billing export with per-VM lifetimes would make this derived and narrow.",
+    bucket="derived",
+    source="per-cluster credits over per-cluster measured worker vCPU-hours: "
+    + " / ".join(f"{r:.3f}" for r in _CREDIT_RATES)
+    + ". quota.py's 0.6-1.25 ran the same division against vms x cluster lifetime, "
+    "which charges every worker for the wall clock of the slowest. Its width was the "
+    "staggered exits, exactly as its own note guessed, and not a varying rate",
+    upgrade="Nothing from this run. A second billed run would say whether the rate "
+    "moves between workspaces or over time.",
 )
 
 S3_USD_PER_GB_MONTH = q(
@@ -334,7 +446,7 @@ SCALING_BASIS = q(
     "within 7% against 3.7x off the item basis. The model scales by a ratio against "
     "the same reference, so a constant items-per-group factor cancels exactly",
     upgrade="A per-tile solar-day count for all 700 tiles. It is a STAC metadata job, not a "
-    "compute job, and it removes the largest uncertainty in the term carrying 88% "
+    "compute job, and it removes the largest uncertainty in the term carrying 84% "
     "of compute. What does not cancel is the variation: WRS-2 path overlap grows "
     "toward the poles, so item-scaling overstates high-latitude tiles. The residual "
     "bias is conservative and the model cannot bound it.",
@@ -441,8 +553,9 @@ def measured_idle(records: list[dict[str, Any]], *, boot_s: float) -> dict[str, 
         "idle_bucket": "assumed",
         "per_wave": envelopes,
         "note": (
-            "Billed VM-time is now an observation. Idle stays bounded rather than "
-            "measured until per-unit durations exist, so the bucket does not move."
+            "Billed VM-time is now an observation, per worker rather than per "
+            "cluster. Idle stays bounded rather than measured until per-unit "
+            "durations exist, so the bucket does not move."
         ),
     }
 
@@ -488,6 +601,23 @@ def _unit_compute_min(cluster: str, wall_min: float) -> float:
     return min(each, max(0.0, wall_min - BOOT_MIN))
 
 
+def split_cluster(rec: ClusterRecord) -> tuple[float, float, float]:
+    """Boot, useful, and idle VM-minutes for one cluster, worker by worker.
+
+    Splitting per worker rather than per cluster is what the measured lifetimes
+    buy. A worker that lived 1.89 minutes is charged 1.89 minutes of boot and no
+    compute, where a fleet-wide wall clock would have charged it the full round.
+    """
+    boot = useful = idle = 0.0
+    for life in rec.worker_lifetimes_min:
+        b = min(BOOT_MIN, life)
+        u = _unit_compute_min(rec.stage, life)
+        boot += b
+        useful += u
+        idle += max(0.0, life - b - u)
+    return boot, useful, idle
+
+
 def decompose_reference_run() -> Decomposition:
     """Split the reference run into boot / useful compute / idle, per cluster.
 
@@ -497,11 +627,9 @@ def decompose_reference_run() -> Decomposition:
     terms summing to what was reported.
     """
     d = Decomposition()
-    for name, vms, _cpus, wall_min, usd_h in FLEET_SHAPE:
-        boot = vms * min(BOOT_MIN, wall_min)
-        useful = vms * _unit_compute_min(name, wall_min)
-        idle = max(0.0, vms * wall_min - boot - useful)
-        rate = usd_h / 60.0
+    for rec in CLUSTERS:
+        boot, useful, idle = split_cluster(rec)
+        rate = rec.usd_per_min
         d.boot_vm_min += boot
         d.useful_vm_min += useful
         d.idle_vm_min += idle
@@ -510,14 +638,18 @@ def decompose_reference_run() -> Decomposition:
         d.idle_usd_od += idle * rate
         d.per_cluster.append(
             {
-                "cluster": name,
-                "vms": vms,
-                "wall_min": wall_min,
-                "vm_min_total": vms * wall_min,
+                "cluster": rec.stage,
+                "cluster_id": rec.cluster_id,
+                "vms": float(rec.workers),
+                "wall_min": rec.cluster_lifetime_min,
+                "vm_min_total": round(rec.vm_minutes, 1),
+                "vm_min_if_all_lived_the_wall_clock": round(
+                    rec.workers * rec.cluster_lifetime_min, 1
+                ),
                 "vm_min_boot": round(boot, 1),
                 "vm_min_useful": round(useful, 1),
                 "vm_min_idle": round(idle, 1),
-                "usd_on_demand": round(vms * wall_min * rate, 2),
+                "usd_on_demand": round(rec.vm_minutes * rate, 2),
             }
         )
     return d
@@ -526,19 +658,23 @@ def decompose_reference_run() -> Decomposition:
 def reference_totals() -> dict[str, Any]:
     """VM-hours, vCPU-hours, on-demand dollars, and the two implied factors.
 
-    The two implied factors are derived from user-reported numerators, so they
-    corroborate the anchor rather than measure it. Both land on values recorded
-    independently: 0.445 against the 0.44 sample in ``pricing.json``, and 0.844
-    inside the 0.6-1.25 band in ``quota.py``. Two mistyped figures would have to
-    land there by accident, which is why the anchor is usable. It is still not
-    a measurement.
+    Both denominators are measured now, so the two factors part company. The
+    credit rate divides a measured numerator by a measured denominator and is a
+    measurement of the rate. The spot factor still divides a user-reported dollar
+    figure by that denominator, so it corroborates the AWS anchor against the
+    0.44 sample in ``pricing.json`` and does not measure a spot rate.
+
+    Reading the shape per worker rather than per cluster moves the denominator
+    12 percent: 279.7 vCPU-hours against the 317.7 the transcribed shape gave.
     """
-    vm_h = sum(n * m / 60.0 for _, n, _, m, _ in FLEET_SHAPE)
-    vcpu_h = sum(n * c * m / 60.0 for _, n, c, m, _ in FLEET_SHAPE)
-    usd_od = sum(n * m / 60.0 * p for _, n, _, m, p in FLEET_SHAPE)
+    vm_h = sum(c.vm_minutes for c in CLUSTERS) / 60.0
+    vcpu_h = sum(c.vcpu_hours for c in CLUSTERS)
+    usd_od = sum(c.vm_minutes * c.usd_per_min for c in CLUSTERS)
     return {
         "vm_hours": round(vm_h, 2),
         "vcpu_hours": round(vcpu_h, 2),
+        "vm_hours_if_all_lived_the_wall_clock": round(_NAIVE_VM_MIN / 60.0, 2),
+        "scheduler_vm_hours_unpriced": SCHEDULER_VM_HOURS,
         "usd_on_demand": round(usd_od, 2),
         "usd_billed_spot": BILLED_AWS_USD,
         "implied_spot_factor": round(BILLED_AWS_USD / usd_od, 3),
@@ -629,12 +765,12 @@ def stage_shares() -> dict[str, dict[str, float]]:
         "offsets": {"boot": 0.0, "useful": 0.0, "idle": 0.0},
         "composite": {"boot": 0.0, "useful": 0.0, "idle": 0.0},
     }
-    for name, vms, _c, wall, usd_h in FLEET_SHAPE:
-        rate = usd_h / 60.0
-        boot = vms * min(BOOT_MIN, wall) * rate
-        useful = vms * _unit_compute_min(name, wall) * rate
-        idle = max(0.0, vms * wall * rate - boot - useful)
-        tgt = shares["composite" if name.startswith("composite") else "offsets"]
+    for rec in CLUSTERS:
+        vm_boot, vm_useful, vm_idle = split_cluster(rec)
+        boot = vm_boot * rec.usd_per_min
+        useful = vm_useful * rec.usd_per_min
+        idle = vm_idle * rec.usd_per_min
+        tgt = shares["composite" if rec.is_composite else "offsets"]
         tgt["boot"] += boot
         tgt["useful"] += useful
         tgt["idle"] += idle
@@ -673,8 +809,8 @@ def layers(equiv: dict[str, Any]) -> dict[str, Any]:
 
 def reference_vcpu_hours() -> tuple[float, float]:
     """``(offsets, composite)`` vCPU-hours in the reference run."""
-    off = sum(n * c * m / 60.0 for nm, n, c, m, _ in FLEET_SHAPE if not nm.startswith("composite"))
-    comp = sum(n * c * m / 60.0 for nm, n, c, m, _ in FLEET_SHAPE if nm.startswith("composite"))
+    off = sum(c.vcpu_hours for c in CLUSTERS if not c.is_composite)
+    comp = sum(c.vcpu_hours for c in CLUSTERS if c.is_composite)
     return off, comp
 
 
@@ -818,7 +954,7 @@ def derived_quantities(report: dict[str, Any]) -> list[Quantity]:
     """Quantities the model computes, each with its arithmetic in the source.
 
     Registered separately from the inputs because they are outputs, and because
-    every one of them inherits a user-reported or assumed input. A derived
+    every one of them inherits a measured, user-reported, or assumed input. A derived
     figure is never stronger than what it was derived from, and reading one as
     a measurement is the mistake this register exists to stop.
     """
@@ -833,8 +969,10 @@ def derived_quantities(report: dict[str, Any]) -> list[Quantity]:
             t["vm_hours"],
             "VM-hours",
             "derived",
-            "sum(vms x minutes) / 60 over the fleet shape: (15x31 + 14x7 + 35x26) / 60. "
-            "Inherits user_reported.",
+            "sum of every worker's own billed window / 60, from the cluster event "
+            "logs. The transcribed shape gave 24.55 by charging all 64 workers the "
+            "wall clock of their cluster; vms x cluster lifetime on the measured "
+            "lifetimes gives 30.68. Inherits measured.",
             DERIVED_UPGRADE,
         ),
         Quantity(
@@ -842,8 +980,10 @@ def derived_quantities(report: dict[str, Any]) -> list[Quantity]:
             t["vcpu_hours"],
             "vCPU-hours",
             "derived",
-            "sum(vms x vcpus x minutes) / 60: (15x8x31 + 14x8x7 + 35x16x26) / 60. "
-            "Inherits user_reported.",
+            "sum over workers of lifetime x that cluster's vcpus / 60. The "
+            "transcribed shape gave 317.73, 12 percent higher, because the 16-vCPU "
+            "composite fleet was the one whose workers exited most unevenly. "
+            "Inherits measured.",
             DERIVED_UPGRADE,
         ),
         Quantity(
@@ -851,8 +991,8 @@ def derived_quantities(report: dict[str, Any]) -> list[Quantity]:
             t["usd_on_demand"],
             "USD",
             "derived",
-            "VM-hours per cluster x the pricing.json list rate. Inherits measured "
-            "prices and a user_reported shape.",
+            "measured worker VM-hours per cluster x the pricing.json list rate. Both "
+            "inputs are measured, so this one is not weakened by its shape any more.",
             DERIVED_UPGRADE,
         ),
         Quantity(
@@ -860,9 +1000,10 @@ def derived_quantities(report: dict[str, Any]) -> list[Quantity]:
             t["implied_spot_factor"],
             "fraction of on-demand",
             "derived",
-            f"{BILLED_AWS_USD} / {t['usd_on_demand']}. Both inputs user_reported, so "
-            "this corroborates the anchor against pricing.json's 0.44 sample rather "
-            "than measuring a spot rate.",
+            f"{BILLED_AWS_USD} / {t['usd_on_demand']}. The denominator is measured "
+            "and the numerator is not, so this corroborates the AWS anchor against "
+            "pricing.json's 0.44 sample rather than measuring a spot rate. It sits "
+            "inside the 0.30-0.75 band either way.",
             DERIVED_UPGRADE,
         ),
         Quantity(
@@ -870,8 +1011,9 @@ def derived_quantities(report: dict[str, Any]) -> list[Quantity]:
             t["implied_credits_per_vcpu_hour"],
             "credits per vCPU-hour",
             "derived",
-            f"{BILLED_CREDITS} / {t['vcpu_hours']}. Inherits user_reported, and sits "
-            "inside quota.py's 0.6-1.25 band.",
+            f"{BILLED_CREDITS} / {t['vcpu_hours']}. Both inputs measured. Against "
+            f"the transcribed shape this read 0.844, which understated the rate by "
+            f"charging vCPU-hours the fleet never billed.",
             DERIVED_UPGRADE,
         ),
         Quantity(
@@ -879,9 +1021,12 @@ def derived_quantities(report: dict[str, Any]) -> list[Quantity]:
             d["useful_fraction_of_vm_time"],
             "fraction",
             "derived",
-            f"{d['useful_vm_min']:.0f} useful VM-min / {total_vm_min:.0f} total. Idle "
-            "is the residue after boot and compute, so it carries the error in both "
-            "compute assumptions.",
+            f"{d['useful_vm_min']:.0f} useful VM-min / {total_vm_min:.0f} total. The "
+            "denominator is measured and the numerator is not: idle is the residue "
+            "after boot and compute, so it carries the error in both compute "
+            "assumptions. offsets_round_1 shows the strain, booking 342 of its 507 "
+            "VM-minutes as idle because a 6-minute per-unit figure is applied to VMs "
+            "that lived 34 minutes processing many units.",
             DERIVED_UPGRADE,
         ),
         Quantity(
@@ -970,7 +1115,8 @@ def derived_quantities(report: dict[str, Any]) -> list[Quantity]:
                 "credit interval",
                 "derived",
                 "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the "
-                "0.6-1.25 credit rate band. Never multiplied by a dollar price.",
+                f"{CREDITS_PER_VCPU_HOUR_BAND[0]}-{CREDITS_PER_VCPU_HOUR_BAND[1]} "
+                "measured credit rate band. Never multiplied by a dollar price.",
                 DERIVED_UPGRADE,
             )
         )
@@ -1029,7 +1175,10 @@ def main() -> None:
     r = report["reference_run"]
     t = r["totals"]
     print(f"Pipeline regime: {report['pipeline_regime']}")
-    print(f"Reference run: {r['tile']} {r['date']} -- anchor is USER-REPORTED")
+    print(
+        f"Reference run: {r['tile']} {r['date']} -- fleet shape and credits MEASURED, "
+        "AWS dollars USER-REPORTED"
+    )
     print(f"  {t['vm_hours']} VM-h, {t['vcpu_hours']} vCPU-h, ${t['usd_on_demand']} on-demand list")
     print(f"  reported ${t['usd_billed_spot']} spot -> spot factor {t['implied_spot_factor']}")
     print(
