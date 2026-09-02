@@ -146,7 +146,7 @@ returned to the cap — only when its units' artifacts are listed, or when the
 backend confirms the submission dead. An expired wave whose units have not
 landed keeps its capacity and is logged as overdue.
 
-### Held width has two regimes, and the boundary is the wave's own budget
+### Held width is measured, not inferred — the census
 
 An earlier draft counted held width **per unit**: a 60-unit wave with 45
 artifacts on the ground held 15. That reads a landed artifact as a released VM,
@@ -157,25 +157,140 @@ Measured against an independent model of the substrate, a 50-tile run capped at
 64 peaked at **82**: the driver freed slots the array had not, the next wave
 booted on top, and the real concurrency was the sum of both.
 
-So `Wave.held_at` holds the **full requested width** while a wave is inside its
-budget, and drops to zero when its last unit lands. That cannot exceed the cap,
-because a wave is never submitted wider than the headroom left.
+The draft after that held the full width inside the wave's budget and degraded
+to one worker per absent unit past it. Both regimes are guesses, they are
+guesses in opposite directions, and they come from the same expression. Past
+its budget a wave is either gone, holding nothing, or alive with a hung unit,
+holding everything; the degraded count over-charges the first and under-charges
+the second. Three divergence windows were measured, and they are one defect:
 
-Past the budget the count degrades to **one worker per absent unit**. A wave
-is past it when a whole derived deadline and a further `budgets.VM_BOOT_S` have
-run since it last landed anything, which is the only evidence of life there is:
-a late wave that is still producing is not a dead one, and measuring from the
-submission instead declared a deep composite wave stranded while it worked and
-took ten tiles down with it. A wave that has stopped is either gone, in which
-case it holds nothing at all, or alive with finished workers idle in an array
-the substrate should have ended. Charging the full
-width for either case charges for a wave that has already broken its contract,
-and the price of the strict rule is a run that fails tiles whose own work
-landed: one slow unit in a cap-wide wave would pin the whole cap for the rest
-of the build, which was reproduced as nine healthy tiles completing zero. The
-exposure the degradation admits is bounded by the landed units of waves that
-are already overdue, and it cannot reach the healthy tail the full-width rule
-exists to protect.
+| Window | What the bucket showed | One truth | The other |
+|---|---|---|---|
+| A, hung task | units absent, not moving | `W` VMs, one unit stuck | `0` VMs, array preempted |
+| B, lost acknowledgement | units landing normally | `W` VMs, the recorded wave | `k·W`, the recorded wave plus orphans |
+| C, submission failure | units absent, not moving | `0` VMs, never submitted | `W` VMs, answer lost |
+
+In every row the driver's whole observation is identical on both branches and
+the branches differ by a wave's width. **Absence of an artifact is evidence
+about work and never about billing.** The bucket is written by workers
+*completing units*; nothing a worker does or fails to do distinguishes "up and
+idle" from "up and stuck" from "gone".
+
+So the width is **measured**. `fleet_backend.FleetBackend.census(run_id)`
+returns the substrate's own record of every worker it is billing this run for,
+found from the run id alone, and one invariant replaces every ad-hoc rule:
+
+> `Ĥ(t) = max( intent_charge(t), census(t).total )`
+
+where `intent_charge` counts **every submission attempt at its full requested
+width** from the instant the call is issued, and a charge is discharged only by
+a census taken *afterwards* that does not contain that submission's identity.
+
+It is sound because a worker cannot exist before its attempt was issued and
+cannot be missing from both the intent ledger and a later census. It converges
+because every charge is discharged by the first census that omits it, and a
+census is taken every poll. The maximum rather than either term alone: the
+census lags a submission, so intent covers the boot; intent cannot see a worker
+belonging to no attempt this driver holds, so the census covers the orphan.
+
+Two backend guarantees carry it, and the first is the one whose absence caused
+all three windows:
+
+- **`enumerable_by_run`** — every billing resource a run creates is
+  discoverable from `run_id` alone, *including one created by a call whose
+  response was lost*. On Coiled that is free and was already there:
+  `batch_run` is handed `name=fleet_cluster_name(run_id, stage, wave)` before it
+  does anything, so `list_clusters` filtered on `fleet_cluster_prefix(run_id)`
+  finds a cluster whose creation answer never came back. The key was never in
+  the reply, which is the entire point — `batch_run` is a non-atomic two-step
+  (`POST /api/v2/jobs/compressed` → `job_id`, then `coiled.Cluster(...)`) with
+  **no idempotency key**, and listing by a pre-computed name is the only
+  recovery path for VMs billing under an id nobody holds.
+- **`census_is_authoritative`** — the census reflects the substrate's record of
+  billing, not an inference from work products. It may be stale and it may be
+  unavailable; it may not be wrong by construction.
+
+Because there is no idempotency key, `_submit_with_retries` charges **per
+attempt**: an attempt that raises on the way back may have created a cluster and
+booted its workers, so `attempts × W` stays charged until a census says
+otherwise. It over-counts whenever the substrate's name guard really did refuse
+the retries, which is the direction to be wrong in — under-counting is the
+measured 90-up / 30-counted window — and the first census that can be taken
+corrects it.
+
+`stranded_at` is **demoted**. It no longer feeds capacity at all; it feeds
+barriers, the stall test, and the poll budget. That decoupling is the fix: "when
+should a tile re-demand" is a forecast question and `budgets` answers it well,
+while "is a VM billing" is a measurement question and a forecast must never
+answer it. Substituting the first for the second was the whole of Window A.
+
+### Unknown is never zero, and degraded mode says so
+
+`census()` returns `None` when the substrate **cannot be asked** — no
+credentials, control plane down, a backend that predates the contract. `None`
+means unknown and never "nothing is running": a driver that read a blip as an
+empty fleet would offer its whole cap as headroom at the moment it had lost
+sight of the bill. The code this replaces sat permanently in a worse version of
+this mode and never said so; the transition is now logged once, as
+`fleet_census_degraded`, and `capacity_ledger()` carries `degraded`.
+
+Without a census the driver falls back to the intent charge plus a
+`GhostLedger`, and admits only while `intent + ghosts + x ≤ C`. Two releases
+remain, and neither is as good as a measurement:
+
+- **Every unit landed.** `queues_surplus` ties the array's end to its last unit,
+  so this is the substrate's own contract read through the bucket rather than an
+  inference about idle workers. Observed at poll resolution: late, never early.
+- **Stranded past its budget with nothing able to confirm it**, on a run whose
+  substrate *has* answered a census at some point. Released into the ghost
+  ledger, which keeps charging the width for `fleet_ghost_ttl_s` — escape E1,
+  `2C`-safe, and live. The gate matters: a control plane that answered and
+  stopped is a transient and a TTL is a real bound, while a substrate that has
+  never answered offers no evidence that anything it started is enumerable at
+  all. There the driver holds, and the run ends loudly through `_stalled` rather
+  than quietly at twice its cap.
+
+Where the census *is* available, `_stalled` and `_abandon_stranded` become
+nearly unreachable, because the record they exist to give up on is exactly the
+record a census explains.
+
+Conservatism in the count is deliberate. The Coiled client names only
+`pending`, `assigned` and `error` and substring-matches `done`; it never
+enumerates the state set. So `_TERMINAL_WORKER_STATES` is an allowlist and an
+**unrecognized state counts as live**, mirroring the rule `classify_failure`
+already follows for an unknown error.
+
+## The cap bounds concurrency. It is not a budget.
+
+These are two properties and only one of them is delivered, so they are named
+apart:
+
+- **SAFETY-C (concurrency).** `∀t. A(t) ≤ C`. This is what `fleet_max_vms`
+  expresses and what the census enforces.
+- **SAFETY-$ (spend).** `∫ A(t) dt ≤ B`. This is what anyone actually wants,
+  and **SAFETY-C does not imply it.**
+
+Nothing server-side remembers `fleet_max_vms`: `max_workers` never reaches the
+jobs API, it becomes `cluster_kwargs["n_workers"]`, a fixed cluster size chosen
+at creation. And `cluster_details` projects a worker's `created` but **no stop
+time**, so the driver can measure concurrency live and cannot integrate it. A
+cluster that replaces reclaimed spot VMs churns distinct instance ids at
+constant concurrency: `A(t)` never moves, launches accumulate, the bill grows.
+
+The census therefore gives a sound live concurrency measurement and a **lower**
+bound on spend — each observed worker has been alive at least since `created`.
+It gives no upper bound on spend. No docstring, comment or line of this ADR may
+imply that `fleet_max_vms` caps what a run costs; a run at half the cap for
+twice as long costs the same.
+
+One residual risk, named: because nothing server-side remembers the cap,
+anything that adds workers to a cluster — spot replacement, adaptive scaling —
+raises real concurrency without violating any server-side limit. The census
+catches it, which is an argument for taking it *every poll* rather than only on
+suspicion. Three billing event logs from the S30W065 run were checked at zero
+cost and show 67 distinct instance ids against 67 launch events, no
+reclamation, and no replacement — evidence of absence in a sample without
+churn, not proof of absence under churn.
 
 The barrier remains a separate question and still expires on time: a tile
 re-demands when *its record* ages out, whether or not the wave holding its
@@ -235,9 +350,10 @@ starts it, and marked `acknowledged` only when a handle comes back. The
 ordering is also what makes recovery idempotent: the wave record's key is a
 pure function of `(run_id, stage, wave)`, so a driver that dies inside the call,
 a restart, and a duplicate driver all adopt that one wave rather than minting a
-second beside it. An unacknowledged wave has no handle to probe, so it is the
-one wave the backend can never confirm, which is why `_stalled` exists rather
-than being an alternative to it.
+second beside it. An unacknowledged wave has no handle to
+probe — but it does have an identity, computed before the call, so a census
+finds its cluster if one was created and omits it if none was. `_stalled`
+survives for the degraded case where no census can be taken at all.
 
 The rule is easy to state and easy to breach, because there are several facts
 about the *driver* that look like facts about a VM. Three were found in review
@@ -262,9 +378,9 @@ and each is pinned by a test that fails when the shortcut is put back:
   Deleting the rule changed no test's verdict. The evidence now lives on the
   `Wave`, written only by `_refresh_wave_evidence` from the bucket, so nothing
   a tile does to itself can reach the cap at all. `FleetDriver.capacity_ledger`
-  publishes the identities being counted, so the arithmetic can be reconciled
-  against an independent ledger of potentially-live workers rather than only
-  against itself.
+  publishes the identities being counted alongside the census total, so the
+  arithmetic can be reconciled against an independent ledger of
+  potentially-live workers rather than only against itself.
 
 Adoption follows the same rule, and this is where the first draft put the
 defect back one process later. It adopted only waves whose deadline had not
@@ -275,8 +391,10 @@ on the ordinary terms.
 
 An adopted wave is the one case where this process has confirmed nothing
 itself, and the horizon in the record is the *previous* driver's arithmetic. So
-adoption forces exactly one probe of every inherited wave, whatever
-`probe_waves` and that horizon say. Without it a record claiming a
+adoption takes a census first — it answers for every inherited wave at once, and
+for anything a previous driver started and never recorded — and then forces
+exactly one probe of every inherited wave, whatever `probe_waves` and that
+horizon say. Without it a record claiming a
 million-second deadline postponed the only question that could release its
 width, for as long as it liked.
 
@@ -351,7 +469,9 @@ evaluation therefore has a checklist rather than a reading exercise.
 | `no_dependencies_needed` | Stage ordering is the driver's poll loop (ADR-010, ADR-016). A substrate with a DAG feature is fine; its DAG feature is unused. |
 | `unique_wave_names` | `wave_name` is unique per `(run_id, stage, wave)` and stable, so two drivers agree and a resumed one does not rebuild a name still in flight. |
 | `opaque_handle` | The handle id is JSON-serializable and stable: it is persisted in the wave record and handed back to `probe` by a later process, possibly on another machine. |
-| `probe_is_advisory` | `probe` may say "dead" or "unknown", never "succeeded". Completion is bytes in the bucket, so a probe can only ever end a barrier sooner. |
+| `probe_is_advisory` | `probe` may say "dead" or "unknown", never "succeeded". Completion is bytes in the bucket, so a probe can only ever end a barrier sooner. Subsumed by `census` where one can be taken, and kept because it may not be. |
+| `enumerable_by_run` | Every billing resource a run creates is discoverable from `run_id` alone, **including one created by a call whose response was lost.** `submission_identity` is a pure function of the request, fixed before the call, and discoverable by listing. This is the guarantee whose absence causes all three divergence windows. |
+| `census_is_authoritative` | `census` reflects the substrate's own record of billing, not an inference from work products. It may be stale and it may be unavailable (`None`); it may not be wrong by construction. Unavailable is never zero. |
 | `classified_failures` | Control-plane errors map to terminal or transient, and an *unrecognized* error maps to transient. Guessing terminal for the unknown case turns every ordinary blip into a dead run. |
 | `no_silent_cost_substitution` | However cheap capacity is requested, the expensive class must not be silently substituted. |
 

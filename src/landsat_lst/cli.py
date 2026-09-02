@@ -2070,7 +2070,7 @@ def shard_unit(*, run_id: str, stage: str, token: str, units: int | None) -> Non
     "--max-vms",
     type=int,
     default=None,
-    help="Hard ceiling on VMs in flight across the whole run",
+    help="Ceiling on CONCURRENT VMs across the whole run (not a spend cap)",
 )
 @click.option(
     "--wave-window",
