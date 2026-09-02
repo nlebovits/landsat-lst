@@ -527,14 +527,6 @@ class Settings(BaseSettings):
         "window, the fleet width, or a measured rate moves. Set it only to "
         "reach for a stopwatch during an incident.",
     )
-    coiled_credit_quota: float = Field(
-        default=400.0,
-        gt=0,
-        description="Credits the workspace is allowed per period. Provenance: "
-        "the kill message of 2026-08-22, 'You have reached the workspace quota "
-        "of 400 Coiled credits'. Used only when the usage endpoint gives no "
-        "remaining figure, as the base a run's debits are subtracted from.",
-    )
     coiled_credit_period_days: int = Field(
         default=30,
         ge=1,

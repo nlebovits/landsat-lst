@@ -591,6 +591,104 @@ class TestPreflightCredits:
 
         assert balance.remaining is None
 
+    def test_0g_the_operator_supplies_the_limit_because_coiled_will_not(self):
+        """Coiled publishes no limit, so the arithmetic closes with a person.
+
+        The limit was stored once, at 400, and the operator raises it in the
+        console as work advances. No stored copy follows that, and a stale one
+        that reads high lets an unaffordable run start.
+        """
+        asked = {}
+
+        def ask(balance, estimated, needed):
+            asked.update(spent=balance.spent, estimated=estimated, needed=needed)
+            return 1000.0
+
+        balance = quota.preflight_credits(
+            100.0,
+            balance_source=lambda: quota.CreditBalance(
+                remaining=None,
+                source="usage_endpoint+billing_activity",
+                has_quota=True,
+                spent=668.1,
+            ),
+            ask_limit=ask,
+        )
+
+        assert asked["spent"] == 668.1
+        assert balance.remaining == pytest.approx(331.9)
+        assert balance.source.endswith("+operator")
+
+    def test_0h_a_run_that_does_not_fit_the_supplied_limit_is_refused(self, monkeypatch):
+        monkeypatch.setattr(settings, "coiled_credit_safety", 2.0)
+
+        with pytest.raises(quota.QuotaRefused) as excinfo:
+            quota.preflight_credits(
+                300.0,
+                balance_source=lambda: quota.CreditBalance(
+                    remaining=None, source="billing_activity", has_quota=True, spent=668.1
+                ),
+                ask_limit=lambda *_: 1000.0,
+            )
+
+        assert "short by" in str(excinfo.value)
+
+    def test_0i_no_terminal_and_no_acknowledgement_refuses(self, monkeypatch):
+        """Silence is never taken as a limit."""
+        monkeypatch.setattr(settings, "ack_quota", False)
+
+        with pytest.raises(quota.QuotaRefused) as excinfo:
+            quota.preflight_credits(
+                42.0,
+                balance_source=lambda: quota.CreditBalance(
+                    remaining=None, source="billing_activity", has_quota=True, spent=10.0
+                ),
+                ask_limit=lambda *_: None,
+            )
+
+        message = str(excinfo.value)
+        assert "publishes no limit" in message
+        assert "--ack-quota" in message
+
+    def test_0j_an_exhausted_flag_refuses_before_anyone_is_asked(self):
+        """``has_quota=false`` is terminal, and no supplied number argues."""
+
+        def ask(*_):  # pragma: no cover - must never run
+            raise AssertionError("the operator was asked despite an exhausted quota")
+
+        with pytest.raises(quota.QuotaRefused, match="out of credits"):
+            quota.preflight_credits(
+                1.0,
+                balance_source=lambda: quota.CreditBalance(
+                    remaining=None, source="usage_endpoint", has_quota=False
+                ),
+                ask_limit=ask,
+            )
+
+    def test_0k_billing_reports_debits_and_never_invents_a_remaining(self, monkeypatch):
+        """The sources compose, and neither of them holds a limit."""
+        monkeypatch.setattr(
+            quota,
+            "_usage_endpoint_balance",
+            lambda: quota.CreditBalance(
+                remaining=None, source="usage_endpoint", has_quota=True, detail="ws"
+            ),
+        )
+        monkeypatch.setattr(
+            quota,
+            "_billing_balance",
+            lambda: quota.CreditBalance(
+                remaining=None, source="billing_activity", spent=668.1, detail="sum"
+            ),
+        )
+
+        balance = quota.read_balance()
+
+        assert balance.remaining is None
+        assert balance.spent == 668.1
+        assert balance.has_quota is True
+        assert balance.source == "usage_endpoint+billing_activity"
+
     def test_0f_the_driver_submits_nothing_when_the_preflight_refuses(
         self, storage, plan, job, clock, monkeypatch
     ):
