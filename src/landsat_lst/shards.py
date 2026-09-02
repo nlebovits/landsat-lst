@@ -160,6 +160,11 @@ def shard_log_key(root: str, stage: str, index: int, attempt: int) -> str:
     return f"{root}/state/{stage}.{index:04d}.{attempt}.log"
 
 
+def shard_profile_key(root: str, stage: str, index: int, attempt: int, label: str) -> str:
+    """One shard profile beside its state object and log under ``_shards/``."""
+    return f"{root}/state/{stage}.{index:04d}.{attempt}.{label}.profile.json"
+
+
 def export_claim_key(root: str) -> str:
     """One composite shard's claim on running the export itself.
 

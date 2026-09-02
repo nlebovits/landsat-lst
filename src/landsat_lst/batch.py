@@ -591,7 +591,14 @@ def submit_shard_stage(
 
     if stage == "composite":
         kwargs["vm_type"] = [settings.shard_composite_vm_type]
-        kwargs["env"] = {**environ, "LST_LOAD_CHUNK_SIZE": str(settings.shard_composite_chunk)}
+        composite_env = {
+            **environ,
+            "LST_LOAD_CHUNK_SIZE": str(settings.shard_composite_chunk),
+        }
+        # Composite profiling is the evidence feature this stage promises.
+        # Keep an explicit operator opt-out forwarded by _worker_environ.
+        composite_env.setdefault("LST_PROFILE_DASK", "1")
+        kwargs["env"] = composite_env
     elif stage == "export":
         kwargs["disk_size"] = settings.shard_export_disk_gb
 

@@ -1027,6 +1027,22 @@ class TestSubmitShardStage:
         assert fake_coiled["vm_type"] == [settings.shard_composite_vm_type]
         assert fake_coiled["env"]["LST_LOAD_CHUNK_SIZE"] == str(settings.shard_composite_chunk)
 
+    def test_composite_stage_enables_profile_on_the_vm(self, fake_coiled, monkeypatch):
+        from landsat_lst.batch import submit_shard_stage
+
+        monkeypatch.delenv("LST_PROFILE_DASK", raising=False)
+        submit_shard_stage(stage="composite", run_id="r1", tile="N40W075", indexes=[0])
+
+        assert fake_coiled["env"]["LST_PROFILE_DASK"] == "1"
+
+    def test_composite_stage_preserves_explicit_profile_opt_out(self, fake_coiled, monkeypatch):
+        from landsat_lst.batch import submit_shard_stage
+
+        monkeypatch.setenv("LST_PROFILE_DASK", "0")
+        submit_shard_stage(stage="composite", run_id="r1", tile="N40W075", indexes=[0])
+
+        assert fake_coiled["env"]["LST_PROFILE_DASK"] == "0"
+
     def test_the_export_stage_asks_for_scratch_disk(self, fake_coiled):
         """It holds every band slab, a full-tile intermediate, and a COG at once."""
         from landsat_lst.batch import submit_shard_stage

@@ -29,7 +29,10 @@ Before implementing or substantially reviewing a performance change:
    is demonstrated.
 
 For cloud work, the contract must also cap AWS dollars and Coiled credits, name
-the exact workload, require code-identity evidence, and define output equivalence.
+the exact workload and launch command, require a retained baseline artifact and
+full Git revisions, require code-identity evidence, and define output equivalence.
+Experiment contracts are limited to $100 and 400 Coiled credits; smaller limits
+should be used whenever the discriminator allows them.
 The contract is a prerequisite, **not authorization**: the operator must still
 explicitly approve every cloud launch.
 

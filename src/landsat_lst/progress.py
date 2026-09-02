@@ -48,7 +48,7 @@ import structlog
 from landsat_lst.config import settings
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from landsat_lst.job import JobResult
     from landsat_lst.models import ProcessingJob
@@ -173,6 +173,7 @@ class TileHeartbeat:
         interval_s: float | None = None,
         key: str | None = None,
         pointer_key: str | None = None,
+        profile_key: Callable[[str], str] | None = None,
     ) -> None:
         self.run_id = run_id
         self.job = job
@@ -192,6 +193,10 @@ class TileHeartbeat:
         default_pointer = None if key is not None else storage.run_record_key(run_id, self.tile)
         self.key = key if key is not None else storage.run_record_key(run_id, self.tile, attempt)
         self.pointer_key = pointer_key if pointer_key is not None else default_pointer
+        # A shard overrides its state key to stay under ``_shards/``. Its
+        # profile must use the same grammar rather than falling back to a
+        # whole-tile key under ``_runs/``.
+        self._profile_key = profile_key
 
         # The tile's outcome, folded in by :meth:`set_result` and published by
         # the terminal beat. Holding it here rather than writing it to a second
@@ -228,6 +233,12 @@ class TileHeartbeat:
         # Memory as a time series. See the append in the beat builder for why
         # the per-beat reading alone was not enough.
         self._rss_series: list[tuple[float, float | None]] = []
+
+    def profile_key_for(self, label: str) -> str:
+        """Return the profile key for this heartbeat's artifact grammar."""
+        if self._profile_key is not None:
+            return self._profile_key(label)
+        return self.storage.profile_key(self.run_id, self.tile, label, self.attempt)
 
     def _identity(self) -> dict[str, Any]:
         """The fields that never change for the life of this attempt."""

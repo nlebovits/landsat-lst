@@ -68,4 +68,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(json.dumps(deny(f"BLOCKED: STAC endpoint guard failed: {exc}")))

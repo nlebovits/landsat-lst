@@ -12,9 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def main() -> int:
     failures: list[str] = []
     required = {
-        "AGENTS.md": "docs/performance-evidence-policy.md",
         "CLAUDE.md": "docs/performance-evidence-policy.md",
-        "src/landsat_lst/shard_tasks.py": "PROFILE_COMPOSITE",
+        "docs/performance-evidence-policy.md": "## Required order",
     }
     for name, marker in required.items():
         path = ROOT / name

@@ -3,6 +3,7 @@
   "claim": "The proposed change reduces the named production metric without changing scientific output.",
   "inputs": {
     "workload": "exact tile, shard, scene count, and stage",
+    "launch_command": "exact cloud-launch command, excluding the LST_EVIDENCE_CONTRACT assignment",
     "baseline_revision": "full git SHA",
     "treatment_revision": "full git SHA"
   },

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deny cloud experiments without a valid pre-registered evidence contract."""
+"""Deny cloud experiments without a valid, launch-bound evidence contract."""
 
 from __future__ import annotations
 
@@ -10,13 +10,29 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "src"))
-from landsat_lst.evidence_contract import load_contract  # noqa: E402
 
+# Match command segments at their executable, not arbitrary source text inside
+# arguments. The old ``coiled.batch_run(`` search denied ``grep`` while the
+# production shard CLI passed straight through.
+_SEGMENT = r"(?:^|[\n;&|]+)\s*"
+_PREFIX = (
+    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|[^\s]+))\s+)*(?:(?:uv|poetry)\s+run\s+)?"
+)
+_PYTHON = r"python(?:3(?:\.\d+)?)?"
 LAUNCH_PATTERNS = (
-    re.compile(r"\bcoiled\.(?:batch_run|Cluster)\s*\("),
-    re.compile(r"\blandsat-lst\s+(?:process|benchmark|shard\s+process)\b.*\s--distributed\b"),
-    re.compile(r"\b(?:python\s+)?scripts/probe_[^\s]+\.py\b.*\s--launch\b"),
+    re.compile(_SEGMENT + _PREFIX + r"landsat-lst\s+process\b[^\n;&|]*\s--distributed\b"),
+    re.compile(_SEGMENT + _PREFIX + r"landsat-lst\s+benchmark\b"),
+    re.compile(_SEGMENT + _PREFIX + r"landsat-lst\s+shard\s+(?:process|resume)\b"),
+    re.compile(_SEGMENT + _PREFIX + r"coiled\s+batch\s+run\b"),
+    re.compile(
+        _SEGMENT
+        + _PREFIX
+        + _PYTHON
+        + r"\s+-m\s+landsat_lst\.cli\s+(?:process\b[^\n;&|]*\s--distributed\b|benchmark\b|shard\s+(?:process|resume)\b)"
+    ),
+    re.compile(
+        _SEGMENT + _PREFIX + _PYTHON + r"\s+scripts/probe_[^\s]+\.py\b[^\n;&|]*\s--launch\b"
+    ),
 )
 
 
@@ -57,8 +73,11 @@ def main() -> None:
         )
         return
     try:
+        sys.path.insert(0, str(ROOT / "src"))
+        from landsat_lst.evidence_contract import load_contract  # noqa: PLC0415
+
         path = Path(contract)
-        load_contract(path if path.is_absolute() else ROOT / path)
+        load_contract(path if path.is_absolute() else ROOT / path, launch_command=command)
     except (OSError, ValueError) as exc:
         print(json.dumps(deny(f"Cloud experiment blocked: invalid evidence contract: {exc}")))
         return
@@ -66,4 +85,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        # Hook failures are advisory in Claude Code. Emit a deny rather than a
+        # traceback so malformed input or an import regression cannot fail open.
+        print(json.dumps(deny(f"Cloud experiment blocked: evidence guard failed: {exc}")))

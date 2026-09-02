@@ -1057,10 +1057,7 @@ def _profile_destination(label: str) -> tuple[Any, str] | None:
     """
     heartbeat = active_heartbeat()
     if heartbeat is not None:
-        key = heartbeat.storage.profile_key(
-            heartbeat.run_id, heartbeat.tile, label, heartbeat.attempt
-        )
-        return heartbeat.storage, key
+        return heartbeat.storage, heartbeat.profile_key_for(label)
 
     from landsat_lst.storage import LocalStorage  # noqa: PLC0415
 

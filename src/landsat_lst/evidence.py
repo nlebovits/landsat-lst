@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
+import re
 import shutil
 import subprocess  # nosec B404
 from datetime import UTC, datetime
@@ -14,6 +16,11 @@ from typing import Any
 from landsat_lst.evidence_contract import load_contract
 
 _SECRET_PARTS = ("token", "secret", "password", "credential", "access_key", "session_key")
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|ACCESS_KEY|SESSION_KEY)[A-Z0-9_]*)"
+    r"(\s*[:=]\s*)([^\s,;]+)"
+)
+_BEARER = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+")
 
 
 def sha256_file(path: Path) -> str:
@@ -23,6 +30,16 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _redact_text(value: str) -> str:
+    """Redact credential assignments and secret values embedded in log text."""
+    redacted = _SECRET_ASSIGNMENT.sub(r"\1\2<redacted>", value)
+    redacted = _BEARER.sub(r"\1<redacted>", redacted)
+    for key, secret in os.environ.items():
+        if len(secret) >= 4 and any(part in key.lower() for part in _SECRET_PARTS):
+            redacted = redacted.replace(secret, "<redacted>")
+    return redacted
 
 
 def _safe(value: Any) -> Any:
@@ -38,15 +55,19 @@ def _safe(value: Any) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [_safe(item) for item in value]
+
+    safe_value = value
     if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, Path):
-        return str(value)
+        safe_value = value.isoformat()
+    elif isinstance(value, str):
+        safe_value = _redact_text(value)
+    elif isinstance(value, Path):
+        safe_value = str(value)
     try:
-        json.dumps(value)
+        json.dumps(safe_value)
     except (TypeError, ValueError):
-        return repr(value)
-    return value
+        safe_value = repr(safe_value)
+    return safe_value
 
 
 def _git_identity() -> dict[str, Any]:
@@ -93,6 +114,14 @@ def _coiled_cluster(
     record: dict[str, Any] = {"cluster_id": cluster_id, "workspace": workspace}
     with coiled.Cloud(workspace=workspace) as cloud:
         details = cloud.cluster_details(cluster_id, workspace=workspace)
+        if not isinstance(details, dict) or not isinstance(details.get("name"), str):
+            raise RuntimeError(f"Coiled cluster {cluster_id} details did not contain a string name")
+        for private_name in ("server", "_do_request", "_sync"):
+            if not hasattr(cloud, private_name):
+                version = getattr(coiled, "__version__", "unknown")
+                raise RuntimeError(
+                    f"Coiled {version} lacks collector API {private_name}; update the collector"
+                )
         record["details"] = _safe(details)
         record["logs"] = _safe(dict(cloud.cluster_logs(cluster_id, workspace=workspace)))
         cluster_name = details["name"]
@@ -192,6 +221,19 @@ def collect_evidence(
     return destination
 
 
+def _run_frisky(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+    """Run Frisky and turn process failures into concise operator errors."""
+    try:
+        return subprocess.run(  # nosec B603 B607
+            ["frisky", *args], check=True, capture_output=True
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("frisky executable was not found; install the frisky extra") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode(errors="replace").strip() if exc.stderr else "no stderr"
+        raise RuntimeError(f"frisky {' '.join(args[:2])} failed: {detail}") from exc
+
+
 def capture_frisky(source: str, output_dir: Path, *, limit: int = 1_000_000_000) -> list[Path]:
     """Persist Frisky spans plus an agent-readable offline overview."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -200,18 +242,10 @@ def capture_frisky(source: str, output_dir: Path, *, limit: int = 1_000_000_000)
     if source_path.is_file():
         shutil.copy2(source_path, spans)
     else:
-        result = subprocess.run(  # nosec B603 B607
-            ["frisky", "observe", "spans", source, "--limit", str(limit)],
-            check=True,
-            capture_output=True,
-        )
+        result = _run_frisky(["observe", "spans", source, "--limit", str(limit)])
         spans.write_bytes(result.stdout)
 
     overview = output_dir / "frisky-overview.json"
-    result = subprocess.run(  # nosec B603 B607
-        ["frisky", "observe", "overview", str(spans), "--json"],
-        check=True,
-        capture_output=True,
-    )
+    result = _run_frisky(["observe", "overview", str(spans), "--json"])
     overview.write_bytes(result.stdout)
     return [spans, overview]

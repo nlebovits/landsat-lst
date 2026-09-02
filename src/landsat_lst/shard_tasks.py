@@ -1285,6 +1285,9 @@ def run_shard(
                 storage=storage,
                 attempt=attempt,
                 key=shards.shard_state_key(root, stage, index, attempt),
+                profile_key=lambda label: shards.shard_profile_key(
+                    root, stage, index, attempt, label
+                ),
             )
         )
         report_phase(f"shard_{stage}")
