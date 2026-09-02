@@ -30,6 +30,9 @@ contract rather than a description of ``CoiledFleetBackend``.
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 from landsat_lst import batch, shards
@@ -621,3 +624,126 @@ class TestTheCoiledCensusCountsConservatively:
     def test_a_reap_without_credentials_is_a_no_op(self, monkeypatch):
         monkeypatch.setattr("landsat_lst.shard_driver._coiled_credentials_present", lambda: False)
         assert batch.fleet_reap_identity(RUN_ID, "whatever") is None
+
+    def test_an_unrecognized_cluster_state_counts_as_live(self):
+        """The cluster-level half of the same rule, and it needs its own pin.
+
+        A listed cluster retires only on a state the allowlist names. Inverting
+        this into a running-allowlist makes the census report a *smaller* fleet
+        than exists, which is the single direction it may never be wrong in,
+        and it used to be possible to do that without failing a test.
+        """
+        assert batch._cluster_is_live({"current_state": {"state": "scaling"}})
+        assert batch._cluster_is_live({"current_state": {"state": "starting"}})
+        assert batch._cluster_is_live({"current_state": {}})
+        assert batch._cluster_is_live({}), "an absent state is unknown, and unknown is live"
+        assert batch._cluster_is_live({"current_state": {"state": "stopping"}}), (
+            "a cluster being torn down is a cluster being billed"
+        )
+
+    def test_a_cluster_retires_only_on_a_state_the_allowlist_names(self):
+        assert not batch._cluster_is_live({"current_state": {"state": "stopped"}})
+        assert not batch._cluster_is_live({"current_state": {"state": "error"}})
+        assert not batch._cluster_is_live({"current_state": "terminated"})
+
+    def test_the_census_counts_a_cluster_whose_state_it_cannot_read(self, monkeypatch):
+        """The same rule at the call site, since that is where it was invertible.
+
+        Two clusters, one in a state this client has never heard of and one
+        genuinely stopped. The census has to report the first and drop the
+        second, and it has to do it without a control plane.
+        """
+        listed = [
+            {
+                "name": batch.fleet_cluster_prefix(RUN_ID) + "offse-w1",
+                "id": 1,
+                "current_state": {"state": "reticulating"},
+            },
+            {
+                "name": batch.fleet_cluster_prefix(RUN_ID) + "offse-w2",
+                "id": 2,
+                "current_state": {"state": "stopped"},
+            },
+            {"name": "someone-elses-cluster", "id": 3, "current_state": {"state": "running"}},
+        ]
+        details = {1: {"workers": [{"current_state": {"state": "running"}}] * 5}}
+
+        class _Cloud:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            @staticmethod
+            def cluster_details(cluster_id):
+                return details[cluster_id]
+
+        monkeypatch.setattr("landsat_lst.shard_driver._coiled_credentials_present", lambda: True)
+        monkeypatch.setitem(
+            sys.modules, "coiled", types.SimpleNamespace(list_clusters=lambda **_kw: listed)
+        )
+        monkeypatch.setitem(sys.modules, "coiled.v2", types.ModuleType("coiled.v2"))
+        monkeypatch.setitem(
+            sys.modules,
+            "coiled.v2.core",
+            types.SimpleNamespace(Cloud=_Cloud),
+        )
+
+        census = batch.fleet_worker_census(RUN_ID)
+        assert census is not None
+        assert census.total == 5
+        assert census.identities == frozenset({batch.fleet_cluster_prefix(RUN_ID) + "offse-w1"})
+
+
+class TestACollidingSubmissionNameIsRefused:
+    """``unique_wave_names``, and why stability alone was not enough.
+
+    There is no idempotency key on this path, so a retry after a lost answer
+    reuses the identity of an attempt that may already be billing. A substrate
+    that widens the existing array instead of refusing puts
+    ``shard_submit_retries`` times the cap up: 180 workers against a cap of 64,
+    with 120 units dispatched twice, and no census is consulted between two
+    attempts inside one retry loop. Coiled refuses, which is why the run is
+    clean today; the contract now asks for it.
+    """
+
+    def test_the_contract_names_the_requirement(self):
+        assert "unique_wave_names" in BACKEND_CONTRACT
+
+    def test_the_in_memory_backend_refuses_a_second_live_submission(self, clock):
+        backend = InMemoryFleetBackend(clock=clock)
+        request = WaveRequest(stage="offsets", run_id=RUN_ID, units=(), wave=1, max_workers=7)
+        backend.submit(request)
+
+        with pytest.raises(RuntimeError, match="already running"):
+            backend.submit(request)
+
+        census = backend.census(RUN_ID)
+        assert census.total == 7, "the refusal leaves the first array alone"
+
+    def test_a_refused_retry_cannot_stack_a_second_width(self, clock):
+        """The measured consequence, from the substrate's side rather than the driver's."""
+        backend = InMemoryFleetBackend(clock=clock)
+        backend.lose_next_answer()
+        request = WaveRequest(stage="offsets", run_id=RUN_ID, units=(), wave=1, max_workers=60)
+        with pytest.raises(ConnectionError):
+            backend.submit(request)
+
+        for _ in range(settings.shard_submit_retries):
+            with pytest.raises(RuntimeError, match="already running"):
+                backend.submit(request)
+
+        assert backend.census(RUN_ID).total == 60, (
+            "one identity, one width, however many times the retry loop asks"
+        )
+
+    def test_a_reaped_identity_may_be_submitted_again(self, clock):
+        """The refusal is about what is *running*, not about a name being used once."""
+        backend = InMemoryFleetBackend(clock=clock)
+        request = WaveRequest(stage="offsets", run_id=RUN_ID, units=(), wave=1, max_workers=3)
+        backend.submit(request)
+        backend.reap(RUN_ID, backend.submission_identity(RUN_ID, "offsets", 1))
+
+        backend.submit(request)
+        assert backend.census(RUN_ID).total == 3

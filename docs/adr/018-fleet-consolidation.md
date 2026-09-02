@@ -260,6 +260,15 @@ enumerates the state set. So `_TERMINAL_WORKER_STATES` is an allowlist and an
 **unrecognized state counts as live**, mirroring the rule `classify_failure`
 already follows for an unknown error.
 
+That rule is read twice, against two different objects: once per worker record
+from `cluster_details`, and once per cluster record from `list_clusters`. Only
+the first was pinned by a test. Inverting the second into a running-allowlist
+made the census report a smaller fleet than exists, which is the one direction
+it may never be wrong in, and no test failed. The cluster-level read is now the
+named `batch._cluster_is_live`, and both directions are asserted: an
+unrecognized or absent cluster state counts live, and only a state the
+allowlist names retires one.
+
 ## The cap bounds concurrency. It is not a budget.
 
 These are two properties and only one of them is delivered, so they are named
@@ -467,7 +476,7 @@ evaluation therefore has a checklist rather than a reading exercise.
 | `fire_and_forget` | `submit` returns promptly with a handle. The driver has other tiles to step. |
 | `at_least_once` | A unit may run more than once. Units are idempotent at their artifact keys, so this is permitted rather than tolerated. What is not allowed is silently skipping a unit in a way the driver cannot notice — which it notices by listing the artifact, never by an exit code. |
 | `no_dependencies_needed` | Stage ordering is the driver's poll loop (ADR-010, ADR-016). A substrate with a DAG feature is fine; its DAG feature is unused. |
-| `unique_wave_names` | `wave_name` is unique per `(run_id, stage, wave)` and stable, so two drivers agree and a resumed one does not rebuild a name still in flight. |
+| `unique_wave_names` | `wave_name` is unique per `(run_id, stage, wave)` and stable, so two drivers agree and a resumed one does not rebuild a name still in flight. **A second submission under a name already running is refused**, not accepted and added to it. Stability alone left a hole: the submission path has no idempotency key, so a retry after a lost answer reuses the identity of an attempt that may already be billing, and a substrate that widens the existing array puts `shard_submit_retries` times the cap up. Measured on a permissive substrate: 180 workers against a cap of 64, with 120 units dispatched twice, and no census is consulted between two attempts inside one retry loop. Coiled refuses, which is why real runs are clean at 60. |
 | `opaque_handle` | The handle id is JSON-serializable and stable: it is persisted in the wave record and handed back to `probe` by a later process, possibly on another machine. |
 | `probe_is_advisory` | `probe` may say "dead" or "unknown", never "succeeded". Completion is bytes in the bucket, so a probe can only ever end a barrier sooner. Subsumed by `census` where one can be taken, and kept because it may not be. |
 | `enumerable_by_run` | Every billing resource a run creates is discoverable from `run_id` alone, **including one created by a call whose response was lost.** `submission_identity` is a pure function of the request, fixed before the call, and discoverable by listing. This is the guarantee whose absence causes all three divergence windows. |

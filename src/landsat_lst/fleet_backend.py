@@ -72,7 +72,18 @@ log = structlog.get_logger()
 #: ``unique_wave_names``
 #:     ``wave_name`` is unique per ``(run_id, stage, wave)`` and stable, so two
 #:     drivers computing the same wave agree, and a resumed driver does not
-#:     rebuild the name of something still running.
+#:     rebuild the name of something still running. **A second submission under
+#:     a name that is already running is refused**, rather than accepted and
+#:     added to what that name already holds. Stability alone is not enough:
+#:     the submission path has no idempotency key, so a retry after a lost
+#:     acknowledgement reuses the identity of an attempt that may already be
+#:     billing. A substrate that widens the existing array instead of refusing
+#:     puts ``shard_submit_retries`` times the cap up -- 180 workers against a
+#:     cap of 64, with 120 units dispatched twice -- and the census cannot stop
+#:     it, because nothing consults a census between two attempts inside one
+#:     retry loop. Coiled refuses (``Unable to add batch jobs to existing
+#:     cluster``), which is why the run is clean today, and the contract now
+#:     asks for the behaviour the driver depends on rather than assuming it.
 #: ``opaque_handle``
 #:     The handle id is JSON-serializable and stable for the life of the wave.
 #:     It is persisted in the wave record and handed back to ``probe`` by a
@@ -479,6 +490,10 @@ class InMemoryFleetBackend:
       it, so :meth:`lose_next_answer` can simulate the window that has no
       recovery except listing: the workers exist, the caller holds no handle,
       and only ``run_id`` finds them;
+    - a second submission under an identity that already has live workers is
+      refused, which is ``unique_wave_names``. The refusal is what stops a
+      retry after a lost answer from stacking a second full width on top of a
+      first one nobody holds;
     - :meth:`reap` is a request. It stops the workers, but a caller learns that
       from the next census rather than from the return value;
     - :attr:`answerable` off makes :meth:`census` return ``None``, which is the
@@ -543,10 +558,16 @@ class InMemoryFleetBackend:
         self.submissions.append(request)
         identity = self.submission_identity(request.run_id, request.stage, request.wave)
         width = max(1, int(request.max_workers))
+        run = self.workers.setdefault(request.run_id, {})
+        if run.get(identity, 0) > 0:
+            # ``unique_wave_names``. A retry after a lost answer arrives here
+            # under the identity of the attempt that may already be billing,
+            # and widening that array is how one wave puts three caps up.
+            msg = f"a submission named {identity!r} is already running"
+            raise RuntimeError(msg)
         # Workers first, handle second: that ordering is the substrate's, and
         # reversing it here would hide the only window worth simulating.
-        run = self.workers.setdefault(request.run_id, {})
-        run[identity] = run.get(identity, 0) + width
+        run[identity] = width
         if self._lose_answer:
             self._lose_answer = False
             msg = f"lost the answer for {identity!r}"

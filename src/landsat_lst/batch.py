@@ -756,6 +756,24 @@ def _live_workers(details: object) -> int:
     return live
 
 
+def _cluster_is_live(record: object) -> bool:
+    """Whether one listed cluster still counts against the run.
+
+    The cluster-level half of the same allowlist discipline
+    :func:`_live_workers` applies per worker, and it is a *separate* rule
+    because it reads a different object: a cluster record from
+    ``list_clusters`` rather than a worker record from ``cluster_details``.
+    Only a state on :data:`_TERMINAL_WORKER_STATES` retires a cluster;
+    anything else, an absent state included, counts live.
+
+    Inverting this into a running-allowlist makes the census report a smaller
+    fleet than exists, which is the one direction it may never be wrong in: a
+    driver reading an under-count offers headroom it does not have. The rule
+    was unpinned until this function existed to pin.
+    """
+    return _state_of(record) not in _TERMINAL_WORKER_STATES
+
+
 def fleet_worker_census(run_id: str):
     """Every VM Coiled is billing this run for, found from ``run_id`` alone.
 
@@ -800,7 +818,7 @@ def fleet_worker_census(run_id: str):
         with Cloud() as cloud:
             for record in matched:
                 identity = str(record.get("name"))
-                if _state_of(record) in _TERMINAL_WORKER_STATES:
+                if not _cluster_is_live(record):
                     continue
                 try:
                     details = cloud.cluster_details(record.get("id"))
