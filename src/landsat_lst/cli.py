@@ -1868,9 +1868,17 @@ def shard_process(
         # Identity before credits: a session that cannot call STS cannot read a
         # Coiled balance either, and "log in again" beats "balance unreadable".
         quota.preflight_identity()
+        # Then permission, which STS does not answer: a read-only identity
+        # clears the identity gate and fails on the first artifact.
+        quota.preflight_write_access()
         estimate = quota.estimate_run_credits()
         balance = quota.preflight_credits(estimate)
-    except (ShardBackendMismatch, quota.IdentityRefused, quota.QuotaRefused) as e:
+    except (
+        ShardBackendMismatch,
+        quota.IdentityRefused,
+        quota.WriteAccessRefused,
+        quota.QuotaRefused,
+    ) as e:
         raise click.ClickException(str(e)) from e
     console.print(
         f"  credits: ~{estimate:.0f} needed, "
@@ -1912,6 +1920,7 @@ def shard_resume(run_id: str, tile: str, ack_quota: bool) -> None:
         ShardStageFailed,
         ShardBackendMismatch,
         quota.IdentityRefused,
+        quota.WriteAccessRefused,
         quota.QuotaRefused,
     ) as e:
         raise click.ClickException(str(e)) from e
@@ -2121,9 +2130,15 @@ def shard_fleet(
     try:
         require_shared_storage(get_storage(), None)
         quota.preflight_identity()
+        quota.preflight_write_access()
         estimate = quota.estimate_run_credits() * len(jobs)
         balance = quota.preflight_credits(estimate)
-    except (ShardBackendMismatch, quota.IdentityRefused, quota.QuotaRefused) as e:
+    except (
+        ShardBackendMismatch,
+        quota.IdentityRefused,
+        quota.WriteAccessRefused,
+        quota.QuotaRefused,
+    ) as e:
         raise click.ClickException(str(e)) from e
     console.print(
         f"  credits: ~{estimate:.0f} needed for {len(jobs)} tile(s), "
@@ -2182,6 +2197,7 @@ def shard_resume_fleet(
         ShardBackendMismatch,
         FileNotFoundError,
         quota.IdentityRefused,
+        quota.WriteAccessRefused,
         quota.QuotaRefused,
     ) as e:
         raise click.ClickException(str(e)) from e

@@ -643,11 +643,12 @@ class TestSampledRunsProfileThemselves:
 def s3_backend(monkeypatch):
     """The only backend the driver will submit Coiled work against.
 
-    Also stubs *both* preflights, which run before the run id is printed and
-    must never reach a control plane from a unit test. A CI runner has no AWS
-    session, so an unstubbed identity check refuses there and passes only on a
-    laptop that happens to be logged in -- which is how this escaped once
-    already. The refusal paths have their own scenarios in
+    Also stubs *all three* preflights, which run before the run id is printed
+    and must never reach a control plane from a unit test. A CI runner has no
+    AWS session, so an unstubbed identity check refuses there and passes only
+    on a laptop that happens to be logged in -- which is how this escaped once
+    already. The write probe is worse: unstubbed it puts a real object in the
+    publication bucket. The refusal paths have their own scenarios in
     tests/unit/test_driver_state_machine.py.
     """
     from landsat_lst import quota
@@ -655,6 +656,9 @@ def s3_backend(monkeypatch):
 
     monkeypatch.setattr(settings, "storage_backend", "s3")
     monkeypatch.setattr(quota, "preflight_identity", lambda **_: "arn:aws:sts::0:assumed-role/t")
+    monkeypatch.setattr(
+        quota, "preflight_write_access", lambda **_: ["arn:aws:sts::0:assumed-role/t"]
+    )
     monkeypatch.setattr(
         quota, "read_balance", lambda: quota.CreditBalance(remaining=10_000.0, source="test")
     )
@@ -685,6 +689,38 @@ class TestShardGroup:
 
         assert result.exit_code != 0
         assert "LST_STORAGE_BACKEND=s3" in result.output
+        assert "shard resume" not in result.output
+
+    def test_an_identity_that_cannot_write_fails_before_a_run_id_is_printed(
+        self, runner, s3_backend, monkeypatch
+    ):
+        """Same placement rule as the backend and credit gates.
+
+        A read-only identity clears STS, so the run would boot a fleet, stage
+        nothing, and fail on its first artifact -- one wasted boot per worker,
+        showing up as shards that never published. Refusing here costs a
+        round trip.
+        """
+        del s3_backend
+        from landsat_lst import quota
+
+        def refuse(**_kwargs) -> list[str]:
+            raise quota.WriteAccessRefused(
+                "PutObject was refused (AccessDenied) for the driver, which runs as "
+                "arn:aws:iam::392361759182:user/vercel-data-access from the default "
+                "credential chain. The target is s3://a-bucket/a-prefix/.",
+                arn="arn:aws:iam::392361759182:user/vercel-data-access",
+                bucket="a-bucket",
+                key="a-prefix/_preflight/probe.json",
+            )
+
+        monkeypatch.setattr(quota, "preflight_write_access", refuse)
+
+        result = runner.invoke(main, ["shard", "process", "--tile", "N40W075"])
+
+        assert result.exit_code != 0
+        assert "vercel-data-access" in result.output
+        assert "a-bucket" in result.output
         assert "shard resume" not in result.output
 
     def test_process_prints_the_resume_line_before_it_starts(self, runner, s3_backend):
@@ -720,6 +756,32 @@ class TestShardGroup:
 
         assert result.exit_code == 0
         assert resume.call_args.args == ("run-7", "N40W075")
+
+    def test_resume_formats_a_write_refusal_as_a_cli_error(self, runner):
+        from landsat_lst import quota
+
+        refusal = quota.WriteAccessRefused(
+            "ListObjectsV2 was refused", arn="arn:aws:iam::1:user/x", bucket="b", key="k"
+        )
+        with patch("landsat_lst.shard_driver.resume_tile", side_effect=refusal):
+            result = runner.invoke(main, ["shard", "resume", "run-7", "N40W075"])
+
+        assert result.exit_code != 0
+        assert "Error: ListObjectsV2 was refused" in result.output
+        assert result.exception is not refusal
+
+    def test_resume_fleet_formats_a_write_refusal_as_a_cli_error(self, runner):
+        from landsat_lst import quota
+
+        refusal = quota.WriteAccessRefused(
+            "PutObject was refused", arn="arn:aws:iam::1:user/x", bucket="b", key="k"
+        )
+        with patch("landsat_lst.fleet_driver.resume_fleet", side_effect=refusal):
+            result = runner.invoke(main, ["shard", "resume-fleet", "run-7"])
+
+        assert result.exit_code != 0
+        assert "Error: PutObject was refused" in result.output
+        assert result.exception is not refusal
 
     def test_a_stage_subcommand_forwards_its_index(self, runner):
         with patch("landsat_lst.shard_tasks.run_shard", return_value=[]) as run_shard:
