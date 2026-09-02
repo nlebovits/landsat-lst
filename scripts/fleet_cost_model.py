@@ -1,7 +1,7 @@
 """All-in fleet cost model for issue #108, in ranges, with every input labelled.
 
 Anchored on the S30W065 acceptance run of 2026-08-23 and reconciled against
-``docs/adr/017-fleet-consolidation.md`` as the driver that is actually being
+``docs/adr/018-fleet-consolidation.md`` as the driver that is actually being
 integrated. Usage::
 
     python scripts/fleet_cost_model.py                # table to stdout
@@ -362,11 +362,11 @@ CAPTURE_BANDS: dict[str, tuple[float, float]] = q(
     },
     "fraction of provisioning + idle removed",
     bucket="assumed",
-    source="ADR-017: capture = 1 - 1/R for queue depth R. At 700 tiles the first offsets "
+    source="ADR-018: capture = 1 - 1/R for queue depth R. At 700 tiles the first offsets "
     "wave buffers about 10,500 units against a 64-VM cap, R about 164, boot capture "
     "0.994. Idle capture is lower because a tail wave, a final round's stragglers, "
     "a competing composite stage, and tiles not becoming ready together all remain.",
-    upgrade="The ~$0.50 queues_surplus probe in ADR-017, then a capped calibration run that "
+    upgrade="The ~$0.50 queues_surplus probe in ADR-018, then a capped calibration run that "
     "counts boots and idle VM-minutes.",
 )
 
@@ -375,7 +375,7 @@ QUEUES_SURPLUS = q(
     None,
     "boolean",
     bucket="unknown",
-    source="ADR-017 backend contract: read from documented Coiled semantics and never "
+    source="ADR-018 backend contract: read from documented Coiled semantics and never "
     "verified against real Coiled by this project",
     upgrade="The ~$0.50 one-wave probe: more units than workers, count the workers that "
     "start and how units distribute. Until it passes, every capture figure is an "
