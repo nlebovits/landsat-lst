@@ -1934,13 +1934,22 @@ class TestCapacityIsReleasedOnlyOnEvidence:
         assert driver.in_flight == 0
 
     def test_a_submission_that_may_have_started_holds_its_capacity(self, storage, clock):
-        """An unanswered submission is not an unstarted one.
+        """An unanswered submission is not an unstarted one -- once per attempt.
 
         The control plane can accept the request, boot the workers, and lose
         the answer on the way back. A driver that counts only what it was told
         about then reports its whole cap free while the workers run, and the
-        next wave boots on top of them. So the width is held, and only the
-        artifacts or a confirmed death release it.
+        next wave boots on top of them. So the width is held, and only a census
+        that stops reporting the identity releases it.
+
+        Held for **every attempt**, not once for the wave. There is no
+        idempotency key on this path and the submission is a non-atomic
+        two-step, so each of the three attempts may have created a cluster and
+        booted its workers: the charge is ``attempts * width``. It over-counts
+        whenever the substrate's name guard did refuse the retries, and that is
+        the direction to be wrong in -- under-counting is the measured
+        90-up / 30-counted window, and a census corrects the over-count on the
+        first poll that can be taken.
         """
         fleet = FakeWaveFleet(
             storage, _plans(TILES[:1]), clock=clock, raise_always=RuntimeError("control plane")
@@ -1950,8 +1959,9 @@ class TestCapacityIsReleasedOnlyOnEvidence:
         driver._flush("offsets")
 
         assert driver.summary.submissions == 1
-        assert driver.in_flight == 2
-        assert driver.headroom == 2
+        assert fleet.submit_attempts == settings.shard_submit_retries
+        assert driver.in_flight == 2 * settings.shard_submit_retries
+        assert driver.headroom == 0
         wave = driver.summary.waves[0]
         assert wave.acknowledged is False
         assert wave.handle_id is None
@@ -1980,15 +1990,20 @@ class TestCapacityIsReleasedOnlyOnEvidence:
         body = json.loads(storage.read_text(shards.fleet_submission_key(RUN_ID, "offsets", 1)))
         assert body["acknowledged"] is False
         assert body["max_workers"] == 2
+        # The attempt count is part of the record, because it is part of the
+        # charge. A resumed driver that read only the width would give back two
+        # thirds of what this one is holding.
+        assert body["attempts"] == settings.shard_submit_retries
 
+        charged = 2 * settings.shard_submit_retries
         resumed = self._driver_with(storage, clock, fleet, max_vms=4)
         resumed.adopt_live_waves()
-        assert resumed.in_flight == 2
+        assert resumed.in_flight == charged
         assert len(resumed._live) == 1
-        # And again: adoption is a read, so a third driver counts the same two.
+        # And again: adoption is a read, so a third driver counts the same.
         again = self._driver_with(storage, clock, fleet, max_vms=4)
         again.adopt_live_waves()
-        assert again.in_flight == 2
+        assert again.in_flight == charged
 
     def test_an_overlapped_composite_wave_gives_width_back_when_its_bands_land(
         self, storage, clock

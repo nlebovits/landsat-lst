@@ -425,8 +425,9 @@ class Settings(BaseSettings):
     coiled_max_workers: int = Field(
         default=4,
         description="Ceiling on VMs running batch tasks at once. Coiled gives "
-        "each task its own VM and queues the rest, so this is the cost cap: a "
-        "700-tile job never runs 700 machines.",
+        "each task its own VM and queues the rest, so a 700-tile job never runs "
+        "700 machines. A CONCURRENCY ceiling, not a cost cap: spend is "
+        "concurrency integrated over time and nothing here bounds the time.",
     )
     coiled_job_timeout: str = Field(
         default="24 hours",
@@ -665,11 +666,29 @@ class Settings(BaseSettings):
     fleet_max_vms: int = Field(
         default=64,
         ge=1,
-        description="Hard ceiling on VMs in flight across the whole "
-        "consolidated run, counted against live waves rather than against "
-        "submissions. This is the cost cap, and it is the only one: a wave is "
-        "never submitted wider than the headroom left, so a run cannot exceed "
-        "it by racing two stages against each other.",
+        description="Ceiling on CONCURRENT VMs across the whole consolidated "
+        "run: the driver never submits a wave wider than the headroom left, so "
+        "two stages cannot race each other past it. It is NOT a spending cap. "
+        "Spend is the integral of concurrency over time, and nothing here "
+        "bounds the time: a run at half this cap for twice as long costs the "
+        "same, and a fleet that replaces reclaimed spot VMs churns instance "
+        "launches at flat concurrency. The census measures what is running and "
+        "so enforces this cap; it yields only a LOWER bound on the bill, "
+        "because the substrate reports when a worker started and not when it "
+        "stopped. See ADR-018.",
+    )
+    fleet_ghost_ttl_s: float = Field(
+        default=300.0,
+        ge=0.0,
+        description="How long width released without an authoritative worker "
+        "census keeps counting against the concurrency cap. Reached only in "
+        "degraded mode -- no credentials, control plane down, or a backend that "
+        "cannot be asked -- where the driver cannot tell a wave with a hung "
+        "unit from a wave that was preempted. Holding forever is safe and "
+        "deadlocks the run; releasing at once is live and doubles the bill. "
+        "Charging the released width for a bounded interval is both, at a "
+        "ceiling of twice the cap. One VM boot is the default because that is "
+        "the interval a fleet can plausibly still be tearing down in.",
     )
     fleet_wave_window_s: float = Field(
         default=120.0,

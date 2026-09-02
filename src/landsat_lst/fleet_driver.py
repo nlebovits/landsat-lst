@@ -46,6 +46,25 @@ Three properties are worth stating because they are what the tests assert:
   the whole cap still runs -- queued, not split. Splitting a tile's demand
   across two waves would write a submission record for a partial index set, and
   the remainder would cost the tile a barrier round it never used.
+
+**The cap is measured, and it bounds concurrency rather than spend.** Held
+width used to be inferred from the bucket, and a listing of work products is not
+a function of whether a VM exists -- which is how the same expression
+over-charged a wave that was gone and under-charged one that was merely slow.
+So the driver asks the substrate: ``backend.census(run_id)`` reports every
+worker being billed for this run, found from the run id alone, and
+
+    H(t) = max( intent_charge(t), census(t).total )
+
+where ``intent_charge`` counts every submission *attempt* at its full requested
+width from the instant the call is issued. Bytes in the bucket are still what
+decides whether *work* is done; they no longer decide whether a machine is up.
+
+``settings.fleet_max_vms`` is a **concurrency** ceiling and not a budget. Spend
+is the integral of concurrency over time, the substrate reports when a worker
+started and not when it stopped, and nothing server-side remembers the cap at
+all. The census enforces the concurrency bound and yields only a *lower* bound
+on the bill. See ADR-018.
 """
 
 from __future__ import annotations
@@ -80,7 +99,7 @@ from landsat_lst.storage import PRODUCTS, get_storage
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from landsat_lst.fleet_backend import FleetBackend, WaveHandle
+    from landsat_lst.fleet_backend import FleetBackend, WaveHandle, WorkerCensus
     from landsat_lst.models import ProcessingJob
     from landsat_lst.storage import StorageBackend
 
@@ -595,6 +614,13 @@ class TileTrack:
     clock: Clock
     job: ProcessingJob | None = None
     dead_handles: set = field(default_factory=set)
+    #: Submission identities an authoritative census stopped reporting, shared
+    #: by the driver for the same reason ``dead_handles`` is. It is the wider of
+    #: the two and the only one that covers a submission this driver holds no
+    #: handle for -- which is precisely the record a resumed driver inherits.
+    #: A **barrier** input, never a capacity one: it lets a tile stop waiting
+    #: out a deadline on machines that are gone.
+    dead_identities: set = field(default_factory=set)
     #: Per stage, the unit indexes a wave the driver still counts as live is
     #: carrying for this tile. Refreshed by the driver each poll, exactly as
     #: ``dead_handles`` is, because a track cannot see a wave.
@@ -907,8 +933,17 @@ class TileTrack:
         uploaded and then stopped has already been re-checked against the bucket
         by the caller, so what is left here is a fleet that will never produce
         anything, and waiting out its deadline buys nothing.
+
+        A census that no longer reports the submission's identity says the same
+        thing and says it about records this driver holds no handle for. That
+        is the case the handle set cannot reach: an adopted record, or one whose
+        submission answer was lost, has ``cluster_id`` ``None`` and would
+        otherwise be waited out in full against a substrate that is running
+        nothing.
         """
         if record.get("cluster_id") is not None and record["cluster_id"] in self.dead_handles:
+            return False
+        if record.get("cluster_name") and record["cluster_name"] in self.dead_identities:
             return False
         # The wave that wrote this record knows its own queue depth; the caller
         # only knows one round's worth. Preferring the record is what stops a
@@ -979,7 +1014,32 @@ class Wave:
     #: never by the tracks it carries: capacity must not be a function of a
     #: tile's own despair, and while this lived on the tracks a tile failing
     #: between the refresh and the flush in the same poll moved the number.
+    #:
+    #: **Never an input to capacity.** It answers "has this wave's work landed",
+    #: which is a question about the bucket, and it feeds barriers, retirement
+    #: in degraded mode, and the completion timestamps. What it must not do
+    #: again is set a width.
     outstanding_units: set[tuple[str, int]] | None = None
+    #: The name this wave is discoverable under, from
+    #: :meth:`~landsat_lst.fleet_backend.FleetBackend.submission_identity`. A
+    #: pure function of ``(run_id, stage, wave)``, fixed *before* the first
+    #: submission attempt, and therefore the one key that survives an attempt
+    #: whose answer was lost. It is what a census is matched against.
+    identity: str = ""
+    #: Submission attempts issued for this wave, counting the ones that raised.
+    #: Each is charged at full width until a census says otherwise.
+    attempts: int = 0
+    #: When the last attempt was issued. A charge may only be discharged by a
+    #: census taken *after* this: an earlier one could not have seen the
+    #: workers it started.
+    last_attempt_at: float = 0.0
+    #: Width asked for, kept separately from :attr:`max_workers` because a
+    #: handle overwrites that with what the substrate granted.
+    requested_workers: int = 0
+    #: Whether the charge has been given back, and on what evidence. Set once;
+    #: a discharged wave leaves ``_live`` in the same pass.
+    discharged: bool = False
+    discharged_by: str = ""
 
     def stranded(self, now: float) -> bool:
         """Past a whole budget and a boot since this wave last showed a sign of life.
@@ -1003,39 +1063,36 @@ class Wave:
         since = self.submitted_at if self.last_completion_at is None else self.last_completion_at
         return since + self.deadline_s + budgets.VM_BOOT_S
 
-    def held_at(self, now: float) -> int:
-        """Workers this wave is holding. Two regimes, and the boundary is its budget.
+    def intent_charge(self) -> int:
+        """Width charged for this wave: **every attempt, at the width it asked for.**
 
-        **Inside its budget it holds its full width.** A batch array keeps
-        every VM it started until the array itself finishes: the worker that
-        published this artifact takes the next unit off the queue, or waits in
-        a cluster that is still billing. Counting the width down per landed
-        artifact measures work rather than machines, and the difference is a
-        whole wave at the tail -- the driver freed slots the substrate had not,
-        the next wave booted on top, and a run capped at 64 peaked at 82.
+        The whole of the capacity rule, and it reads nothing about work. A
+        worker cannot exist before its attempt was issued, so charging from the
+        instant of the call is sound by construction; and a charge is given
+        back only by a census that does not contain this wave's identity, which
+        is the one observation that is a function of machines.
 
-        **Past it the count degrades to one worker per absent unit.** A wave
-        that has overrun its derived deadline by a boot is either gone, in
-        which case it holds nothing at all, or alive with finished workers idle
-        in an array the substrate should have ended. Charging the full width
-        for either is charging for a wave that has already broken its contract,
-        and the price of doing so is a run that fails tiles whose own work
-        landed: one slow unit in a cap-wide wave would pin the whole cap for
-        the rest of the build. The exposure this admits is bounded by the
-        landed units of waves that are already overdue, and it cannot reach the
-        healthy tail the full-width rule exists to protect.
+        Per *attempt*, not per wave, because there is no idempotency key on the
+        submission path this drives: ``coiled.batch_run`` is a non-atomic
+        two-step, and an attempt whose answer was lost may have created a
+        cluster and booted its workers. Charging only the attempt that answered
+        is charging for a subset of what may be running.
 
-        Zero once every unit has landed, because that is when the array ends.
-        With no evidence at all the wave holds its full requested width:
-        over-counting delays a submission, under-counting doubles a bill.
+        At the width **requested**, not the width the handle reported. A handle
+        can only ever report a width the substrate clamped downward, and an
+        attempt that lost its answer reports nothing at all while billing at the
+        width it was given. So the charge takes the larger of the two.
+
+        There is deliberately no second regime. The deleted one degraded the
+        charge to one worker per outstanding unit once a wave overran its
+        budget, which is the category error this class exists to stop making:
+        it answered "is a VM billing" with a count of artifacts, over-charged a
+        wave that was gone (Window C) and under-charged one that was merely
+        slow (Window A) from the same expression.
         """
-        if self.outstanding_units is None:
-            return self.max_workers
-        if not self.outstanding_units:
+        if self.discharged:
             return 0
-        if self.stranded(now):
-            return min(self.max_workers, len(self.outstanding_units))
-        return self.max_workers
+        return max(1, self.attempts) * max(self.requested_workers, self.max_workers)
 
     def expired(self, now: float) -> bool:
         return now >= self.submitted_at + self.deadline_s
@@ -1079,12 +1136,70 @@ class Wave:
             "units": len(self.units),
             "tiles": list(self.tiles),
             "max_workers": self.max_workers,
+            "requested_workers": self.requested_workers,
             "handle_name": self.handle_name,
+            "identity": self.identity,
+            "attempts": self.attempts,
+            "last_attempt_at": self.last_attempt_at,
             "acknowledged": self.acknowledged,
             "first_completion_at": self.first_completion_at,
             "last_completion_at": self.last_completion_at,
             "provisioning_idle_s": self.provisioning_idle_s,
         }
+
+
+@dataclass
+class GhostLedger:
+    """Width released while the substrate could not be asked about it.
+
+    The degraded half of the capacity rule, and the only place the driver ever
+    gives back a charge on something other than a census. When no census can be
+    taken, a wave that has overrun its budget and cannot be confirmed dead is
+    one of two executions the driver cannot tell apart -- ``W`` workers with a
+    hung unit, or zero workers because the array was preempted. Holding the
+    width is safe and kills liveness (Window C: the run failed four tiles of
+    four while nothing was running). Releasing it is live and unsafe (Window A:
+    127 VMs against a cap of 64).
+
+    So the width is released *and* kept charged, here, for a bounded time. That
+    is escape E1 in ``evidence/design/properties.md``, and the ledger is what
+    makes it ``2C``-safe rather than unbounded: admission requires
+    ``intent + ghosts + x <= C``, so at most one cap's worth of released width
+    can be outstanding at a time. A naive "release after D" with no ledger grows
+    the over-admission as ``ceil(L/D) * C`` over a long run, which is the
+    version that is not worth having.
+
+    Two things end an entry. The TTL, which is the hard bound and is what makes
+    the run live again. Or the wave's units all landing, which is the substrate
+    contract saying the array is over -- evidence beats a timer, so
+    :meth:`settle` drops the entry early rather than paying out the rest of it.
+    """
+
+    #: ``identity -> (width, expires_at)``.
+    entries: dict[str, tuple[int, float]] = field(default_factory=dict)
+
+    def add(self, identity: str, width: int, now: float, ttl: float) -> None:
+        if width <= 0:
+            return
+        held, expires = self.entries.get(identity, (0, now))
+        self.entries[identity] = (max(held, int(width)), max(expires, now + float(ttl)))
+
+    def settle(self, identity: str) -> None:
+        """Drop an entry the substrate's own contract has now accounted for."""
+        self.entries.pop(identity, None)
+
+    def width(self, now: float) -> int:
+        """Released-but-unconfirmed width still charged against the cap."""
+        expired = [key for key, (_, expires) in self.entries.items() if now >= expires]
+        for key in expired:
+            del self.entries[key]
+        return sum(width for width, _ in self.entries.values())
+
+    def horizon(self, now: float) -> float:
+        """Seconds until the last entry expires, so a poll budget can cover it."""
+        if not self.entries:
+            return 0.0
+        return max(0.0, max(expires for _, expires in self.entries.values()) - now)
 
 
 @dataclass
@@ -1179,20 +1294,180 @@ class FleetDriver:
         self._live: list[Wave] = []
         self._wave_no: dict[str, int] = dict.fromkeys(WAVE_STAGES, 0)
         self._dead_handles: set = set()
+        #: The last census taken, or ``None`` when the substrate could not be
+        #: asked. ``None`` is *unknown*, never *empty* -- see :meth:`in_flight`.
+        self._census: WorkerCensus | None = None
+        #: Width released without a census to confirm it. Empty whenever a
+        #: census is available, because then nothing is released without one.
+        self._ghosts = GhostLedger()
+        #: Whether the run is currently accounting without a census. Held so
+        #: the transition is logged once rather than every poll -- a
+        #: multi-hour run polls tens of thousands of times.
+        self._degraded: bool | None = None
+        #: Whether an authoritative census has ever been obtained on this run.
+        #: Separates "the control plane stopped answering" from "this substrate
+        #: cannot be asked at all" -- see :meth:`_discharge_reason` rule 5.
+        self._census_seen: bool = False
+        #: Identities a census or a probe has settled, published to the tracks.
+        self._dead_identities: set[str] = set()
 
     # -- capacity ---------------------------------------------------------
 
-    def _retire(self) -> None:
-        """Give back the headroom of waves that are provably over.
+    def take_census(self) -> None:
+        """Ask the substrate what it is billing this run for. Once per poll.
 
-        **A deadline is not proof.** An expired wave whose units have not landed
-        is a wave that is late, and a late wave's workers are still billing.
-        Releasing its width on expiry is how a run comes to hold two waves'
-        worth of VMs against a one-wave cap: the tiles re-demand, a fresh wave
-        is submitted into headroom that only exists on paper, and the real
-        concurrency is the sum of both. So a wave is retired on evidence only --
-        every tile it carried has settled that stage, or the backend has
-        confirmed the submission dead.
+        One control-plane query for the whole run, replacing one probe per live
+        wave, and it answers a question the probe could not put at all: what is
+        running that this driver holds no handle for.
+
+        Best-effort in the same sense as every other instrumentation call in
+        this project -- a failure is logged and swallowed. What it must *not* do
+        is degrade to zero, so a failure yields ``None`` and
+        :attr:`in_flight` switches to the ghost-ledger rule.
+
+        Resolved by lookup rather than by attribute access on the protocol,
+        because a backend written before ``enumerable_by_run`` existed has no
+        ``census`` at all, and the honest reading of that is the same as a
+        control plane that will not answer: unknown, run degraded, say so.
+        """
+        take = getattr(self.backend, "census", None)
+        census: WorkerCensus | None = None
+        if take is not None:
+            try:
+                census = take(self.run_id)
+            except Exception as e:
+                log.warning("fleet_census_failed", run_id=self.run_id, error=str(e))
+        self._census = census
+        self._census_seen = self._census_seen or census is not None
+        self._note_census_mode(census)
+
+    def _note_census_mode(self, census: WorkerCensus | None) -> None:
+        """Log the degraded transition, once per crossing rather than per poll."""
+        degraded = census is None
+        if degraded == self._degraded:
+            return
+        self._degraded = degraded
+        if degraded:
+            log.warning(
+                "fleet_census_degraded",
+                run_id=self.run_id,
+                backend=getattr(self.backend, "name", "?"),
+                concurrency_cap=self.max_vms,
+                ghost_ttl_s=settings.fleet_ghost_ttl_s,
+                note=(
+                    "no authoritative worker census; capacity is the intent charge plus a "
+                    "ghost ledger, which bounds concurrency at 2x the cap rather than at it"
+                ),
+            )
+            return
+        log.info(
+            "fleet_census_available",
+            run_id=self.run_id,
+            total=census.total if census else 0,
+            identities=len(census.identities) if census else 0,
+        )
+
+    def _discharge_reason(self, wave: Wave, now: float) -> str | None:
+        """The evidence, if any, that this wave's charge may be given back.
+
+        Ordered by strength, and the ordering is the whole design:
+
+        1. **The backend confirmed the submission dead.** A statement about
+           machines, and the only thing a probe is allowed to assert.
+        2. **A census taken after the last attempt omits the identity.** The
+           authoritative case. ``after`` matters: an earlier census could not
+           have seen workers an attempt had not yet asked for.
+        3. Nothing else, *while a census is available*. In particular, every
+           unit of the wave having landed does **not** discharge it -- the
+           artifacts say the work finished, the census says the VMs are still
+           there, and the census is the one that is billing.
+
+        With no census, two degraded rules take over and neither is as good:
+
+        4. **Every unit landed.** ``queues_surplus`` ties the array's end to its
+           last unit, so this is the substrate's own contract read through the
+           bucket rather than an inference about idle workers. Observed at poll
+           resolution, so late and never early.
+        5. **Stranded past its budget with nothing able to confirm it**, on a
+           run whose substrate *has* answered a census at some point. The
+           genuinely undecidable case, released into the :class:`GhostLedger`
+           so the width keeps counting while the tiles get to move again.
+
+        Rule 5 is gated on having seen a census, and the gate is the difference
+        between two situations that look alike and are not. A control plane that
+        answered this run and has now stopped answering is a transient, the
+        identity is known to be enumerable, and a TTL is a real bound on the
+        release -- escape E1, ``2C``-safe. A substrate that has *never* answered
+        offers no evidence that anything it started is enumerable at all, so a
+        timed release would be a guess with nothing behind it. There the driver
+        holds, and the run ends loudly through :meth:`_stalled` rather than
+        quietly at twice its cap. That is the liveness price of soundness when
+        there is no measurement, and it is the price the design accepts: it is
+        exactly Window C, and it is bounded, stated, and one tile-failure per
+        tile rather than a silent doubling of the bill.
+        """
+        if wave.handle_id is not None and wave.handle_id in self._dead_handles:
+            return "probe_dead"
+        census = self._census
+        if census is not None:
+            if census.as_of >= wave.last_attempt_at and wave.identity not in census.identities:
+                return "census_absent"
+            return None
+        if wave.units and wave.outstanding_units is not None and not wave.outstanding_units:
+            return "array_ended"
+        if self._census_seen and wave.units and wave.stranded(now):
+            return "stranded_unconfirmed"
+        return None
+
+    def _discharge(self, wave: Wave, reason: str, now: float) -> None:
+        """Give a wave's charge back, ghosting it when nothing confirmed the release."""
+        width = self.wave_held(wave)
+        wave.discharged = True
+        wave.discharged_by = reason
+        if reason == "stranded_unconfirmed":
+            self._ghosts.add(wave.identity, width, now, settings.fleet_ghost_ttl_s)
+            log.warning(
+                "fleet_wave_ghosted",
+                run_id=self.run_id,
+                stage=wave.stage,
+                wave=wave.wave,
+                identity=wave.identity,
+                width=width,
+                ttl_s=settings.fleet_ghost_ttl_s,
+                note="width released without confirmation; still charged until the TTL expires",
+            )
+            return
+        # Confirmed, or as good as: drop any ghost this identity was carrying
+        # from an earlier release rather than paying out the rest of its TTL.
+        self._ghosts.settle(wave.identity)
+        if reason in ("census_absent", "probe_dead"):
+            # Told to the tracks, so a tile stops waiting out a deadline on
+            # workers the substrate has stopped reporting.
+            self._dead_identities.add(wave.identity)
+        log.info(
+            "fleet_wave_discharged",
+            run_id=self.run_id,
+            stage=wave.stage,
+            wave=wave.wave,
+            identity=wave.identity,
+            reason=reason,
+            width=width,
+        )
+
+    def _retire(self) -> None:
+        """Give back the charge of waves the substrate is no longer billing for.
+
+        **A deadline is not proof and neither is an artifact.** An expired wave
+        whose units have not landed is a wave that is late, and a late wave's
+        workers are still billing. A wave whose units *have* landed may still
+        have an array draining. Releasing on either is how a run comes to hold
+        two waves' worth of VMs against a one-wave cap: the tiles re-demand, a
+        fresh wave is submitted into headroom that only exists on paper, and the
+        real concurrency is the sum of both.
+
+        So the release rule is :meth:`_discharge_reason`, whose first two
+        answers are statements about machines. The bucket is consulted only when
+        no census can be taken, and then the run is already logged as degraded.
 
         The barrier is a separate question and still expires on time: a tile
         re-demands when *its record* ages out, whether or not the wave that
@@ -1200,37 +1475,30 @@ class FleetDriver:
         resubmission rather than permitting an over-run, which is the safe way
         round.
 
-        A wave that neither settles nor can be confirmed dead holds its width
-        until :meth:`_stalled` gives up on it and the run fails saying so. That
-        is deliberate: a loud stall costs less than a silent doubling of the
-        bill, and :meth:`_probe` always checks expired waves so the
-        confirmation path does not depend on ``probe_waves``. What is *not*
-        acceptable, and was the behaviour before, is holding it silently until
-        the poll ceiling and then returning as though the run had finished.
-
         There is deliberately no shortcut through a track's own state. An
-        earlier draft also retired a wave once every tile it carried had
-        *settled* that stage, which reads as evidence and is not: a tile settles
-        when it finishes a stage, and it settles just as surely when it gives up
-        after its last barrier round. In the second case the artifacts are
-        absent precisely because the workers are still running, so that
-        shortcut handed a live wave's width back on the strength of the tile's
-        own despair.
+        earlier draft retired a wave once every tile it carried had *settled*
+        that stage, which reads as evidence and is not: a tile settles when it
+        finishes a stage, and it settles just as surely when it gives up after
+        its last barrier round. In the second case the artifacts are absent
+        precisely because the workers are still running, so that shortcut handed
+        a live wave's width back on the strength of the tile's own despair.
         """
         self._refresh_wave_evidence()
+        now = self.clock.now()
         kept: list[Wave] = []
         for wave in self._live:
-            dead = wave.handle_id is not None and wave.handle_id in self._dead_handles
-            if self.wave_held(wave) == 0 or dead:
+            reason = self._discharge_reason(wave, now)
+            if reason is not None:
+                self._discharge(wave, reason, now)
                 continue
-            if wave.expired(self.clock.now()):
+            if wave.expired(now):
                 log.warning(
                     "fleet_wave_overdue",
                     run_id=self.run_id,
                     stage=wave.stage,
                     wave=wave.wave,
                     max_workers=wave.max_workers,
-                    note="still counted against the cap until it settles or is confirmed dead",
+                    note="still charged against the cap until a census stops reporting it",
                 )
             kept.append(wave)
         self._live = kept
@@ -1316,6 +1584,7 @@ class FleetDriver:
             run_id=self.run_id,
             waves=len(self._live),
             in_flight=self.in_flight,
+            degraded=self._census is None,
             reason=reason,
         )
         self._settle_stragglers(reason)
@@ -1371,12 +1640,12 @@ class FleetDriver:
                 self._record_wave(wave)
 
     def wave_held(self, wave: Wave) -> int:
-        """Workers this wave can still have running. See :meth:`Wave.held_at`.
+        """Workers this wave is charged for. See :meth:`Wave.intent_charge`.
 
-        A wave's own evidence, never a track's: nothing a tile does to itself
-        may move the cap.
+        A wave's own charge, never a track's: nothing a tile does to itself may
+        move the cap.
         """
-        return wave.held_at(self.clock.now())
+        return wave.intent_charge()
 
     def wave_outstanding(self, wave: Wave) -> int:
         """Units of this wave whose artifacts were absent at the last refresh.
@@ -1391,9 +1660,41 @@ class FleetDriver:
         return len(wave.outstanding_units)
 
     @property
-    def in_flight(self) -> int:
-        """Workers this driver believes are up, across every live wave."""
+    def intent_charge(self) -> int:
+        """``intent_charge(t)``: every undischarged submission attempt, at full width."""
         return sum(self.wave_held(wave) for wave in self._live)
+
+    @property
+    def in_flight(self) -> int:
+        """``H(t) = max(intent_charge(t), census(t).total)``. The one capacity rule.
+
+        Sound because a worker cannot exist outside the interval between the
+        attempt that asked for it and the census that stops reporting it, and
+        both ends of that interval are represented. Convergent because every
+        charge is discharged by the first census that omits its identity, and a
+        census is taken every poll.
+
+        The maximum rather than either term alone. The census can lag a
+        submission -- a cluster does not appear the instant ``batch_run``
+        returns -- so the intent charge covers the boot. The intent charge can
+        miss workers that belong to this run and to no attempt this driver
+        holds -- an orphan from a lost acknowledgement, a spot replacement above
+        the cap -- so the census covers those. Neither dominates, which is why
+        neither is dropped.
+
+        **When there is no census, this is a different guarantee and says so.**
+        ``None`` from the backend means "cannot answer", so the driver falls
+        back to the intent charge plus :class:`GhostLedger`: still bounded, but
+        by ``2C`` rather than ``C``, and only because the ledger keeps released
+        width charged for a TTL. That mode is logged (``fleet_census_degraded``)
+        rather than inferred, which the code it replaces never did -- it was
+        permanently in a worse version of this mode and silent about it.
+        """
+        intent = self.intent_charge
+        census = self._census
+        if census is None:
+            return intent + self._ghosts.width(self.clock.now())
+        return max(intent, census.total)
 
     def capacity_ledger(self) -> dict:
         """Every worker the driver is counting, by the identity that holds it.
@@ -1405,18 +1706,36 @@ class FleetDriver:
         independent ledger of potentially-live workers can be reconciled
         against it without sharing a line of this module's counting.
         """
+        census = self._census
+        now = self.clock.now()
         return {
             "run_id": self.run_id,
-            "max_vms": self.max_vms,
+            #: A ceiling on *concurrent* VMs. Not a budget: see
+            #: :attr:`~landsat_lst.config.Settings.fleet_max_vms`.
+            "concurrency_cap": self.max_vms,
             "in_flight": self.in_flight,
+            "intent_charge": self.intent_charge,
             "headroom": self.headroom,
+            #: ``null`` means the substrate could not be asked, which is not
+            #: the same as a census reporting nothing.
+            "census_total": None if census is None else census.total,
+            "census_as_of": None if census is None else census.as_of,
+            "census_unattributed": None if census is None else census.unattributed,
+            "degraded": census is None,
+            "ghost_width": self._ghosts.width(now),
             "waves": [
                 {
                     "stage": wave.stage,
                     "wave": wave.wave,
                     "handle_name": wave.handle_name,
+                    "identity": wave.identity,
+                    "attempts": wave.attempts,
                     "acknowledged": wave.acknowledged,
                     "max_workers": wave.max_workers,
+                    "requested_workers": wave.requested_workers,
+                    "census_workers": None
+                    if census is None
+                    else census.by_identity.get(wave.identity, 0),
                     "held": self.wave_held(wave),
                     "outstanding": sorted(
                         shards.fleet_unit_token(tile, index)
@@ -1493,7 +1812,11 @@ class FleetDriver:
             units=len(units),
             workers=workers,
         )
-        name = self.backend.wave_name(self.run_id, stage, wave_no)
+        # The identity, before anything is called. It is a pure function of
+        # ``(run_id, stage, wave)``, so it is the same string a census will be
+        # matched against and the same string a resumed driver rebuilds -- and,
+        # crucially, the same string whether or not the submission answers.
+        name = self._identity(stage, wave_no)
         submitted_at = self.clock.now()
 
         # Records first, and one per tile: that is what keeps adoption, the
@@ -1511,9 +1834,11 @@ class FleetDriver:
             units=units,
             tiles=tuple(dict.fromkeys(demand.tile for demand in demands)),
             max_workers=workers,
+            requested_workers=workers,
             submitted_at=submitted_at,
             deadline_s=deadline_s,
             handle_name=name,
+            identity=name,
             # Seed the evidence for what is about to be submitted. A demand
             # only ever carries indexes whose artifacts are absent, so at the
             # moment of submission the wave holds its full width, and saying so
@@ -1538,7 +1863,7 @@ class FleetDriver:
         self.summary.waves.append(wave)
         self._record_wave(wave)
 
-        handle = self._submit_with_retries(stage, units, wave_no, workers)
+        handle = self._submit_with_retries(wave)
         if handle is not None:
             wave.handle_id = handle.id
             wave.handle_name = handle.name or name
@@ -1556,19 +1881,26 @@ class FleetDriver:
             self._record_wave(wave)
         else:
             # Retries exhausted on transient errors, which is exactly the case
-            # that cannot be read as "nothing started". The wave keeps its
-            # width and stays unacknowledged until its artifacts settle it or
-            # the run gives up on it loudly. There is no handle to probe, so
-            # this is the one wave the backend can never confirm, and holding
-            # it is why :meth:`_stalled` exists.
+            # that cannot be read as "nothing started": every attempt may have
+            # created a cluster whose answer was lost. All of them stay charged,
+            # and the census finds them by ``identity`` even though no handle
+            # came back -- which is the whole point of fixing the name before
+            # the call rather than reading it out of the reply.
             log.error(
                 "fleet_wave_unacknowledged",
                 run_id=self.run_id,
                 stage=stage,
                 wave=wave_no,
-                max_workers=workers,
-                note="submission unconfirmed; its width is held until the artifacts settle it",
+                identity=name,
+                attempts=wave.attempts,
+                charged=self.wave_held(wave),
+                note="submission unconfirmed; every attempt stays charged until a census clears it",
             )
+            # Republished with the attempt count, so a resumed driver charges
+            # what this one charged. Without it the record says one attempt, the
+            # next driver charges one width, and the under-count survives
+            # exactly the crash the record exists to survive.
+            self._record_wave(wave)
         self._buffer[stage] = {}
         self._buffered_since.pop(stage, None)
         log.info(
@@ -1583,10 +1915,30 @@ class FleetDriver:
             in_flight=self.in_flight,
         )
 
-    def _submit_with_retries(
-        self, stage: str, units: tuple[tuple[str, int], ...], wave_no: int, workers: int
-    ) -> WaveHandle | None:
-        """Submit, retrying transient control-plane failures.
+    def _identity(self, stage: str, wave_no: int) -> str:
+        """The name this wave will be discoverable under, before it is submitted.
+
+        ``submission_identity`` where the backend has it, ``wave_name`` where it
+        does not. The fallback is not politeness: the two have always been the
+        same string on every backend here, and a backend predating the census
+        contract still produces a deterministic, pre-call name -- which is all
+        an identity has to be.
+        """
+        identify = getattr(self.backend, "submission_identity", None)
+        if identify is None:
+            return self.backend.wave_name(self.run_id, stage, wave_no)
+        return identify(self.run_id, stage, wave_no)
+
+    def _submit_with_retries(self, wave: Wave) -> WaveHandle | None:
+        """Submit, retrying transient control-plane failures, **charging per attempt.**
+
+        Every attempt is charged at full width from the instant the call is
+        issued, and stays charged until a census omits the wave's identity.
+        That is not defensive book-keeping: there is no idempotency key on this
+        path, the submission is a non-atomic two-step, and an attempt that
+        raises on the way back may have created a cluster and booted its
+        workers. Counting only the attempt that answered counts a subset of
+        what may be billing, which is the measured 90-up / 30-counted window.
 
         Terminal means the run stops now and says why: a quota that is already
         exhausted is not going to clear inside a backoff, and burning the
@@ -1597,16 +1949,22 @@ class FleetDriver:
         :data:`~landsat_lst.fleet_backend.BACKEND_CONTRACT`. All the state
         machine requires is that an unrecognized error be transient.
         """
+        stage, wave_no, units = wave.stage, wave.wave, wave.units
         last = ""
         for attempt in range(1, settings.shard_submit_retries + 1):
             try:
+                # Charged *before* the call, for the same reason the wave is
+                # recorded before it: the substrate can accept the request,
+                # start the VMs, and lose the answer.
+                wave.attempts += 1
+                wave.last_attempt_at = self.clock.now()
                 return self.backend.submit(
                     WaveRequest(
                         stage=stage,
                         run_id=self.run_id,
                         units=units,
                         wave=wave_no,
-                        max_workers=workers,
+                        max_workers=wave.requested_workers,
                         fleet_units=self.units,
                     )
                 )
@@ -1730,10 +2088,22 @@ class FleetDriver:
                     units=units,
                     tiles=tiles,
                     max_workers=int(body.get("max_workers") or 0),
+                    requested_workers=int(
+                        body.get("requested_workers") or body.get("max_workers") or 0
+                    ),
                     submitted_at=float(body.get("submitted_at") or 0.0),
                     deadline_s=float(body.get("deadline_s") or 0.0),
                     handle_id=body.get("handle_id"),
                     handle_name=str(body.get("handle_name") or ""),
+                    # A record written before identities existed still has one,
+                    # because the identity was always a pure function of the
+                    # key's own fields. Rebuilding it rather than defaulting to
+                    # empty is what lets a census discharge an adopted wave.
+                    identity=str(body.get("identity") or self._identity(stage, number)),
+                    attempts=int(body.get("attempts") or 1),
+                    last_attempt_at=float(
+                        body.get("last_attempt_at") or body.get("submitted_at") or 0.0
+                    ),
                     # A record written before this field existed describes a
                     # wave that was submitted, so absence reads as acknowledged.
                     acknowledged=bool(body.get("acknowledged", True)),
@@ -1752,9 +2122,13 @@ class FleetDriver:
         # Take the evidence without stamping a completion time, then retire
         # whatever the bucket already settles, so a resume into a finished run
         # starts with its whole cap rather than with a roster of ghosts.
-        # The one forced probe of the run. A wave this process never submitted
-        # is a wave it has confirmed nothing about, and its record's horizon is
-        # the previous driver's arithmetic rather than this one's.
+        # The census first: it answers for every adopted wave at once, and for
+        # anything the previous driver started and never recorded. A wave this
+        # process never submitted is a wave it has confirmed nothing about, and
+        # its record's horizon is the previous driver's arithmetic rather than
+        # this one's -- so the probe is forced too, for the degraded case where
+        # no census can be taken.
+        self.take_census()
         self._probe(force=True)
         self._refresh_wave_evidence(stamp=False)
         self._retire()
@@ -1905,9 +2279,13 @@ class FleetDriver:
             self.summary.polls += 1
             # One listing per shared prefix, before any tile looks at anything.
             self.index.refresh()
+            # One control-plane query for the whole run, before any capacity
+            # decision is taken against it.
+            self.take_census()
             self._probe()
             for track in self.tracks:
                 track.dead_handles = self._dead_handles
+                track.dead_identities = self._dead_identities
             self._retire()
             self._publish_held_units()
             if self._stalled():
@@ -1970,10 +2348,16 @@ class FleetDriver:
         wave is live and producing. With nothing live it does not move, which
         is the case a ceiling exists for.
         """
-        if not self._live:
+        now = self.clock.now()
+        # A ghost holds capacity with no wave behind it, so a run waiting one
+        # out has nothing in ``_live`` to extend the budget and would be cut off
+        # for being patient. The horizon is finite by construction.
+        remaining = self._ghosts.horizon(now)
+        if self._live:
+            remaining = max(remaining, max(wave.stranded_at() for wave in self._live) - now)
+        if remaining <= 0:
             return 0
-        remaining = max(wave.stranded_at() for wave in self._live) - self.clock.now()
-        return self.summary.polls + int(max(0.0, remaining) / max(settings.fleet_poll_s, 1e-6)) + 2
+        return self.summary.polls + int(remaining / max(settings.fleet_poll_s, 1e-6)) + 2
 
 
 # --------------------------------------------------------------------------
