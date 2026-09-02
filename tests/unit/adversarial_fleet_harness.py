@@ -771,7 +771,7 @@ def build_simulation(
     polls_target: int | None = None,
     wave_window_s: float = 0.0,
     probe_waves: bool = False,
-    backend_cls: type[SimBackend] = SimBackend,
+    backend_cls: type[SimBackend] | None = None,
     **backend_kw,
 ) -> Simulation:
     """A whole run, wired up: production-shaped plans, a physical substrate, a ledger.
@@ -795,7 +795,12 @@ def build_simulation(
     stub_scientific_work(monkeypatch, writers)
 
     terms = stage_terms(plans[0])
-    backend = backend_cls(storage, writers, clock=clock, ledger=ledger, terms=terms, **backend_kw)
+    # Resolved here rather than bound as a default, which is the rule this
+    # project already keeps for the billing source: a default evaluated at
+    # definition time cannot be substituted, and a caller that swaps the class
+    # on the module gets the original one without being told.
+    cls = backend_cls if backend_cls is not None else SimBackend
+    backend = cls(storage, writers, clock=clock, ledger=ledger, terms=terms, **backend_kw)
     storage.on_list = backend.tick
 
     if poll_s is None:
