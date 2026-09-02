@@ -38,6 +38,9 @@ jobs:
       - name: Run linter
         run: uv run ruff check .
 
+      - name: Check performance evidence safeguards
+        run: uv run python scripts/check_evidence_policy.py
+
       - name: Type check
         run: uv run ty check src/
 

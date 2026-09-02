@@ -92,6 +92,7 @@ DEFAULT_PLAN_SCENES = 300
 
 #: Labels under which :func:`profile_compute` dumps its summaries.
 PROFILE_DESTRIPE_OFFSETS = "destripe_offsets"
+PROFILE_COMPOSITE = "composite"
 
 #: Ceilings on a dumped profile, so instrumentation cannot outgrow what it
 #: instruments. The resource curve is strided rather than truncated, because

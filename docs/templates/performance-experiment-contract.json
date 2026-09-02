@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "claim": "The proposed change reduces the named production metric without changing scientific output.",
+  "inputs": {
+    "workload": "exact tile, shard, scene count, and stage",
+    "baseline_revision": "full git SHA",
+    "treatment_revision": "full git SHA"
+  },
+  "baseline": {
+    "metric": "wall_s",
+    "value": 0,
+    "unit": "seconds",
+    "classification": "measured",
+    "artifact": "path or immutable object identifier"
+  },
+  "target_metric": "wall_s",
+  "minimum_effect": {
+    "direction": "decrease",
+    "fraction": 0.1
+  },
+  "production_discriminator": "The smallest target-environment run that can reject the claim.",
+  "stop_rule": "Reject if the target metric improves by less than the minimum effect.",
+  "max_cloud_cost_usd": 1,
+  "max_coiled_credits": 20,
+  "code_identity_required": true,
+  "output_equivalence_required": true,
+  "operator_note": "This contract constrains a run; it does not authorize one."
+}

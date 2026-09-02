@@ -1666,6 +1666,82 @@ def tile_info(tile_name: str) -> None:
 
 
 @main.group()
+def evidence() -> None:
+    """Collect durable performance and cost evidence."""
+
+
+@evidence.command("collect")
+@click.option("--contract", "contract_path", type=click.Path(path_type=Path), required=True)
+@click.option("--out", "output_dir", type=click.Path(path_type=Path), required=True)
+@click.option("--run-id", default=None, help="Pipeline run whose published artifacts to include")
+@click.option("--cluster-id", type=int, multiple=True, help="Coiled cluster; repeatable")
+@click.option("--workspace", default=None, help="Coiled workspace for the cluster IDs")
+@click.option(
+    "--metric-query",
+    multiple=True,
+    help="Historical Coiled metric selector (for example cpu); repeatable",
+)
+@click.option(
+    "--attachment",
+    type=click.Path(path_type=Path),
+    multiple=True,
+    help="Exported chart, CSV, report, or spans.json to copy and hash; repeatable",
+)
+def evidence_collect(
+    *,
+    contract_path: Path,
+    output_dir: Path,
+    run_id: str | None,
+    cluster_id: tuple[int, ...],
+    workspace: str | None,
+    metric_query: tuple[str, ...],
+    attachment: tuple[Path, ...],
+) -> None:
+    """Bundle run artifacts, historical Coiled telemetry, and attachments.
+
+    This command is read-only against Coiled and pipeline storage. Historical
+    metric queries can be large: one production cluster's ``cpu`` series was
+    17.5 MB. Omit ``--metric-query`` when lifecycle, logs, and billing suffice.
+    """
+    from landsat_lst.evidence import collect_evidence
+
+    try:
+        destination = collect_evidence(
+            output_dir=output_dir,
+            contract_path=contract_path,
+            run_id=run_id,
+            cluster_ids=cluster_id,
+            workspace=workspace,
+            metric_queries=metric_query,
+            attachments=attachment,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print(f"Wrote [bold]{destination}[/bold]")
+
+
+@evidence.command("capture-frisky")
+@click.argument("source")
+@click.option("--out", "output_dir", type=click.Path(path_type=Path), required=True)
+@click.option("--limit", type=int, default=1_000_000_000, show_default=True)
+def evidence_capture_frisky(source: str, output_dir: Path, limit: int) -> None:
+    """Persist live Frisky spans, or summarize an existing spans.json.
+
+    SOURCE is a live Frisky dashboard URL or a previously captured JSON file.
+    Capturing before cluster shutdown is mandatory: ordinary historical Dask
+    host metrics cannot be converted into Frisky task and transfer spans.
+    """
+    from landsat_lst.evidence import capture_frisky
+
+    try:
+        paths = capture_frisky(source, output_dir, limit=limit)
+    except (OSError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    for path in paths:
+        console.print(f"Wrote [bold]{path}[/bold]")
+
+
+@main.group()
 def catalog() -> None:
     """Build and validate the published STAC catalog."""
 

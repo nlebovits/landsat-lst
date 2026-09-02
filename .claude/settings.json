@@ -7,6 +7,20 @@
           {
             "type": "command",
             "command": "python3 .claude/hooks/stac-endpoint-guard.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/performance-evidence-guard.py"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/performance-evidence-context.py"
           }
         ]
       }
