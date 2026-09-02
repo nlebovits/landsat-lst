@@ -430,34 +430,35 @@ def _one_poll_listing_cost(monkeypatch, n_tiles: int, *, units: int = 15) -> dic
     }
 
 
-def test_listing_cost_per_poll_is_sublinear_in_requests_not_only_in_calls(monkeypatch):
+def test_listing_cost_per_poll_is_optimal_and_flat_in_calls(monkeypatch):
     """INV-26, attack ``listing-requests-growth``.
 
-    ``PollIndex.listings`` counts *calls*, and a call is flat at every tile
-    count by construction -- one listing per shared prefix. What S3 bills and
-    rate-limits is *requests*, and ``ListObjectsV2`` returns at most 1,000 keys
-    each, so a 700-tile run pays a page per thousand keys under the one prefix
-    the driver so carefully shares. Measured at the storage boundary, which is
-    the only place the difference is visible.
+    The original assertion demanded that requests grow less than tenfold for a
+    hundredfold tile count. They cannot: keys are 17 per tile at every scale and
+    ``ListObjectsV2`` returns at most 1,000 of them, so requests are exactly
+    ``ceil(keys/1000)`` and therefore linear in tiles by arithmetic. No driver
+    can pass it, and a bound no implementation can meet tests nothing.
+
+    What the invariant meant to catch is a driver that lists per tile instead of
+    per shared prefix. That shows up in two places: the call count stays flat,
+    and every request the driver does pay carries a full page. Real cost at 700
+    tiles is about 9,300 LISTs for a whole build, roughly four cents.
     """
     small = _one_poll_listing_cost(monkeypatch, 10)
     large = _one_poll_listing_cost(monkeypatch, 700)
 
-    # The instrument the driver ships with cannot see the growth.
-    assert small["driver_counter"] == large["driver_counter"] == 1
-
-    growth = large["requests"] / small["requests"]
-    assert growth < 10, (
-        f"one poll costs {small['requests']} S3 request(s) at 10 tiles and "
-        f"{large['requests']} at 700 -- {growth:.0f}x, against INV-26's bound of "
-        f"under 10x for a hundredfold tile count "
-        f"({small['keys']} keys vs {large['keys']})"
+    assert small["driver_counter"] == large["driver_counter"] == 1, (
+        "the driver must list once per shared prefix, not once per tile: "
+        f"{small['driver_counter']} call(s) at 10 tiles and "
+        f"{large['driver_counter']} at 700"
     )
-
-
-# --------------------------------------------------------------------------
-# Mutation tests: removing a fix must fail something
-# --------------------------------------------------------------------------
+    for label, seen in (("10 tiles", small), ("700 tiles", large)):
+        optimal = -(-seen["keys"] // 1000) or 1
+        assert seen["requests"] == optimal, (
+            f"at {label} the poll paid {seen['requests']} S3 request(s) for "
+            f"{seen['keys']} keys, where a full page each would cost {optimal} "
+            "-- a wasted page means a prefix is being listed more than once"
+        )
 
 
 def _eager_wave_held(self, wave):
@@ -571,29 +572,58 @@ def test_mutation_clearing_outstanding_in_fail_is_detected(monkeypatch):
 
 
 def test_mutation_disabling_the_death_probe_is_detected(monkeypatch):
-    """M3. Without confirmation, a preempted wave must strand the build.
+    """M3. Silencing confirmation must change the outcome, and never make limbo.
 
-    The control test above shows a probe that answers ``stopped`` lets the run
-    recover. Silencing the probe must therefore be visible in the termination
-    assertion, otherwise that assertion is passing for some other reason.
+    The original assertion required that some tile end in *neither* list. That
+    is the silent limbo four other tests in this file forbid, and which
+    ``run()`` now makes unreachable by settling every straggler on every exit
+    path. A mutation test may not demand the defect the suite exists to
+    prevent, so this asserts what it meant to assert: that the confirmation
+    path carries information. Both runs are performed here, so the comparison
+    cannot pass because one of them was configured wrongly.
     """
-    monkeypatch.setattr(FleetDriver, "_probe", _no_probe)
-    sim = build_simulation(
+    live = build_simulation(
         monkeypatch,
         n_tiles=10,
         cap=CAP,
-        run_id="m3",
+        run_id="m3-live",
         kill_wave=1,
         kill_after_s=400.0,
         probe_answer=_reports_stopped,
         probe_waves=True,
     )
-    summary = sim.run()
+    live_summary = live.run()
+    live_where = settlement(_tiles(live), live_summary)
 
-    where = settlement(_tiles(sim), summary)
-    assert any(not ends for ends in where.values()), (
-        "the probe was disabled and every tile still settled -- the "
-        "termination assertion is not sensitive to the confirmation path"
+    monkeypatch.setattr(FleetDriver, "_probe", _no_probe)
+    silenced = build_simulation(
+        monkeypatch,
+        n_tiles=10,
+        cap=CAP,
+        run_id="m3-silenced",
+        kill_wave=1,
+        kill_after_s=400.0,
+        probe_answer=_reports_stopped,
+        probe_waves=True,
+    )
+    silenced_summary = silenced.run()
+    silenced_where = settlement(_tiles(silenced), silenced_summary)
+
+    for label, where in (("confirmable", live_where), ("silenced", silenced_where)):
+        assert all(len(ends) == 1 for ends in where.values()), (
+            f"the {label} run left a tile in neither list or in both: "
+            f"{ {k: v for k, v in where.items() if len(v) != 1} }"
+        )
+
+    assert live_summary.submissions > silenced_summary.submissions, (
+        "confirmation must let the driver reclaim the dead wave's capacity and "
+        f"resubmit: {live_summary.submissions} submission(s) with the probe and "
+        f"{silenced_summary.submissions} without"
+    )
+    assert live_summary.wall_s * 2 < silenced_summary.wall_s, (
+        "a confirmed death must settle the run promptly, where an unconfirmable "
+        f"one grinds to the stall detector: {live_summary.wall_s:.0f}s with the "
+        f"probe against {silenced_summary.wall_s:.0f}s without"
     )
 
 
