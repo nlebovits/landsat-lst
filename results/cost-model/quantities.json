@@ -1,0 +1,384 @@
+{
+  "pipeline_regime": "source-grid 30 m, pre-#121",
+  "regime_note": "Draft PR #121 delivers a nominal ~100 m grid, aggregating 3x3 source cells before the percentile. The source read is deliberately unchanged, so the composite stage's bytes stand, but its working set, its task count, and its output size all move, and PR #121 gate 4 leaves R_COMPOSITE_MB_S unrevised. Recalibrate against a 100 m run before quoting any figure here after #121 lands.",
+  "buckets": {
+    "measured": "A retained artifact in this repository is the observation itself.",
+    "derived": "Arithmetic over other quantities, never stronger than its weakest input.",
+    "assumed": "A modelling choice, carrying a value, a range, and a sensitivity.",
+    "user_reported": "Transcribed from an external system with no export retained.",
+    "unknown": "Cannot be settled from this repository. Never given a value."
+  },
+  "quantities": [
+    {
+      "name": "reference_fleet_shape",
+      "value": [
+        [
+          "offsets_round_1",
+          15.0,
+          8,
+          31.0,
+          0.504
+        ],
+        [
+          "offsets_round_2",
+          14.0,
+          8,
+          7.0,
+          0.504
+        ],
+        [
+          "composite_round_1",
+          35.0,
+          16,
+          26.0,
+          0.768
+        ]
+      ],
+      "unit": "(vms, vcpus, minutes, usd/h) per cluster",
+      "bucket": "user_reported",
+      "source": "S30W065 2026-08-23, transcribed into quota.py and test_driver_state_machine.py; no billing export retained",
+      "upgrade": "Attach the Coiled billing activity export for that run under results/."
+    },
+    {
+      "name": "reference_billed_aws_usd",
+      "value": 7.28,
+      "unit": "USD",
+      "bucket": "user_reported",
+      "source": "$2.19 + $4.55 + $0.54 spot, spoken; appears in no commit of this repository",
+      "upgrade": "Attach the AWS Cost Explorer export or invoice line for 2026-08-23."
+    },
+    {
+      "name": "reference_billed_credits",
+      "value": 268.11,
+      "unit": "Coiled credits",
+      "bucket": "user_reported",
+      "source": "quota.py docstring, per cluster 67.81 / 16.15 / 184.15; no billing export retained",
+      "upgrade": "Attach the Coiled billing activity export for that run under results/."
+    },
+    {
+      "name": "vm_boot_minutes",
+      "value": 5.0,
+      "unit": "minutes",
+      "bucket": "user_reported",
+      "source": "budgets.VM_BOOT_S = 300; '4-5 min observed' across the S30W065 runs of 2026-08-21/22",
+      "upgrade": "Retain the driver logs those boots were read from, or time a boot in the probe run."
+    },
+    {
+      "name": "offsets_unit_compute_minutes",
+      "value": 6.0,
+      "unit": "minutes",
+      "bucket": "user_reported",
+      "source": "ADR-016: offsets-side shards computed for about six minutes each",
+      "upgrade": "Publish per-unit start and finish stamps from a shard's own state objects."
+    },
+    {
+      "name": "composite_fastest_vm_minutes",
+      "value": 20.0,
+      "unit": "minutes",
+      "bucket": "user_reported",
+      "source": "fastest composite VM finished at 20 min; the fleet's spread was 20-32 min",
+      "upgrade": "Publish per-unit timings; the spread to 32 is unattributed between work and wait."
+    },
+    {
+      "name": "composite_unit_compute_minutes",
+      "value": 15.0,
+      "unit": "minutes",
+      "bucket": "assumed",
+      "source": "the fastest VM's wall clock minus one boot, treating the 20-32 spread as straggler and barrier time rather than work",
+      "upgrade": "Per-unit timings would make this derived. If half the spread is work, the composite term rises about 40% and it already carries 88% of compute."
+    },
+    {
+      "name": "spot_fraction_band",
+      "value": [
+        0.3,
+        0.75
+      ],
+      "unit": "fraction of on-demand",
+      "bucket": "assumed",
+      "source": "pricing.json spot_band, provenance 'assumed'; samples 0.35 / 0.44 / 0.71 on 2026-08-14. Valid because settings.shard_spot_policy is 'spot'; under spot_with_fallback the upper bound is 1.00",
+      "upgrade": "Not reducible. Spot is priced per type, per AZ, per minute, and a finished run cannot be repriced against what it paid."
+    },
+    {
+      "name": "credits_per_vcpu_hour_band",
+      "value": [
+        0.6,
+        1.25
+      ],
+      "unit": "credits per vCPU-hour",
+      "bucket": "assumed",
+      "source": "quota.py observed band across the run's three clusters; the spread is staggered VM lifetimes rather than a different rate",
+      "upgrade": "A billing export with per-VM lifetimes would make this derived and narrow."
+    },
+    {
+      "name": "s3_standard_usd_per_gb_month",
+      "value": 0.023,
+      "unit": "USD/GB-month",
+      "bucket": "measured",
+      "source": "AWS S3 Standard list price, us-west-2",
+      "upgrade": "Nothing. It is a published list price."
+    },
+    {
+      "name": "output_gb_per_tile",
+      "value": 1.5,
+      "unit": "GB compressed",
+      "bucket": "assumed",
+      "source": "compressed COG pair at the 30 m grid; no shipped tile was measured",
+      "upgrade": "Measure a shipped tile. #121 cuts the uncompressed output 9x, so this is one of the inputs that goes stale first. Immaterial either way at ~$24/month."
+    },
+    {
+      "name": "consolidation_capture_bands",
+      "value": {
+        "queues_surplus_false": [
+          0.0,
+          0.0
+        ],
+        "conservative": [
+          0.5,
+          0.8
+        ],
+        "design_band": [
+          0.85,
+          0.95
+        ]
+      },
+      "unit": "fraction of provisioning + idle removed",
+      "bucket": "assumed",
+      "source": "ADR-017: capture = 1 - 1/R for queue depth R. At 700 tiles the first offsets wave buffers about 10,500 units against a 64-VM cap, R about 164, boot capture 0.994. Idle capture is lower because a tail wave, a final round's stragglers, a competing composite stage, and tiles not becoming ready together all remain.",
+      "upgrade": "The ~$0.50 queues_surplus probe in ADR-017, then a capped calibration run that counts boots and idle VM-minutes."
+    },
+    {
+      "name": "queues_surplus_holds",
+      "value": null,
+      "unit": "boolean",
+      "bucket": "unknown",
+      "source": "ADR-017 backend contract: read from documented Coiled semantics and never verified against real Coiled by this project",
+      "upgrade": "The ~$0.50 one-wave probe: more units than workers, count the workers that start and how units distribute. Until it passes, every capture figure is an assumption resting on an unverified premise."
+    },
+    {
+      "name": "credit_unit_price_usd",
+      "value": null,
+      "unit": "USD per Coiled credit",
+      "bucket": "unknown",
+      "source": "no marginal credit price is recorded for this account anywhere in the repository",
+      "upgrade": "One question to the account owner, or one invoice line."
+    },
+    {
+      "name": "usable_credit_quota",
+      "value": null,
+      "unit": "Coiled credits per period",
+      "bucket": "unknown",
+      "source": "settings.coiled_credit_quota is 400, transcribed from the kill message of 2026-08-22. That is the quota that was hit on one day, not a statement of what this workspace can be granted, and the period boundary is not observable either",
+      "upgrade": "Read the workspace usage endpoint, or ask the account owner for the quota and its reset period."
+    },
+    {
+      "name": "excess_retry_uplift",
+      "value": {
+        "queues_surplus_false": 0.15,
+        "conservative": 0.15,
+        "design_band": 0.05
+      },
+      "unit": "fraction",
+      "bucket": "assumed",
+      "source": "deliberately small: the reference run already contains a recovery round (offsets_round_2) and a spot reclaim, so the base rate of retrying is inside the anchor and an uplift on top of it would count it twice",
+      "upgrade": "Count recovery rounds across a multi-tile calibration run."
+    },
+    {
+      "name": "contingency",
+      "value": {
+        "queues_surplus_false": 0.25,
+        "conservative": 0.25,
+        "design_band": 0.15
+      },
+      "unit": "fraction",
+      "bucket": "assumed",
+      "source": "unmodelled all-in slack: driver hours, S3 request charges, a stage re-run after a bug, price drift since pricing.json as_of 2026-08-14",
+      "upgrade": "Judgement. Keep it, and keep it named."
+    },
+    {
+      "name": "approval_ceiling_usd",
+      "value": 3000.0,
+      "unit": "USD",
+      "bucket": "measured",
+      "source": "issue #108 acceptance text; an approval ceiling set by the project owner",
+      "upgrade": "Nothing. It is a stated constraint, not an estimate, and it is neither a target nor a prediction."
+    },
+    {
+      "name": "composite_scaling_basis",
+      "value": "items",
+      "unit": "basis",
+      "bucket": "assumed",
+      "source": "scene_counts.json counts STAC items; budgets._scene_count uses solar-day time steps, and the reference run's observed composite matches the solar-day basis within 7% against 3.7x off the item basis. The model scales by a ratio against the same reference, so a constant items-per-group factor cancels exactly",
+      "upgrade": "A per-tile solar-day count for all 700 tiles. It is a STAC metadata job, not a compute job, and it removes the largest uncertainty in the term carrying 88% of compute. What does not cancel is the variation: WRS-2 path overlap grows toward the poles, so item-scaling overstates high-latitude tiles. The residual bias is conservative and the model cannot bound it."
+    },
+    {
+      "name": "reference_vm_hours",
+      "value": 24.55,
+      "unit": "VM-hours",
+      "bucket": "derived",
+      "source": "sum(vms x minutes) / 60 over the fleet shape: (15x31 + 14x7 + 35x26) / 60. Inherits user_reported.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "reference_vcpu_hours",
+      "value": 317.73,
+      "unit": "vCPU-hours",
+      "bucket": "derived",
+      "source": "sum(vms x vcpus x minutes) / 60: (15x8x31 + 14x8x7 + 35x16x26) / 60. Inherits user_reported.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "reference_usd_on_demand",
+      "value": 16.38,
+      "unit": "USD",
+      "bucket": "derived",
+      "source": "VM-hours per cluster x the pricing.json list rate. Inherits measured prices and a user_reported shape.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "implied_spot_factor",
+      "value": 0.445,
+      "unit": "fraction of on-demand",
+      "bucket": "derived",
+      "source": "7.28 / 16.38. Both inputs user_reported, so this corroborates the anchor against pricing.json's 0.44 sample rather than measuring a spot rate.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "implied_credits_per_vcpu_hour",
+      "value": 0.844,
+      "unit": "credits per vCPU-hour",
+      "bucket": "derived",
+      "source": "268.11 / 317.73. Inherits user_reported, and sits inside quota.py's 0.6-1.25 band.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "reference_useful_fraction_of_vm_time",
+      "value": 0.437,
+      "unit": "fraction",
+      "bucket": "derived",
+      "source": "643 useful VM-min / 1473 total. Idle is the residue after boot and compute, so it carries the error in both compute assumptions.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "total_scenes_700_tiles",
+      "value": 2566229,
+      "unit": "STAC items",
+      "bucket": "measured",
+      "source": "sum over results/cost-model/scene_counts.json, a retained artifact of a STAC query. Items, not solar-day groups: see composite_scaling_basis.",
+      "upgrade": "A per-tile solar-day count would replace the basis assumption."
+    },
+    {
+      "name": "mean_land_fraction",
+      "value": 0.757,
+      "unit": "fraction",
+      "bucket": "derived",
+      "source": "mean over results/cost-model/land_fractions.json, computed from Natural Earth 10m buffered 25 km against each 5-degree cell.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "offsets_equivalents",
+      "value": 559.9,
+      "unit": "reference tiles",
+      "bucket": "derived",
+      "source": "sum(scenes x (land_fraction + 1)) / reference, because phase A skips blocks with no land and phase B reads the full footprint.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "composite_equivalents",
+      "value": 620.2,
+      "unit": "reference tiles",
+      "bucket": "derived",
+      "source": "sum(scenes) / reference scenes. No land discount: the native stack is read at full footprint whatever the land fraction.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "compute_usd_on_demand",
+      "value": 4723.0,
+      "unit": "USD on-demand",
+      "bucket": "derived",
+      "source": "per-stage useful dollars x that stage's equivalents. Work the pipeline must do whatever schedules it, so consolidation cannot touch it.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "provisioning_usd_on_demand",
+      "value": 5149.0,
+      "unit": "USD on-demand",
+      "bucket": "derived",
+      "source": "per-stage (boot + idle) dollars x that stage's equivalents. The only layer consolidation acts on.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "compute_composite_share",
+      "value": 0.882,
+      "unit": "fraction",
+      "bucket": "derived",
+      "source": "composite compute / total compute. After consolidation every further dollar has to come from this pass rather than from scheduling.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "aws_usd_spot_queues_surplus_false",
+      "value": {
+        "low": 4281.0,
+        "high": 10667.0
+      },
+      "unit": "USD interval",
+      "bucket": "derived",
+      "source": "(compute + provisioning x (1 - capture)) x (1 + retry) x (1 + contingency) x spot, at capture 0.0-0.0 and spot 0.3-0.75, plus storage. Inherits three assumed inputs and a user_reported anchor.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "coiled_credits_queues_surplus_false",
+      "value": {
+        "low": 166059.0,
+        "high": 345955.0
+      },
+      "unit": "credit interval",
+      "bucket": "derived",
+      "source": "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the 0.6-1.25 credit rate band. Never multiplied by a dollar price.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "aws_usd_spot_conservative",
+      "value": {
+        "low": 2505.0,
+        "high": 7892.0
+      },
+      "unit": "USD interval",
+      "bucket": "derived",
+      "source": "(compute + provisioning x (1 - capture)) x (1 + retry) x (1 + contingency) x spot, at capture 0.5-0.8 and spot 0.3-0.75, plus storage. Inherits three assumed inputs and a user_reported anchor.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "coiled_credits_conservative",
+      "value": {
+        "low": 96769.0,
+        "high": 255734.0
+      },
+      "unit": "credit interval",
+      "bucket": "derived",
+      "source": "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the 0.6-1.25 credit rate band. Never multiplied by a dollar price.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "aws_usd_spot_design_band",
+      "value": {
+        "low": 1828.0,
+        "high": 5001.0
+      },
+      "unit": "USD interval",
+      "bucket": "derived",
+      "source": "(compute + provisioning x (1 - capture)) x (1 + retry) x (1 + contingency) x spot, at capture 0.85-0.95 and spot 0.3-0.75, plus storage. Inherits three assumed inputs and a user_reported anchor.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    },
+    {
+      "name": "coiled_credits_design_band",
+      "value": {
+        "low": 70373.0,
+        "high": 161767.0
+      },
+      "unit": "credit interval",
+      "bucket": "derived",
+      "source": "scaled vCPU-hours x (1 - overhead share x capture) x uplift x the 0.6-1.25 credit rate band. Never multiplied by a dollar price.",
+      "upgrade": "Nothing on its own. It inherits the bucket of its weakest input, so it strengthens when that input does."
+    }
+  ]
+}
