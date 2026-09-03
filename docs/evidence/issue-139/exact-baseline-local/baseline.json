@@ -1,0 +1,105 @@
+{
+  "purpose": "Local exact-transform baseline (v1 contract): S30W065 band 16 rows 8704:9216, columns 0:4096, 40 scenes sampled evenly from 2021-2025 on Planetary Computer, zero offsets, land mask on, GED mask on, per-column loading.",
+  "revision": "ffe0a8e2",
+  "settings": {
+    "warp_exact_transform": true,
+    "shard_composite_per_column": true,
+    "shard_composite_chunk": 512,
+    "offsets_algorithm_version": 2
+  },
+  "pixel_hashes": {
+    "chunk512/lst_p95": {
+      "pixel_sha256": "dde6c3e3516013f47c8561e7690e90e8b4857f71859b4b5fba532ac38c89a5b5",
+      "shape": [
+        1,
+        512,
+        4096
+      ],
+      "dtype": "uint16",
+      "tags_differing_from_1024": null
+    },
+    "chunk512/qa_count": {
+      "pixel_sha256": "066b0751dbcafa63d5b3d3f5c4a704181dd8a819cfc401f4977614d5f6de2330",
+      "shape": [
+        12,
+        512,
+        4096
+      ],
+      "dtype": "uint8",
+      "tags_differing_from_1024": null
+    },
+    "chunk1024/lst_p95": {
+      "pixel_sha256": "dde6c3e3516013f47c8561e7690e90e8b4857f71859b4b5fba532ac38c89a5b5",
+      "shape": [
+        1,
+        512,
+        4096
+      ],
+      "dtype": "uint16"
+    },
+    "chunk1024/qa_count": {
+      "pixel_sha256": "066b0751dbcafa63d5b3d3f5c4a704181dd8a819cfc401f4977614d5f6de2330",
+      "shape": [
+        12,
+        512,
+        4096
+      ],
+      "dtype": "uint8"
+    }
+  },
+  "chunk_512_vs_1024": "pixel arrays identical in both products; TIFF tag differences only: {}",
+  "approximate_transform_delta": {
+    "lst_p95_pixels_changed": 91754,
+    "of": 2097152,
+    "dn_p50": 15,
+    "dn_p90": 61,
+    "dn_p99": 139,
+    "dn_max": 2090,
+    "valid_to_nodata": 89,
+    "nodata_to_valid": 131,
+    "qa_count_pixels_changed": 351
+  },
+  "scene_ids": [
+    "LC08_L2SP_227081_20210102_02_T1",
+    "LC08_L2SP_227082_20210323_02_T1",
+    "LC08_L2SP_229081_20210609_02_T2",
+    "LC08_L2SP_226084_20210823_02_T2",
+    "LC08_L2SP_228082_20211109_02_T1",
+    "LC09_L2SP_227085_20211228_02_T1",
+    "LC08_L2SP_227084_20220206_02_T1",
+    "LC09_L2SP_226085_20220327_02_T1",
+    "LC09_L2SP_230081_20220510_02_T1",
+    "LC09_L2SP_229081_20220620_02_T1",
+    "LC09_L2SP_227081_20220809_02_T2",
+    "LC09_L2SP_229081_20221010_02_T1",
+    "LC09_L2SP_226082_20221122_02_T1",
+    "LC09_L2SP_227084_20221231_02_T1",
+    "LC08_L2SP_227082_20230209_02_T1",
+    "LC08_L2SP_227083_20230329_02_T1",
+    "LC08_L2SP_226083_20230509_02_T1",
+    "LC08_L2SP_227085_20230617_02_T1",
+    "LC09_L2SP_230081_20230801_02_T1",
+    "LC08_L2SP_230081_20230910_02_T1",
+    "LC08_L2SP_226081_20231016_02_T1",
+    "LC08_L2SP_227085_20231124_02_T1",
+    "LC09_L2SP_227085_20240103_02_T1",
+    "LC08_L2SP_227081_20240212_02_T1",
+    "LC08_L2SP_228081_20240322_02_T1",
+    "LC09_L2SP_228082_20240501_02_T2",
+    "LC09_L2SP_229081_20240609_02_T1",
+    "LC09_L2SP_230083_20240718_02_T1",
+    "LC09_L2SP_229084_20240828_02_T1",
+    "LC08_L2SP_229082_20241007_02_T2",
+    "LC09_L2SP_229083_20241116_02_T1",
+    "LC08_L2SP_230083_20250102_02_T1",
+    "LC09_L2SP_230083_20250211_02_T1",
+    "LC09_L2SP_226081_20250319_02_T1",
+    "LC09_L2SP_227082_20250427_02_T1",
+    "LC09_L2SP_228082_20250605_02_T1",
+    "LC08_L2SP_228081_20250715_02_T2",
+    "LC09_L2SP_228084_20250824_02_T1",
+    "LC08_L2SP_228082_20251003_02_T1",
+    "LC09_L2SP_226081_20251114_02_T1"
+  ],
+  "note": "The 40 STAC items are Planetary Computer landsat-c2-l2 items with these ids; the band slabs (2.6 MB) are gitignored and live under results/ on the machine that ran the gate, identified here by pixel hash."
+}
