@@ -56,7 +56,12 @@ def scene_times(n: int = SCENES) -> list[str]:
 
 
 def make_plan(
-    *, ref_shards: int = 2, scene_shards: int = 2, band_shards: int = 2, tile: str = TILE
+    *,
+    ref_shards: int = 2,
+    scene_shards: int = 2,
+    band_shards: int = 2,
+    tile: str = TILE,
+    block_weights: list[int] | None = None,
 ):
     """A four-scene, four-block, two-band plan.
 
@@ -66,7 +71,9 @@ def make_plan(
 
     ``tile`` is a parameter only so a consolidated run can have several plans at
     once (ADR-018). Every tile in a fleet gets its own ``shard_root``, so two
-    plans built here never share a key.
+    plans built here never share a key. ``block_weights`` defaults to ``None``,
+    the shape of every plan written before #133, so the fixture exercises the
+    land split unless a test asks for the weighted one.
     """
     blocks = shards.block_spans(COARSE, BLOCK)
     return shards.TilePlan(
@@ -85,6 +92,7 @@ def make_plan(
         ref_shards=ref_shards,
         scene_shards=scene_shards,
         band_shards=band_shards,
+        block_weights=block_weights,
     )
 
 

@@ -763,6 +763,18 @@ Rules worth keeping:
 - **Fleet widths come from `projection.tile_projection` when the `shard_*_vms` settings
   are 0**, clamped to the work available. A shard with no block is a VM that boots to bill
   a minute.
+- **Phase-A blocks are dealt by scene weight, and the weight lives in the plan.** The
+  planner counts the STAC footprints crossing each block (`shards.block_scene_weights`,
+  zero for a land-free block) and stores them as `block_weights`; `shards.climatology_groups`
+  is the only function that turns a plan into groups, and the planner, every shard, and
+  `budgets._widest_block_share` all go through it. A plan without weights splits on the
+  land flag exactly as before, and the digest ignores weights because they decide who
+  reduces a block, never what it reduces to. **Never recompute the weights on a VM**: a
+  shard and the driver deriving them from different catalogs is a block nobody owns. On
+  S30W065 an equal-count split gave one shard 4,191 footprint intersections and another
+  1,798, and phase-A time per shard tracked that count at r = 0.907 (#133,
+  `docs/findings-offsets-phase-a-balance.md`). The ticket's discriminator run was skipped
+  on the operator's call; the next production tile's `phase_seconds` is the measurement.
 
 ---
 

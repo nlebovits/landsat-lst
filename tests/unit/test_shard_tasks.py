@@ -202,6 +202,27 @@ class TestWorkAssignment:
             seen.extend(group)
         assert seen == plan.blocks
 
+    def test_a_weighted_plan_partitions_the_blocks_exactly_too(self):
+        """The offsets stay consistent with the groups when the split is by weight.
+
+        Three heavy blocks first and one land-free block: the weighted split
+        closes group 0 after one block where the land split took two, and
+        every shard must still locate its blocks in the plan by ``start``.
+        """
+        weighted = make_plan(block_weights=[900, 300, 300, 0])
+        land = make_plan()
+
+        groups = [climatology_group(weighted, i) for i in range(weighted.ref_shards)]
+
+        assert [g for _, g in groups] != [
+            climatology_group(land, i)[1] for i in range(land.ref_shards)
+        ]
+        seen = []
+        for start, group in groups:
+            assert weighted.blocks[start : start + len(group)] == group
+            seen.extend(group)
+        assert seen == weighted.blocks
+
     def test_the_scene_groups_partition_the_batches_exactly(self, plan):
         seen = []
         for index in range(plan.scene_shards):

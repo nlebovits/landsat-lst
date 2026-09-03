@@ -24,9 +24,12 @@ from landsat_lst.shards import (
     SHARD_PREFIX,
     TilePlan,
     balance_by_land,
+    balance_by_weight,
     band_edges,
     band_key,
+    block_scene_weights,
     block_spans,
+    climatology_groups,
     items_key,
     partition,
     plan_key,
@@ -225,6 +228,140 @@ class TestBalanceByLand:
         with pytest.raises(ValueError, match="disagree"):
             balance_by_land(block_spans((40, 40), 20), [True], 2)
 
+    def test_it_is_the_weighted_split_on_unit_weights(self):
+        """The land split is the weighted one with every land block at one."""
+        spans = block_spans((400, 40), 20)
+        has_land = [i % 7 < 3 for i in range(len(spans))]
+
+        weights = [1 if flag else 0 for flag in has_land]
+        assert balance_by_land(spans, has_land, 4) == balance_by_weight(spans, weights, 4)
+
+
+class TestBalanceByWeight:
+    """An equal split of blocks is not an equal split of what they read (#133)."""
+
+    def test_heavy_blocks_are_spread_more_evenly_than_a_plain_split(self):
+        """The S30W065 shape: every block has land, the first quarter is dense."""
+        spans = block_spans((400, 20), 20)
+        weights = [800 if i < len(spans) // 4 else 200 for i in range(len(spans))]
+
+        balanced = balance_by_weight(spans, weights, 4)
+        plain = partition(spans, 4)
+
+        def group_weights(groups):
+            index = dict(zip(spans, weights, strict=True))
+            return [sum(index[s] for s in group) for group in groups]
+
+        assert max(group_weights(balanced)) < max(group_weights(plain))
+
+    def test_groups_stay_contiguous_and_complete(self):
+        spans = block_spans((400, 40), 20)
+        weights = [(i * 37) % 11 for i in range(len(spans))]
+
+        groups = balance_by_weight(spans, weights, 5)
+
+        assert [s for group in groups for s in group] == spans
+        assert all(groups)
+
+    def test_every_group_is_non_empty_even_when_one_block_holds_all_the_weight(self):
+        spans = block_spans((200, 20), 20)
+        weights = [1000 if i == 0 else 0 for i in range(len(spans))]
+
+        groups = balance_by_weight(spans, weights, 4)
+
+        assert len(groups) == 4
+        assert all(groups)
+
+    def test_no_weight_anywhere_degenerates_to_partition(self):
+        spans = block_spans((200, 20), 20)
+
+        assert balance_by_weight(spans, [0] * len(spans), 3) == partition(spans, 3)
+
+    def test_it_is_deterministic(self):
+        spans = block_spans((400, 40), 20)
+        weights = [(i * 37) % 11 for i in range(len(spans))]
+
+        assert balance_by_weight(spans, weights, 4) == balance_by_weight(spans, weights, 4)
+
+    def test_a_negative_weight_is_refused(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            balance_by_weight(block_spans((40, 40), 20), [1, -1, 1, 1], 2)
+
+    def test_mismatched_inputs_are_refused(self):
+        with pytest.raises(ValueError, match="disagree"):
+            balance_by_weight(block_spans((40, 40), 20), [1], 2)
+
+
+def _toy_affine():
+    """A 20 x 20 pixel grid over lon 0..2, lat 0..2, north up, 0.1 deg pixels."""
+    from affine import Affine
+
+    return Affine(0.1, 0.0, 0.0, 0.0, -0.1, 2.0)
+
+
+class TestBlockSceneWeights:
+    """The weight is footprints crossing the block, and nothing for a block never read."""
+
+    def test_a_footprint_over_the_whole_grid_counts_once_per_block(self):
+        from shapely.geometry import box
+
+        blocks = block_spans((20, 20), 10)
+
+        weights = block_scene_weights(blocks, [True] * 4, [box(0, 0, 2, 2)], _toy_affine())
+
+        assert weights == [1, 1, 1, 1]
+
+    def test_a_footprint_inside_one_block_counts_in_that_block_only(self):
+        """Blocks are y-major: index 3 is the south-east quarter, lon 1..2, lat 0..1."""
+        from shapely.geometry import box
+
+        blocks = block_spans((20, 20), 10)
+
+        weights = block_scene_weights(blocks, [True] * 4, [box(1.2, 0.2, 1.8, 0.8)], _toy_affine())
+
+        assert weights == [0, 0, 0, 1]
+
+    def test_a_footprint_on_a_shared_edge_counts_in_both_blocks(self):
+        """A scene straddling a block boundary is read by both shards."""
+        from shapely.geometry import box
+
+        blocks = block_spans((20, 20), 10)
+
+        weights = block_scene_weights(blocks, [True] * 4, [box(0.5, 1.5, 1.5, 1.9)], _toy_affine())
+
+        assert weights == [1, 1, 0, 0]
+
+    def test_a_land_free_block_weighs_nothing_whatever_crosses_it(self):
+        from shapely.geometry import box
+
+        blocks = block_spans((20, 20), 10)
+
+        weights = block_scene_weights(
+            blocks, [True, False, True, False], [box(0, 0, 2, 2)] * 3, _toy_affine()
+        )
+
+        assert weights == [3, 0, 3, 0]
+
+    def test_a_scene_without_a_footprint_is_skipped(self):
+        from shapely.geometry import box
+
+        blocks = block_spans((20, 20), 10)
+
+        weights = block_scene_weights(
+            blocks, [True] * 4, [None, box(0, 0, 2, 2), None], _toy_affine()
+        )
+
+        assert weights == [1, 1, 1, 1]
+
+    def test_no_footprints_at_all_is_all_zero(self):
+        blocks = block_spans((20, 20), 10)
+
+        assert block_scene_weights(blocks, [True] * 4, [], _toy_affine()) == [0, 0, 0, 0]
+
+    def test_mismatched_inputs_are_refused(self):
+        with pytest.raises(ValueError, match="disagree"):
+            block_scene_weights(block_spans((20, 20), 10), [True], [], _toy_affine())
+
 
 class TestKeyGrammar:
     """One module owns the suffixes, as ``runs.py`` does for the run prefix."""
@@ -328,6 +465,43 @@ class TestTilePlan:
         assert back.scene_batches == plan.scene_batches
         assert back.bands == plan.bands
         assert (back.ref_shards, back.scene_shards, back.band_shards) == (3, 2, 4)
+        assert back.block_weights == plan.block_weights
+
+    def test_block_weights_round_trip(self):
+        n = len(block_spans((9000, 9000), 2048))
+        plan = _plan(block_weights=[(i * 13) % 7 for i in range(n)])
+
+        back = TilePlan.from_dict(plan.to_dict())
+
+        assert back.block_weights == plan.block_weights
+
+    def test_a_record_without_weights_loads_and_splits_on_land(self):
+        """A plan written before weights existed splits exactly as it did then."""
+        n = len(block_spans((9000, 9000), 2048))
+        has_land = [i % 3 != 0 for i in range(n)]
+        payload = _plan(block_has_land=has_land).to_dict()
+        del payload["block_weights"]
+
+        back = TilePlan.from_dict(payload)
+
+        assert back.block_weights is None
+        assert climatology_groups(back) == balance_by_land(back.blocks, has_land, back.ref_shards)
+
+    def test_a_record_with_weights_splits_on_them(self):
+        n = len(block_spans((9000, 9000), 2048))
+        weights = [1000 if i < 3 else 1 for i in range(n)]
+        plan = _plan(block_weights=weights)
+
+        groups = climatology_groups(plan)
+
+        assert groups == balance_by_weight(plan.blocks, weights, plan.ref_shards)
+        assert groups != balance_by_land(plan.blocks, plan.block_has_land, plan.ref_shards)
+
+    def test_weights_do_not_change_the_digest(self):
+        """Weights decide who reduces a block, never what it reduces to."""
+        n = len(block_spans((9000, 9000), 2048))
+
+        assert _plan().digest == _plan(block_weights=[5] * n).digest
 
     def test_the_record_is_plain_json(self):
         import json

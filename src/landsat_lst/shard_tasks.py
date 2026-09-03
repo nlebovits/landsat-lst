@@ -69,6 +69,8 @@ from landsat_lst.storage import PRODUCTS, get_storage
 from landsat_lst.tiling import geobox_for_bbox, parse_tile_name
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from landsat_lst.storage import StorageBackend
 
 log = structlog.get_logger()
@@ -429,6 +431,9 @@ def resolve_tile_plan(
     block_edge = _io_block_edge(lst, settings.destripe_unit_memory_gb)
     blocks = shards.block_spans(coarse_shape, block_edge)
     block_has_land = [bool(land_values[y0:y1, x0:x1].any()) for y0, y1, x0, x1 in blocks]
+    block_weights = shards.block_scene_weights(
+        blocks, block_has_land, _footprints(items), coarse_geobox.affine
+    )
     scene_batches = _scene_batches(lst, settings.destripe_scene_batch)
 
     ref_shards, scene_shards, band_shards = shards.stage_shard_counts(
@@ -458,12 +463,14 @@ def resolve_tile_plan(
         ref_shards=ref_shards,
         scene_shards=scene_shards,
         band_shards=band_shards,
+        block_weights=block_weights,
     )
 
     # Items first. A reader that finds the plan and no items would see a tile it
     # is allowed to start shards for and cannot load.
     storage.write_text(shards.items_key(root), json.dumps(items_to_dicts(items)))
     storage.write_text(shards.plan_key(root), json.dumps(plan.to_dict(), indent=2))
+    group_weights = [sum(block_weights[i] for i in idx) for idx in _group_indexes(plan)]
     log.info(
         "shard_plan_written",
         tile=job.tile.name,
@@ -473,9 +480,38 @@ def resolve_tile_plan(
         ref_shards=ref_shards,
         scene_shards=scene_shards,
         band_shards=band_shards,
+        block_weight_min=min(block_weights),
+        block_weight_max=max(block_weights),
+        group_weight_min=min(group_weights),
+        group_weight_max=max(group_weights),
         digest=plan.digest,
     )
     return plan
+
+
+def _footprints(items: Sequence[Any]) -> list[Any]:
+    """Scene footprints as shapely geometries, ``None`` where an item has none."""
+    from shapely.geometry import box, shape  # noqa: PLC0415
+
+    out: list[Any] = []
+    for item in items:
+        geometry = getattr(item, "geometry", None)
+        if geometry is not None:
+            out.append(shape(geometry))
+            continue
+        bbox = getattr(item, "bbox", None)
+        out.append(None if bbox is None else box(*bbox))
+    return out
+
+
+def _group_indexes(plan: shards.TilePlan) -> list[range]:
+    """Global block indexes of each phase-A group, in group order."""
+    out: list[range] = []
+    start = 0
+    for group in shards.climatology_groups(plan):
+        out.append(range(start, start + len(group)))
+        start += len(group)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -486,13 +522,15 @@ def resolve_tile_plan(
 def climatology_group(plan: shards.TilePlan, index: int) -> tuple[int, list[shards.Span]]:
     """The blocks one phase-A shard owns, and the global index of the first.
 
-    Balanced on land rather than on block count: a block with no land pixel is
-    filled with NaN and never read, so an equal-count split on a coastal tile
-    would hand one shard a scene-deep read and another almost nothing. The
-    groups are contiguous, so one integer offset locates the whole group in the
-    plan's block list.
+    Balanced on what each block reads rather than on block count: the scene
+    footprints crossing it when the plan stores them, the land flag when it
+    does not (:func:`landsat_lst.shards.climatology_groups`). A block with no
+    land pixel is filled with NaN and never read, so an equal-count split on
+    a coastal tile would hand one shard a scene-deep read and another almost
+    nothing. The groups are contiguous, so one integer offset locates the
+    whole group in the plan's block list.
     """
-    groups = shards.balance_by_land(plan.blocks, plan.block_has_land, plan.ref_shards)
+    groups = shards.climatology_groups(plan)
     start = sum(len(g) for g in groups[:index])
     return start, groups[index]
 
