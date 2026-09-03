@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "claim": "Replacing 18 per-column stac_load calls with one whole-band stac_load and sequential 2048px output computes restores composite-shard setup and exporting time while retaining exact-transform scientific output and bounding peak RSS on a 32 GiB worker.",
+  "inputs": {
+    "workload": "Band 16 of tile S30W065, window 2021-2025, replayed from the same frozen 4403-item plan used by r5: one complete 512 x 18000 production composite shard, exact reprojection, chunk 1024, one whole-band stac_load, and sequential 2048px execution groups.",
+    "launch_command": "env -u LST_PROFILE_DASK -u LST_STAC_URL -u LST_DASK_MAX_THREADS AWS_PROFILE=radiant-earth LST_STORAGE_BACKEND=s3 LST_EXEC_TRACE=1 LST_GED_GAP_MASK=false LST_COILED_RETRIES=0 LST_SHARD_COMPOSITE_VM_TYPE=c6i.4xlarge LST_SHARD_COMPOSITE_PER_COLUMN=false LST_SHARD_COMPOSITE_CHUNK=1024 LST_WARP_EXACT_TRANSFORM=true uv run python /tmp/submit_bounded_exec_shard.py --run-id shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b --index 16 --offsets require-v2 --out results/issue-139/cloud-r6/submission.json",
+    "baseline_revision": "6bab3c8e256d69e811465dda064fc5bbb63f9a7c",
+    "treatment_revision": "6fd98631e1671c7109df683c85d2bbbc7469d407",
+    "real_data": {
+      "kind": "real",
+      "identity": "Tile S30W065, window 2021-2025, the 4403 STAC items frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111683185 bytes) and plan.json (220702 bytes, digest 94bc658516d9fbb9, 35 bands), band 16 covering rows 8704:9216 of the 18000-row production geobox. Both objects are copied byte-for-byte within S3 to the fresh run root; the canonical merged-offset key is unchanged because its identity derives from the frozen plan.",
+      "production_relationship": "The complete production S30W065 band 16 workload on the production grid and Earth Search in us-west-2. The c6i.4xlarge worker has the intended 32 GiB RAM and 16 vCPU production economics. GED masking is disabled to match the retained r5 and original baseline workload.",
+      "known_differences": [
+        "The execution architecture differs from r5 only in loading once for the full band and explicitly computing/writing sequential 2048px longitude groups; exact reprojection, offset algorithm version 2, chunk 1024, masks, composite graph, encodings, and products are unchanged.",
+        "c6i.4xlarge replaces r5 m6i.4xlarge while retaining 32 GiB and 16 vCPU; CPU generation and price differ and are recorded.",
+        "The existing version-2 merged-offset record created by r5 is required and reused without overwrite, so r6b and r5 execute on identical scientific inputs. A normal production run would recompute version-2 offsets.",
+        "LST_GED_GAP_MASK=false reproduces the retained pre-mask workload. Production thread count is unset, execution tracing is enabled, Dask profiling is absent, Coiled retries are zero, and exactly one shard attempt is permitted."
+      ]
+    }
+  },
+  "baseline": {
+    "metric": "exporting_wall_s",
+    "value": 1842.7,
+    "unit": "seconds",
+    "classification": "measured",
+    "artifact": "139-v1exact1024-r5.result.json"
+  },
+  "target_metric": "exporting_wall_s",
+  "measurement_plan": {
+    "target_environment": "production",
+    "phases": [
+      "loading",
+      "exporting"
+    ],
+    "metrics": [
+      "loading_wall_s",
+      "exporting_wall_s",
+      "peak_rss_mb",
+      "rio_read_calls",
+      "reads_per_item",
+      "network_recv_mb_s",
+      "cpu_utilization",
+      "observed_coiled_credits",
+      "observed_cloud_cost_usd",
+      "active_tasks_by_class",
+      "host_gap_max_s"
+    ],
+    "raw_artifacts": [
+      "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.events.jsonl.gz",
+      "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.timeline.csv",
+      "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.summary.json",
+      "_shards/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/S30W065/state/composite.0016.1.json",
+      "_shards/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/S30W065/state/composite.0016.1.log",
+      "Coiled lifecycle, billing, CPU, memory, and network telemetry collected with landsat-lst evidence collect",
+      "_shards/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/S30W065/composite/lst_p95/band016.tif and qa_count/band016.tif, compared exactly against r5 band016 slabs"
+    ],
+    "profiling": {
+      "method": "landsat_lst.exectrace: Dask local-scheduler pretask/posttask callbacks bound submit-to-return intervals; a spawned child process samples the shard's CPU, RSS, and file descriptors and the host's network and disk counters once per second through psutil; every twentieth odc.loader._rio.rio_read records source URI, requested shape, thread, and three stamps (before open, at _do_read entry, after return). The pure timeline builder counts half-open active intervals with sorted starts and finishes.",
+      "artifact": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.timeline.csv",
+      "observer_effect_control": "The same execution tracer used by r5 records task intervals and a child-process one-second host series. No Dask profiler is enabled. Trace serialization and upload occur after compute. The r5 comparator used the same observer, so overhead is held constant."
+    },
+    "baseline_repetitions": 1,
+    "treatment_repetitions": 1,
+    "aggregation": "single"
+  },
+  "minimum_effect": {
+    "direction": "decrease",
+    "fraction": 0.2,
+    "reading": "Success requires exporting_wall_s <= 1474.2 s (at least 20% below r5 1842.7 s and approximately back to the retained 1372.2 s baseline), loading_wall_s <= 120 s rather than r5 884.6 s, peak_rss_mb <= 28672, no OOM, and exact output equivalence."
+  },
+  "production_discriminator": "Exactly one complete S30W065 band-16 composite shard attempt on one c6i.4xlarge in us-west-2, production thread pool, one full-band load at chunk 1024, sequential 2048px compute/write groups, frozen r5 inputs, private fresh prefix, no retries and no publication.",
+  "stop_rule": "Stop after this one attempt regardless of outcome. Proceed only if it completes without OOM, peak_rss_mb <= 28672, loading_wall_s <= 120, exporting_wall_s <= 1474.2, exact output equivalence passes, and required trace and billing artifacts exist. No retry, candidate change, or follow-up cloud run.",
+  "result_artifact": "139-bounded2048-r6.result.json",
+  "max_cloud_cost_usd": 1,
+  "max_coiled_credits": 20,
+  "code_identity_required": true,
+  "output_equivalence_required": true,
+  "output_equivalence": {
+    "method": "Read both r6 production band-16 TIFF pixel arrays and compare them against the retained r5 exact-transform, chunk-1024 band-16 arrays for lst_p95 and qa_count. Record per-product max_abs_diff and pixel hashes.",
+    "acceptance_criterion": "Both products have identical shape and dtype and max_abs_diff == 0; passed must equal the conjunction of those checks.",
+    "tolerance": 0,
+    "result_artifact": "139-bounded2048-r6-equivalence.json"
+  },
+  "notes": [
+    "The r5 measured comparator used 18 stac_load calls: loading 884.6 s, exporting 1842.7 s, peak RSS 9907.8 MB, and 25424 reads. The older single-load production path loaded in 53.2 s and exported in 1372.2 s.",
+    "Local full-cardinality graph construction at treatment revision made exactly one stac_load and took 31.75 s total; this is local setup evidence only, not production performance evidence.",
+    "Local real-shard exact output matched the established exact baseline for both products. Production equivalence is newly gated against r5 because both use exact reprojection and identical frozen offsets.",
+    "Cumulative prior issue-139 cost excludes this attempt. r5 cost 12.5023 credits and derived $0.6063. Expected cap here is 20 credits and $1.",
+    "The contract and temporary launch harness remain untracked during the run so the checkout stays exactly at treatment revision 6fd9863; they are preserved with the result afterward."
+  ],
+  "operator_note": "Explicitly approved in conversation on 2026-09-04: exactly one production validation shard for commit 6fd9863 on a 32 GiB, 16-vCPU c6i.4xlarge-class worker; retries disabled; fresh private prefix; no publication or overwrite."
+}

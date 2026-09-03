@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "contract_sha256": "00a22dd43b1355ea364f7f8cb0d116e85a0b87f712fb4b20b171714b5a760ae2",
+  "environment": "production",
+  "input_identity": "Tile S30W065, window 2021-2025, the 4403 STAC items frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111683185 bytes) and plan.json (220702 bytes, digest 94bc658516d9fbb9, 35 bands), band 16 covering rows 8704:9216 of the 18000-row production geobox. Both objects are copied byte-for-byte within S3 to the fresh run root; the canonical merged-offset key is unchanged because its identity derives from the frozen plan.",
+  "baseline_revision": "6bab3c8e256d69e811465dda064fc5bbb63f9a7c",
+  "treatment_revision": "6fd98631e1671c7109df683c85d2bbbc7469d407",
+  "baseline_observations": [
+    {
+      "metric": "exporting_wall_s",
+      "value": 1842.7,
+      "unit": "seconds",
+      "artifact": "139-v1exact1024-r5.result.json"
+    }
+  ],
+  "treatment_observations": [
+    {
+      "metric": "exporting_wall_s",
+      "value": 1354.2,
+      "unit": "seconds",
+      "artifact": "issue-139/cloud-r6/raw/state/composite.0016.1.json"
+    }
+  ],
+  "profiling_artifact": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.timeline.csv",
+  "observed_cloud_cost_usd": 0.28875621584444444,
+  "observed_coiled_credits": 6.6312,
+  "observed_effect_fraction": 0.26510012481684486,
+  "minimum_effect_met": true,
+  "output_equivalence_passed": true,
+  "decision": "proceed",
+  "limitations": [
+    "This is one production band-shard observation on c6i.4xlarge. Exporting was 1354.2 s, 26.5% below r5 and 1.3% below the older 1372.2 s single-load baseline; it supports recovery to baseline-like speed, not a general throughput acceleration claim.",
+    "The run retained r5 read geometry and count: 25424 rio_read calls, 12.649 per intersecting item. Mean receive throughput was 9.065 MB/s over 12266.6 MB, and mean CPU was 2.74 busy cores (17.1% of 16 vCPU). There is no claim of a read-throughput fix; the gain is removing repeated setup while bounding memory.",
+    "Peak RSS was 14807.8 MiB (14.46 GiB), below the 28672 MiB gate. The heartbeat series repeatedly returned to roughly 3.2-5.9 GiB between group waves, consistent with previous groups being released.",
+    "Both full production pixel arrays exactly match r5: zero differing pixels and max_abs_diff 0 for lst_p95 and qa_count. Longitude pixel scale metadata differs by 3.8e-19 degrees, about 6.8e-15 degrees over the full width; all other compared metadata matches. The operator explicitly approved passing under the pre-registered shape/dtype/pixel criterion with this limitation retained.",
+    "The instance ran on-demand despite requested spot policy. 6.6312 credits are the direct Coiled billing debit. $0.288756 is derived from the 1528.709 s cluster lifecycle at a $0.68/hour c6i.4xlarge on-demand rate and is not an AWS invoice.",
+    "An initial proposed r6 prefix received copied plan/items but no cloud launch after the submitter refused to overwrite an existing v2 offset record. The only cluster launched was r6b, cluster 2002585, one attempt with retries disabled."
+  ]
+}

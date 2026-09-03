@@ -1,0 +1,286 @@
+"""Prepare inputs and submit exactly one traced S30W065 composite shard (#139).
+
+This command performs three account preflights, verifies the retained input
+identity, copies plan.json and items.json within S3 to a fresh run root, and
+then submits band 16.  Merely importing this module performs no external work.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+TILE = "S30W065"
+INDEX = 16
+ROWS = (8704, 9216)
+RETAINED_RUN = "shard-S30W065-2021-2025-20260823T102135Z"
+PLAN_DIGEST = "94bc658516d9fbb9"
+PLAN_BYTES = 220_702
+ITEMS_BYTES = 111_683_185
+PLAN_ITEMS = 4_403
+VM_TYPE = "m6i.4xlarge"
+# Validation of the per-column dataflow at chunk 1024 on the production thread
+# pool. The retained plan was cut at 512 and is re-stamped, not re-planned.
+RETAINED_CHUNK = 512
+COMPOSITE_CHUNK = 1024
+# The retained plan and its merged offsets were computed under ALGORITHM_VERSION 1
+# (approximate transformer). The v1 contract is version 2.
+RETAINED_ALGORITHM_VERSION = 1
+ESTIMATED_CREDITS = 9.0
+OPERATOR_CREDIT_LIMIT = 20.0
+
+
+def _refuse(message: str) -> int:
+    print(f"refusing: {message}", file=sys.stderr)
+    return 2
+
+
+def _head(storage, key: str) -> dict:
+    return storage.client.head_object(
+        Bucket=storage.bucket,
+        Key=storage._full_key(key),
+    )
+
+
+def _copy(storage, source: str, destination: str) -> None:
+    storage.client.copy_object(
+        Bucket=storage.bucket,
+        Key=storage._full_key(destination),
+        CopySource={
+            "Bucket": storage.bucket,
+            "Key": storage._full_key(source),
+        },
+    )
+
+
+def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - each refusal is a launch gate
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--index", type=int, default=INDEX)
+    parser.add_argument(
+        "--offsets",
+        choices=["require-v2", "copy-v1"],
+        default="require-v2",
+        help="require-v2: refuse without a version-2 merged offsets record; "
+        "copy-v1: explicitly reuse the retained approximate record for this validation",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("results/issue-139/cloud/submission.json"),
+    )
+    args = parser.parse_args()
+
+    if os.environ.get("AWS_PROFILE") != "radiant-earth":
+        return _refuse("AWS_PROFILE must be radiant-earth")
+    if os.environ.get("LST_STORAGE_BACKEND") != "s3":
+        return _refuse("LST_STORAGE_BACKEND must be s3")
+    if os.environ.get("LST_EXEC_TRACE") != "1":
+        return _refuse("LST_EXEC_TRACE must be 1")
+    if os.environ.get("LST_GED_GAP_MASK") != "false":
+        return _refuse("LST_GED_GAP_MASK must be false for the retained pre-mask workload")
+    if os.environ.get("LST_COILED_RETRIES") != "0":
+        return _refuse("LST_COILED_RETRIES must be 0")
+    if "LST_PROFILE_DASK" in os.environ:
+        return _refuse("LST_PROFILE_DASK must be unset")
+    if "LST_STAC_URL" in os.environ:
+        return _refuse("LST_STAC_URL must be unset so workers use Earth Search")
+    if args.index != INDEX:
+        return _refuse(f"this contract permits index {INDEX} only")
+    if args.run_id == RETAINED_RUN:
+        return _refuse("run id must not be the retained run")
+
+    from landsat_lst import batch, quota, shards  # noqa: PLC0415
+    from landsat_lst.config import settings  # noqa: PLC0415
+    from landsat_lst.shard_tasks import apply_shard_settings  # noqa: PLC0415
+    from landsat_lst.storage import S3Storage, get_storage  # noqa: PLC0415
+
+    if settings.shard_composite_vm_type != VM_TYPE:
+        return _refuse(f"LST_SHARD_COMPOSITE_VM_TYPE must resolve to {VM_TYPE}")
+    if settings.shard_spot_policy != "spot":
+        return _refuse("LST_SHARD_SPOT_POLICY must resolve to spot")
+    if not settings.exec_trace:
+        return _refuse("execution trace did not resolve enabled")
+    if settings.profile_dask:
+        return _refuse("Dask profiling resolved enabled")
+    if settings.ged_gap_mask:
+        return _refuse("GED gap mask resolved enabled")
+    if settings.coiled_retries != 0:
+        return _refuse("Coiled retries did not resolve to zero")
+    if settings.dask_max_threads is not None:
+        return _refuse(
+            f"dask_max_threads resolved to {settings.dask_max_threads}; this run uses the "
+            "production default pool (unset)"
+        )
+    if not settings.shard_composite_per_column:
+        return _refuse("shard_composite_per_column resolved off")
+    if not settings.warp_exact_transform:
+        return _refuse("warp_exact_transform resolved off; the v1 contract is exact reprojection")
+    if settings.shard_composite_chunk != COMPOSITE_CHUNK:
+        return _refuse(
+            f"shard_composite_chunk resolved to {settings.shard_composite_chunk}, not {COMPOSITE_CHUNK}"
+        )
+
+    storage = get_storage()
+    if not isinstance(storage, S3Storage):
+        return _refuse("configured storage is not S3Storage")
+
+    arn = quota.preflight_identity()
+    print(f"identity ok: {arn}")
+    probed = quota.preflight_write_access()
+    print(f"write access ok: {probed}")
+    balance = quota.preflight_credits(ESTIMATED_CREDITS, acknowledged=True)
+    print(f"credits ok: {balance}")
+
+    source_root = shards.shard_root(RETAINED_RUN, TILE)
+    destination_root = shards.shard_root(args.run_id, TILE)
+    if storage.list_prefix(f"{destination_root}/"):
+        return _refuse(f"fresh run prefix already contains objects: {destination_root}/")
+
+    source_plan = shards.plan_key(source_root)
+    source_items = shards.items_key(source_root)
+    destination_plan = shards.plan_key(destination_root)
+    destination_items = shards.items_key(destination_root)
+    plan_head = _head(storage, source_plan)
+    items_head = _head(storage, source_items)
+    if plan_head["ContentLength"] != PLAN_BYTES:
+        return _refuse(f"retained plan size changed: {plan_head['ContentLength']} != {PLAN_BYTES}")
+    if items_head["ContentLength"] != ITEMS_BYTES:
+        return _refuse(
+            f"retained items size changed: {items_head['ContentLength']} != {ITEMS_BYTES}"
+        )
+
+    raw_plan = storage.read_text(source_plan)
+    if raw_plan is None:
+        return _refuse(f"retained plan is absent: {source_plan}")
+    # The retained plan was stamped under load_chunk_size=512. Parse it under
+    # that setting so the digest check passes, then re-stamp it under the
+    # candidate's 1024 with to_dict(): bands, blocks, scene ids, and stamps
+    # are byte-identical, only the digest moves, and the merged-offset key
+    # (scene ids, factor, clamp) does not depend on the chunk at all.
+    settings.load_chunk_size = RETAINED_CHUNK
+    import landsat_lst.offsets as offsets_module  # noqa: PLC0415
+
+    current_version = offsets_module.ALGORITHM_VERSION
+    offsets_module.ALGORITHM_VERSION = (
+        RETAINED_ALGORITHM_VERSION  # parse under the version it was cut at
+    )
+    try:
+        plan = shards.TilePlan.from_dict(json.loads(raw_plan))
+        if plan.digest != PLAN_DIGEST:
+            return _refuse(f"retained plan digest changed: {plan.digest} != {PLAN_DIGEST}")
+    finally:
+        offsets_module.ALGORITHM_VERSION = current_version
+    if len(plan.scene_ids) != PLAN_ITEMS:
+        return _refuse(f"retained plan has {len(plan.scene_ids)} items, expected {PLAN_ITEMS}")
+    if len(plan.bands) != 35 or tuple(plan.bands[INDEX]) != ROWS:
+        return _refuse(
+            f"retained band geometry changed: bands={len(plan.bands)}, band16={plan.bands[INDEX]}"
+        )
+    apply_shard_settings()
+    if settings.load_chunk_size != COMPOSITE_CHUNK:
+        return _refuse(f"apply_shard_settings left load_chunk_size at {settings.load_chunk_size}")
+    restamped = plan.to_dict()
+    retained = json.loads(raw_plan)
+    for key in retained:
+        if key != "digest" and retained[key] != restamped.get(key):
+            return _refuse(f"re-stamped plan differs from the retained plan in {key!r}")
+
+    storage.write_text(destination_plan, json.dumps(restamped, indent=2))
+    _copy(storage, source_items, destination_items)
+
+    # Offsets. The v1 contract keys the merged record on ALGORITHM_VERSION 2 and
+    # no such record exists for this tile, so the composite shard would wait at
+    # its offsets barrier forever. Two explicit ways forward, never a silent one.
+    from landsat_lst.offsets import OffsetKey  # noqa: PLC0415
+    from landsat_lst.shard_tasks import _offset_key  # noqa: PLC0415
+
+    v2_key = _offset_key(plan).storage_key
+    v1_key = OffsetKey.build(
+        tile=plan.tile,
+        window=plan.window,
+        factor=plan.offset_factor,
+        scene_ids=plan.scene_ids,
+        algorithm_version=RETAINED_ALGORITHM_VERSION,
+    ).storage_key
+    has_v2 = storage.read_text(v2_key) is not None
+    if args.offsets == "require-v2" and not has_v2:
+        return _refuse(
+            f"no version-2 offsets record at {v2_key}; run the offsets stage or pass --offsets copy-v1"
+        )
+    if args.offsets == "copy-v1":
+        if has_v2:
+            return _refuse(
+                f"a version-2 offsets record already exists at {v2_key}; refusing to overwrite it"
+            )
+        if storage.read_text(v1_key) is None:
+            return _refuse(f"retained version-1 offsets record absent: {v1_key}")
+        _copy(storage, v1_key, v2_key)
+        print(
+            f"offsets: copied the retained approximate-transform record {v1_key} to {v2_key} "
+            "(explicit reuse for this validation; local check: median offsets unchanged to 4 decimals)"
+        )
+    if storage.read_text(destination_plan) is None:
+        return _refuse("re-stamped plan did not land")
+    if _head(storage, destination_items)["ContentLength"] != ITEMS_BYTES:
+        return _refuse("copied items size does not match retained source")
+    print(f"inputs copied: {source_root} -> {destination_root}")
+
+    submission = batch.submit_shard_stage(
+        stage="composite",
+        run_id=args.run_id,
+        tile=TILE,
+        indexes=[INDEX],
+        submission_round=1,
+    )
+    record = {
+        "run_id": args.run_id,
+        "tile": TILE,
+        "index": INDEX,
+        "rows": list(ROWS),
+        "vm_type": settings.shard_composite_vm_type,
+        "dask_max_threads": settings.dask_max_threads,
+        "shard_composite_chunk": settings.shard_composite_chunk,
+        "shard_composite_per_column": settings.shard_composite_per_column,
+        "retained_plan_digest": PLAN_DIGEST,
+        "restamped_plan_digest": restamped["digest"],
+        "warp_exact_transform": settings.warp_exact_transform,
+        "offsets_policy": args.offsets,
+        "offsets_v2_key": v2_key,
+        "spot_policy": settings.shard_spot_policy,
+        "cluster_id": submission.cluster_id,
+        "job_id": submission.job_id,
+        "name": submission.name,
+        "submitted_at": datetime.now(UTC).isoformat(),
+        "state_key": shards.shard_state_key(destination_root, "composite", INDEX, 1),
+        "trace_keys": {
+            name: f"{shards.unit_trace_prefix(args.run_id, 'composite', TILE, INDEX)}"
+            f".exectrace.{suffix}"
+            for name, suffix in {
+                "events": "events.jsonl.gz",
+                "timeline": "timeline.csv",
+                "summary": "summary.json",
+            }.items()
+        },
+        "band_keys": {
+            product: shards.band_key(destination_root, product, INDEX)
+            for product in ("lst_p95", "qa_count")
+        },
+        "retained_run": RETAINED_RUN,
+        "retained_exporting_wall_s": 1372.2,
+        "estimated_credits": ESTIMATED_CREDITS,
+        "operator_credit_limit": OPERATOR_CREDIT_LIMIT,
+        "identity": arn,
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(record, indent=2) + "\n")
+    print(json.dumps(record, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

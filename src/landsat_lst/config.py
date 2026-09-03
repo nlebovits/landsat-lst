@@ -155,6 +155,21 @@ class Settings(BaseSettings):
         "mask -- never to offset estimation, and never to qa_count (zero "
         "observations is data; the count layer stays the evidence).",
     )
+    warp_exact_transform: bool = Field(
+        default=True,
+        description="Warp every source read with GDAL's exact transformer. This "
+        "is the v1 scientific contract (2026-09-03): an output pixel must not "
+        "depend on the processing window it was read through. rasterio's "
+        "default is an approximate transformer at 0.125 px, linearised per "
+        "destination window, under which a 512 x 1024 window moved 3,642 of 84M "
+        "source pixels against 512 x 512 on 40 real S30W065 scenes and the P95 "
+        "by up to 1,681 DN. Exact makes every window bit-identical; against the "
+        "approximate product it moves 4.4% of P95 pixels, 97% of them by under "
+        "1 C, and is why offsets.ALGORITHM_VERSION is 2. Off exists only to "
+        "reproduce the pre-v1 product. Cost 5 to 32 ms of warp CPU per 512 x 512 "
+        "read. Applied through pipeline._install_warp_tolerance to every "
+        "load_scenes call in the process.",
+    )
     ged_gap_buffer_cells: int = Field(
         default=1,
         ge=0,
@@ -484,22 +499,29 @@ class Settings(BaseSettings):
         "rather than a list so the chunk this stage runs at "
         "(shard_composite_chunk) describes a known core count.",
     )
+    shard_composite_per_column: bool = Field(
+        default=False,
+        description="Experimental compatibility switch for loading a composite "
+        "band through one stac_load call per longitude chunk. Production keeps "
+        "this off: shard export bounds execution over one whole-band graph instead.",
+    )
     shard_composite_chunk: int = Field(
-        default=512,
+        default=1024,
         ge=64,
         description="Spatial chunk edge a composite shard loads at, overriding "
-        "load_chunk_size. 512, not 1024: the old 1024 rationale assumed a row "
-        "band's time axis shrinks with its rows, and it does not -- odc-stac "
-        "prunes chunk reads spatially but never thins the time axis, and ~90% "
-        "of solar-day groups touch every band (measured on S30W065's 1,031 "
-        "steps). At 1024 the rechunk task holds 4.32 GB and 16 threads want "
-        "69 GB on a 64 GiB VM. The 2026-08-22 packing probe measured the real "
-        "composite at chunk 512: ~34 GB peak VmHWM per shard, 45.5 MB/s "
-        "decoded, 44% headroom on m6i.4xlarge -- and showed a second shard "
-        "OOMs, which is also why intra-VM packing was rejected "
-        "(results/probe/composite_packing.json). Applied by every shard "
-        "process AND by the planner, so the plan digest -- which covers "
-        "load_chunk_size -- agrees across all of them.",
+        "load_chunk_size. 1024 is safe on two conditions that both hold now. "
+        "Memory: the 2026-08-22 rejection (16 rechunks at 4.32 GB, 69 GB) was "
+        "the all-columns-resident ordering; composite shards now compute and "
+        "write two longitude chunks at a time from one whole-band graph. Pixels: "
+        "the read window is also the warp window, and under rasterio's default "
+        "approximate transformer a 512 x 1024 window moved 3,642 of 84M source "
+        "pixels and the P95 by up to 1,681 DN; under warp_exact_transform (the "
+        "v1 contract) 512 and 1024 are bit-identical in both products through "
+        "the shard path (docs/evidence/issue-139/exact-baseline-local). The "
+        "gain is the #139 read-rate lever: reads cost per request, not per byte, "
+        "and a 512-row band reads 512 x 1024 windows, half the reads per item. "
+        "Applied by every shard process AND by the planner, so the plan digest "
+        "-- which covers load_chunk_size -- agrees across all of them.",
     )
     shard_export_disk_gb: int = Field(
         default=100,
@@ -767,6 +789,21 @@ class Settings(BaseSettings):
         description="Sampling interval for ResourceProfiler's RSS and CPU "
         "curve. One second over a two-hour phase is 7,200 samples, which the "
         "dump strides down before writing.",
+    )
+    exec_trace: bool = Field(
+        default=False,
+        description="Record a per-second composite-shard execution trace. Off by "
+        "default and intended only for a bounded measurement run.",
+    )
+    exec_trace_interval_s: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="Seconds between host samples in an execution trace.",
+    )
+    exec_trace_read_sample: int = Field(
+        default=20,
+        ge=1,
+        description="Record timing and source metadata for every Nth rio_read call.",
     )
 
     @model_validator(mode="after")

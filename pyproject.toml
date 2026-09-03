@@ -49,6 +49,8 @@ dependencies = [
     "odc-geo>=0.5.1",
     "planetary-computer>=1.0.0",
     "boto3>=1.34.0",
+    # Imported directly by the opt-in composite execution trace.
+    "psutil>=5.9.0",
     # Imported directly for the STAC retry policy and the IMDS instance-type
     # read. Both arrive transitively through pystac-client; they are declared
     # here because this package imports them. urllib3 must be 2.x: the retry

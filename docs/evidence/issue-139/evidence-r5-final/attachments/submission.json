@@ -1,0 +1,38 @@
+{
+  "run_id": "shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5",
+  "tile": "S30W065",
+  "index": 16,
+  "rows": [
+    8704,
+    9216
+  ],
+  "vm_type": "m6i.4xlarge",
+  "dask_max_threads": null,
+  "shard_composite_chunk": 1024,
+  "shard_composite_per_column": true,
+  "retained_plan_digest": "94bc658516d9fbb9",
+  "restamped_plan_digest": "4230fc98933de63e",
+  "warp_exact_transform": true,
+  "offsets_policy": "copy-v1",
+  "offsets_v2_key": "_offsets/S30W065/2021-2025/f2/v2-eac1fa94a9fc760f.json",
+  "spot_policy": "spot",
+  "cluster_id": 2002207,
+  "job_id": 384183,
+  "name": "lst-198792a9-S30W065-compo-r1",
+  "submitted_at": "2026-09-03T20:29:43.873376+00:00",
+  "state_key": "_shards/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/S30W065/state/composite.0016.1.json",
+  "trace_keys": {
+    "events": "_shards/timings/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/composite.S30W065.0016.exectrace.events.jsonl.gz",
+    "timeline": "_shards/timings/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/composite.S30W065.0016.exectrace.timeline.csv",
+    "summary": "_shards/timings/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/composite.S30W065.0016.exectrace.summary.json"
+  },
+  "band_keys": {
+    "lst_p95": "_shards/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/S30W065/composite/lst_p95/band016.tif",
+    "qa_count": "_shards/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/S30W065/composite/qa_count/band016.tif"
+  },
+  "retained_run": "shard-S30W065-2021-2025-20260823T102135Z",
+  "retained_exporting_wall_s": 1372.2,
+  "estimated_credits": 9.0,
+  "operator_credit_limit": 20.0,
+  "identity": "arn:aws:sts::939788573396:assumed-role/AWSReservedSSO_coiled_on_EC2_9672f1ceb228eb20/nissim.lebovits@radiant.earth"
+}

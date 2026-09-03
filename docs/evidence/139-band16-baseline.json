@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "issue": 139,
+  "what": "The retained production exporting time and resource context for the exact composite band replayed by the execution-trace measurement. These values are a baseline identity and context, not a prediction from the local recorder gate.",
+  "source": {
+    "run_id": "shard-S30W065-2021-2025-20260823T102135Z",
+    "stage": "composite",
+    "artifact": "results/probe/composite_band_phase_seconds.json",
+    "artifact_tracked": false,
+    "derivation": "_shards/{run_id}/S30W065/state/composite.0016.1.json plus its retained plan.json and items.json, read 2026-09-03",
+    "classification": "measured"
+  },
+  "band": {
+    "index": 16,
+    "rows": [
+      8704,
+      9216
+    ],
+    "distinct_items": 2010,
+    "reads": 40596,
+    "scenes_found": 4403,
+    "scenes_kept": 912,
+    "exporting_wall_s": 1372.2,
+    "elapsed_s": 1444.4,
+    "peak_rss_mb": 40082.8125,
+    "instance_type": "m6i.4xlarge",
+    "instance_lifecycle": "spot",
+    "classification": "measured"
+  },
+  "related_production_observations": {
+    "source_rate_mb_s": "approximately 10-11",
+    "exporting_fit_s_per_distinct_item": 0.691,
+    "exporting_fit_stderr_s_per_distinct_item": 0.0542,
+    "highest_band_peak_rss_mb": 43948.75,
+    "highest_rss_band": 27,
+    "classification": "measured",
+    "note": "The physical causes remain unknown. The local 40-scene recorder gate is excluded because it validates recorder mechanics only."
+  }
+}

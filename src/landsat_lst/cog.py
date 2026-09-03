@@ -103,6 +103,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import dask
+import dask.array as dask_array
 import numpy as np
 import rasterio
 import rioxarray  # noqa: F401 - needed for .rio accessor
@@ -110,6 +111,7 @@ import structlog
 from rasterio.windows import Window
 from rio_cogeo.cogeo import cog_translate, cog_validate
 from rio_cogeo.profiles import cog_profiles
+from rioxarray.raster_writer import RasterioWriter
 
 from landsat_lst.encoding import LST_FILL_VALUE, LST_OFFSET, LST_SCALE
 
@@ -200,6 +202,65 @@ def write_intermediates(pairs: Sequence[tuple[xr.DataArray, Path]]) -> None:
     pending = [d for d in deferred if d is not None]
     if pending:
         dask.compute(*pending)
+
+
+def write_intermediates_bounded(
+    pairs: Sequence[tuple[xr.DataArray, Path]], *, longitude_group: int
+) -> None:
+    """Write full-shape rasters through sequential longitude-slice computes.
+
+    Each destination header is created once from the full encoded array. Every
+    compute then sees only one lazy longitude slice from that already-built
+    graph, so Dask culls source reads outside the group and can release the
+    group intermediate results before the next one starts. Both products stay
+    in the same compute so their common source tasks are still shared.
+    """
+    if longitude_group <= 0:
+        raise ValueError("longitude_group must be positive")
+    if not pairs:
+        return
+
+    widths = {int(da.sizes["longitude"]) for da, _path in pairs}
+    if len(widths) != 1:
+        raise ValueError("bounded intermediate arrays must share a longitude width")
+    width = widths.pop()
+
+    # ``to_raster(compute=False)`` writes the full-shape header before it builds
+    # the deferred store. Discard that full store graph: the loop below builds
+    # only the region stores that are actually executed.
+    lazy_pairs = []
+    for da, path in pairs:
+        deferred = _write_intermediate(da, path, compute=False)
+        if deferred is not None:
+            lazy_pairs.append((da, path))
+        del deferred
+    if not lazy_pairs:
+        return
+
+    target_lock = threading.Lock()
+    for start in range(0, width, longitude_group):
+        stop = min(start + longitude_group, width)
+        slices = [da.isel(longitude=slice(start, stop)) for da, _path in lazy_pairs]
+        sources = [part.data for part in slices]
+        targets: list[Any] = [RasterioWriter(path) for _da, path in lazy_pairs]
+        regions = [
+            (slice(None), slice(start, stop))
+            if part.ndim == 2
+            else (slice(None), slice(None), slice(start, stop))
+            for part in slices
+        ]
+        stores = dask_array.store(
+            sources,
+            targets,
+            regions=regions,
+            lock=target_lock,
+            compute=False,
+        )
+        if isinstance(stores, tuple | list):
+            dask.compute(*stores)
+        else:
+            dask.compute(stores)
+        del stores, targets, sources, slices
 
 
 def _dataset_tags(attrs: Mapping[str, Any]) -> dict[str, str]:

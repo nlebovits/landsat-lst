@@ -277,6 +277,11 @@ def unit_timing_key(run_id: str, stage: str, tile: str, index: int) -> str:
     return f"{unit_timing_prefix(run_id)}{stage}.{tile}.{index:04d}.json"
 
 
+def unit_trace_prefix(run_id: str, stage: str, tile: str, index: int) -> str:
+    """Stem shared by one work unit's execution-trace artifacts."""
+    return f"{unit_timing_prefix(run_id)}{stage}.{tile}.{index:04d}"
+
+
 def fleet_unit_token(tile: str, index: int) -> str:
     """One task's whole input: which tile, and which shard of it.
 

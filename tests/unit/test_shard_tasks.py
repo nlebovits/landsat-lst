@@ -333,14 +333,14 @@ class TestCompositeShard:
 
         assert run_composite_shard(RUN_ID, TILE, 0, storage=storage) == []
 
-    def test_the_native_pass_runs_under_the_composite_profile(
+    def test_the_native_pass_runs_under_the_composite_profile_and_trace(
         self, storage, plan, published, monkeypatch
     ):
-        """``profile_compute(PROFILE_COMPOSITE)`` wraps the export, and only it.
+        """The two opt-in observers wrap the native export, and only it.
 
-        The wrapper is the one place a shard's task profile comes from. Off by
-        default, it costs nothing; deleted, the measurement-stage evidence for
-        the memory-critical block silently stops existing.
+        These wrappers are the only place the shard's task evidence comes
+        from. Both are off by default; deleting either silently removes its
+        measurement artifact.
         """
         from contextlib import contextmanager
 
@@ -349,18 +349,31 @@ class TestCompositeShard:
         _stub_native_load(monkeypatch, plan)
         write_offset_cache(storage, plan)
         entered: list[str] = []
+        traced: list[tuple[object, str]] = []
 
         @contextmanager
         def recording(label: str):
             entered.append(label)
             yield
 
+        @contextmanager
+        def recording_trace(*, storage, stem: str):
+            traced.append((storage, stem))
+            yield
+
         monkeypatch.setattr("landsat_lst.shard_tasks.profile_compute", recording)
+        monkeypatch.setattr("landsat_lst.shard_tasks.exec_trace", recording_trace)
 
         written = run_composite_shard(RUN_ID, TILE, 0, storage=storage)
 
         assert written
         assert entered == [PROFILE_COMPOSITE]
+        assert traced == [
+            (
+                storage,
+                shards.unit_trace_prefix(RUN_ID, "composite", TILE, 0),
+            )
+        ]
 
     # A composite shard without merged offsets now *waits* rather than refusing
     # -- its VM was started early on purpose. See TestOffsetRecordWait.

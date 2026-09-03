@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "claim": "Under the v1 scientific contract (exact Landsat reprojection, warp_exact_transform on by default, offsets ALGORITHM_VERSION 2), the composite shard loads a band column by column and reads 512 x 1024 windows. Locally, exact 512 and exact 1024 are pixel-identical in both products through the shard path. One traced production shard measures exporting wall, peak RSS, reads per item and MB/s, and cost, and records its output against the retained approximate-transform band 16 as a product change, not as an equivalence gate.",
+  "inputs": {
+    "workload": "Band 16 of tile S30W065, window 2021-2025, replayed from the plan and frozen item list of retained run shard-S30W065-2021-2025-20260823T102135Z. One complete 512-row composite shard, rows 8704:9216, 4403 items in the plan, 2010 distinct items intersecting this band, and 912 solar days kept.",
+    "launch_command": "env -u LST_PROFILE_DASK -u LST_STAC_URL -u LST_DASK_MAX_THREADS AWS_PROFILE=radiant-earth LST_STORAGE_BACKEND=s3 LST_EXEC_TRACE=1 LST_GED_GAP_MASK=false LST_COILED_RETRIES=0 LST_SHARD_COMPOSITE_VM_TYPE=m6i.4xlarge uv run python scripts/experimental/submit_exec_trace_shard.py --run-id shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5 --index 16 --offsets copy-v1 --out results/issue-139/cloud-r5/submission.json",
+    "baseline_revision": "08177fd8572b80c45f0ffbcd1f6f1285afa5fd15",
+    "treatment_revision": "6bab3c8e256d69e811465dda064fc5bbb63f9a7c",
+    "real_data": {
+      "kind": "real",
+      "identity": "Tile S30W065, window 2021-2025, the 4403 STAC items frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111683185 bytes) and plan.json (220702 bytes, digest 94bc658516d9fbb9, 35 bands), band 16 covering rows 8704:9216 of the 18000-row production geobox. Both objects are copied byte-for-byte within S3 to the fresh run root; the canonical merged-offset key is unchanged because its identity derives from the frozen plan.",
+      "production_relationship": "This is the complete production band from the shipped S30W065 run, on the production grid, reading Earth Search assets in us-west-2 on m6i.4xlarge. LST_GED_GAP_MASK=false reproduces the retained run, which predates the post-P95 GED mask.",
+      "known_differences": [
+        "warp_exact_transform=true (default since ffe0a8e): every source read warps with GDAL's exact transformer. Against the retained approximate product this moved 4.4% of P95 pixels on the 40-scene local gate, 97% of them by under 1 C, with 220 of 2.1M valid/nodata flips. The retained band 16 is therefore not an equivalence baseline for this run; the local exact-512 slabs are (docs/evidence/issue-139/exact-baseline-local), and exact 512 equals exact 1024 there pixel for pixel.",
+        "shard_composite_per_column=true and shard_composite_chunk=1024 (defaults since 7f06dd4): half the reads per item of the retained 512 geometry, one to two rechunks in flight instead of all 36 columns resident.",
+        "offsets: no ALGORITHM_VERSION-2 merged record exists for this tile. --offsets copy-v1 copies the retained version-1 record to the version-2 key for this validation only, explicitly and recorded in submission.json. Local check over the full band width, 14 overlapping scenes: median offsets unchanged to four decimals while 6% of coarse pixels moved. A production v1 run would recompute them through the offsets stage.",
+        "The retained plan (digest 94bc658516d9fbb9, cut at load_chunk_size=512 under ALGORITHM_VERSION 1) is parsed under those values and re-stamped under 1024 and version 2 by TilePlan.to_dict after a field-by-field equality check; bands, blocks, scene ids and stamps are unchanged.",
+        "Production thread pool (unset); LST_EXEC_TRACE=1 attaches the #139 recorder; LST_GED_GAP_MASK=false and LST_COILED_RETRIES=0 as before; one attempt, an OOM is the recorded outcome.",
+        "The VM may be on-demand despite the spot policy; that changes cost, not the measurement."
+      ]
+    }
+  },
+  "baseline": {
+    "metric": "exporting_wall_s",
+    "value": 1372.2,
+    "unit": "seconds",
+    "classification": "measured",
+    "artifact": "139-band16-baseline.json"
+  },
+  "target_metric": "exporting_wall_s",
+  "measurement_plan": {
+    "target_environment": "production",
+    "phases": [
+      "exporting"
+    ],
+    "metrics": [
+      "exporting_wall_s",
+      "peak_rss_mb",
+      "rio_read_calls",
+      "reads_per_item",
+      "network_recv_mb_s",
+      "active_tasks_by_class",
+      "sampled_source_open_s",
+      "sampled_source_read_s",
+      "host_gap_max_s"
+    ],
+    "raw_artifacts": [
+      "_shards/timings/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/composite.S30W065.0016.exectrace.events.jsonl.gz",
+      "_shards/timings/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/composite.S30W065.0016.exectrace.timeline.csv",
+      "_shards/timings/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/composite.S30W065.0016.exectrace.summary.json",
+      "_shards/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/S30W065/state/composite.0016.1.json",
+      "_shards/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/S30W065/state/composite.0016.1.log",
+      "Coiled lifecycle, billing, CPU, and memory telemetry collected with landsat-lst evidence collect",
+      "_shards/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/S30W065/composite/lst_p95/band016.tif and qa_count/band016.tif, compared against the retained run's band016 slabs"
+    ],
+    "profiling": {
+      "method": "landsat_lst.exectrace: Dask local-scheduler pretask/posttask callbacks bound submit-to-return intervals; a spawned child process samples the shard's CPU, RSS, and file descriptors and the host's network and disk counters once per second through psutil; every twentieth odc.loader._rio.rio_read records source URI, requested shape, thread, and three stamps (before open, at _do_read entry, after return). The pure timeline builder counts half-open active intervals with sorted starts and finishes.",
+      "artifact": "_shards/timings/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/composite.S30W065.0016.exectrace.timeline.csv",
+      "observer_effect_control": "No untraced treatment arm exists and no runtime improvement claim is permitted. Hot paths append primitive values only; the sampler lives in a child process so it neither holds nor waits for the shard's GIL; gzip, CSV, JSON, and three independent storage uploads occur after compute_finished_at. Sample gaps, sampler mode, hook status, and upload bounds are retained in summary.json so observer failures are visible. LST_PROFILE_DASK is absent."
+    },
+    "baseline_repetitions": 1,
+    "treatment_repetitions": 1,
+    "aggregation": "single"
+  },
+  "minimum_effect": {
+    "direction": "decrease",
+    "fraction": 0.2,
+    "reading": "exporting_wall_s at least 20% below the retained 1,372.2 s (expected 800-1,100 s: half the reads, at 0.7-1.0x the 512 read rate, plus 5-32 ms of exact-warp CPU per read that stays under the read bottleneck). peak_rss_mb below 24,000 (model 12-22 GB). reads per item at most 60% of the retained 24.06."
+  },
+  "production_discriminator": "Exactly one complete composite shard attempt: S30W065 band 16 on one m6i.4xlarge in us-west-2, production thread pool, per-column loading at chunk 1024, replaying the retained plan and item list. Read the trace, the state object, and the slab comparison together, then stop.",
+  "stop_rule": "Stop after this one attempt regardless of outcome. Proceed only if exporting_wall_s falls at least 20% below 1,372.2 s, peak_rss_mb is below 24,000, reads per item are at most 60% of 24.06, and the trace passes its gates (artifacts present, host gaps below five seconds, active tasks at most the pool size, uploads after compute). Any other outcome is stop, recorded with its numbers. No retry, no second shard, no tuning without new operator approval.",
+  "result_artifact": "139-v1exact1024-r5.result.json",
+  "max_cloud_cost_usd": 1,
+  "max_coiled_credits": 20,
+  "code_identity_required": true,
+  "output_equivalence_required": true,
+  "output_equivalence": {
+    "method": "Two parts. (1) Pre-registered and already measured: exact 512 versus exact 1024 through the shard path on the 40-scene local gate, pixel hashes in docs/evidence/issue-139/exact-baseline-local/baseline.json, identical in lst_p95 and qa_count. (2) Recorded, not gated: the production band-16 slabs against the retained approximate-transform slabs. Report max_abs_diff, the fraction of pixels differing by more than 1 DN, and valid/nodata flips; the local gate predicts about 4% of lst_p95 pixels moving, 97% by under 1 C. This is the v1 product change and is reported as such.",
+    "acceptance_criterion": "Part (1) identical (already true at revision 6bab3c8e256d). Part (2) reported with its numbers; no threshold, because the retained product was made under the pre-v1 contract.",
+    "tolerance": 0,
+    "result_artifact": "139-v1exact1024-equivalence.json"
+  },
+  "notes": [
+    "Cumulative issue-139 cost before this attempt: 15.4802 Coiled credits (clusters 2000998, 2001031, 2001315). Expected 4-6 credits here.",
+    "The offsets copy is the one explicit reuse in this run and exists so the shard does not wait at its barrier; it is named in submission.json.",
+    "The contract and submission script remain untracked until the measurement result is known, matching the repository guard's documented preparation workflow.",
+    "The launch command excludes its own LST_EVIDENCE_CONTRACT assignment because normalize_launch_command removes only that assignment."
+  ],
+  "operator_note": "Approved in conversation on 2026-09-03. Exactly one production validation shard for per-column + exact transform + 1024; the operator also confirmed LST_GED_GAP_MASK=false."
+}

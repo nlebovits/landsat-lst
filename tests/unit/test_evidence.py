@@ -44,7 +44,9 @@ class StubStorage:
                 "_shards/run-1/N40W075/composite/lst_p95/band003.tif": modified,
             }
         if prefix == "_shards/timings/run-1/":
-            return {}
+            return {
+                "_shards/timings/run-1/composite.N40W075.0003.exectrace.events.jsonl.gz": modified
+            }
         raise AssertionError(prefix)
 
     def read_text(self, key: str) -> str:
@@ -56,6 +58,11 @@ class StubStorage:
                 "code_identity": {"revision": self.revision, "package_version": "0.1-test"},
             }
         )
+
+    def download(self, key: str, local: Path) -> bool:
+        assert key.endswith(".jsonl.gz")
+        local.write_bytes(b"\x1f\x8btrace")
+        return True
 
 
 def contract(tmp_path: Path) -> Path:
@@ -174,6 +181,11 @@ def test_collect_evidence_with_injected_storage(tmp_path: Path, monkeypatch) -> 
     assert bundle["code"]["package_version"] == "0.1-test"
     keys = {artifact["key"] for artifact in bundle["run_artifacts"]}
     assert "_shards/run-1/N40W075/state/composite.0003.1.composite.profile.json" in keys
+    trace = next(
+        artifact for artifact in bundle["run_artifacts"] if artifact["key"].endswith(".gz")
+    )
+    assert trace["content_encoding"] == "base64"
+    assert trace["content_base64"] == "H4t0cmFjZQ=="
     assert not any(key.endswith(".tif") for key in keys)
     assert bundle["worker_code_verification"]["status"] == "verified"
     for artifact in bundle["contract_artifacts"].values():

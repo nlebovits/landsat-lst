@@ -52,6 +52,7 @@ import xarray as xr
 
 from landsat_lst import offsets, shards
 from landsat_lst.config import settings
+from landsat_lst.exectrace import exec_trace
 from landsat_lst.logging_config import configure_logging
 from landsat_lst.models import ProcessingJob
 from landsat_lst.normalization import _io_block_edge, _scene_batches, climatology_by_blocks
@@ -997,8 +998,12 @@ def run_composite_shard(
     Returns:
         The keys written, empty when they already existed.
     """
-    from landsat_lst.cog import lst_product, qa_product, write_intermediates  # noqa: PLC0415
-    from landsat_lst.job import _encode_native  # noqa: PLC0415
+    from landsat_lst.cog import (  # noqa: PLC0415
+        lst_product,
+        qa_product,
+        write_intermediates_bounded,
+    )
+    from landsat_lst.job import _encode_native, _thread_cap  # noqa: PLC0415
     from landsat_lst.pipeline import (  # noqa: PLC0415
         _build_ged_gap_mask,
         _build_land_mask,
@@ -1022,7 +1027,12 @@ def run_composite_shard(
     patch_url = _patch_url_for(ctx.items)
     report_phase("loading", scenes_found=len(ctx.items))
     data = load_scenes(
-        ctx.items, ctx.job.tile.bbox, patch_url=patch_url, fail_on_error=False, geobox=geobox
+        ctx.items,
+        ctx.job.tile.bbox,
+        patch_url=patch_url,
+        fail_on_error=False,
+        geobox=geobox,
+        per_column=settings.shard_composite_per_column,
     )
     with timed_section("land_mask"):
         land = _build_land_mask(geobox, data.latitude, data.longitude)
@@ -1051,12 +1061,22 @@ def run_composite_shard(
             lst_product(native, paths["lst_p95"]),
             qa_product(native, paths["qa_count"]),
         ]
+        # settings.dask_max_threads (LST_DASK_MAX_THREADS) bounds the threaded
+        # scheduler here exactly as process_tile_job bounds a whole tile; None
+        # leaves dask's CPU-count pool, which is what every production shard
+        # has run on so far.
         with (
+            _thread_cap(),
             timed_section("exporting", scenes_found=len(ctx.items)),
             profile_compute(PROFILE_COMPOSITE),
+            exec_trace(
+                storage=ctx.storage,
+                stem=shards.unit_trace_prefix(run_id, "composite", tile, index),
+            ),
         ):
-            write_intermediates(
-                [(p.da, path) for p, path in zip(products, paths.values(), strict=True)]
+            write_intermediates_bounded(
+                [(p.da, path) for p, path in zip(products, paths.values(), strict=True)],
+                longitude_group=2 * settings.load_chunk_size,
             )
         report_phase("uploading")
         for product, path in paths.items():
