@@ -18,7 +18,7 @@ from urllib3.util.retry import Retry
 from landsat_lst.config import settings
 from landsat_lst.encoding import LST_MIN_TRUSTED_C
 from landsat_lst.ged import gap_mask_for_geobox
-from landsat_lst.kernels import nanquantile_last
+from landsat_lst.kernels import nanquantile_last, quantile_last_sentinel
 from landsat_lst.masks import get_land_mask_for_geobox, load_land_polygons
 from landsat_lst.normalization import (
     debias_with_offsets,
@@ -30,7 +30,14 @@ from landsat_lst.normalization import (
 )
 from landsat_lst.offsets import OffsetCache, OffsetKey, cache_for_items
 from landsat_lst.progress import report_phase, timed_section
-from landsat_lst.qa import apply_qa_mask, convert_to_celsius
+from landsat_lst.qa import (
+    DN_SENTINEL,
+    apply_qa_mask,
+    celsius_stack,
+    convert_to_celsius,
+    dn_stack,
+    dn_to_celsius,
+)
 from landsat_lst.tiling import geobox_for_bbox
 
 if TYPE_CHECKING:
@@ -567,12 +574,13 @@ def compute_annual_composite(
         P50 (median) was removed per stakeholder feedback - hot season temps
         (P95) are what matter for urban heat applications. See issue #22.
     """
-    masked = apply_qa_mask(data)
-
-    lst = convert_to_celsius(masked["lwir11"])
+    # The stack is uint16 DN with 0 for "no observation", not float32 Celsius
+    # (issue #136). It keeps exactly the samples the Celsius path kept, at
+    # half the bytes, and the P95 is converted to Celsius on its 2-D result.
+    lst = dn_stack(data)
 
     if land_mask is not None:
-        lst = lst.where(land_mask)
+        lst = lst.where(land_mask, DN_SENTINEL)
 
     scenes_kept = None
     if settings.destripe and offsets is not None:
@@ -609,8 +617,12 @@ def compute_annual_composite(
         # it before it starts rather than after. With a warm cache it is a
         # kilobyte read instead, and the phase passes in under a second.
         with timed_section("destriping"):
+            # The estimator, when it has no coarse source, reads the native
+            # stack as the float32 Celsius it always did (a lazy view; the
+            # values are bit-identical). The correction lands on the DN stack.
             lst, offset, keep = seasonal_debias(
-                lst,
+                celsius_stack(lst),
+                apply_to=lst,
                 max_offset_c=settings.destripe_max_offset_c,
                 min_scene_pixels=settings.destripe_min_scene_pixels,
                 min_offset_samples=settings.destripe_min_offset_samples,
@@ -655,8 +667,12 @@ def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
     if lst.chunks is not None:
         lst = lst.chunk({"time": -1})
 
-    # notnull() (not ~np.isnan) so the result stays a typed xarray DataArray.
-    valid_mask = lst.notnull()
+    # A uint16 DN stack marks "no observation" with 0 (issue #136); a float
+    # Celsius stack, which the benchmarks and the equivalence oracle still
+    # build, marks it with NaN. notnull() (not ~np.isnan) so the float case
+    # stays a typed xarray DataArray.
+    integer_stack = np.issubdtype(lst.dtype, np.integer)
+    valid_mask = (lst != DN_SENTINEL) if integer_stack else lst.notnull()
 
     # Per-calendar-month climatology of valid observations. groupby pools every
     # year in the window into its month bucket; reindex guarantees all 12 months.
@@ -681,14 +697,29 @@ def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
     # (pinned by tests/unit/test_kernels.py). apply_ufunc moves time to the
     # last axis per block; the single-chunk time rechunk above guarantees the
     # core dimension is whole.
-    lst_p95 = xr.apply_ufunc(
-        nanquantile_last,
-        lst,
-        input_core_dims=[["time"]],
-        kwargs={"q": 0.95},
-        dask="parallelized",
-        output_dtypes=[np.float64],
-    )
+    # On the DN stack the sort runs on two-byte integers with the sentinel
+    # first, and the affine map to Celsius is applied to the 2-D float64
+    # result: quantile and affine map commute exactly, so the only departure
+    # from the Celsius path is the offset rounded to whole DN upstream.
+    if integer_stack:
+        lst_p95 = xr.apply_ufunc(
+            quantile_last_sentinel,
+            lst,
+            input_core_dims=[["time"]],
+            kwargs={"q": 0.95, "sentinel": DN_SENTINEL},
+            dask="parallelized",
+            output_dtypes=[np.float64],
+        )
+        lst_p95 = dn_to_celsius(lst_p95)
+    else:
+        lst_p95 = xr.apply_ufunc(
+            nanquantile_last,
+            lst,
+            input_core_dims=[["time"]],
+            kwargs={"q": 0.95},
+            dask="parallelized",
+            output_dtypes=[np.float64],
+        )
     lst_p95 = lst_p95.where(total_valid > 0, settings.nodata)
 
     # Guard against a pixel that has observations yet still produces a P95 on

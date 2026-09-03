@@ -48,7 +48,7 @@ import xarray as xr
 from landsat_lst.config import settings
 from landsat_lst.encoding import LST_MIN_TRUSTED_C, LST_SCALE, encode_lst_uint16
 from landsat_lst.kernels import nanquantile_last
-from landsat_lst.pipeline import _composite_graph
+from landsat_lst.pipeline import _composite_graph, compute_annual_composite
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 
 # Landsat Collection 2 Level-2 ST_B10 scaling, as written in qa.convert_to_celsius.
@@ -241,6 +241,32 @@ def main() -> int:  # noqa: PLR0915
         np.abs(debiased32.values[valid].astype(np.float64) - cc[valid] / 100.0).mean() / LST_SCALE
     )
     r["qa_count_equal"] = bool(np.array_equal(qa_i16, qa_base))
+    results.append(r)
+
+    # ---- The implemented DN path, end to end --------------------------------
+    # compute_annual_composite now builds the uint16 stack itself; this arm is
+    # the shipped code rather than a re-spelling of it.
+    full = compute_annual_composite(
+        ds,
+        offsets=(
+            xr.DataArray(_offsets(scenes, args.seed), dims=("time",), coords={"time": ds.time}),
+            xr.DataArray(
+                np.full(scenes, 10**9, dtype=np.int64), dims=("time",), coords={"time": ds.time}
+            ),
+        ),
+    )
+    dn_full = encode_lst_uint16(full["lst_p95"]).values
+    r = _compare("implemented_dn_path", dn_full, dn_base, valid_out)
+    r["max_abs_delta_c"] = float(
+        np.nanmax(
+            np.abs(full["lst_p95"].values.astype(np.float64) - p95_base_c.astype(np.float64))[
+                valid_out
+            ]
+        )
+    )
+    r["bytes_per_element"] = 2
+    r["qa_count_equal"] = bool(np.array_equal(full["qa_count"].values, qa_base))
+    r["matches_uint16_dn_arm"] = bool(np.array_equal(dn_full, dn_u16))
     results.append(r)
 
     peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024

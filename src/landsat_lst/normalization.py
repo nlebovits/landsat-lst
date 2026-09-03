@@ -38,6 +38,7 @@ from landsat_lst.config import settings
 from landsat_lst.kernels import sort_median_axis0
 from landsat_lst.profiling import PROFILE_DESTRIPE_OFFSETS, profile_compute
 from landsat_lst.progress import GraphProgress, report_phase, timed_section
+from landsat_lst.qa import debias_dn
 from landsat_lst.shards import block_spans
 
 if TYPE_CHECKING:
@@ -644,7 +645,15 @@ def debias_with_offsets(
         )
         raise ValueError(msg)
 
-    debiased = lst.isel(time=kept_idx) - offset_here.isel(time=kept_idx)
+    kept = lst.isel(time=kept_idx)
+    offset_kept = offset_here.isel(time=kept_idx)
+    if np.issubdtype(kept.dtype, np.integer):
+        # The composite's uint16 DN stack (issue #136): shift by whole DN and
+        # stay two bytes wide. The float branch below is what the offset
+        # estimator's own Celsius stacks still take.
+        debiased = debias_dn(kept, offset_kept)
+    else:
+        debiased = kept - offset_kept
 
     return debiased, offset, keep
 
@@ -658,6 +667,7 @@ def seasonal_debias(
     offset_source: xr.DataArray | None = None,
     cache: OffsetCache | None = None,
     land_mask: xr.DataArray | None = None,
+    apply_to: xr.DataArray | None = None,
 ) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
     """De-bias each scene against a per-pixel monthly climatology.
 
@@ -693,6 +703,12 @@ def seasonal_debias(
             unit form skip phase-A blocks with no land pixel. A work-skip
             only; values are identical with or without it.
 
+        apply_to: The stack to correct, when it is not ``lst`` itself. The
+            composite hands its ``uint16`` DN stack here and a float32 Celsius
+            view of it as ``lst``, so the estimator reads the values it always
+            read while the correction lands on two bytes per element (issue
+            #136). Must share ``lst``'s time coordinate.
+
     Returns:
         ``(debiased, offset, keep)``. ``debiased`` covers only the surviving
         scenes. ``offset`` and ``keep`` are indexed on the *original* time axis
@@ -719,7 +735,7 @@ def seasonal_debias(
     # :func:`rejection_floor` for why the two floors replace rather than convert
     # into each other.
     return debias_with_offsets(
-        lst,
+        lst if apply_to is None else apply_to,
         offset,
         n_valid,
         max_offset_c=max_offset_c,

@@ -23,6 +23,7 @@ ADRs are kept for history and link to their replacement.
 | [015](015-bounded-work-unit-offsets.md) | Bounded work units for the offset pass, replacing one graph over the window | Accepted |
 | [016](016-sharded-tile-execution.md) | One tile across many VMs, sequenced by S3 barriers | Accepted |
 | [018](018-fleet-consolidation.md) | One work array per stage per wave, carrying many tiles | Proposed |
+| [019](019-composite-stack-in-native-dn.md) | The composite stack is uint16 DN with a 0 sentinel, converted to Celsius on the 2-D P95 | Accepted |
 
 ## Adding an ADR
 

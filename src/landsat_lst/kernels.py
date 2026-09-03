@@ -103,3 +103,47 @@ def nanquantile_last(x: np.ndarray, q: float) -> np.ndarray:
     np.subtract(b, diff * (1 - t), out=out, where=t >= 0.5)
     out[n == 0] = np.nan
     return out
+
+
+def quantile_last_sentinel(x: np.ndarray, q: float, sentinel: int = 0) -> np.ndarray:
+    """Linear-method quantile over the last axis of an integer stack, float64 out.
+
+    The composite's stack is ``uint16`` DN with ``sentinel`` marking no
+    observation (issue #136). An integer array has no NaN, so the sentinel
+    sorts *first* rather than last, and the gather starts at ``T - n`` where
+    the valid run begins. The lerp is the same two-branch float64 arithmetic
+    :func:`nanquantile_last` runs, so on the same values the two agree bit
+    for bit; ``tests/unit/test_kernels.py`` pins that against
+    ``np.nanquantile`` on the float64 image of the stack.
+
+    Args:
+        x: ``(..., time)`` integer array; ``sentinel`` must sort below every
+            valid value (0 for DN).
+        q: Quantile in [0, 1].
+        sentinel: The no-observation value.
+
+    Returns:
+        float64 array of quantiles in the stack's units; NaN where a pixel has
+        no valid values.
+    """
+    if x.shape[-1] == 0:
+        return np.full(x.shape[:-1], np.nan, dtype=np.float64)
+    n = (x != sentinel).sum(axis=-1)
+    s = np.sort(x, axis=-1)
+    last = x.shape[-1] - 1
+    first = x.shape[-1] - n
+    h = (n - 1) * np.float64(q)
+    lo = np.clip(np.floor(h).astype(np.int64), 0, last)
+    hi = np.clip(lo + 1, 0, np.clip(n - 1, 0, last))
+    # A pixel with n == 0 has first == T; clip keeps the gather in bounds and
+    # its result is overwritten with NaN below.
+    ia = np.clip(first + lo, 0, last)
+    ib = np.clip(first + hi, 0, last)
+    a = np.take_along_axis(s, ia[..., None], -1)[..., 0].astype(np.float64)
+    b = np.take_along_axis(s, ib[..., None], -1)[..., 0].astype(np.float64)
+    t = h - lo
+    diff = b - a
+    out = np.asarray(a + diff * t, dtype=np.float64)
+    np.subtract(b, diff * (1 - t), out=out, where=t >= 0.5)
+    out[n == 0] = np.nan
+    return out

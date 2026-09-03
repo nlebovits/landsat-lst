@@ -431,6 +431,43 @@ being parseable.
 
 ---
 
+## The composite stack is uint16 DN — do not promote it
+
+The composite's stack is native `uint16` DN with `0` for "no observation", from the
+load to the P95, and the affine map to Celsius runs on the 2-D float64 quantile
+(`qa.dn_stack`, `qa.debias_dn`, `kernels.quantile_last_sentinel`). It used to be
+float32 Celsius, which carried four bytes of precision into a product encoded at
+0.01 C from a source quantized at 0.0034 C. Halving the stack halved the
+composite shard's peak RSS: 24.2 GB to 10.2 GB at 16 column chunks on the corrected
+local probe, and the 36-chunk production band models 18 to 19 GB against the 31.9 to
+43.9 GB measured on 64 GiB VMs. See [ADR-019](docs/adr/019-composite-stack-in-native-dn.md)
+and [findings](docs/findings-composite-precision-audit.md), issue #136.
+
+Rules worth keeping:
+
+- **The stack was never float64, and `apply_qa_mask` never promoted to it.** xarray
+  promotes `uint16` to float32 under `where`, and the offset cache has read float32
+  since 2026-08-21. The float64 in the #129 probe log was the probe's own float64
+  synthetic offsets widening the subtraction. Do not cite that number.
+- **One departure from the Celsius path, and it is bounded.** The scene offset is
+  applied as a whole-DN shift, so the P95 moves by at most half a DN (0.0017 C).
+  The encoder truncates, so 4 to 7% of pixels flip by exactly one output DN on real
+  data and none by more. The operator accepted this on 2026-09-03. `qa_count` is
+  exact. `offsets.ALGORITHM_VERSION` did not move: the estimator still reads a
+  float32 Celsius view (`qa.celsius_stack`) that is bit-identical to the old stack.
+- **`_composite_graph` dispatches on dtype.** A float stack takes `nanquantile_last`,
+  which is what `tests/benchmark` and the equivalence oracle build. Do not remove the
+  float branch to simplify; it is the oracle.
+- **The clamp is the float32 clamp read back as DN** (`qa.dn_clamp_bounds`, 21,694 to
+  59,727 at the default -50 to 80 C). Change the clamp through `settings`, never by
+  editing a DN.
+- **A float `lwir11` is rounded to DN on entry.** Only test fixtures do that; a
+  production load is `uint16` end to end.
+- **The probe must build float32 offsets** (`scripts/probe_composite_local.py`). Its
+  first version built float64 and measured a pipeline production does not run.
+
+---
+
 ## One native pass per tile — keep it that way
 
 A tile used to read the full native stack three times: an eager coverage reduction, the

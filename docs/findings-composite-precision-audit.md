@@ -257,13 +257,96 @@ Recorded for scoping. None of it is implemented.
 - The probe must build float32 offsets before any candidate is measured with
   it, or the baseline it reports is the float64 pipeline again.
 
-## 6. Where the evidence lives
+## 6. The candidate, implemented and measured
+
+The operator accepted the one-DN behavior on 2026-09-03 and asked for one
+bounded candidate: the uint16 DN stack, nothing else. It is in
+[ADR-019](adr/019-composite-stack-in-native-dn.md). What it changed:
+
+- `qa.py`: `dn_stack`, `dn_clamp_bounds`, `celsius_stack`, `debias_dn`,
+  `offset_dn_shift`, `dn_to_celsius`, and the DN constants.
+- `kernels.py`: `quantile_last_sentinel`, the integer P95 kernel.
+- `normalization.py`: `debias_with_offsets` dispatches on dtype;
+  `seasonal_debias` takes `apply_to`, so the estimator reads the float32
+  Celsius view and the correction lands on the DN stack.
+- `pipeline.py`: `compute_annual_composite` builds the DN stack;
+  `_composite_graph` dispatches on dtype and converts the 2-D P95 to Celsius.
+- `tests/unit/test_dn_stack.py`: 40 tests. The sentinel kernel is pinned bit
+  for bit against `np.nanquantile` on the float64 image of the stack; the
+  whole composite is pinned at most one encoded DN from the float32 path with
+  `qa_count` equal; the Celsius view is pinned bit-identical to the old stack.
+- `scripts/probe_composite_local.py`: ported from the #129 worktree, offsets
+  cast to float32, and a `--keep-dir` so two arms can be diffed.
+
+The full unit suite passes credential-less (1,591), the composite integration
+tests pass (32), and `tests/benchmark` passes (16) on the float oracle.
+
+### Corrected probe, both arms [M]
+
+16 threads, 1,031 scenes with 923 kept, chunk 512, 512 rows, laptop with 16
+logical cores and 54 GB. Each point is a fresh subprocess under `RLIMIT_AS`
+and an RSS watchdog. `results/issue-136/probe/{baseline_f32,candidate_u16}.jsonl`.
+
+| Column chunks | float32 peak, GB | uint16 peak, GB | Ratio | float32 wall, s | uint16 wall, s | float32 CPU, s | uint16 CPU, s |
+|---|---|---|---|---|---|---|---|
+| 4 | 9.45 | 5.04 | 0.53 | 48.2 | 37.2 | 205 | 162 |
+| 8 | 16.92 | 7.75 | 0.46 | 62.2 | 52.2 | 419 | 317 |
+| 16 | 24.24 | 10.18 | 0.42 | 101.2 | 79.3 | 804 | 625 |
+
+Task counts are identical per point (3,216, 6,224, 12,240). The fused P95
+task holds 44 to 48% of task time on the candidate against 51 to 56% on the
+baseline, and the `where` chain 19 to 21% against 22 to 26%.
+
+The float32 baseline at 8 column chunks is 16.9 GB where the float64 probe
+in #129 reported 23.2 GB at the same point and was killed at 26 GB with 16
+threads: the 2x the audit predicted for the mis-shaped probe.
+
+### Extrapolation to a production band [D]
+
+Peak grows 1.23 GB per column chunk on the baseline and 0.43 GB on the
+candidate between 4 and 16 chunks. A production band has 36:
+
+| | float32 | uint16 |
+|---|---|---|
+| Linear to 36 chunks | 48.9 GB | 18.8 GB |
+| 16-chunk ratio applied to the measured worst case, 43.9 GB | | 18.4 GB |
+| 16-chunk ratio applied to the measured median, 39.7 GB | | 16.7 GB |
+
+The float32 extrapolation overshoots the VM's 31.9 to 43.9 GB because the
+synthetic source delivers pieces faster than S3 does, so more of the band
+piles up before the P95 retires it. That makes the candidate's 18.8 GB the
+pessimistic figure. Against a 32 GiB VM with about 30 GiB usable, and the
+ticket's 27 to 28 GiB target, the model leaves 9 to 10 GB of headroom.
+
+### Product differences, implemented path [M]
+
+| Data | Pixels compared | Identical | One DN | More than one | Max delta, C | `qa_count` |
+|---|---|---|---|---|---|---|
+| Fixture window (800, 800), real | 262,144 | 243,014 | 19,130 (7.3%) | 0 | 0.0015 | equal |
+| Fixture window (1600, 300), real | 262,141 | 251,930 | 10,211 (3.9%) | 0 | 0.0016 | equal |
+| Probe, 4 chunks, synthetic, zero offsets | 1,048,576 | 1,048,176 | 400 (0.04%) | 0 | | equal |
+| Probe, 8 chunks, synthetic, zero offsets | 2,097,152 | 2,096,329 | 823 (0.04%) | 0 | | equal |
+
+The implemented path reproduces the audit's `uint16_dn_stack` arm bit for bit
+on both windows. With zero offsets the DN path is exact and the residual
+0.04% is the float32 per-sample rounding of the old path.
+
+### Verdict on the local question
+
+Yes on the model: one change, peak RSS at 0.42 to 0.53 of the float32 arm,
+wall time down 16 to 23%, CPU down 21 to 25%, the product within the accepted
+one-DN behavior, `qa_count` exact. The next and only cloud discriminator is
+one representative 512-row composite shard on a 32 GiB VM. It has not run.
+
+## 7. Where the evidence lives
 
 - `scripts/experimental/precision_audit_p95.py`: the harness. Run from the repo
   root with `PYTHONPATH=src`, one window at a time.
 - `results/issue-136/precision_audit_window_800_800.json` and
-  `precision_audit_window_1600_300.json`: the two runs above, untracked
-  (`results/` is gitignored).
+  `precision_audit_window_1600_300.json`: the two windows, with the
+  implemented arm, untracked (`results/` is gitignored).
+- `results/issue-136/probe/baseline_f32.jsonl`, `candidate_u16.jsonl`, and
+  the kept products under `base_c{4,8}/` and `cand_c{4,8}/`.
 - `results/probe/composite_band_phase_seconds.json`: the 35-band RSS anchor.
 - `results/fixtures/S30W065_2021-2025_n300_f8/`: the real-data fixture.
 - `.claude/worktrees/issue-129-composite-shard/`: the probe and the #129
