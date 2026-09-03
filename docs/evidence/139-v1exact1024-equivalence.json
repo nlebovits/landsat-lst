@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "issue": 139,
+  "method": "Two-part exact-transform equivalence contract",
+  "max_abs_diff": 0,
+  "tolerance": 0,
+  "passed": true,
+  "local_exact_512_vs_1024": {
+    "lst_p95": {
+      "max_abs_diff": 0,
+      "different_pixels": 0,
+      "pixel_sha256": "dde6c3e3516013f47c8561e7690e90e8b4857f71859b4b5fba532ac38c89a5b5"
+    },
+    "qa_count": {
+      "max_abs_diff": 0,
+      "different_pixels": 0,
+      "pixel_sha256": "066b0751dbcafa63d5b3d3f5c4a704181dd8a819cfc401f4977614d5f6de2330"
+    }
+  },
+  "production_exact_vs_retained_approximate": {
+    "gated": false,
+    "lst_p95": {
+      "pixels": 9216000,
+      "different_pixels": 485946,
+      "fraction_different": 0.052728515625,
+      "pixels_diff_gt_1_dn": 459416,
+      "fraction_diff_gt_1_dn": 0.049849826388888886,
+      "max_abs_diff_dn": 774,
+      "changed_diff_dn_p50": 14,
+      "changed_diff_dn_p90": 57,
+      "changed_diff_dn_p99": 139,
+      "valid_to_nodata": 0,
+      "nodata_to_valid": 0
+    },
+    "qa_count": {
+      "pixels": 110592000,
+      "different_pixels": 289991,
+      "fraction_different": 0.002622169777199074,
+      "pixels_diff_gt_1": 7064,
+      "fraction_diff_gt_1": 6.38744212962963e-05,
+      "max_abs_diff": 13,
+      "changed_diff_p50": 1,
+      "changed_diff_p90": 1,
+      "changed_diff_p99": 2,
+      "valid_to_nodata": 82,
+      "nodata_to_valid": 56
+    },
+    "metadata_note": "Candidate and retained slabs share dimensions and CRS. Pixel width differs by 3.7947076036992655e-19 degrees from retained plan restamping; qa_count candidate has no explicit nodata tag while retained uses 0."
+  },
+  "basis": "The required equivalence gate is local exact-transform chunk 512 versus chunk 1024 through the real shard path. The production comparison is against a retained approximate-transform product and is descriptive by contract."
+}

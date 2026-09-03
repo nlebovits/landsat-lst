@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "contract_sha256": "113e440f5afe3f2239e8251cd8599944082b6aaab872a149b93646ce01ff3972",
+  "environment": "production",
+  "input_identity": "Tile S30W065, window 2021-2025, the 4403 STAC items frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111683185 bytes) and plan.json (220702 bytes, digest 94bc658516d9fbb9, 35 bands), band 16 covering rows 8704:9216 of the 18000-row production geobox. Both objects are copied byte-for-byte within S3 to the fresh run root; the canonical merged-offset key is unchanged because its identity derives from the frozen plan.",
+  "baseline_revision": "08177fd8572b80c45f0ffbcd1f6f1285afa5fd15",
+  "treatment_revision": "6bab3c8e256d69e811465dda064fc5bbb63f9a7c",
+  "baseline_observations": [
+    {
+      "metric": "exporting_wall_s",
+      "value": 1372.2,
+      "unit": "seconds",
+      "artifact": "139-band16-baseline.json"
+    }
+  ],
+  "treatment_observations": [
+    {
+      "metric": "exporting_wall_s",
+      "value": 1842.7,
+      "unit": "seconds",
+      "artifact": "_shards/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/S30W065/state/composite.0016.1.json"
+    }
+  ],
+  "profiling_artifact": "_shards/timings/shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5/composite.S30W065.0016.exectrace.timeline.csv",
+  "observed_cloud_cost_usd": 0.6063032650666667,
+  "observed_coiled_credits": 12.5023,
+  "observed_effect_fraction": -0.3428800466404314,
+  "minimum_effect_met": false,
+  "output_equivalence_passed": true,
+  "decision": "stop",
+  "limitations": [
+    "The exact-transform 1024 candidate completed successfully in one attempt, but exporting took 1,842.7 s, 34.3% longer than the retained 1,372.2 s baseline and therefore failed the pre-registered 20% decrease requirement. No regression attribution is claimed because the scientific transform changed and tracing was enabled.",
+    "The other pre-registered gates passed: process peak RSS was 9,907.8 MB, 25,424 rio_read calls over 2,010 distinct items is 12.649 reads/item, host gap max was 1.002 s with zero gaps over 2 s, active tasks stayed below the 16-thread pool, and trace upload started after compute finished.",
+    "The production slab comparison is intentionally descriptive because its retained comparator used approximate reprojection. The gated local exact-transform 512 and 1024 slabs remain bit-identical for lst_p95 and qa_count.",
+    "The run reused the retained version-1 merged offsets under the version-2 key, exactly as pre-registered, because no version-2 full-tile offsets existed. A normal production v1 run would recompute offsets.",
+    "The 12.5023 credits are the Coiled billing debit for cluster 2002207. The $0.6063 figure is derived from its 47 min 22 s lifecycle at the repository contract rate of $0.768 per VM-hour and is not an AWS invoice."
+  ]
+}
