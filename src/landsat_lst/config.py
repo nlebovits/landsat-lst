@@ -155,6 +155,21 @@ class Settings(BaseSettings):
         "mask -- never to offset estimation, and never to qa_count (zero "
         "observations is data; the count layer stays the evidence).",
     )
+    warp_exact_transform: bool = Field(
+        default=True,
+        description="Warp every source read with GDAL's exact transformer. This "
+        "is the v1 scientific contract (2026-09-03): an output pixel must not "
+        "depend on the processing window it was read through. rasterio's "
+        "default is an approximate transformer at 0.125 px, linearised per "
+        "destination window, under which a 512 x 1024 window moved 3,642 of 84M "
+        "source pixels against 512 x 512 on 40 real S30W065 scenes and the P95 "
+        "by up to 1,681 DN. Exact makes every window bit-identical; against the "
+        "approximate product it moves 4.4% of P95 pixels, 97% of them by under "
+        "1 C, and is why offsets.ALGORITHM_VERSION is 2. Off exists only to "
+        "reproduce the pre-v1 product. Cost 5 to 32 ms of warp CPU per 512 x 512 "
+        "read. Applied through pipeline._install_warp_tolerance to every "
+        "load_scenes call in the process.",
+    )
     ged_gap_buffer_cells: int = Field(
         default=1,
         ge=0,

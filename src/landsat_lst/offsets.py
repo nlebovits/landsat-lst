@@ -61,7 +61,16 @@ log = structlog.get_logger()
 #: values bit-identical -- pinned in the unit tests against the preserved
 #: groupby formulation and measured at max |delta| = 0.0 over 300 real
 #: scenes -- so it takes no bump: cached estimates stay valid answers.
-ALGORITHM_VERSION = 1
+#:
+#: 2 (2026-09-03): every source read warps with GDAL's exact transformer
+#: (``settings.warp_exact_transform``, the v1 scientific contract). The
+#: coarse factor-2 stack the estimator reads changed on 6.0% of its pixels
+#: against the approximate transformer, and ``n_valid`` moved with it. The
+#: median offsets themselves did not move to four decimals on the 14 real
+#: scenes checked, but a record computed from the approximate stack is an
+#: answer to a different input and must not be reused; the version, which
+#: also sits in the plan digest, is what refuses it.
+ALGORITHM_VERSION = 2
 
 #: Hex characters kept from the input digest. 16 is 64 bits: collision odds stay
 #: negligible across every tile-window this project will ever build, and the key

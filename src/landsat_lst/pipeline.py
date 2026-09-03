@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pystac_client
@@ -300,6 +300,7 @@ def load_scenes(
     # the grid to this bbox, which is what left neighbouring tiles misregistered
     # by a fraction of a pixel. See ADR-008.
     target = geobox if geobox is not None else geobox_for_bbox(bbox, resolution_factor)
+    _install_warp_tolerance()
 
     def _load(gbox: GeoBox) -> xr.Dataset:
         return stac_load(
@@ -316,6 +317,45 @@ def load_scenes(
     if not per_column:
         return _load(target)
     return _load_by_column(_load, target, csize)
+
+
+_WARP_ORIGINAL: Callable[..., Any] | None = None
+
+
+def _install_warp_tolerance() -> None:
+    """Make every ``rasterio.warp.reproject`` in this process exact.
+
+    This is the v1 scientific contract's one code seam. odc-loader's
+    ``_do_read`` calls ``rasterio.warp.reproject`` by module attribute and
+    passes no ``tolerance``, so rasterio builds GDAL's approximate transformer
+    at 0.125 source pixels, linearised per destination window, and the
+    nearest-neighbour source pick then depends on the window a pixel was read
+    through. odc exposes no knob for it, so the only seam this codebase owns
+    is the module attribute itself: it is swapped, once per process, for a
+    wrapper that supplies ``tolerance=0.0`` when the caller gave none. A
+    caller's explicit ``tolerance`` is always kept. The wrapper reads
+    ``settings.warp_exact_transform`` on every call, so the pre-v1 behaviour
+    is one setting away for reproduction and tests can flip it either way.
+    It reaches every warp in the process, which is every Landsat read:
+    composite loads, the coarse offsets loads, and the fixture fetch.
+    """
+    global _WARP_ORIGINAL  # noqa: PLW0603 - process-wide patch, installed once
+    import rasterio.warp  # noqa: PLC0415
+
+    if _WARP_ORIGINAL is not None:
+        return
+    original = rasterio.warp.reproject
+
+    def reproject(*args: Any, **kwargs: Any) -> Any:
+        if settings.warp_exact_transform:
+            kwargs.setdefault("tolerance", 0.0)
+        return original(*args, **kwargs)
+
+    wrapper: Any = reproject
+    wrapper.__wrapped__ = original
+    _WARP_ORIGINAL = original
+    warp_module: Any = rasterio.warp
+    warp_module.reproject = reproject
 
 
 def _load_by_column(load: Callable[[GeoBox], xr.Dataset], geobox: GeoBox, csize: int) -> xr.Dataset:
