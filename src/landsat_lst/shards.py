@@ -276,6 +276,20 @@ def unit_timing_key(run_id: str, stage: str, tile: str, index: int) -> str:
     return f"{unit_timing_prefix(run_id)}{stage}.{tile}.{index:04d}.json"
 
 
+def unit_trace_prefix(run_id: str, stage: str, tile: str, index: int) -> str:
+    """Stem for one unit's read-trace artifacts, without the suffix.
+
+    Beside the unit timings rather than beside the shard's profile, for one
+    reason: ``evidence._run_artifacts`` sweeps ``unit_timing_prefix`` wholesale
+    into a bundle, while from the run prefix it takes only ``/state/`` keys. A
+    trace written under the run prefix would have to be attached by hand.
+
+    The caller appends ``.readtrace.jsonl.gz`` for the raw log and
+    ``.readtrace.summary.json`` for the parsed summary. See issue #135.
+    """
+    return f"{unit_timing_prefix(run_id)}{stage}.{tile}.{index:04d}"
+
+
 def fleet_unit_token(tile: str, index: int) -> str:
     """One task's whole input: which tile, and which shard of it.
 

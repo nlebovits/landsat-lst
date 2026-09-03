@@ -65,6 +65,7 @@ from landsat_lst.offsets import (
 from landsat_lst.profiling import PROFILE_COMPOSITE, profile_compute
 from landsat_lst.progress import TileHeartbeat, capture_task_log, report_phase, timed_section
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
+from landsat_lst.readtrace import ReadTraceComplete, read_trace
 from landsat_lst.storage import PRODUCTS, get_storage
 from landsat_lst.tiling import geobox_for_bbox, parse_tile_name
 
@@ -1013,9 +1014,24 @@ def run_composite_shard(
             lst_product(native, paths["lst_p95"]),
             qa_product(native, paths["qa_count"]),
         ]
+        # The read trace wraps this block and not the "loading" one: loading
+        # only builds the graph, and write_intermediates holds the shard's one
+        # dask.compute, so every byte moves here. Inert unless
+        # settings.read_trace is on (issue #135).
         with (
             timed_section("exporting", scenes_found=len(ctx.items)),
             profile_compute(PROFILE_COMPOSITE),
+            read_trace(
+                stage="composite",
+                run_id=run_id,
+                tile=tile,
+                index=index,
+                context={
+                    "rows": [start, stop],
+                    "scenes_found": len(ctx.items),
+                    "chunk": settings.load_chunk_size,
+                },
+            ),
         ):
             write_intermediates(
                 [(p.da, path) for p, path in zip(products, paths.values(), strict=True)]
@@ -1291,7 +1307,14 @@ def run_shard(
             )
         )
         report_phase(f"shard_{stage}")
-        return _dispatch(stage, run_id, tile, index, job=job, units=units, storage=storage)
+        try:
+            return _dispatch(stage, run_id, tile, index, job=job, units=units, storage=storage)
+        except ReadTraceComplete as e:
+            # The read trace stopped the shard on purpose once its capture
+            # window closed, so the run costs a diagnostic rather than a band.
+            # Unreachable unless settings.read_trace is on (issue #135).
+            log.info("read_trace_complete", stage=stage, tile=tile, index=index, detail=str(e))
+            return []
 
 
 def _heartbeat_job(storage: StorageBackend, root: str, tile: str) -> ProcessingJob:

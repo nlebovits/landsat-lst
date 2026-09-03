@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "issue": 135,
+  "what": "The measured per-item cost of a composite shard's exporting phase, and the single band the #135 read trace runs against. Extracted from the retained #129 probe artifact, which is gitignored and lives on one machine; the contract validator needs a baseline that exists in the repository, and the finding should outlive the laptop.",
+  "source": {
+    "run_id": "shard-S30W065-2021-2025-20260823T102135Z",
+    "stage": "composite",
+    "artifact": "results/probe/composite_band_phase_seconds.json",
+    "artifact_tracked": false,
+    "derivation": "_shards/{run_id}/S30W065/state/composite.{index}.1.json + plan.json + items.json, read 2026-09-03",
+    "method": "n_items = distinct STAC items whose footprint intersects any 512-column chunk of the band; n_reads = sum over column chunks of intersecting items, x2 bands; src_px = intersected footprint area in native pixels x2"
+  },
+  "fit": {
+    "over": "the comparable 512-row composite bands, item count against exporting seconds",
+    "model": "exporting_s = intercept + slope * distinct_items",
+    "excluded_bands": {
+      "0": "1,024 rows",
+      "34": "80 rows",
+      "23": "1.5x outlier, no retained explanation"
+    },
+    "bands": 32,
+    "intercept_s": 119.4,
+    "slope_s_per_item": 0.691,
+    "slope_stderr_s_per_item": 0.0542,
+    "r_squared": 0.8443,
+    "classification": "measured",
+    "sensitivity_including_band_23": {
+      "bands": 33,
+      "intercept_s": 169.8,
+      "slope_s_per_item": 0.6617,
+      "slope_stderr_s_per_item": 0.0576,
+      "r_squared": 0.81
+    }
+  },
+  "band": {
+    "index": 16,
+    "why": "the highest distinct-item count among the comparable 512-row bands",
+    "rows": 512,
+    "distinct_items": 2010,
+    "reads": 40596,
+    "source_pixels": 8420456664.663815,
+    "scenes_found": 4403,
+    "scenes_kept": 912,
+    "exporting_s": 1372.2,
+    "elapsed_s": 1444.4,
+    "peak_rss_mb": 40082.8125,
+    "instance_type": "m6i.4xlarge",
+    "instance_lifecycle": "spot",
+    "classification": "measured"
+  },
+  "unmeasured": "The physical cause of the per-item cost. #129 excluded dependency assembly and falsified the GDAL cloud-configuration premise by dumping the effective config inside a read task, then closed with no candidate."
+}

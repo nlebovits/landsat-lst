@@ -769,6 +769,33 @@ class Settings(BaseSettings):
         "dump strides down before writing.",
     )
 
+    # Request-level accounting for the composite shard's remote reads. A band's
+    # exporting time scales at 0.691 s per distinct item and the physical cause
+    # is unmeasured; see issue #135 and landsat_lst.readtrace.
+    read_trace: bool = Field(
+        default=False,
+        description="Record one entry per GDAL remote request during the "
+        "composite shard's compute, then write a raw log and a parsed summary "
+        "beside the run's unit timings. Answers how many round trips a first "
+        "touch of a COG costs, how much requests to different files overlap, "
+        "and whether a byte range is fetched twice. Off by default, and it "
+        "stops the shard when the capture window closes: this is a diagnostic "
+        "run, not a production one.",
+    )
+    read_trace_seconds: float = Field(
+        default=90.0,
+        description="How long to record before writing the trace and stopping "
+        "the shard. A pathological band runs 1,372 s, and 90 s of requests is "
+        "a representative sample at about a twentieth of the cost.",
+    )
+    read_trace_max_records: int = Field(
+        default=500_000,
+        description="Cap on retained request records, so a band that issues "
+        "far more requests than expected bounds its memory rather than the "
+        "recorder becoming the failure. Records past the cap are counted and "
+        "dropped.",
+    )
+
     @model_validator(mode="after")
     def _grid_must_be_integral(self) -> "Settings":
         """Reject any grid where the globe or a tile lands on a fractional pixel.
