@@ -122,17 +122,28 @@ def _widest_block_share(plan: shards.TilePlan) -> float:
     """The largest phase-A shard's share of the blocks.
 
     The *largest*, because a barrier waits for the slowest shard. Taken from
-    the same ``balance_by_land`` split the shards themselves use rather than
-    from ``blocks / ref_shards``: the groups are balanced on land, so an even
-    division would understate the widest one on a coastal tile.
+    the same ``climatology_groups`` split the shards themselves use rather
+    than from ``blocks / ref_shards``: the groups are balanced on what they
+    read, so an even division would understate the widest one.
+
+    Deliberately a share of *blocks*, not of the plan's scene weights. A
+    weight-balanced split hands a thinly covered region more blocks (one
+    S30W065 group modelled at 9 of 81), and counting blocks then widens that
+    shard's deadline. Counting weight would narrow every deadline exactly
+    when the split changed, and a deadline that expires early is the failure
+    that costs a fleet.
     """
-    from landsat_lst.shards import balance_by_land  # noqa: PLC0415
+    from landsat_lst.shards import climatology_groups  # noqa: PLC0415
 
     total = len(plan.blocks)
     if total == 0:
         return 1.0
-    groups = balance_by_land(plan.blocks, plan.block_has_land, plan.ref_shards)
-    return max(len(group) for group in groups) / total
+    from landsat_lst.shards import balance_by_land  # noqa: PLC0415
+
+    groups = climatology_groups(plan)
+    legacy_groups = balance_by_land(plan.blocks, plan.block_has_land, plan.ref_shards)
+    widest = max(*(map(len, groups)), *(map(len, legacy_groups)))
+    return widest / total
 
 
 def _widest_scene_share(plan: shards.TilePlan) -> float:

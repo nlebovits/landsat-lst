@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict, dataclass, field
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -534,19 +535,88 @@ def partition(seq: Sequence[Any], n: int) -> list[list[Any]]:
     return out
 
 
+def balance_by_weight(spans: Sequence[Span], weights: Sequence[float], n: int) -> list[list[Span]]:
+    """Split ``spans`` into ``n`` contiguous groups holding similar total weight.
+
+    An equal split of the *blocks* is not an equal split of the *work*. What a
+    phase-A shard reads for a block is the scenes whose footprints cross it,
+    and on S30W065 that count ran from 198 to 821 per block: an equal-count
+    split handed one shard 4,191 footprint intersections and another 1,798,
+    and every shard then waited for the heaviest at the in-process barrier
+    (#133). Splitting on cumulative weight makes the groups alike in what they
+    read while staying contiguous.
+
+    Deterministic minimax partitioning: among every possible contiguous split,
+    choose one whose heaviest group has the least total weight. Every group is
+    left at least one span. With no weight anywhere this degenerates to
+    :func:`partition`'s shape.
+
+    Args:
+        spans: Blocks in the order :func:`block_spans` produced them.
+        weights: Non-negative cost of each span. A zero is a span that costs
+            nothing to own, such as a block with no land pixel.
+        n: How many groups.
+
+    Returns:
+        ``n`` non-empty contiguous groups whose concatenation is ``spans``.
+
+    Raises:
+        ValueError: If the inputs disagree in length, a weight is negative or
+            non-finite, or ``n`` is out of range.
+    """
+    if len(spans) != len(weights):
+        msg = f"spans and weights disagree: {len(spans)} vs {len(weights)}"
+        raise ValueError(msg)
+    if n <= 0 or n > len(spans):
+        msg = f"cannot split {len(spans)} spans into {n} groups"
+        raise ValueError(msg)
+    numeric = [float(w) for w in weights]
+    if any(not isfinite(w) or w < 0 for w in numeric):
+        msg = "block weights must be finite and non-negative"
+        raise ValueError(msg)
+
+    total = sum(numeric)
+    if total == 0:
+        return partition(spans, n)
+
+    # ``best[k][end]`` is the lightest possible maximum group weight when the
+    # first ``end`` spans are split into ``k`` non-empty contiguous groups.
+    # The production plan has tens of blocks, so the O(n * blocks**2) dynamic
+    # program is tiny beside resolving thousands of scene footprints.
+    prefix = [0.0]
+    for weight in numeric:
+        prefix.append(prefix[-1] + weight)
+
+    count = len(spans)
+    best = [[float("inf")] * (count + 1) for _ in range(n + 1)]
+    cuts = [[-1] * (count + 1) for _ in range(n + 1)]
+    best[0][0] = 0.0
+    for groups in range(1, n + 1):
+        for end in range(groups, count + 1):
+            for start in range(groups - 1, end):
+                cost = max(best[groups - 1][start], prefix[end] - prefix[start])
+                if cost < best[groups][end]:
+                    best[groups][end] = cost
+                    cuts[groups][end] = start
+
+    out: list[list[Span]] = []
+    end = count
+    for groups in range(n, 0, -1):
+        start = cuts[groups][end]
+        out.append(list(spans[start:end]))
+        end = start
+    out.reverse()
+    return out
+
+
 def balance_by_land(spans: Sequence[Span], has_land: Sequence[bool], n: int) -> list[list[Span]]:
     """Split ``spans`` into ``n`` contiguous groups holding similar land counts.
 
-    An equal split of the *blocks* is not an equal split of the *work*: a block
-    with no land pixel is filled with NaN and never read
+    This is the legacy split a plan without block weights gets. A block with
+    no land pixel is filled with NaN and never read
     (:func:`landsat_lst.normalization.climatology_by_blocks`), so on a coastal
     tile an equal-count split can hand one shard every scene it must read and
-    another almost nothing. Balancing on land blocks makes the groups cost
-    roughly alike while staying contiguous.
-
-    Greedy and deterministic: a group closes as soon as its cumulative land
-    count reaches its share of the total, and every group is left at least one
-    span. With no land anywhere this degenerates to :func:`partition`'s shape.
+    another almost nothing.
 
     Args:
         spans: Blocks in the order :func:`block_spans` produced them.
@@ -580,7 +650,6 @@ def balance_by_land(spans: Sequence[Span], has_land: Sequence[bool], n: int) -> 
             out.append(list(spans[start:]))
             break
         target = total * (k + 1) / n
-        # Never consume the spans the remaining groups need to stay non-empty.
         ceiling = len(spans) - remaining
         end = start + 1
         acc = seen + land[start]
@@ -591,6 +660,73 @@ def balance_by_land(spans: Sequence[Span], has_land: Sequence[bool], n: int) -> 
         seen = acc
         start = end
     return out
+
+
+def block_scene_weights(
+    blocks: Sequence[Span],
+    has_land: Sequence[bool],
+    footprints: Sequence[Any],
+    affine: Any,
+) -> list[int]:
+    """How many scene footprints cross each block, with land-free blocks at zero.
+
+    The weight :func:`balance_by_weight` splits phase A on. Computed once by
+    the planner and stored in the plan, never on a VM: a shard and the driver
+    re-deriving it from a catalog that is not frozen could disagree, and a
+    disagreement about the split is a block nobody owns.
+
+    Args:
+        blocks: Spans in the order :func:`block_spans` produced them, as pixel
+            indexes into the grid ``affine`` describes.
+        has_land: Whether each block holds at least one land pixel. A block
+            without one weighs zero whatever crosses it, because the reducer
+            never reads it.
+        footprints: Scene footprints as shapely geometries in the grid's CRS,
+            or ``None`` for a scene without one, which is skipped.
+        affine: The grid's pixel-to-CRS transform, ``affine * (col, row)``.
+
+    Returns:
+        One non-negative integer per block.
+
+    Raises:
+        ValueError: If ``blocks`` and ``has_land`` disagree in length.
+    """
+    from shapely.geometry import box  # noqa: PLC0415
+    from shapely.strtree import STRtree  # noqa: PLC0415
+
+    if len(blocks) != len(has_land):
+        msg = f"blocks and has_land disagree: {len(blocks)} vs {len(has_land)}"
+        raise ValueError(msg)
+
+    geoms = [g for g in footprints if g is not None and not g.is_empty]
+    if not geoms:
+        return [0] * len(blocks)
+    tree = STRtree(geoms)
+
+    weights: list[int] = []
+    for (y0, y1, x0, x1), land in zip(blocks, has_land, strict=True):
+        if not land:
+            weights.append(0)
+            continue
+        ax, ay = affine * (x0, y0)
+        bx, by = affine * (x1, y1)
+        cell = box(min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
+        weights.append(len(tree.query(cell, predicate="intersects")))
+    return weights
+
+
+def climatology_groups(plan: TilePlan) -> list[list[Span]]:
+    """The phase-A split every reader of ``plan`` agrees on.
+
+    The one place that decides which weights the split uses: the plan's
+    stored scene weights when it carries them, the land flags when it does
+    not (a plan written before weights existed). The planner, each shard, and
+    the budget all come through here, so a plan splits the same way in every
+    process that reads it.
+    """
+    if plan.block_weights is not None:
+        return balance_by_weight(plan.blocks, plan.block_weights, plan.ref_shards)
+    return balance_by_land(plan.blocks, plan.block_has_land, plan.ref_shards)
 
 
 @dataclass(frozen=True)
@@ -630,6 +766,12 @@ class TilePlan:
     ref_shards: int = 1
     scene_shards: int = 1
     band_shards: int = 1
+    #: Scene footprints crossing each block, from :func:`block_scene_weights`,
+    #: which :func:`climatology_groups` splits phase A on. ``None`` on a plan
+    #: written before weights existed, which then splits on land flags. Not
+    #: in the digest: the weights decide who reduces a block, never what the
+    #: block reduces to.
+    block_weights: list[int] | None = None
     #: Digest of the configuration the plan was cut under, filled in by
     #: :meth:`to_dict` and checked by :meth:`from_dict`.
     _digest: str | None = field(default=None, repr=False, compare=False)
@@ -710,6 +852,11 @@ class TilePlan:
             ref_shards=int(payload.get("ref_shards", 1)),
             scene_shards=int(payload.get("scene_shards", 1)),
             band_shards=int(payload.get("band_shards", 1)),
+            block_weights=(
+                None
+                if payload.get("block_weights") is None
+                else [int(w) for w in payload["block_weights"]]
+            ),
             _digest=stored,
         )
         if stored is not None and stored != plan.digest:
