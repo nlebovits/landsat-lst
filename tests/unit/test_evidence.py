@@ -62,7 +62,7 @@ def contract(tmp_path: Path) -> Path:
     baseline = tmp_path / "baseline.json"
     baseline.write_text('{"wall_s": 840}\n')
     equivalence = tmp_path / "equivalence.json"
-    equivalence.write_text('{"passed": true}\n')
+    equivalence.write_text('{"passed": true, "max_abs_diff": 0}\n')
     payload = {
         "schema_version": 1,
         "claim": "Treatment reduces wall time.",
@@ -111,6 +111,7 @@ def contract(tmp_path: Path) -> Path:
         "output_equivalence": {
             "method": "SHA-256",
             "acceptance_criterion": "both output checksums match",
+            "tolerance": 0,
             "result_artifact": str(equivalence),
         },
     }
@@ -146,6 +147,8 @@ def contract(tmp_path: Path) -> Path:
             }
         ],
         "profiling_artifact": profile.name,
+        "observed_cloud_cost_usd": 0.5,
+        "observed_coiled_credits": 4,
         "observed_effect_fraction": 0.1,
         "minimum_effect_met": True,
         "output_equivalence_passed": True,
@@ -225,7 +228,7 @@ def test_collect_evidence_refuses_to_overwrite_bundle(tmp_path: Path) -> None:
 
 def test_collect_evidence_rejects_equivalence_disagreement(tmp_path: Path) -> None:
     contract_path = contract(tmp_path)
-    (tmp_path / "equivalence.json").write_text('{"passed": false}\n')
+    (tmp_path / "equivalence.json").write_text('{"passed": false, "max_abs_diff": 1}\n')
 
     with pytest.raises(ValueError, match="does not match"):
         collect_evidence(output_dir=tmp_path / "bundle", contract_path=contract_path)
@@ -234,7 +237,7 @@ def test_collect_evidence_rejects_equivalence_disagreement(tmp_path: Path) -> No
 def test_failed_equivalence_is_publishable_only_as_stop(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("landsat_lst.evidence.importlib.metadata.version", lambda _: "0.1-test")
     contract_path = contract(tmp_path)
-    (tmp_path / "equivalence.json").write_text('{"passed": false}\n')
+    (tmp_path / "equivalence.json").write_text('{"passed": false, "max_abs_diff": 1}\n')
     result_path = tmp_path / "result.json"
     result = json.loads(result_path.read_text())
     result["output_equivalence_passed"] = False
@@ -387,3 +390,67 @@ def test_capture_frisky_turns_process_failure_into_cli_message(tmp_path: Path, m
     assert result.exit_code == 1
     assert "dashboard unavailable" in result.output
     assert "Traceback" not in result.output
+
+
+def _validated_bundle(tmp_path: Path, monkeypatch) -> dict:
+    monkeypatch.setattr("landsat_lst.evidence.importlib.metadata.version", lambda _: "0.1-test")
+    manifest = collect_evidence(
+        output_dir=tmp_path / "bundle", contract_path=contract(tmp_path), storage=StubStorage()
+    )
+    return json.loads(manifest.read_text())
+
+
+def _decide(bundle: dict) -> None:
+    from landsat_lst.evidence import _validate_bundle_decision
+
+    _validate_bundle_decision(
+        bundle["decision"],
+        bundle["contract"],
+        True,
+        require_proceed=False,
+    )
+
+
+def test_bundle_decision_rejects_more_observations_than_pre_registered(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Extra runs are not free: a median over nine hides four disasters.
+
+    The retained-artifact digests catch a tampered bundle first; this pins
+    the arithmetic check behind them, which is what a bundle assembled by
+    hand, with digests recomputed, would meet.
+    """
+    bundle = _validated_bundle(tmp_path, monkeypatch)
+    _decide(bundle)
+    extra = dict(bundle["decision"]["treatment_observations"][0])
+    bundle["decision"]["treatment_observations"].append(extra)
+    with pytest.raises(ContractError, match="differ from the pre-registered repetitions"):
+        _decide(bundle)
+
+
+def test_bundle_decision_rejects_a_run_that_exceeded_its_cost_cap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bundle = _validated_bundle(tmp_path, monkeypatch)
+    bundle["decision"]["observed_cloud_cost_usd"] = 2.0  # cap is 1
+    with pytest.raises(ContractError, match="exceeds the pre-registered max_cloud_cost_usd"):
+        _decide(bundle)
+
+
+def test_bundle_decision_rejects_a_string_effect(tmp_path: Path, monkeypatch) -> None:
+    """``validate_result`` requires a number; the bundle path must agree with it."""
+    bundle = _validated_bundle(tmp_path, monkeypatch)
+    bundle["decision"]["observed_effect_fraction"] = "0.1"
+    with pytest.raises(ContractError, match="observed_effect_fraction must be numeric"):
+        _decide(bundle)
+
+
+def test_collection_refuses_a_contradictory_equivalence_report(tmp_path: Path) -> None:
+    contract_path = contract(tmp_path)
+    (tmp_path / "equivalence.json").write_text('{"passed": true, "max_abs_diff": 9999}\n')
+    with pytest.raises(ValueError, match="contradicts"):
+        collect_evidence(
+            output_dir=tmp_path / "bundle",
+            contract_path=contract_path,
+            storage=StubStorage(),
+        )

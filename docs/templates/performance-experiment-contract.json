@@ -61,7 +61,8 @@
   "output_equivalence": {
     "method": "named checksum or scientific comparison procedure",
     "acceptance_criterion": "exact tolerance and pass condition",
-    "result_artifact": "path to a post-run JSON report containing passed=true"
+    "tolerance": 0,
+    "result_artifact": "path to a post-run JSON report recording max_abs_diff and passed; passed must equal max_abs_diff <= tolerance"
   },
   "operator_note": "This contract constrains a run; it does not authorize one."
 }

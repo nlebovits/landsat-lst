@@ -312,6 +312,35 @@ class TestCompositeShard:
 
         assert run_composite_shard(RUN_ID, TILE, 0, storage=storage) == []
 
+    def test_the_native_pass_runs_under_the_composite_profile(
+        self, storage, plan, published, monkeypatch
+    ):
+        """``profile_compute(PROFILE_COMPOSITE)`` wraps the export, and only it.
+
+        The wrapper is the one place a shard's task profile comes from. Off by
+        default, it costs nothing; deleted, the measurement-stage evidence for
+        the memory-critical block silently stops existing.
+        """
+        from contextlib import contextmanager
+
+        from landsat_lst.profiling import PROFILE_COMPOSITE
+
+        _stub_native_load(monkeypatch, plan)
+        write_offset_cache(storage, plan)
+        entered: list[str] = []
+
+        @contextmanager
+        def recording(label: str):
+            entered.append(label)
+            yield
+
+        monkeypatch.setattr("landsat_lst.shard_tasks.profile_compute", recording)
+
+        written = run_composite_shard(RUN_ID, TILE, 0, storage=storage)
+
+        assert written
+        assert entered == [PROFILE_COMPOSITE]
+
     # A composite shard without merged offsets now *waits* rather than refusing
     # -- its VM was started early on purpose. See TestOffsetRecordWait.
 

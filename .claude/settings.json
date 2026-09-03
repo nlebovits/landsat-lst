@@ -6,11 +6,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/stac-endpoint-guard.py"
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/stac-endpoint-guard.py\""
           },
           {
             "type": "command",
-            "command": "python3 .claude/hooks/performance-evidence-guard.py"
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/performance-evidence-guard.py\""
           }
         ]
       }
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/performance-evidence-context.py"
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/performance-evidence-context.py\""
           }
         ]
       }

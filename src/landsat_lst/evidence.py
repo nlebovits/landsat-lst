@@ -15,7 +15,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from landsat_lst.evidence_contract import ContractError, load_contract, load_result
+from landsat_lst.evidence_contract import (
+    ContractError,
+    equivalence_passed,
+    load_contract,
+    load_json,
+    load_result,
+    validate_result_cost,
+)
 
 _SECRET_PARTS = ("token", "secret", "password", "credential", "access_key", "session_key")
 _SECRET_ASSIGNMENT = re.compile(
@@ -122,17 +129,12 @@ def _resolve_artifact(contract_path: Path, value: str) -> Path:
     return source if source.is_absolute() else contract_path.parent / source
 
 
-def _validate_equivalence_result(source: Path) -> bool:
-    """Return an explicit post-run scientific comparison result."""
+def _validate_equivalence_result(source: Path, tolerance: float) -> bool:
+    """Return the post-run comparison verdict, recomputed from its own numbers."""
     try:
-        result = json.loads(source.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read output-equivalence result {source}: {exc}") from exc
-    if not isinstance(result, dict) or not isinstance(result.get("passed"), bool):
-        raise ValueError(
-            f"output-equivalence result must be a JSON object with boolean passed: {source}"
-        )
-    return result["passed"]
+        return equivalence_passed(load_json(source, what="output-equivalence result"), tolerance)
+    except ContractError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _retain_artifact(source: Path, output_dir: Path, stem: str) -> dict[str, Any]:
@@ -285,8 +287,10 @@ def collect_evidence(
     equivalence_source = _resolve_artifact(
         contract_path, contract["output_equivalence"]["result_artifact"]
     )
-    equivalence_passed = _validate_equivalence_result(equivalence_source)
-    if result["output_equivalence_passed"] is not equivalence_passed:
+    equivalence = _validate_equivalence_result(
+        equivalence_source, contract["output_equivalence"]["tolerance"]
+    )
+    if result["output_equivalence_passed"] is not equivalence:
         raise ValueError(
             "decision output_equivalence_passed does not match the retained equivalence result"
         )
@@ -370,10 +374,7 @@ def collect_evidence(
 
 
 def _load_evidence_bundle(source: Path) -> dict[str, Any]:
-    try:
-        bundle = json.loads(source.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ContractError(f"cannot read evidence bundle {source}: {exc}") from exc
+    bundle = load_json(source, what="evidence bundle")
     if not isinstance(bundle, dict) or bundle.get("schema_version") != 1:
         raise ContractError("evidence bundle must be a schema-version 1 JSON object")
     return bundle
@@ -436,14 +437,11 @@ def _retained_artifact_paths(source: Path, artifacts: Any, required: set[str]) -
 
 
 def _load_retained_json(retained_paths: dict[str, Path]) -> tuple[Any, Any, Any]:
-    try:
-        return (
-            json.loads(retained_paths["contract"].read_text()),
-            json.loads(retained_paths["result"].read_text()),
-            json.loads(retained_paths["output_equivalence"].read_text()),
-        )
-    except json.JSONDecodeError as exc:
-        raise ContractError(f"retained evidence JSON is invalid: {exc}") from exc
+    return (
+        load_json(retained_paths["contract"], what="retained contract"),
+        load_json(retained_paths["result"], what="retained result"),
+        load_json(retained_paths["output_equivalence"], what="retained output-equivalence"),
+    )
 
 
 def _validate_embedded_evidence(
@@ -459,11 +457,11 @@ def _validate_embedded_evidence(
         raise ContractError("embedded decision does not match retained result")
     if retained_result.get("contract_sha256") != artifacts["contract"]["sha256"]:
         raise ContractError("retained result is not bound to the retained contract")
-    if not isinstance(retained_equivalence, dict) or not isinstance(
-        retained_equivalence.get("passed"), bool
-    ):
-        raise ContractError("retained output-equivalence result has no boolean passed value")
-    return retained_equivalence["passed"]
+    try:
+        tolerance = retained_contract["output_equivalence"]["tolerance"]
+    except (KeyError, TypeError) as exc:
+        raise ContractError("retained contract declares no output_equivalence.tolerance") from exc
+    return equivalence_passed(retained_equivalence, tolerance)
 
 
 def _observation_values(decision: dict[str, Any], arm: str) -> list[float]:
@@ -485,10 +483,12 @@ def _validate_observation_minimums(
     plan: dict[str, Any], baseline_values: list[float], treatment_values: list[float]
 ) -> None:
     if (
-        len(baseline_values) < plan["baseline_repetitions"]
-        or len(treatment_values) < plan["treatment_repetitions"]
+        len(baseline_values) != plan["baseline_repetitions"]
+        or len(treatment_values) != plan["treatment_repetitions"]
     ):
-        raise ContractError("evidence decision has fewer observations than pre-registered")
+        raise ContractError(
+            "evidence decision observation counts differ from the pre-registered repetitions"
+        )
 
 
 def _validate_bundle_decision(
@@ -498,22 +498,36 @@ def _validate_bundle_decision(
     *,
     require_proceed: bool,
 ) -> None:
-    plan = contract["measurement_plan"]
+    try:
+        plan = contract["measurement_plan"]
+        aggregation = plan["aggregation"]
+        direction = contract["minimum_effect"]["direction"]
+        minimum_fraction = float(contract["minimum_effect"]["fraction"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ContractError(f"evidence bundle contract is malformed: {exc}") from exc
     baseline_values = _observation_values(decision, "baseline")
     treatment_values = _observation_values(decision, "treatment")
     _validate_observation_minimums(plan, baseline_values, treatment_values)
-    baseline_value = _aggregate_evidence_values(baseline_values, plan["aggregation"])
-    treatment_value = _aggregate_evidence_values(treatment_values, plan["aggregation"])
-    direction = contract["minimum_effect"]["direction"]
+    if not all(
+        math.isfinite(value) and value > 0 for value in [*baseline_values, *treatment_values]
+    ):
+        raise ContractError("evidence decision observations must be positive and finite")
+    baseline_value = _aggregate_evidence_values(baseline_values, aggregation)
+    treatment_value = _aggregate_evidence_values(treatment_values, aggregation)
     effect = (
         (baseline_value - treatment_value) / baseline_value
         if direction == "decrease"
         else (treatment_value - baseline_value) / baseline_value
     )
-    worthwhile = effect >= contract["minimum_effect"]["fraction"]
-    recorded_effect = float(decision.get("observed_effect_fraction", float("nan")))
-    if not math.isclose(effect, recorded_effect, rel_tol=1e-9, abs_tol=1e-9):
+    worthwhile = effect >= minimum_fraction
+    recorded_effect = decision.get("observed_effect_fraction")
+    if not isinstance(recorded_effect, int | float) or isinstance(recorded_effect, bool):
+        raise ContractError("evidence decision observed_effect_fraction must be numeric")
+    if not math.isclose(effect, float(recorded_effect), rel_tol=1e-9, abs_tol=1e-9):
         raise ContractError("evidence decision effect does not match retained observations")
+    cost_errors = validate_result_cost(decision, contract)
+    if cost_errors:
+        raise ContractError("; ".join(cost_errors))
     if decision.get("minimum_effect_met") is not worthwhile:
         raise ContractError("evidence decision minimum_effect_met does not match observations")
     equivalence_passed = decision.get("output_equivalence_passed")

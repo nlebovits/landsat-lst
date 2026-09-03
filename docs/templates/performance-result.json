@@ -22,6 +22,8 @@
     }
   ],
   "profiling_artifact": "path to the retained profile or phase-timing artifact",
+  "observed_cloud_cost_usd": 0,
+  "observed_coiled_credits": 0,
   "observed_effect_fraction": 0,
   "minimum_effect_met": false,
   "output_equivalence_passed": true,

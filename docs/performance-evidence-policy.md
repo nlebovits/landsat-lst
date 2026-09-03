@@ -52,12 +52,19 @@ must either be measured or held identical between baseline and treatment.
 
 Write a result based on `docs/templates/performance-result.json`. It must retain:
 
-- raw baseline and treatment observations;
-- full baseline and treatment revisions;
+- raw baseline and treatment observations, exactly as many as the contract
+  pre-registered per arm, every one positive and finite;
+- full baseline and treatment revisions, distinct from each other;
 - exact input and environment identity;
 - the pre-registered profiling or phase-timing artifact;
-- the recomputed effect and minimum-effect comparison;
-- scientific output equivalence;
+- what the run spent (`observed_cloud_cost_usd`, `observed_coiled_credits`),
+  checked against the contract's caps: a run that exceeded its own cap is an
+  invalid result, not a footnote;
+- the recomputed effect and minimum-effect comparison (the pre-registered
+  minimum effect is at least 5%, below which the stop rule cannot separate a
+  change from placement noise);
+- scientific output equivalence, whose report records `max_abs_diff` and a
+  `passed` that must equal `max_abs_diff <= tolerance` from the contract;
 - limitations and contrary observations;
 - an unambiguous `stop` or `proceed` decision.
 
@@ -102,18 +109,31 @@ $100 and 400 Coiled credits; use smaller limits whenever possible.
 A contract is a prerequisite, **not authorization**. The operator must explicitly
 approve every cloud launch.
 
-The Claude Bash hook denies recognized direct, wrapped, subshell, and nested-shell
-cloud launches without a valid `LST_EVIDENCE_CONTRACT`. Launch validation binds
-the treatment revision to a clean tracked checkout. Workers emit the bound
-revision, installed package version, and instrumentation-module digest. Evidence
+The Claude Bash hook denies recognized cloud launches without a valid
+`LST_EVIDENCE_CONTRACT`: direct; wrapped (`env`, `uv run`, `exec`, `nohup`,
+`setsid`, `timeout`, `nice`, `stdbuf`, `sudo`); nested (`bash -c`, `eval`,
+`ssh`, `xargs`); the Python API (`python -c`, a heredoc, or a script that names
+`submit_batch`, `drive_tile`, `batch_run`, and their siblings); and `make`,
+`just`, or `tox` recipes that do any of these. `landsat-lst benchmark` without
+`--distributed` is the local CI tier and is allowed. The guard binds the
+treatment revision to the checkout the command runs *from*, which must be clean
+of tracked changes and of untracked files under `src/`, and both contract
+revisions must exist as commits there. Workers emit the bound revision,
+installed package version, and instrumentation-module digest; an operator's own
+`LST_CODE_REVISION` reaches the VM only when no contract is set. Evidence
 collection rejects missing or mismatched worker revisions.
+
+The guard reads the command text. It cannot see a script it is not given, a
+`Makefile` in a directory other than the command's, or a launch that hides
+behind an alias. It is a seat belt for an agent, not a sandbox.
 
 ## Profiling boundary
 
 Profiling is experiment-controlled because instrumentation can perturb the system
-being measured. Production Batch submissions do not enable Dask profiling by
-default. A contract or explicit diagnostic command must request it and state how
-observer effects are controlled.
+being measured. A production Batch submission enables Dask profiling only when
+`LST_PROFILE_DASK` says so or the run passes `--max-scenes` (a sample exists to be
+measured). A contract or explicit diagnostic command must request it and state
+how observer effects are controlled.
 
 Frisky can inspect a live Coiled Dask cluster through
 `frisky.hijack(cluster.get_client())`. The production pipeline uses Coiled Batch

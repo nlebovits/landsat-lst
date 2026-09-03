@@ -21,8 +21,20 @@ REQUIRED_TEXT = (
 )
 MAX_CLOUD_COST_USD = 100.0
 MAX_COILED_CREDITS = 400.0
+#: Smallest effect a contract may pre-register. Below this the stop rule cannot
+#: separate a real change from run-to-run noise: two measurements of one tile
+#: differ by a few percent from EC2 placement alone, so a contract that asks for
+#: 1e-12 turns any repeat into ``proceed``.
+MIN_EFFECT_FRACTION = 0.05
+#: Fields a result must carry so a run can be checked against the caps its own
+#: contract declared. A cap that nothing compares against is a number.
+COST_FIELDS = {
+    "observed_cloud_cost_usd": "max_cloud_cost_usd",
+    "observed_coiled_credits": "max_coiled_credits",
+}
 TARGET_ENVIRONMENTS = {"production", "production-representative"}
 _FULL_REVISION = re.compile(r"[0-9a-f]{40}")
+_NULL_REVISION = "0" * 40
 _TILE = re.compile(r"(?<![A-Z0-9])[NS]\d{2}[EW]\d{3}(?![A-Z0-9])", re.IGNORECASE)
 _CONTRACT_ASSIGNMENT = re.compile(r"\bLST_EVIDENCE_CONTRACT=(?:'[^']+'|\"[^\"]+\"|[^\s]+)\s*")
 
@@ -44,6 +56,41 @@ def _resolve(base_dir: Path, value: str) -> Path:
     return path if path.is_absolute() else base_dir / path
 
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non-finite JSON constant {name} is not a measurement")
+
+
+def load_json(source: Path, *, what: str) -> Any:
+    """Parse one evidence file, refusing ``Infinity`` and ``NaN`` outright.
+
+    ``json.loads`` accepts both by default, and ``math.isclose(inf, inf)`` is
+    true, so an observation of ``Infinity`` would recompute to a matching
+    infinite effect and pass every arithmetic check downstream.
+    """
+    try:
+        return json.loads(source.read_text(), parse_constant=_reject_constant)
+    except (OSError, ValueError) as exc:
+        raise ContractError(f"cannot read {what} {source}: {exc}") from exc
+
+
+def _finite_positive(value: Any) -> bool:
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def _finite_nonnegative(value: Any) -> bool:
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
 def sha256_file(path: Path) -> str:
     """Return the digest used to bind result manifests to contracts and artifacts."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -61,6 +108,14 @@ def _validate_inputs(value: Any) -> list[str]:
         revision = value.get(name)
         if _nonempty(revision) and _FULL_REVISION.fullmatch(revision) is None:
             errors.append(f"inputs.{name} must be a full 40-character lowercase hex revision")
+        elif revision == _NULL_REVISION:
+            errors.append(f"inputs.{name} must name a real commit, not the null revision")
+    baseline, treatment = value.get("baseline_revision"), value.get("treatment_revision")
+    if _nonempty(baseline) and baseline == treatment:
+        errors.append(
+            "inputs.baseline_revision and inputs.treatment_revision must differ; "
+            "an experiment with no code change measures nothing"
+        )
 
     real_data = value.get("real_data")
     if not isinstance(real_data, dict):
@@ -91,9 +146,8 @@ def _validate_baseline(value: Any, base_dir: Path) -> list[str]:
     errors = _required_strings(value, ("metric", "unit", "artifact"), "baseline.")
     if value.get("classification") != "measured":
         errors.append("baseline.classification must be measured")
-    number = value.get("value")
-    if not isinstance(number, int | float) or isinstance(number, bool) or number <= 0:
-        errors.append("baseline.value must be a positive value")
+    if not _finite_positive(value.get("value")):
+        errors.append("baseline.value must be a positive finite value")
     artifact = value.get("artifact")
     if _nonempty(artifact) and not _resolve(base_dir, artifact).is_file():
         errors.append(f"baseline.artifact must be an existing file: {_resolve(base_dir, artifact)}")
@@ -109,8 +163,10 @@ def _validate_effect(value: Any) -> list[str]:
     fraction = value.get("fraction")
     if not isinstance(fraction, int | float) or isinstance(fraction, bool):
         errors.append("minimum_effect.fraction must be numeric")
-    elif not 0 < fraction < 1:
-        errors.append("minimum_effect.fraction must be between 0 and 1")
+    elif not MIN_EFFECT_FRACTION <= fraction < 1:
+        errors.append(
+            f"minimum_effect.fraction must be at least {MIN_EFFECT_FRACTION:g} and below 1"
+        )
     return errors
 
 
@@ -135,11 +191,43 @@ def _validate_limits(data: dict[str, Any]) -> list[str]:
 def _validate_output_equivalence(value: Any) -> list[str]:
     if not isinstance(value, dict):
         return ["output_equivalence must be an object"]
-    return _required_strings(
+    errors = _required_strings(
         value,
         ("method", "acceptance_criterion", "result_artifact"),
         "output_equivalence.",
     )
+    if not _finite_nonnegative(value.get("tolerance")):
+        errors.append(
+            "output_equivalence.tolerance must be a non-negative finite number; "
+            "the post-run max_abs_diff is checked against it"
+        )
+    return errors
+
+
+def equivalence_passed(report: Any, tolerance: float) -> bool:
+    """Recompute a post-run equivalence verdict from its own numbers.
+
+    A report that says ``passed: true`` beside ``max_abs_diff: 9999`` is a
+    contradiction, not a pass. The verdict is ``max_abs_diff <= tolerance``,
+    and the recorded ``passed`` must agree with it.
+    """
+    if not isinstance(report, dict):
+        raise ContractError("output-equivalence result must be a JSON object")
+    difference = report.get("max_abs_diff")
+    if not _finite_nonnegative(difference):
+        raise ContractError(
+            "output-equivalence result must record a finite non-negative max_abs_diff"
+        )
+    recorded = report.get("passed")
+    if not isinstance(recorded, bool):
+        raise ContractError("output-equivalence result must record a boolean passed")
+    recomputed = difference <= tolerance
+    if recorded is not recomputed:
+        raise ContractError(
+            f"output-equivalence passed={recorded} contradicts max_abs_diff={difference} "
+            f"against tolerance={tolerance}"
+        )
+    return recomputed
 
 
 def _string_list(value: Any, field: str, *, allow_empty: bool = False) -> list[str]:
@@ -193,36 +281,81 @@ def _validate_measurement_plan(value: Any, target_metric: Any) -> list[str]:
     return errors
 
 
-def repository_identity(root: Path) -> dict[str, Any]:
-    """Return the exact tracked checkout identity used to submit worker code."""
+def _git(root: Path, *args: str) -> str:
+    result = subprocess.run(  # nosec B603 B607
+        ["git", *args], cwd=root, check=True, capture_output=True, text=True
+    )
+    return result.stdout.strip()
 
-    def git(*args: str) -> str:
-        result = subprocess.run(  # nosec B603 B607
-            ["git", *args], cwd=root, check=True, capture_output=True, text=True
-        )
-        return result.stdout.strip()
 
+def launch_root(start: Path | None = None) -> Path:
+    """The checkout a launch runs from: the git toplevel of ``start`` (default cwd).
+
+    Never the checkout that holds this module. An editable install of one
+    worktree launched from another would otherwise bind the contract to the
+    revision of the wrong tree and then ship the right one.
+    """
+    origin = (start or Path.cwd()).resolve()
     try:
+        return Path(_git(origin, "rev-parse", "--show-toplevel"))
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ContractError(
+            f"{origin} is not inside a git checkout; run the experiment from a checkout "
+            "of the treatment revision so the launch can be bound to it"
+        ) from exc
+
+
+def repository_identity(root: Path) -> dict[str, Any]:
+    """Return the exact checkout identity used to submit worker code.
+
+    ``dirty`` covers tracked changes anywhere and *untracked files under
+    ``src/``*: an untracked module inside the importable package ships with the
+    experiment and is invisible to ``--untracked-files=no``. Untracked files
+    elsewhere (a generated ``AGENTS.md``, a scratch notebook) do not.
+    """
+    try:
+        tracked = _git(root, "status", "--porcelain", "--untracked-files=no")
+        untracked_source = _git(root, "status", "--porcelain", "--untracked-files=all", "--", "src")
         return {
-            "revision": git("rev-parse", "HEAD"),
-            "dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
+            "revision": _git(root, "rev-parse", "HEAD"),
+            "dirty": bool(tracked or untracked_source),
         }
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise ContractError(f"cannot resolve launch code identity in {root}: {exc}") from exc
+        raise ContractError(
+            f"cannot resolve launch code identity: {root} is not a git checkout "
+            f"(an installed wheel cannot be bound; launch from a checkout): {exc}"
+        ) from exc
+
+
+def _commit_exists(root: Path, revision: str) -> bool:
+    try:
+        _git(root, "cat-file", "-e", f"{revision}^{{commit}}")
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
 
 
 def bind_contract_to_repository(data: dict[str, Any], root: Path) -> dict[str, Any]:
-    """Require the treatment revision to identify the tracked launch checkout."""
+    """Require the treatment revision to identify the clean launch checkout.
+
+    Both revisions must also exist as commits in that checkout: a baseline
+    nobody can check out is a baseline nobody can rerun.
+    """
     identity = repository_identity(root)
     if identity["dirty"]:
         raise ContractError(
-            "launch checkout has tracked changes; commit them before the experiment"
+            "launch checkout has tracked changes or untracked files under src/; "
+            "commit or remove them before the experiment"
         )
-    treatment = data["inputs"]["treatment_revision"]
+    inputs = data["inputs"]
+    treatment = inputs["treatment_revision"]
     if treatment != identity["revision"]:
         raise ContractError(
             f"inputs.treatment_revision does not match launch checkout {identity['revision']}"
         )
+    for name in ("baseline_revision", "treatment_revision"):
+        if not _commit_exists(root, inputs[name]):
+            raise ContractError(f"inputs.{name} {inputs[name]} is not a commit in {root}")
     return identity
 
 
@@ -290,10 +423,7 @@ def validate_contract(
 def load_contract(path: str | Path, *, launch_command: str | None = None) -> dict[str, Any]:
     """Load and validate one contract, raising a concise ContractError."""
     source = Path(path)
-    try:
-        data = json.loads(source.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ContractError(f"cannot read contract {source}: {exc}") from exc
+    data = load_json(source, what="contract")
     errors = validate_contract(data, base_dir=source.parent, launch_command=launch_command)
     if errors:
         raise ContractError("invalid performance contract: " + "; ".join(errors))
@@ -307,12 +437,15 @@ def _observations(
     base_dir: Path,
     metric: str,
     unit: str,
-    minimum: int,
+    expected: int,
 ) -> tuple[list[float], list[str]]:
     errors: list[str] = []
     numbers: list[float] = []
-    if not isinstance(value, list) or len(value) < minimum:
-        return numbers, [f"{name} must contain at least {minimum} observation(s)"]
+    if not isinstance(value, list) or len(value) != expected:
+        # Exactly the pre-registered count. Extra runs are not free: with
+        # ``median`` and one registered repetition, nine runs of which four
+        # were disasters still aggregate to the fast one.
+        return numbers, [f"{name} must contain exactly {expected} observation(s)"]
     for index, observation in enumerate(value):
         prefix = f"{name}[{index}]"
         if not isinstance(observation, dict):
@@ -323,8 +456,8 @@ def _observations(
         if observation.get("unit") != unit:
             errors.append(f"{prefix}.unit must equal contract baseline.unit")
         number = observation.get("value")
-        if not isinstance(number, int | float) or isinstance(number, bool) or number <= 0:
-            errors.append(f"{prefix}.value must be positive")
+        if not _finite_positive(number):
+            errors.append(f"{prefix}.value must be positive and finite")
         else:
             numbers.append(float(number))
         artifact = observation.get("artifact")
@@ -398,11 +531,26 @@ def _validate_result_support(
     elif not _resolve(base_dir, profile).is_file():
         errors.append("result.profiling_artifact must be an existing file")
     errors.extend(_string_list(data.get("limitations"), "result.limitations"))
-    equivalence_passed = data.get("output_equivalence_passed")
-    if not isinstance(equivalence_passed, bool):
+    equivalence = data.get("output_equivalence_passed")
+    if not isinstance(equivalence, bool):
         errors.append("result.output_equivalence_passed must be boolean")
         return None, errors
-    return equivalence_passed, errors
+    return equivalence, errors
+
+
+def validate_result_cost(data: dict[str, Any], contract: dict[str, Any]) -> list[str]:
+    """Compare what the run spent against the caps its contract declared."""
+    errors: list[str] = []
+    for field, cap_field in COST_FIELDS.items():
+        spent = data.get(field)
+        if not _finite_nonnegative(spent):
+            errors.append(f"result.{field} must be a non-negative finite number")
+        elif spent > contract[cap_field]:
+            errors.append(
+                f"result.{field} {spent:g} exceeds the pre-registered "
+                f"{cap_field} {contract[cap_field]:g}; the run broke its own contract"
+            )
+    return errors
 
 
 def _effect(baseline_value: float, treatment_value: float, direction: str) -> float:
@@ -465,7 +613,7 @@ def validate_result(
         base_dir=observation_dir,
         metric=contract["target_metric"],
         unit=contract["baseline"]["unit"],
-        minimum=plan["baseline_repetitions"],
+        expected=plan["baseline_repetitions"],
     )
     treatment, treatment_errors = _observations(
         data.get("treatment_observations"),
@@ -473,15 +621,14 @@ def validate_result(
         base_dir=observation_dir,
         metric=contract["target_metric"],
         unit=contract["baseline"]["unit"],
-        minimum=plan["treatment_repetitions"],
+        expected=plan["treatment_repetitions"],
     )
     errors.extend(baseline_errors)
     errors.extend(treatment_errors)
-    equivalence_passed, support_errors = _validate_result_support(data, plan, observation_dir)
+    equivalence, support_errors = _validate_result_support(data, plan, observation_dir)
     errors.extend(support_errors)
-    errors.extend(
-        _validate_result_decision(data, contract, baseline, treatment, equivalence_passed)
-    )
+    errors.extend(validate_result_cost(data, contract))
+    errors.extend(_validate_result_decision(data, contract, baseline, treatment, equivalence))
     return errors
 
 
@@ -490,10 +637,7 @@ def load_result(path: str | Path, contract_path: str | Path) -> dict[str, Any]:
     source = Path(path)
     contract_source = Path(contract_path)
     contract = load_contract(contract_source)
-    try:
-        data = json.loads(source.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ContractError(f"cannot read result {source}: {exc}") from exc
+    data = load_json(source, what="result")
     errors = validate_result(
         data,
         contract,
