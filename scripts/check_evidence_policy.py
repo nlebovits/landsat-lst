@@ -32,7 +32,7 @@ def main() -> int:  # noqa: PLR0912 - one branch per safeguard
     failures: list[str] = []
     required = {
         "AGENTS.override.md": "validated evidence bundle records",
-        "CLAUDE.md": "## Mandatory performance-evidence gate",
+        "CLAUDE.md": "the smoke test comes first, in the conversation",
         "docs/performance-evidence-policy.md": "## Required lifecycle",
         ".github/pull_request_template.md": "<!-- performance-evidence",
         GATE_SCRIPT: 'require_proceed=stage == "optimization"',
