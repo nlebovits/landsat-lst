@@ -338,7 +338,71 @@ wall time down 16 to 23%, CPU down 21 to 25%, the product within the accepted
 one-DN behavior, `qa_count` exact. The next and only cloud discriminator is
 one representative 512-row composite shard on a 32 GiB VM. It has not run.
 
-## 7. Where the evidence lives
+## 7. The cloud discriminator: stop
+
+The operator greenlit one 512-row composite shard on a 32 GiB worker on
+2026-09-03. Band 27, the band with the highest measured peak (43.9 GB on a
+64 GiB `m6i.4xlarge`), ran on a `c6i.4xlarge` (16 vCPU, 32 GiB, the same
+core count) from the retained production plan, item list, and merged
+offsets, under a fresh run prefix. Decision rule, fixed before the run: peak
+RSS at or under 28 GiB with both slabs published passes; above 28 GiB, an
+OOM, or a material output difference stops.
+
+**Result: stop.** Attempt 1 of run `shard-S30W065-2021-2025-20260903T112514Z-u16gate2`
+(Coiled cluster 2000575) was killed at **28,789.5 MB (28.11 GiB)** after
+1,391.8 s, 1,313.7 s of it in `exporting`, with no log and no error object,
+which is the OOM shape on a 32 GiB VM. No band slab was published. Coiled
+started a retry, which was stopped at 422 s and 9.3 GB to bound spend.
+Output equivalence could not be measured. The contract, the decision
+manifest (validated by `evidence_contract.validate_result`, decision `stop`),
+and the bundle from `landsat-lst evidence collect` are under
+`results/issue-136/cloud/`; the state objects are retained on S3 under the
+run prefix.
+
+| | Baseline, f32, m6i.4xlarge (64 GiB) | Candidate, uint16, c6i.4xlarge (32 GiB) |
+|---|---|---|
+| Elapsed at last heartbeat, s | 1,365.8 (done) | 1,391.8 (killed) |
+| `exporting` phase, s | 1,293.4 | 1,313.7 and counting |
+| Sampled RSS at 1,270 to 1,330 s, MB | 32,103, plateau | 25,646 to 27,277, still climbing |
+| Sampled RSS slope, 120 to 1,270 s | 1.75 GB/min | 1.45 GB/min (0.83 of baseline) |
+| `peak_rss_mb` (VmHWM) | 43,948.75 | 28,789.5, a lower bound |
+| Effect on the contract metric | | 0.345 decrease, above the 0.30 minimum |
+
+Two facts from the series [M] that the local probe did not show:
+
+- **RSS climbs linearly through `exporting` in both arms, and halving the
+  stack cut the slope by 17%, not 50%.** The growing term is therefore mostly
+  not the Celsius or DN stack. The pieces a read task holds before its
+  column's merge can run are the raw `uint16` `lwir11` and `qa_pixel` reads,
+  four bytes per pixel-scene in both arms, if the elementwise chain is not
+  fused into the read task; that is a hypothesis this run cannot test and
+  the stop rule forbids chasing.
+- **The baseline's sampled plateau was 32.1 GB while its VmHWM was 43.9 GB.**
+  An 11.8 GB spike sits between two 60 s heartbeats, at the end of the
+  phase. The candidate was killed before reaching that point, so 28.1 GiB is
+  a lower bound on its peak, and the true peak on a 64 GiB VM would likely
+  sit above 30 GiB.
+
+The uint16 stack still does what the local probe measured on this band:
+lower and slower memory growth, and the change is bit-for-bit within the
+accepted contract on real data. It does not move the composite stage onto a
+32 GiB worker, which was the economic goal. Per the stop rule, no further
+memory optimization is stacked on it here.
+
+Arm 1 of the discriminator (run `...20260903T110545Z-u16gate`, cluster
+2000548) never reached compute: four attempts failed in the ASTER GED
+gap-mask lookup because the worktree ships no `data/ged_gap_mask.npz`. The
+mask is applied to the 2-D result after the P95 and cannot move peak RSS, and
+the retained 2026-08-23 band predates it, so arm 2 ran with
+`LST_GED_GAP_MASK=false` to keep the output comparison like for like.
+
+Cost [M]: Coiled billed 1.56 credits for cluster 2000548 and 8.39 for
+2000575, 9.95 in total, against a 20-credit cap; both clusters ran
+on-demand although the shard policy is spot. The EC2 charge is derived at
+about $0.42 for 0.62 VM-hours at the on-demand list price and is not a
+billed number.
+
+## 8. Where the evidence lives
 
 - `scripts/experimental/precision_audit_p95.py`: the harness. Run from the repo
   root with `PYTHONPATH=src`, one window at a time.
@@ -347,6 +411,14 @@ one representative 512-row composite shard on a 32 GiB VM. It has not run.
   implemented arm, untracked (`results/` is gitignored).
 - `results/issue-136/probe/baseline_f32.jsonl`, `candidate_u16.jsonl`, and
   the kept products under `base_c{4,8}/` and `cand_c{4,8}/`.
+- `results/issue-136/cloud/`: `contract.json`, `result.json` (decision
+  `stop`), `equivalence.json`, `submission.json`, the baseline and candidate
+  state objects, and `evidence/evidence.json` from `landsat-lst evidence
+  collect --cluster-id 2000548 --cluster-id 2000575`. Retained copies of the
+  contract and the decision are under `docs/evidence/issue-136/`.
+- S3, run prefixes `_shards/shard-S30W065-2021-2025-20260903T110545Z-u16gate/`
+  and `...T112514Z-u16gate2/` under the project prefix: plan and item copies,
+  state objects, and logs. No band slab and no COG were written.
 - `results/probe/composite_band_phase_seconds.json`: the 35-band RSS anchor.
 - `results/fixtures/S30W065_2021-2025_n300_f8/`: the real-data fixture.
 - `.claude/worktrees/issue-129-composite-shard/`: the probe and the #129

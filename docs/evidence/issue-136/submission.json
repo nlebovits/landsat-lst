@@ -1,0 +1,25 @@
+{
+  "run_id": "shard-S30W065-2021-2025-20260903T112514Z-u16gate2",
+  "tile": "S30W065",
+  "index": 27,
+  "rows": [
+    14336,
+    14848
+  ],
+  "vm_type": "c6i.4xlarge",
+  "spot_policy": "spot",
+  "cluster_id": 2000575,
+  "job_id": 383172,
+  "name": "lst-be618f4b-S30W065-compo-r1",
+  "submitted_at": "2026-09-03T11:28:34.477747+00:00",
+  "state_key": "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/state/composite.0027.1.json",
+  "band_keys": {
+    "lst_p95": "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/composite/lst_p95/band027.tif",
+    "qa_count": "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/composite/qa_count/band027.tif"
+  },
+  "baseline_run": "shard-S30W065-2021-2025-20260823T102135Z",
+  "baseline_peak_rss_mb": 43948.75,
+  "baseline_elapsed_s": 1365.8,
+  "identity": "arn:aws:sts::939788573396:assumed-role/AWSReservedSSO_coiled_on_EC2_9672f1ceb228eb20/nissim.lebovits@radiant.earth",
+  "operator_credit_limit": 20.0
+}

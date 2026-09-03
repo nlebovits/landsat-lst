@@ -438,9 +438,14 @@ load to the P95, and the affine map to Celsius runs on the 2-D float64 quantile
 (`qa.dn_stack`, `qa.debias_dn`, `kernels.quantile_last_sentinel`). It used to be
 float32 Celsius, which carried four bytes of precision into a product encoded at
 0.01 C from a source quantized at 0.0034 C. Halving the stack halved the
-composite shard's peak RSS: 24.2 GB to 10.2 GB at 16 column chunks on the corrected
-local probe, and the 36-chunk production band models 18 to 19 GB against the 31.9 to
-43.9 GB measured on 64 GiB VMs. See [ADR-019](docs/adr/019-composite-stack-in-native-dn.md)
+composite shard's peak RSS on the corrected local probe (24.2 GB to 10.2 GB at 16
+column chunks), and the model put a production band at 18 to 19 GB. The cloud
+discriminator disagreed: band 27 of S30W065 on a 32 GiB `c6i.4xlarge` was OOM-killed
+at 28.1 GiB, still climbing, against 43.9 GB measured for the same band on a 64 GiB
+VM. **The composite stage stays on 64 GiB VMs.** The RSS ramp through `exporting` is
+mostly not stack-proportional (slope 0.83 of the float32 arm), and a 60 s heartbeat
+misses an 11.8 GB end-of-phase spike, so do not model the composite's peak from the
+stack's bytes. See [ADR-019](docs/adr/019-composite-stack-in-native-dn.md)
 and [findings](docs/findings-composite-precision-audit.md), issue #136.
 
 Rules worth keeping:

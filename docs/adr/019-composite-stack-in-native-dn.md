@@ -1,7 +1,10 @@
 # ADR-019: The composite stack is uint16 DN, not float32 Celsius
 
-**Status:** Accepted, 2026-09-03. Local measurement complete; one cloud shard
-on a 32 GiB VM is the remaining discriminator.
+**Status:** Implemented and measured, 2026-09-03. The cloud discriminator
+ran and said **stop**: band 27 on a 32 GiB `c6i.4xlarge` was OOM-killed at
+28.11 GiB, so the composite stage stays on 64 GiB VMs. The representation
+change itself stands on the local measurements and the output contract; the
+VM-size move it was meant to enable does not follow from it.
 **Tracking:** [#136](https://github.com/nlebovits/landsat-lst/issues/136),
 [findings](../findings-composite-precision-audit.md)
 
@@ -75,9 +78,12 @@ Extrapolated linearly to the 36 column chunks of a production band, the
 float32 arm models 48.9 GB against the 31.9 to 43.9 GB measured on the VM
 (reads from S3 are slower than the synthetic source, so fewer pieces pile
 up), and the uint16 arm models 18.8 GB. Applying the 16-chunk ratio to the
-measured worst case gives 18.4 GB. Both sit under the 27 to 28 GiB target with
-9 to 10 GB of headroom. This is a model of a measurement, not a measurement:
-one composite shard on a 32 GiB VM decides.
+measured worst case gives 18.4 GB. Both sat under the 27 to 28 GiB target on the model. The
+measurement disagreed: on a 32 GiB `c6i.4xlarge` the same band reached
+28,789.5 MB after 1,392 s, still climbing at 1.45 GB/min against the
+baseline's 1.75, and was killed. The sampled RSS ramp is mostly not
+stack-proportional, and the baseline's own sampled plateau (32.1 GB) sits
+11.8 GB under its VmHWM (43.9 GB). See the findings doc, section 7.
 
 Costs: two kernels instead of one, a dtype dispatch in `_composite_graph` and
 `debias_with_offsets`, an `apply_to` seam in `seasonal_debias`, and 190 lines

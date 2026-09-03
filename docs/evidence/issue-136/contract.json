@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "claim": "Keeping the composite stack in uint16 DN (ADR-019) halves a 512-row S30W065 composite shard's peak RSS, putting the worst measured band under 28 GiB on a 32 GiB c6i.4xlarge worker, with the encoded lst_p95 within one DN of the shipped band and qa_count exact.",
+  "inputs": {
+    "workload": "S30W065 2021-2025, composite stage, band index 27 (rows 14336:14848), 4,403 STAC items resolving to 1,031 solar days with 912 kept, the plan.json and items.json copied server-side from run shard-S30W065-2021-2025-20260823T102135Z into run shard-S30W065-2021-2025-20260903T112514Z-u16gate2, merged offsets at _offsets/S30W065/2021-2025/f2/v1-a662c8e0b67b4254.json",
+    "launch_command": "env AWS_PROFILE=radiant-earth LST_STORAGE_BACKEND=s3 LST_SHARD_COMPOSITE_VM_TYPE=c6i.4xlarge LST_GED_GAP_MASK=false uv run python scripts/experimental/submit_u16_gate_shard.py --run-id shard-S30W065-2021-2025-20260903T112514Z-u16gate2 --index 27",
+    "baseline_revision": "32afd4b2e2aaaaa16065ed39aa05dd1c83ec6cb7",
+    "treatment_revision": "9f2423a7c39f2c8f799efa689d6cda1607ac5a61",
+    "real_data": {
+      "kind": "real",
+      "identity": "tile S30W065, window 2021-2025, scene ids frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111,683,185 bytes, 2026-08-23) and plan.json (220,702 bytes); offsets record _offsets/S30W065/2021-2025/f2/v1-a662c8e0b67b4254.json (64,356 bytes, 2026-08-22)",
+      "production_relationship": "the exact production inputs of the shipped S30W065 tile; band 27 is the band with the highest measured peak RSS (43,948.75 MB) of the 33 512-row bands in that run",
+      "known_differences": [
+        "VM type c6i.4xlarge (16 vCPU, 32 GiB) instead of m6i.4xlarge (16 vCPU, 64 GiB); same core count, half the memory, which is the boundary under test",
+        "one band submitted alone rather than as part of a 35-band fleet, so no export claim can fire and no COG is written",
+        "spot lifecycle as in production (shard_spot_policy=spot); a preemption invalidates the run rather than the candidate",
+        "LST_GED_GAP_MASK=false: the retained 2026-08-23 band predates the ASTER GED gap mask (#116), and the mask is applied to the 2-D lst_p95 after the P95, so it cannot move peak RSS; disabling it keeps the output comparison like for like. Arm 1 (run shard-S30W065-2021-2025-20260903T110545Z-u16gate, cluster 2000548) failed four times in the mask lookup because the worktree ships no data/ged_gap_mask.npz; that run is retained as evidence and cost is counted."
+      ]
+    }
+  },
+  "baseline": {
+    "metric": "peak_rss_mb",
+    "value": 43948.75,
+    "unit": "MB",
+    "classification": "measured",
+    "artifact": "baseline_composite.0027.1.json"
+  },
+  "target_metric": "peak_rss_mb",
+  "measurement_plan": {
+    "target_environment": "production",
+    "phases": [
+      "exporting"
+    ],
+    "metrics": [
+      "peak_rss_mb",
+      "wall_s",
+      "cpu_s"
+    ],
+    "raw_artifacts": [
+      "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/state/composite.0027.1.json",
+      "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/state/composite.0027.1.log",
+      "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/composite/lst_p95/band027.tif",
+      "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/composite/qa_count/band027.tif"
+    ],
+    "profiling": {
+      "method": "the shard's own heartbeat instrumentation: phase_seconds and peak_rss_mb in the state object, plus the Coiled lifecycle, billing, and CPU/memory series pulled by landsat-lst evidence collect --metric-query cpu",
+      "artifact": "candidate/composite.0027.1.json",
+      "observer_effect_control": "identical to the baseline run: the same TileHeartbeat at 60 s and no profiler in either arm"
+    },
+    "baseline_repetitions": 1,
+    "treatment_repetitions": 1,
+    "aggregation": "single"
+  },
+  "minimum_effect": {
+    "direction": "decrease",
+    "fraction": 0.3
+  },
+  "production_discriminator": "one 512-row composite shard (band 27) of S30W065 on one c6i.4xlarge, reading the retained production plan, items, and offsets under a fresh run id",
+  "stop_rule": "Stop if peak_rss_mb exceeds 28,672 MB (28 GiB), if the task is OOM-killed or fails to publish both band slabs, or if any lst_p95 pixel differs from the retained band027.tif by more than one DN or qa_count differs at all. Do not stack further memory optimizations.",
+  "result_artifact": "result.json",
+  "max_cloud_cost_usd": 1,
+  "max_coiled_credits": 20,
+  "code_identity_required": true,
+  "output_equivalence_required": true,
+  "output_equivalence": {
+    "method": "pixel-wise integer difference of the encoded uint16 lst_p95 band027.tif against the retained band027.tif of run shard-S30W065-2021-2025-20260823T102135Z, fill agreement required; qa_count band027.tif compared with array_equal",
+    "acceptance_criterion": "max_abs_diff in DN at most 1 with identical fill masks, and qa_count exactly equal",
+    "tolerance": 1,
+    "result_artifact": "equivalence.json"
+  },
+  "operator_note": "Greenlit by the operator on 2026-09-03 for exactly one shard, under a dollar; this contract constrains that run and does not authorize another."
+}
