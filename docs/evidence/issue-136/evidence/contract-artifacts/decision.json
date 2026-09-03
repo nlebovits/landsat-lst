@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "contract_sha256": "526112ec7f0643cb9cc987d0547f3853c723b686bead6db899ef2f998d9e0f77",
+  "environment": "production",
+  "input_identity": "tile S30W065, window 2021-2025, scene ids frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111,683,185 bytes, 2026-08-23) and plan.json (220,702 bytes); offsets record _offsets/S30W065/2021-2025/f2/v1-a662c8e0b67b4254.json (64,356 bytes, 2026-08-22)",
+  "baseline_revision": "32afd4b2e2aaaaa16065ed39aa05dd1c83ec6cb7",
+  "treatment_revision": "9f2423a7c39f2c8f799efa689d6cda1607ac5a61",
+  "baseline_observations": [
+    {
+      "metric": "peak_rss_mb",
+      "value": 43948.75,
+      "unit": "MB",
+      "artifact": "baseline_composite.0027.1.json"
+    }
+  ],
+  "treatment_observations": [
+    {
+      "metric": "peak_rss_mb",
+      "value": 28789.5234375,
+      "unit": "MB",
+      "artifact": "candidate/composite.0027.1.json"
+    }
+  ],
+  "profiling_artifact": "candidate/composite.0027.1.json",
+  "observed_cloud_cost_usd": 0.42,
+  "observed_coiled_credits": 9.95,
+  "observed_effect_fraction": 0.3449296410591883,
+  "minimum_effect_met": true,
+  "output_equivalence_passed": false,
+  "decision": "stop",
+  "treatment_detail": {
+    "instance_type": "c6i.4xlarge",
+    "instance_lifecycle": "on-demand",
+    "elapsed_s": 1391.8,
+    "phase_seconds": {
+      "starting": 0.0,
+      "shard_composite": 6.8,
+      "shard_offsets_wait": 0.1,
+      "loading": 56.8,
+      "land_mask": 14.0,
+      "destriping": 0.1,
+      "composite_graph": 0.1,
+      "exporting": 1313.7
+    },
+    "scenes_found": 4403,
+    "scenes_kept": 912,
+    "peak_rss_gib": 28.114768981933594,
+    "gate_28_gib_mb": 28672,
+    "under_28_gib": false
+  },
+  "equivalence_summary": {
+    "max_abs_diff_dn": 65535,
+    "lst_p95": {
+      "pixels_compared": 0,
+      "fill_disagreements": null,
+      "identical": 0,
+      "one_dn": 0,
+      "more_than_one_dn": 0
+    },
+    "qa_count_equal": false
+  },
+  "limitations": [
+    "Coiled billed 1.56 credits for cluster 2000548 and 8.39 for cluster 2000575 (9.95 total, entries 30166783 and 30171653); the USD figure is derived from 0.62 VM-hours at the on-demand c6i.4xlarge list price and is not a billed number",
+    "Both clusters ran on-demand although shard_spot_policy=spot; the instance reported lifecycle on-demand via IMDS",
+    "Arm 1 (cluster 2000548, run shard-S30W065-2021-2025-20260903T110545Z-u16gate) failed four times before any compute, in the GED gap-mask lookup, because the worktree ships no data/ged_gap_mask.npz; arm 2 ran with LST_GED_GAP_MASK=false, which is applied after the P95 and cannot move peak RSS",
+    "Attempt 1 of arm 2 was killed at 28,789.5 MB RSS after 1,391.8 s in exporting with no log or error object, the OOM shape; attempt 2 was stopped at 422 s and 9.3 GB to bound spend. No band slab was published, so output equivalence could not be measured and is recorded as failed",
+    "One band, one attempt at full depth: 28.1 GiB is a lower bound on this band's peak on this VM, since the process was killed before the phase ended; the baseline's exporting phase ran 1,293 s and this attempt was at 1,314 s when it died"
+  ]
+}

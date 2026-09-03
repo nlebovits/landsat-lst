@@ -1,0 +1,22 @@
+{
+  "method": "pixel-wise integer difference of encoded uint16 lst_p95 band027.tif; qa_count array_equal",
+  "tolerance": 1,
+  "max_abs_diff": 65535,
+  "passed": false,
+  "note": "No candidate slab was published: attempt 1 was killed at 28,789.5 MB RSS in the exporting phase after 1,391.8 s, and attempt 2 was stopped by the operator's agent at 422 s to bound spend. An absent product is recorded as the maximal DN difference so that passed == (max_abs_diff <= tolerance) holds; nothing was compared.",
+  "lst_p95": {
+    "pixels_compared": 0,
+    "fill_disagreements": null,
+    "identical": 0,
+    "one_dn": 0,
+    "more_than_one_dn": 0
+  },
+  "qa_count": {
+    "equal": false,
+    "note": "no candidate slab"
+  },
+  "candidate_keys_absent": [
+    "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/composite/lst_p95/band027.tif",
+    "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/composite/qa_count/band027.tif"
+  ]
+}

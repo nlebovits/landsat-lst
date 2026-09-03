@@ -1,0 +1,625 @@
+{
+  "attachments": [],
+  "code": {
+    "dirty": false,
+    "package_version": "0.1.0",
+    "revision": "a47e1918a2d288bbf47be8b41658911bd7d2e8bd"
+  },
+  "coiled_clusters": [
+    {
+      "billing_pages": [
+        {
+          "count": 1,
+          "next": null,
+          "page_size": 15,
+          "previous": null,
+          "results": [
+            {
+              "amount_credits": "-1.5600",
+              "cluster": "lst-289e2396-S30W065-compo-r1",
+              "cluster_id": 2000548,
+              "event_datetime": "2026-09-03T11:21:37.411475Z",
+              "id": 30166783,
+              "instance": "lst-289e2396-S30W065-compo-r1-scheduler-7d140a420f-instance",
+              "kind": "instance",
+              "note": "add_instance_to_billing_table",
+              "user": 13318
+            }
+          ]
+        }
+      ],
+      "cluster_id": 2000548,
+      "coiled_spans": [],
+      "details": {
+        "created": "2026-09-03T11:14:40.666296+00:00",
+        "current_state": {
+          "reason": "No pending tasks for batch run",
+          "state": "stopped",
+          "updated": "2026-09-03T11:21:16.891218+00:00"
+        },
+        "id": 2000548,
+        "name": "lst-289e2396-S30W065-compo-r1",
+        "scheduler": {
+          "created": "2026-09-03T11:14:40.671413+00:00",
+          "current_state": {
+            "reason": "No pending tasks for batch run",
+            "state": "stopped",
+            "updated": "2026-09-03T11:21:41.165214+00:00"
+          },
+          "instance": {
+            "created": "2026-09-03T11:15:01.222287+00:00",
+            "current_state": {
+              "reason": "No pending tasks for batch run",
+              "state": "stopped",
+              "updated": "2026-09-03T11:21:41.716838+00:00"
+            },
+            "id": 33020504,
+            "name": "lst-289e2396-S30W065-compo-r1-scheduler-7d140a420f-instance",
+            "private_ip_address": "10.0.11.66",
+            "public_ip_address": "54.69.134.66"
+          },
+          "name": "lst-289e2396-S30W065-compo-r1-scheduler-7d140a420f"
+        },
+        "workers": []
+      },
+      "logs": {},
+      "metrics": {},
+      "workspace": "nissim-lebovits"
+    },
+    {
+      "billing_pages": [
+        {
+          "count": 1,
+          "next": null,
+          "page_size": 15,
+          "previous": null,
+          "results": [
+            {
+              "amount_credits": "-8.3912",
+              "cluster": "lst-be618f4b-S30W065-compo-r1",
+              "cluster_id": 2000575,
+              "event_datetime": "2026-09-03T12:01:06.512308Z",
+              "id": 30171653,
+              "instance": "lst-be618f4b-S30W065-compo-r1-scheduler-fe15d1f3c1-instance",
+              "kind": "instance",
+              "note": "add_instance_to_billing_table",
+              "user": 13318
+            }
+          ]
+        }
+      ],
+      "cluster_id": 2000575,
+      "coiled_spans": [],
+      "details": {
+        "created": "2026-09-03T11:28:32.991186+00:00",
+        "current_state": {
+          "reason": "User requested stop via CLI",
+          "state": "stopped",
+          "updated": "2026-09-03T12:00:52.167702+00:00"
+        },
+        "id": 2000575,
+        "name": "lst-be618f4b-S30W065-compo-r1",
+        "scheduler": {
+          "created": "2026-09-03T11:28:32.995980+00:00",
+          "current_state": {
+            "reason": "User requested stop via CLI",
+            "state": "stopped",
+            "updated": "2026-09-03T12:01:11.295683+00:00"
+          },
+          "instance": {
+            "created": "2026-09-03T11:28:56.087991+00:00",
+            "current_state": {
+              "reason": "User requested stop via CLI",
+              "state": "stopped",
+              "updated": "2026-09-03T12:01:45.809124+00:00"
+            },
+            "id": 33022305,
+            "name": "lst-be618f4b-S30W065-compo-r1-scheduler-fe15d1f3c1-instance",
+            "private_ip_address": "10.0.10.240",
+            "public_ip_address": "44.247.83.101"
+          },
+          "name": "lst-be618f4b-S30W065-compo-r1-scheduler-fe15d1f3c1"
+        },
+        "workers": []
+      },
+      "logs": {},
+      "metrics": {},
+      "workspace": "nissim-lebovits"
+    }
+  ],
+  "collected_at": "2026-09-03T12:38:39.816557+00:00",
+  "contract": {
+    "baseline": {
+      "artifact": "baseline_composite.0027.1.json",
+      "classification": "measured",
+      "metric": "peak_rss_mb",
+      "unit": "MB",
+      "value": 43948.75
+    },
+    "claim": "Keeping the composite stack in uint16 DN (ADR-019) halves a 512-row S30W065 composite shard's peak RSS, putting the worst measured band under 28 GiB on a 32 GiB c6i.4xlarge worker, with the encoded lst_p95 within one DN of the shipped band and qa_count exact.",
+    "code_identity_required": true,
+    "inputs": {
+      "baseline_revision": "32afd4b2e2aaaaa16065ed39aa05dd1c83ec6cb7",
+      "launch_command": "env AWS_PROFILE=radiant-earth LST_STORAGE_BACKEND=s3 LST_SHARD_COMPOSITE_VM_TYPE=c6i.4xlarge LST_GED_GAP_MASK=false uv run python scripts/experimental/submit_u16_gate_shard.py --run-id shard-S30W065-2021-2025-20260903T112514Z-u16gate2 --index 27",
+      "real_data": {
+        "identity": "tile S30W065, window 2021-2025, scene ids frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111,683,185 bytes, 2026-08-23) and plan.json (220,702 bytes); offsets record _offsets/S30W065/2021-2025/f2/v1-a662c8e0b67b4254.json (64,356 bytes, 2026-08-22)",
+        "kind": "real",
+        "known_differences": [
+          "VM type c6i.4xlarge (16 vCPU, 32 GiB) instead of m6i.4xlarge (16 vCPU, 64 GiB); same core count, half the memory, which is the boundary under test",
+          "one band submitted alone rather than as part of a 35-band fleet, so no export claim can fire and no COG is written",
+          "spot lifecycle as in production (shard_spot_policy=spot); a preemption invalidates the run rather than the candidate",
+          "LST_GED_GAP_MASK=false: the retained 2026-08-23 band predates the ASTER GED gap mask (#116), and the mask is applied to the 2-D lst_p95 after the P95, so it cannot move peak RSS; disabling it keeps the output comparison like for like. Arm 1 (run shard-S30W065-2021-2025-20260903T110545Z-u16gate, cluster 2000548) failed four times in the mask lookup because the worktree ships no data/ged_gap_mask.npz; that run is retained as evidence and cost is counted."
+        ],
+        "production_relationship": "the exact production inputs of the shipped S30W065 tile; band 27 is the band with the highest measured peak RSS (43,948.75 MB) of the 33 512-row bands in that run"
+      },
+      "treatment_revision": "9f2423a7c39f2c8f799efa689d6cda1607ac5a61",
+      "workload": "S30W065 2021-2025, composite stage, band index 27 (rows 14336:14848), 4,403 STAC items resolving to 1,031 solar days with 912 kept, the plan.json and items.json copied server-side from run shard-S30W065-2021-2025-20260823T102135Z into run shard-S30W065-2021-2025-20260903T112514Z-u16gate2, merged offsets at _offsets/S30W065/2021-2025/f2/v1-a662c8e0b67b4254.json"
+    },
+    "max_cloud_cost_usd": 1,
+    "max_coiled_credits": 20,
+    "measurement_plan": {
+      "aggregation": "single",
+      "baseline_repetitions": 1,
+      "metrics": [
+        "peak_rss_mb",
+        "wall_s",
+        "cpu_s"
+      ],
+      "phases": [
+        "exporting"
+      ],
+      "profiling": {
+        "artifact": "candidate/composite.0027.1.json",
+        "method": "the shard's own heartbeat instrumentation: phase_seconds and peak_rss_mb in the state object, plus the Coiled lifecycle, billing, and CPU/memory series pulled by landsat-lst evidence collect --metric-query cpu",
+        "observer_effect_control": "identical to the baseline run: the same TileHeartbeat at 60 s and no profiler in either arm"
+      },
+      "raw_artifacts": [
+        "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/state/composite.0027.1.json",
+        "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/state/composite.0027.1.log",
+        "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/composite/lst_p95/band027.tif",
+        "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/composite/qa_count/band027.tif"
+      ],
+      "target_environment": "production",
+      "treatment_repetitions": 1
+    },
+    "minimum_effect": {
+      "direction": "decrease",
+      "fraction": 0.3
+    },
+    "operator_note": "Greenlit by the operator on 2026-09-03 for exactly one shard, under a dollar; this contract constrains that run and does not authorize another.",
+    "output_equivalence": {
+      "acceptance_criterion": "max_abs_diff in DN at most 1 with identical fill masks, and qa_count exactly equal",
+      "method": "pixel-wise integer difference of the encoded uint16 lst_p95 band027.tif against the retained band027.tif of run shard-S30W065-2021-2025-20260823T102135Z, fill agreement required; qa_count band027.tif compared with array_equal",
+      "result_artifact": "equivalence.json",
+      "tolerance": 1
+    },
+    "output_equivalence_required": true,
+    "production_discriminator": "one 512-row composite shard (band 27) of S30W065 on one c6i.4xlarge, reading the retained production plan, items, and offsets under a fresh run id",
+    "result_artifact": "result.json",
+    "schema_version": 1,
+    "stop_rule": "Stop if peak_rss_mb exceeds 28,672 MB (28 GiB), if the task is OOM-killed or fails to publish both band slabs, or if any lst_p95 pixel differs from the retained band027.tif by more than one DN or qa_count differs at all. Do not stack further memory optimizations.",
+    "target_metric": "peak_rss_mb"
+  },
+  "contract_artifacts": {
+    "baseline_contract": {
+      "bytes": 2466,
+      "path": "contract-artifacts/baseline-contract.json",
+      "sha256": "bdb1bc1908a41e656852ae6ec3c5ae7110835630766c19a984b3e31b41bf0fdf"
+    },
+    "baseline_observation_1": {
+      "bytes": 2466,
+      "path": "contract-artifacts/baseline-observation-1.json",
+      "sha256": "bdb1bc1908a41e656852ae6ec3c5ae7110835630766c19a984b3e31b41bf0fdf"
+    },
+    "contract": {
+      "bytes": 5256,
+      "path": "contract-artifacts/contract.json",
+      "sha256": "526112ec7f0643cb9cc987d0547f3853c723b686bead6db899ef2f998d9e0f77"
+    },
+    "output_equivalence": {
+      "bytes": 959,
+      "path": "contract-artifacts/output-equivalence.json",
+      "sha256": "94a48c0c161af655c3215c897859d87315da10ec53ae1220a6e0e664bc498633"
+    },
+    "profiling": {
+      "bytes": 2608,
+      "path": "contract-artifacts/profiling.json",
+      "sha256": "99c094cd71c78a56d1024a52b5fed4537a8f54f80a5d9da0fdcf503277ff7c12"
+    },
+    "result": {
+      "bytes": 3179,
+      "path": "contract-artifacts/decision.json",
+      "sha256": "87ed63e187ab9479f63ba19d511d5193f091ae1e62d7969e4ea4c4097dbb0fc7"
+    },
+    "treatment_observation_1": {
+      "bytes": 2608,
+      "path": "contract-artifacts/treatment-observation-1.json",
+      "sha256": "99c094cd71c78a56d1024a52b5fed4537a8f54f80a5d9da0fdcf503277ff7c12"
+    }
+  },
+  "decision": {
+    "baseline_observations": [
+      {
+        "artifact": "baseline_composite.0027.1.json",
+        "metric": "peak_rss_mb",
+        "unit": "MB",
+        "value": 43948.75
+      }
+    ],
+    "baseline_revision": "32afd4b2e2aaaaa16065ed39aa05dd1c83ec6cb7",
+    "contract_sha256": "526112ec7f0643cb9cc987d0547f3853c723b686bead6db899ef2f998d9e0f77",
+    "decision": "stop",
+    "environment": "production",
+    "equivalence_summary": {
+      "lst_p95": {
+        "fill_disagreements": null,
+        "identical": 0,
+        "more_than_one_dn": 0,
+        "one_dn": 0,
+        "pixels_compared": 0
+      },
+      "max_abs_diff_dn": 65535,
+      "qa_count_equal": false
+    },
+    "input_identity": "tile S30W065, window 2021-2025, scene ids frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111,683,185 bytes, 2026-08-23) and plan.json (220,702 bytes); offsets record _offsets/S30W065/2021-2025/f2/v1-a662c8e0b67b4254.json (64,356 bytes, 2026-08-22)",
+    "limitations": [
+      "Coiled billed 1.56 credits for cluster 2000548 and 8.39 for cluster 2000575 (9.95 total, entries 30166783 and 30171653); the USD figure is derived from 0.62 VM-hours at the on-demand c6i.4xlarge list price and is not a billed number",
+      "Both clusters ran on-demand although shard_spot_policy=spot; the instance reported lifecycle on-demand via IMDS",
+      "Arm 1 (cluster 2000548, run shard-S30W065-2021-2025-20260903T110545Z-u16gate) failed four times before any compute, in the GED gap-mask lookup, because the worktree ships no data/ged_gap_mask.npz; arm 2 ran with LST_GED_GAP_MASK=false, which is applied after the P95 and cannot move peak RSS",
+      "Attempt 1 of arm 2 was killed at 28,789.5 MB RSS after 1,391.8 s in exporting with no log or error object, the OOM shape; attempt 2 was stopped at 422 s and 9.3 GB to bound spend. No band slab was published, so output equivalence could not be measured and is recorded as failed",
+      "One band, one attempt at full depth: 28.1 GiB is a lower bound on this band's peak on this VM, since the process was killed before the phase ended; the baseline's exporting phase ran 1,293 s and this attempt was at 1,314 s when it died"
+    ],
+    "minimum_effect_met": true,
+    "observed_cloud_cost_usd": 0.42,
+    "observed_coiled_credits": 9.95,
+    "observed_effect_fraction": 0.3449296410591883,
+    "output_equivalence_passed": false,
+    "profiling_artifact": "candidate/composite.0027.1.json",
+    "schema_version": 1,
+    "treatment_detail": {
+      "elapsed_s": 1391.8,
+      "gate_28_gib_mb": 28672,
+      "instance_lifecycle": "on-demand",
+      "instance_type": "c6i.4xlarge",
+      "peak_rss_gib": 28.114768981933594,
+      "phase_seconds": {
+        "composite_graph": 0.1,
+        "destriping": 0.1,
+        "exporting": 1313.7,
+        "land_mask": 14.0,
+        "loading": 56.8,
+        "shard_composite": 6.8,
+        "shard_offsets_wait": 0.1,
+        "starting": 0.0
+      },
+      "scenes_found": 4403,
+      "scenes_kept": 912,
+      "under_28_gib": false
+    },
+    "treatment_observations": [
+      {
+        "artifact": "candidate/composite.0027.1.json",
+        "metric": "peak_rss_mb",
+        "unit": "MB",
+        "value": 28789.5234375
+      }
+    ],
+    "treatment_revision": "9f2423a7c39f2c8f799efa689d6cda1607ac5a61"
+  },
+  "evidence_classes": {
+    "assumed": "not observed",
+    "derived": "calculated from retained measured inputs",
+    "measured": "directly observed and retained here",
+    "unknown": "not presently knowable from retained evidence",
+    "user_reported": "reported externally, not independently retained"
+  },
+  "run_artifacts": [
+    {
+      "bytes": 2607,
+      "content": {
+        "attempt": 1,
+        "code_identity": {
+          "package_version": "0.1.0",
+          "progress_module_sha256": "5acc38c3cc8aec9c9d414e003e50c187c8938848cae91618b3e6bc5f45db4ecd",
+          "revision": "9f2423a7c39f2c8f799efa689d6cda1607ac5a61"
+        },
+        "duration_s": null,
+        "elapsed_s": 1391.8,
+        "end_year": 2025,
+        "error": null,
+        "graph_seq": 0,
+        "graph_state": "idle",
+        "host": "ip-10-0-10-240",
+        "instance_lifecycle": "on-demand",
+        "instance_source": "imds",
+        "instance_type": "c6i.4xlarge",
+        "lst_key": null,
+        "max_scenes": null,
+        "peak_rss_mb": 28789.5234375,
+        "phase": "exporting",
+        "phase_seconds": {
+          "composite_graph": 0.1,
+          "destriping": 0.1,
+          "exporting": 1313.7,
+          "land_mask": 14.0,
+          "loading": 56.8,
+          "shard_composite": 6.8,
+          "shard_offsets_wait": 0.1,
+          "starting": 0.0
+        },
+        "pid": 1216,
+        "qa_key": null,
+        "rss_mb": 28790.66015625,
+        "rss_series": [
+          [
+            0.0,
+            194.14453125
+          ],
+          [
+            0.0,
+            194.19921875
+          ],
+          [
+            6.8,
+            798.56640625
+          ],
+          [
+            6.9,
+            799.078125
+          ],
+          [
+            60.0,
+            814.28515625
+          ],
+          [
+            63.8,
+            847.7265625
+          ],
+          [
+            77.8,
+            1720.38671875
+          ],
+          [
+            78.0,
+            1728.0
+          ],
+          [
+            78.1,
+            1730.85546875
+          ],
+          [
+            120.1,
+            2883.0546875
+          ],
+          [
+            180.6,
+            3666.72265625
+          ],
+          [
+            241.8,
+            5100.25
+          ],
+          [
+            302.1,
+            6555.8671875
+          ],
+          [
+            363.2,
+            7898.0546875
+          ],
+          [
+            423.4,
+            9244.3125
+          ],
+          [
+            483.7,
+            10718.296875
+          ],
+          [
+            544.2,
+            12018.203125
+          ],
+          [
+            604.7,
+            13009.8671875
+          ],
+          [
+            665.2,
+            13086.33984375
+          ],
+          [
+            725.5,
+            13358.0390625
+          ],
+          [
+            786.0,
+            14149.84765625
+          ],
+          [
+            846.4,
+            15592.453125
+          ],
+          [
+            907.9,
+            17021.05078125
+          ],
+          [
+            968.5,
+            18414.71875
+          ],
+          [
+            1028.6,
+            19833.3359375
+          ],
+          [
+            1089.0,
+            21305.44140625
+          ],
+          [
+            1150.4,
+            22755.82421875
+          ],
+          [
+            1210.8,
+            24161.9140625
+          ],
+          [
+            1271.0,
+            25645.6875
+          ],
+          [
+            1331.3,
+            27277.11328125
+          ],
+          [
+            1391.8,
+            28789.66015625
+          ]
+        ],
+        "run_id": "shard-S30W065-2021-2025-20260903T112514Z-u16gate2",
+        "scene_count": null,
+        "scenes_found": 4403,
+        "scenes_kept": 912,
+        "schema": 2,
+        "status": null,
+        "tasks_done": null,
+        "tasks_total": null,
+        "tile": "S30W065",
+        "updated_at": "2026-09-03T11:53:00.208980+00:00",
+        "window": "2021-2025",
+        "year": 2021
+      },
+      "key": "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/state/composite.0027.1.json",
+      "modified": "2026-09-03T11:53:01+00:00",
+      "sha256": "8449fdff92e5d2af8d1a399e79c788eaec15f97c61c701098431c198e46896e9"
+    },
+    {
+      "bytes": 1866,
+      "content": {
+        "attempt": 2,
+        "code_identity": {
+          "package_version": "0.1.0",
+          "progress_module_sha256": "5acc38c3cc8aec9c9d414e003e50c187c8938848cae91618b3e6bc5f45db4ecd",
+          "revision": "9f2423a7c39f2c8f799efa689d6cda1607ac5a61"
+        },
+        "duration_s": null,
+        "elapsed_s": 422.1,
+        "end_year": 2025,
+        "error": null,
+        "graph_seq": 0,
+        "graph_state": "idle",
+        "host": "ip-10-0-10-240",
+        "instance_lifecycle": "on-demand",
+        "instance_source": "imds",
+        "instance_type": "c6i.4xlarge",
+        "lst_key": null,
+        "max_scenes": null,
+        "peak_rss_mb": 9334.34375,
+        "phase": "exporting",
+        "phase_seconds": {
+          "composite_graph": 0.2,
+          "destriping": 0.1,
+          "exporting": 342.1,
+          "land_mask": 14.7,
+          "loading": 56.6,
+          "shard_composite": 8.3,
+          "shard_offsets_wait": 0.1,
+          "starting": 0.1
+        },
+        "pid": 7899,
+        "qa_key": null,
+        "rss_mb": 9333.71484375,
+        "rss_series": [
+          [
+            0.0,
+            185.4296875
+          ],
+          [
+            0.1,
+            185.484375
+          ],
+          [
+            8.3,
+            787.453125
+          ],
+          [
+            8.4,
+            787.9765625
+          ],
+          [
+            60.1,
+            803.15625
+          ],
+          [
+            65.0,
+            836.59765625
+          ],
+          [
+            79.7,
+            1703.6484375
+          ],
+          [
+            79.8,
+            1711.22265625
+          ],
+          [
+            80.0,
+            1714.18359375
+          ],
+          [
+            120.2,
+            2863.74609375
+          ],
+          [
+            180.6,
+            3731.71484375
+          ],
+          [
+            241.0,
+            5132.671875
+          ],
+          [
+            301.3,
+            6556.3671875
+          ],
+          [
+            361.6,
+            7933.31640625
+          ],
+          [
+            422.1,
+            9331.21875
+          ]
+        ],
+        "run_id": "shard-S30W065-2021-2025-20260903T112514Z-u16gate2",
+        "scene_count": null,
+        "scenes_found": 4403,
+        "scenes_kept": 912,
+        "schema": 2,
+        "status": null,
+        "tasks_done": null,
+        "tasks_total": null,
+        "tile": "S30W065",
+        "updated_at": "2026-09-03T12:01:02.942135+00:00",
+        "window": "2021-2025",
+        "year": 2021
+      },
+      "key": "_shards/shard-S30W065-2021-2025-20260903T112514Z-u16gate2/S30W065/state/composite.0027.2.json",
+      "modified": "2026-09-03T12:01:04+00:00",
+      "sha256": "cca91350110674eadb284fb83295c99801de5a4d4a3d1a167b660908c0f69a09"
+    }
+  ],
+  "run_id": "shard-S30W065-2021-2025-20260903T112514Z-u16gate2",
+  "schema_version": 1,
+  "worker_code_verification": {
+    "expected_revision": "9f2423a7c39f2c8f799efa689d6cda1607ac5a61",
+    "identities": [
+      {
+        "package_version": "0.1.0",
+        "progress_module_sha256": "5acc38c3cc8aec9c9d414e003e50c187c8938848cae91618b3e6bc5f45db4ecd",
+        "revision": "9f2423a7c39f2c8f799efa689d6cda1607ac5a61"
+      }
+    ],
+    "status": "verified"
+  }
+}
