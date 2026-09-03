@@ -493,18 +493,24 @@ class Settings(BaseSettings):
         "at the final wave). Off reproduces the single-load graph.",
     )
     shard_composite_chunk: int = Field(
-        default=1024,
+        default=512,
         ge=64,
         description="Spatial chunk edge a composite shard loads at, overriding "
-        "load_chunk_size. 1024 was rejected on 2026-08-22 because the rechunk "
-        "task held 4.32 GB and 16 of them ran at once, 69 GB on a 64 GiB VM; "
-        "that concurrency was the all-columns-resident ordering, which "
-        "shard_composite_per_column removes. With column-by-column order one to "
-        "two rechunks are in flight, and the larger read is the lever the #139 "
-        "traces point at: reads cost per request, not per byte (a qa_pixel window "
-        "costs what a ST_B10 window costs), and the same VM read 18 MB/s at 512 "
-        "against 33-42 MB/s at 1024 in results/probe/composite_rate_m6i4xl.json. "
-        "A 512-row band gives 512 x 1024 reads, twice the pixels of 512 x 512. "
+        "load_chunk_size. Stays at 512 for a correctness reason, not a memory "
+        "one. The 2026-08-22 memory rejection of 1024 (16 rechunks at 4.32 GB) "
+        "was the all-columns-resident ordering that shard_composite_per_column "
+        "removes, and the #139 traces make 1024 the read-rate lever (reads cost "
+        "per request, not per byte). But the read window is also the warp "
+        "window: rasterio's reproject uses GDAL's approximate transformer "
+        "(0.125 px tolerance) linearised per destination window, so the "
+        "nearest-neighbour source pick moves with the window. On 40 real "
+        "scenes a 512 x 1024 window changed 3,642 of 84M source pixels "
+        "(median 75 DN, max 1,254, 17 valid/nodata flips, one a QA cloud bit), "
+        "and the P95 moved by up to 1,681 DN where that pick was the only or "
+        "the 95th observation. An exact transformer makes every window "
+        "bit-identical but moves 0.17% of source picks against the shipped "
+        "product, and a read-once piecewise warp still leaves 9 tie pixels. "
+        "Changing this value changes pixels; it is a product decision. "
         "Applied by every shard process AND by the planner, so the plan digest "
         "-- which covers load_chunk_size -- agrees across all of them.",
     )
