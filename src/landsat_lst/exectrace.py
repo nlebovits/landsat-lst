@@ -615,7 +615,7 @@ class _ExecutionTrace:
         opens = np.asarray(
             [r["open_s"] for r in reads if r["open_s"] is not None], dtype=np.float64
         )
-        datas = np.asarray(
+        data_times = np.asarray(
             [r["read_s"] for r in reads if r["read_s"] is not None], dtype=np.float64
         )
         rss = [float(sample["rss_mb"]) for sample in host if sample.get("rss_mb") is not None]
@@ -650,7 +650,7 @@ class _ExecutionTrace:
             "read_split_recorded": int(opens.size),
             "read_duration_s": _quantiles(totals),
             "read_open_s": _quantiles(opens),
-            "read_data_s": _quantiles(datas),
+            "read_data_s": _quantiles(data_times),
             "peak_rss_mb": max(rss, default=None),
             "artifact_keys": dict(keys),
             "upload_started_at": upload_started_at,
