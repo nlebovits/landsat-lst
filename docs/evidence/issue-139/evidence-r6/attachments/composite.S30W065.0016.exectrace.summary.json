@@ -1,0 +1,218 @@
+{
+  "compute_started_at": 1788474638.5067277,
+  "compute_finished_at": 1788475991.6921422,
+  "wall_s": 1353.1854145526886,
+  "n_tasks": 29272,
+  "per_class": {
+    "read": {
+      "tasks": 17626,
+      "task_seconds": 18937.133483171463
+    },
+    "rechunk": {
+      "tasks": 6948,
+      "task_seconds": 286.59614992141724
+    },
+    "compute": {
+      "tasks": 4230,
+      "task_seconds": 1199.4296624660492
+    },
+    "store": {
+      "tasks": 234,
+      "task_seconds": 1.3861923217773438
+    },
+    "other": {
+      "tasks": 234,
+      "task_seconds": 66.76265716552734
+    }
+  },
+  "dask_num_workers": null,
+  "distinct_worker_threads": 16,
+  "host_sampler_mode": "process",
+  "host_sampler_error": null,
+  "host_interval_s": 1.0,
+  "host_samples": 1355,
+  "host_gap_max_s": 1.0029830932617188,
+  "host_gap_mean_s": 0.9993989370774307,
+  "host_gaps_over_2s": 0,
+  "n_reads_total": 25424,
+  "n_reads_recorded": 1271,
+  "read_sample_rule": "every 20th rio_read call",
+  "read_hook_status": "enabled",
+  "read_hook_error": null,
+  "read_split_recorded": 1271,
+  "read_duration_s": {
+    "n": 1271,
+    "p50": 0.6131906509399414,
+    "p95": 1.0707943439483643,
+    "p99": 1.6301396131515502,
+    "mean": 0.6514095513488626,
+    "max": 2.0613741874694824
+  },
+  "read_open_s": {
+    "n": 1271,
+    "p50": 0.11694002151489258,
+    "p95": 0.3042811155319214,
+    "p99": 0.42418308258056575,
+    "mean": 0.13016347356146477,
+    "max": 1.3928146362304688
+  },
+  "read_data_s": {
+    "n": 1271,
+    "p50": 0.48305702209472656,
+    "p95": 0.8516432046890259,
+    "p99": 1.399204635620116,
+    "mean": 0.5161716105148232,
+    "max": 1.6861841678619385
+  },
+  "peak_rss_mb": 14808.6484375,
+  "artifact_keys": {
+    "events": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.events.jsonl.gz",
+    "timeline": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.timeline.csv",
+    "summary": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.summary.json"
+  },
+  "upload_started_at": 1788475992.1069376,
+  "upload_finished_at": 1788475992.2305582,
+  "upload_errors": {},
+  "prefix_table": [
+    {
+      "id": 0,
+      "prefix": "open",
+      "class": "read",
+      "tasks": 13882,
+      "task_seconds": 356.1325306892395
+    },
+    {
+      "id": 1,
+      "prefix": "rechunk-split-rechunk-merge",
+      "class": "rechunk",
+      "tasks": 927,
+      "task_seconds": 23.306415796279907
+    },
+    {
+      "id": 2,
+      "prefix": "qa_pixel",
+      "class": "read",
+      "tasks": 1872,
+      "task_seconds": 8507.611205101013
+    },
+    {
+      "id": 3,
+      "prefix": "rechunk-merge",
+      "class": "rechunk",
+      "tasks": 945,
+      "task_seconds": 36.574281215667725
+    },
+    {
+      "id": 4,
+      "prefix": "lwir11",
+      "class": "read",
+      "tasks": 1872,
+      "task_seconds": 10073.38974738121
+    },
+    {
+      "id": 5,
+      "prefix": "where",
+      "class": "compute",
+      "tasks": 1872,
+      "task_seconds": 966.5524699687958
+    },
+    {
+      "id": 6,
+      "prefix": "shuffle-split",
+      "class": "rechunk",
+      "tasks": 3258,
+      "task_seconds": 107.57589101791382
+    },
+    {
+      "id": 7,
+      "prefix": "getitem",
+      "class": "rechunk",
+      "tasks": 1818,
+      "task_seconds": 119.13956189155579
+    },
+    {
+      "id": 8,
+      "prefix": "sub",
+      "class": "compute",
+      "tasks": 1818,
+      "task_seconds": 66.1531765460968
+    },
+    {
+      "id": 9,
+      "prefix": "invert",
+      "class": "compute",
+      "tasks": 18,
+      "task_seconds": 6.8056886196136475
+    },
+    {
+      "id": 10,
+      "prefix": "nanquantile_last-transpose",
+      "class": "compute",
+      "tasks": 18,
+      "task_seconds": 119.45247173309326
+    },
+    {
+      "id": 11,
+      "prefix": "getitem-sum-sum-aggregate-stack",
+      "class": "compute",
+      "tasks": 216,
+      "task_seconds": 28.700377464294434
+    },
+    {
+      "id": 12,
+      "prefix": "sum-sum-aggregate",
+      "class": "compute",
+      "tasks": 18,
+      "task_seconds": 7.229346036911011
+    },
+    {
+      "id": 13,
+      "prefix": "stack",
+      "class": "compute",
+      "tasks": 216,
+      "task_seconds": 2.420802593231201
+    },
+    {
+      "id": 14,
+      "prefix": "getitem-where-store-map",
+      "class": "other",
+      "tasks": 216,
+      "task_seconds": 66.75887656211853
+    },
+    {
+      "id": 15,
+      "prefix": "store-map",
+      "class": "store",
+      "tasks": 234,
+      "task_seconds": 1.3861923217773438
+    },
+    {
+      "id": 16,
+      "prefix": "sum-aggregate",
+      "class": "compute",
+      "tasks": 18,
+      "task_seconds": 0.09341907501220703
+    },
+    {
+      "id": 17,
+      "prefix": "finalize-hlgfinalizecompute",
+      "class": "other",
+      "tasks": 18,
+      "task_seconds": 0.0037806034088134766
+    },
+    {
+      "id": 18,
+      "prefix": "nanquantile_last_0",
+      "class": "compute",
+      "tasks": 18,
+      "task_seconds": 0.04432797431945801
+    },
+    {
+      "id": 19,
+      "prefix": "astype-getitem-store-map",
+      "class": "compute",
+      "tasks": 18,
+      "task_seconds": 1.9775824546813965
+    }
+  ]
+}

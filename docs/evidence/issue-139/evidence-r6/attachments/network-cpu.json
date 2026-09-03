@@ -1,0 +1,10 @@
+{
+  "sampled_wall_s": 1353.1861608028412,
+  "recv_total_mb": 12266.573818206787,
+  "send_total_mb": 277.03009510040283,
+  "recv_mean_mb_s": 9.06495659911942,
+  "send_mean_mb_s": 0.20472430410908263,
+  "cpu_core_seconds": 3709.81,
+  "mean_busy_cores": 2.74153705340807,
+  "mean_cpu_percent_of_16_vcpu": 17.134606583800437
+}

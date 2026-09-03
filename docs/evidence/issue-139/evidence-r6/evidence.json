@@ -1,0 +1,712 @@
+{
+  "attachments": [
+    {
+      "bytes": 5234,
+      "path": "attachments/composite.S30W065.0016.exectrace.summary.json",
+      "sha256": "68e7444492c8c0e2d3264313ef2e284a3e1571477cbab2bb2b1b7e7d250b7045"
+    },
+    {
+      "bytes": 1794,
+      "path": "attachments/submission.json",
+      "sha256": "375f973e1f25552ce59c80dd4a7ea5f406612b35c631215a914a990c790cc975"
+    },
+    {
+      "bytes": 323,
+      "path": "attachments/network-cpu.json",
+      "sha256": "d85e75f49915105b57e76c8ea7f36958eaf4733f72e0d36b853f70b393302996"
+    }
+  ],
+  "code": {
+    "dirty": true,
+    "package_version": "0.1.0",
+    "revision": "6fd98631e1671c7109df683c85d2bbbc7469d407"
+  },
+  "coiled_clusters": [
+    {
+      "billing_pages": [
+        {
+          "count": 1,
+          "next": null,
+          "page_size": 15,
+          "previous": null,
+          "results": [
+            {
+              "amount_credits": "-6.6312",
+              "cluster": "lst-7bc206f6-S30W065-compo-r1",
+              "cluster_id": 2002585,
+              "event_datetime": "2026-09-03T22:53:39.949138Z",
+              "id": 30203151,
+              "instance": "lst-7bc206f6-S30W065-compo-r1-scheduler-58e7db98f6-instance",
+              "kind": "instance",
+              "note": "add_instance_to_billing_table",
+              "user": 13318
+            }
+          ]
+        }
+      ],
+      "cluster_id": 2002585,
+      "coiled_spans": [],
+      "details": {
+        "created": "2026-09-03T22:28:06.014265+00:00",
+        "current_state": {
+          "reason": "No pending tasks for batch run",
+          "state": "stopped",
+          "updated": "2026-09-03T22:53:34.723643+00:00"
+        },
+        "id": 2002585,
+        "name": "lst-7bc206f6-S30W065-compo-r1",
+        "scheduler": {
+          "created": "2026-09-03T22:28:06.019423+00:00",
+          "current_state": {
+            "reason": "No pending tasks for batch run",
+            "state": "stopped",
+            "updated": "2026-09-03T22:53:43.474832+00:00"
+          },
+          "instance": {
+            "created": "2026-09-03T22:28:28.396912+00:00",
+            "current_state": {
+              "reason": "No pending tasks for batch run",
+              "state": "stopped",
+              "updated": "2026-09-03T22:53:45.147936+00:00"
+            },
+            "id": 33055382,
+            "name": "lst-7bc206f6-S30W065-compo-r1-scheduler-58e7db98f6-instance",
+            "private_ip_address": "10.0.7.183",
+            "public_ip_address": "35.93.114.207"
+          },
+          "name": "lst-7bc206f6-S30W065-compo-r1-scheduler-58e7db98f6"
+        },
+        "workers": []
+      },
+      "logs": {},
+      "metrics": {
+        "cpu": [],
+        "recv": []
+      },
+      "workspace": "nissim-lebovits"
+    }
+  ],
+  "collected_at": "2026-09-03T23:01:22.601205+00:00",
+  "contract": {
+    "baseline": {
+      "artifact": "139-v1exact1024-r5.result.json",
+      "classification": "measured",
+      "metric": "exporting_wall_s",
+      "unit": "seconds",
+      "value": 1842.7
+    },
+    "claim": "Replacing 18 per-column stac_load calls with one whole-band stac_load and sequential 2048px output computes restores composite-shard setup and exporting time while retaining exact-transform scientific output and bounding peak RSS on a 32 GiB worker.",
+    "code_identity_required": true,
+    "inputs": {
+      "baseline_revision": "6bab3c8e256d69e811465dda064fc5bbb63f9a7c",
+      "launch_command": "env -u LST_PROFILE_DASK -u LST_STAC_URL -u LST_DASK_MAX_THREADS AWS_PROFILE=radiant-earth LST_STORAGE_BACKEND=s3 LST_EXEC_TRACE=1 LST_GED_GAP_MASK=false LST_COILED_RETRIES=0 LST_SHARD_COMPOSITE_VM_TYPE=c6i.4xlarge LST_SHARD_COMPOSITE_PER_COLUMN=false LST_SHARD_COMPOSITE_CHUNK=1024 LST_WARP_EXACT_TRANSFORM=true uv run python /tmp/submit_bounded_exec_shard.py --run-id shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b --index 16 --offsets require-v2 --out results/issue-139/cloud-r6/submission.json",
+      "real_data": {
+        "identity": "Tile S30W065, window 2021-2025, the 4403 STAC items frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111683185 bytes) and plan.json (220702 bytes, digest 94bc658516d9fbb9, 35 bands), band 16 covering rows 8704:9216 of the 18000-row production geobox. Both objects are copied byte-for-byte within S3 to the fresh run root; the canonical merged-offset key is unchanged because its identity derives from the frozen plan.",
+        "kind": "real",
+        "known_differences": [
+          "The execution architecture differs from r5 only in loading once for the full band and explicitly computing/writing sequential 2048px longitude groups; exact reprojection, offset algorithm version 2, chunk 1024, masks, composite graph, encodings, and products are unchanged.",
+          "c6i.4xlarge replaces r5 m6i.4xlarge while retaining 32 GiB and 16 vCPU; CPU generation and price differ and are recorded.",
+          "The existing version-2 merged-offset record created by r5 is required and reused without overwrite, so r6b and r5 execute on identical scientific inputs. A normal production run would recompute version-2 offsets.",
+          "LST_GED_GAP_MASK=false reproduces the retained pre-mask workload. Production thread count is unset, execution tracing is enabled, Dask profiling is absent, Coiled retries are zero, and exactly one shard attempt is permitted."
+        ],
+        "production_relationship": "The complete production S30W065 band 16 workload on the production grid and Earth Search in us-west-2. The c6i.4xlarge worker has the intended 32 GiB RAM and 16 vCPU production economics. GED masking is disabled to match the retained r5 and original baseline workload."
+      },
+      "treatment_revision": "6fd98631e1671c7109df683c85d2bbbc7469d407",
+      "workload": "Band 16 of tile S30W065, window 2021-2025, replayed from the same frozen 4403-item plan used by r5: one complete 512 x 18000 production composite shard, exact reprojection, chunk 1024, one whole-band stac_load, and sequential 2048px execution groups."
+    },
+    "max_cloud_cost_usd": 1,
+    "max_coiled_credits": 20,
+    "measurement_plan": {
+      "aggregation": "single",
+      "baseline_repetitions": 1,
+      "metrics": [
+        "loading_wall_s",
+        "exporting_wall_s",
+        "peak_rss_mb",
+        "rio_read_calls",
+        "reads_per_item",
+        "network_recv_mb_s",
+        "cpu_utilization",
+        "observed_coiled_credits",
+        "observed_cloud_cost_usd",
+        "active_tasks_by_class",
+        "host_gap_max_s"
+      ],
+      "phases": [
+        "loading",
+        "exporting"
+      ],
+      "profiling": {
+        "artifact": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.timeline.csv",
+        "method": "landsat_lst.exectrace: Dask local-scheduler pretask/posttask callbacks bound submit-to-return intervals; a spawned child process samples the shard's CPU, RSS, and file descriptors and the host's network and disk counters once per second through psutil; every twentieth odc.loader._rio.rio_read records source URI, requested shape, thread, and three stamps (before open, at _do_read entry, after return). The pure timeline builder counts half-open active intervals with sorted starts and finishes.",
+        "observer_effect_control": "The same execution tracer used by r5 records task intervals and a child-process one-second host series. No Dask profiler is enabled. Trace serialization and upload occur after compute. The r5 comparator used the same observer, so overhead is held constant."
+      },
+      "raw_artifacts": [
+        "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.events.jsonl.gz",
+        "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.timeline.csv",
+        "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.summary.json",
+        "_shards/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/S30W065/state/composite.0016.1.json",
+        "_shards/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/S30W065/state/composite.0016.1.log",
+        "Coiled lifecycle, billing, CPU, memory, and network telemetry collected with landsat-lst evidence collect",
+        "_shards/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/S30W065/composite/lst_p95/band016.tif and qa_count/band016.tif, compared exactly against r5 band016 slabs"
+      ],
+      "target_environment": "production",
+      "treatment_repetitions": 1
+    },
+    "minimum_effect": {
+      "direction": "decrease",
+      "fraction": 0.2,
+      "reading": "Success requires exporting_wall_s <= 1474.2 s (at least 20% below r5 1842.7 s and approximately back to the retained 1372.2 s baseline), loading_wall_s <= 120 s rather than r5 884.6 s, peak_rss_mb <= 28672, no OOM, and exact output equivalence."
+    },
+    "notes": [
+      "The r5 measured comparator used 18 stac_load calls: loading 884.6 s, exporting 1842.7 s, peak RSS 9907.8 MB, and 25424 reads. The older single-load production path loaded in 53.2 s and exported in 1372.2 s.",
+      "Local full-cardinality graph construction at treatment revision made exactly one stac_load and took 31.75 s total; this is local setup evidence only, not production performance evidence.",
+      "Local real-shard exact output matched the established exact baseline for both products. Production equivalence is newly gated against r5 because both use exact reprojection and identical frozen offsets.",
+      "Cumulative prior issue-139 cost excludes this attempt. r5 cost 12.5023 credits and derived $0.6063. Expected cap here is 20 credits and $1.",
+      "The contract and temporary launch harness remain untracked during the run so the checkout stays exactly at treatment revision 6fd9863; they are preserved with the result afterward."
+    ],
+    "operator_note": "Explicitly approved in conversation on 2026-09-04: exactly one production validation shard for commit 6fd9863 on a 32 GiB, 16-vCPU c6i.4xlarge-class worker; retries disabled; fresh private prefix; no publication or overwrite.",
+    "output_equivalence": {
+      "acceptance_criterion": "Both products have identical shape and dtype and max_abs_diff == 0; passed must equal the conjunction of those checks.",
+      "method": "Read both r6 production band-16 TIFF pixel arrays and compare them against the retained r5 exact-transform, chunk-1024 band-16 arrays for lst_p95 and qa_count. Record per-product max_abs_diff and pixel hashes.",
+      "result_artifact": "139-bounded2048-r6-equivalence.json",
+      "tolerance": 0
+    },
+    "output_equivalence_required": true,
+    "production_discriminator": "Exactly one complete S30W065 band-16 composite shard attempt on one c6i.4xlarge in us-west-2, production thread pool, one full-band load at chunk 1024, sequential 2048px compute/write groups, frozen r5 inputs, private fresh prefix, no retries and no publication.",
+    "result_artifact": "139-bounded2048-r6.result.json",
+    "schema_version": 1,
+    "stop_rule": "Stop after this one attempt regardless of outcome. Proceed only if it completes without OOM, peak_rss_mb <= 28672, loading_wall_s <= 120, exporting_wall_s <= 1474.2, exact output equivalence passes, and required trace and billing artifacts exist. No retry, candidate change, or follow-up cloud run.",
+    "target_metric": "exporting_wall_s"
+  },
+  "contract_artifacts": {
+    "baseline_contract": {
+      "bytes": 2857,
+      "path": "contract-artifacts/baseline-contract.json",
+      "sha256": "494fe794c27d8cfff4464dc1fa98b88cebb274f94ddc087cbf4f75a191a80472"
+    },
+    "baseline_observation_1": {
+      "bytes": 2857,
+      "path": "contract-artifacts/baseline-observation-1.json",
+      "sha256": "494fe794c27d8cfff4464dc1fa98b88cebb274f94ddc087cbf4f75a191a80472"
+    },
+    "contract": {
+      "bytes": 8485,
+      "path": "contract-artifacts/contract.json",
+      "sha256": "00a22dd43b1355ea364f7f8cb0d116e85a0b87f712fb4b20b171714b5a760ae2"
+    },
+    "output_equivalence": {
+      "bytes": 2030,
+      "path": "contract-artifacts/output-equivalence.json",
+      "sha256": "eb004998d33da79569ede1bd48acab71383254fbad7e126b9f77c5fccb7ce3e9"
+    },
+    "profiling": {
+      "bytes": 172737,
+      "path": "contract-artifacts/profiling.csv",
+      "sha256": "65c638fce8158c46059686ec6cfc24f2c031a56601f4d9f2ff47ad70c4d0cd3b"
+    },
+    "result": {
+      "bytes": 3186,
+      "path": "contract-artifacts/decision.json",
+      "sha256": "7dd234cc56791608d7d9cc0d614f561c33667d4e67b3cdf54273bf96bbd422d0"
+    },
+    "treatment_observation_1": {
+      "bytes": 2742,
+      "path": "contract-artifacts/treatment-observation-1.json",
+      "sha256": "69ac5df5ad8619dd9f0637887740142e060a1f64409fca951a08f32ee19a95be"
+    }
+  },
+  "decision": {
+    "baseline_observations": [
+      {
+        "artifact": "139-v1exact1024-r5.result.json",
+        "metric": "exporting_wall_s",
+        "unit": "seconds",
+        "value": 1842.7
+      }
+    ],
+    "baseline_revision": "6bab3c8e256d69e811465dda064fc5bbb63f9a7c",
+    "contract_sha256": "00a22dd43b1355ea364f7f8cb0d116e85a0b87f712fb4b20b171714b5a760ae2",
+    "decision": "proceed",
+    "environment": "production",
+    "input_identity": "Tile S30W065, window 2021-2025, the 4403 STAC items frozen in _shards/shard-S30W065-2021-2025-20260823T102135Z/S30W065/items.json (111683185 bytes) and plan.json (220702 bytes, digest 94bc658516d9fbb9, 35 bands), band 16 covering rows 8704:9216 of the 18000-row production geobox. Both objects are copied byte-for-byte within S3 to the fresh run root; the canonical merged-offset key is unchanged because its identity derives from the frozen plan.",
+    "limitations": [
+      "This is one production band-shard observation on c6i.4xlarge. Exporting was 1354.2 s, 26.5% below r5 and 1.3% below the older 1372.2 s single-load baseline; it supports recovery to baseline-like speed, not a general throughput acceleration claim.",
+      "The run retained r5 read geometry and count: 25424 rio_read calls, 12.649 per intersecting item. Mean receive throughput was 9.065 MB/s over 12266.6 MB, and mean CPU was 2.74 busy cores (17.1% of 16 vCPU). There is no claim of a read-throughput fix; the gain is removing repeated setup while bounding memory.",
+      "Peak RSS was 14807.8 MiB (14.46 GiB), below the 28672 MiB gate. The heartbeat series repeatedly returned to roughly 3.2-5.9 GiB between group waves, consistent with previous groups being released.",
+      "Both full production pixel arrays exactly match r5: zero differing pixels and max_abs_diff 0 for lst_p95 and qa_count. Longitude pixel scale metadata differs by 3.8e-19 degrees, about 6.8e-15 degrees over the full width; all other compared metadata matches. The operator explicitly approved passing under the pre-registered shape/dtype/pixel criterion with this limitation retained.",
+      "The instance ran on-demand despite requested spot policy. 6.6312 credits are the direct Coiled billing debit. $0.288756 is derived from the 1528.709 s cluster lifecycle at a $0.68/hour c6i.4xlarge on-demand rate and is not an AWS invoice.",
+      "An initial proposed r6 prefix received copied plan/items but no cloud launch after the submitter refused to overwrite an existing v2 offset record. The only cluster launched was r6b, cluster 2002585, one attempt with retries disabled."
+    ],
+    "minimum_effect_met": true,
+    "observed_cloud_cost_usd": 0.28875621584444444,
+    "observed_coiled_credits": 6.6312,
+    "observed_effect_fraction": 0.26510012481684486,
+    "output_equivalence_passed": true,
+    "profiling_artifact": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.timeline.csv",
+    "schema_version": 1,
+    "treatment_observations": [
+      {
+        "artifact": "issue-139/cloud-r6/raw/state/composite.0016.1.json",
+        "metric": "exporting_wall_s",
+        "unit": "seconds",
+        "value": 1354.2
+      }
+    ],
+    "treatment_revision": "6fd98631e1671c7109df683c85d2bbbc7469d407"
+  },
+  "evidence_classes": {
+    "assumed": "not observed",
+    "derived": "calculated from retained measured inputs",
+    "measured": "directly observed and retained here",
+    "unknown": "not presently knowable from retained evidence",
+    "user_reported": "reported externally, not independently retained"
+  },
+  "run_artifacts": [
+    {
+      "bytes": 2741,
+      "content": {
+        "attempt": 1,
+        "code_identity": {
+          "package_version": "0.1.0",
+          "progress_module_sha256": "5acc38c3cc8aec9c9d414e003e50c187c8938848cae91618b3e6bc5f45db4ecd",
+          "revision": "6fd98631e1671c7109df683c85d2bbbc7469d407"
+        },
+        "duration_s": null,
+        "elapsed_s": 1425.0,
+        "end_year": 2025,
+        "error": null,
+        "graph_seq": 0,
+        "graph_state": "idle",
+        "host": "ip-10-0-7-183",
+        "instance_lifecycle": "on-demand",
+        "instance_source": "imds",
+        "instance_type": "c6i.4xlarge",
+        "lst_key": null,
+        "max_scenes": null,
+        "peak_rss_mb": 14807.83984375,
+        "phase": "done",
+        "phase_seconds": {
+          "composite_graph": 0.1,
+          "destriping": 0.1,
+          "done": 0.0,
+          "exporting": 1354.2,
+          "land_mask": 12.3,
+          "loading": 50.5,
+          "shard_composite": 7.0,
+          "shard_offsets_wait": 0.1,
+          "starting": 0.1,
+          "uploading": 0.7
+        },
+        "pid": 1147,
+        "qa_key": null,
+        "rss_mb": 3843.87109375,
+        "rss_series": [
+          [
+            0.0,
+            194.203125
+          ],
+          [
+            0.1,
+            194.265625
+          ],
+          [
+            7.1,
+            798.5859375
+          ],
+          [
+            7.2,
+            799.04296875
+          ],
+          [
+            57.7,
+            830.9453125
+          ],
+          [
+            60.1,
+            1485.48828125
+          ],
+          [
+            70.0,
+            1704.5078125
+          ],
+          [
+            70.1,
+            1708.6640625
+          ],
+          [
+            70.2,
+            1711.00390625
+          ],
+          [
+            120.2,
+            3242.52734375
+          ],
+          [
+            180.9,
+            4756.74609375
+          ],
+          [
+            241.8,
+            3236.6484375
+          ],
+          [
+            302.4,
+            4505.74609375
+          ],
+          [
+            362.6,
+            3432.5703125
+          ],
+          [
+            423.1,
+            3894.2890625
+          ],
+          [
+            483.3,
+            5573.4921875
+          ],
+          [
+            543.9,
+            3907.671875
+          ],
+          [
+            604.3,
+            5228.421875
+          ],
+          [
+            666.2,
+            3599.7421875
+          ],
+          [
+            726.8,
+            4292.77734375
+          ],
+          [
+            787.5,
+            5857.8203125
+          ],
+          [
+            847.9,
+            3736.89453125
+          ],
+          [
+            908.3,
+            4832.20703125
+          ],
+          [
+            969.9,
+            3864.6953125
+          ],
+          [
+            1030.7,
+            4145.984375
+          ],
+          [
+            1091.8,
+            4102.97265625
+          ],
+          [
+            1152.7,
+            3689.2109375
+          ],
+          [
+            1213.3,
+            4207.3671875
+          ],
+          [
+            1273.8,
+            6972.92578125
+          ],
+          [
+            1333.9,
+            3875.12890625
+          ],
+          [
+            1394.5,
+            4601.86328125
+          ],
+          [
+            1424.3,
+            3819.546875
+          ],
+          [
+            1425.0,
+            3843.87109375
+          ]
+        ],
+        "run_id": "shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b",
+        "scene_count": null,
+        "scenes_found": 4403,
+        "scenes_kept": 912,
+        "schema": 2,
+        "status": null,
+        "tasks_done": null,
+        "tasks_total": null,
+        "tile": "S30W065",
+        "updated_at": "2026-09-03T22:53:12.929614+00:00",
+        "window": "2021-2025",
+        "year": 2021
+      },
+      "key": "_shards/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/S30W065/state/composite.0016.1.json",
+      "modified": "2026-09-03T22:53:13+00:00",
+      "sha256": "a953c52468af9e65af805cd14b0b517e9985664d446351136a1a54e2e03974df"
+    },
+    {
+      "bytes": 2653,
+      "key": "_shards/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/S30W065/state/composite.0016.1.log",
+      "modified": "2026-09-03T22:53:19+00:00",
+      "sha256": "9b486bd98e5ee0e3048ee33f01eec01ca54ebfd9cd3aa599b4d62d9a992e880a"
+    },
+    {
+      "bytes": 492900,
+      "content_encoding": "base64",
+      "key": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.events.jsonl.gz",
+      "modified": "2026-09-03T22:53:13+00:00",
+      "sha256": "9bebeb44fe82426b08cc0d7b6cc7838118130b46375a5a1aaa5e8be97d691772"
+    },
+    {
+      "bytes": 5234,
+      "content": {
+        "artifact_keys": {
+          "events": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.events.jsonl.gz",
+          "summary": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.summary.json",
+          "timeline": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.timeline.csv"
+        },
+        "compute_finished_at": 1788475991.6921422,
+        "compute_started_at": 1788474638.5067277,
+        "dask_num_workers": null,
+        "distinct_worker_threads": 16,
+        "host_gap_max_s": 1.0029830932617188,
+        "host_gap_mean_s": 0.9993989370774307,
+        "host_gaps_over_2s": 0,
+        "host_interval_s": 1.0,
+        "host_sampler_error": null,
+        "host_sampler_mode": "process",
+        "host_samples": 1355,
+        "n_reads_recorded": 1271,
+        "n_reads_total": 25424,
+        "n_tasks": 29272,
+        "peak_rss_mb": 14808.6484375,
+        "per_class": {
+          "compute": {
+            "task_seconds": 1199.4296624660492,
+            "tasks": 4230
+          },
+          "other": {
+            "task_seconds": 66.76265716552734,
+            "tasks": 234
+          },
+          "read": {
+            "task_seconds": 18937.133483171463,
+            "tasks": 17626
+          },
+          "rechunk": {
+            "task_seconds": 286.59614992141724,
+            "tasks": 6948
+          },
+          "store": {
+            "task_seconds": 1.3861923217773438,
+            "tasks": 234
+          }
+        },
+        "prefix_table": [
+          {
+            "class": "read",
+            "id": 0,
+            "prefix": "open",
+            "task_seconds": 356.1325306892395,
+            "tasks": 13882
+          },
+          {
+            "class": "rechunk",
+            "id": 1,
+            "prefix": "rechunk-split-rechunk-merge",
+            "task_seconds": 23.306415796279907,
+            "tasks": 927
+          },
+          {
+            "class": "read",
+            "id": 2,
+            "prefix": "qa_pixel",
+            "task_seconds": 8507.611205101013,
+            "tasks": 1872
+          },
+          {
+            "class": "rechunk",
+            "id": 3,
+            "prefix": "rechunk-merge",
+            "task_seconds": 36.574281215667725,
+            "tasks": 945
+          },
+          {
+            "class": "read",
+            "id": 4,
+            "prefix": "lwir11",
+            "task_seconds": 10073.38974738121,
+            "tasks": 1872
+          },
+          {
+            "class": "compute",
+            "id": 5,
+            "prefix": "where",
+            "task_seconds": 966.5524699687958,
+            "tasks": 1872
+          },
+          {
+            "class": "rechunk",
+            "id": 6,
+            "prefix": "shuffle-split",
+            "task_seconds": 107.57589101791382,
+            "tasks": 3258
+          },
+          {
+            "class": "rechunk",
+            "id": 7,
+            "prefix": "getitem",
+            "task_seconds": 119.13956189155579,
+            "tasks": 1818
+          },
+          {
+            "class": "compute",
+            "id": 8,
+            "prefix": "sub",
+            "task_seconds": 66.1531765460968,
+            "tasks": 1818
+          },
+          {
+            "class": "compute",
+            "id": 9,
+            "prefix": "invert",
+            "task_seconds": 6.8056886196136475,
+            "tasks": 18
+          },
+          {
+            "class": "compute",
+            "id": 10,
+            "prefix": "nanquantile_last-transpose",
+            "task_seconds": 119.45247173309326,
+            "tasks": 18
+          },
+          {
+            "class": "compute",
+            "id": 11,
+            "prefix": "getitem-sum-sum-aggregate-stack",
+            "task_seconds": 28.700377464294434,
+            "tasks": 216
+          },
+          {
+            "class": "compute",
+            "id": 12,
+            "prefix": "sum-sum-aggregate",
+            "task_seconds": 7.229346036911011,
+            "tasks": 18
+          },
+          {
+            "class": "compute",
+            "id": 13,
+            "prefix": "stack",
+            "task_seconds": 2.420802593231201,
+            "tasks": 216
+          },
+          {
+            "class": "other",
+            "id": 14,
+            "prefix": "getitem-where-store-map",
+            "task_seconds": 66.75887656211853,
+            "tasks": 216
+          },
+          {
+            "class": "store",
+            "id": 15,
+            "prefix": "store-map",
+            "task_seconds": 1.3861923217773438,
+            "tasks": 234
+          },
+          {
+            "class": "compute",
+            "id": 16,
+            "prefix": "sum-aggregate",
+            "task_seconds": 0.09341907501220703,
+            "tasks": 18
+          },
+          {
+            "class": "other",
+            "id": 17,
+            "prefix": "finalize-hlgfinalizecompute",
+            "task_seconds": 0.0037806034088134766,
+            "tasks": 18
+          },
+          {
+            "class": "compute",
+            "id": 18,
+            "prefix": "nanquantile_last_0",
+            "task_seconds": 0.04432797431945801,
+            "tasks": 18
+          },
+          {
+            "class": "compute",
+            "id": 19,
+            "prefix": "astype-getitem-store-map",
+            "task_seconds": 1.9775824546813965,
+            "tasks": 18
+          }
+        ],
+        "read_data_s": {
+          "max": 1.6861841678619385,
+          "mean": 0.5161716105148232,
+          "n": 1271,
+          "p50": 0.48305702209472656,
+          "p95": 0.8516432046890259,
+          "p99": 1.399204635620116
+        },
+        "read_duration_s": {
+          "max": 2.0613741874694824,
+          "mean": 0.6514095513488626,
+          "n": 1271,
+          "p50": 0.6131906509399414,
+          "p95": 1.0707943439483643,
+          "p99": 1.6301396131515502
+        },
+        "read_hook_error": null,
+        "read_hook_status": "enabled",
+        "read_open_s": {
+          "max": 1.3928146362304688,
+          "mean": 0.13016347356146477,
+          "n": 1271,
+          "p50": 0.11694002151489258,
+          "p95": 0.3042811155319214,
+          "p99": 0.42418308258056575
+        },
+        "read_sample_rule": "every 20th rio_read call",
+        "read_split_recorded": 1271,
+        "upload_errors": {},
+        "upload_finished_at": 1788475992.2305582,
+        "upload_started_at": 1788475992.1069376,
+        "wall_s": 1353.1854145526886
+      },
+      "key": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.summary.json",
+      "modified": "2026-09-03T22:53:13+00:00",
+      "sha256": "68e7444492c8c0e2d3264313ef2e284a3e1571477cbab2bb2b1b7e7d250b7045"
+    },
+    {
+      "bytes": 172737,
+      "key": "_shards/timings/shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b/composite.S30W065.0016.exectrace.timeline.csv",
+      "modified": "2026-09-03T22:53:13+00:00",
+      "sha256": "65c638fce8158c46059686ec6cfc24f2c031a56601f4d9f2ff47ad70c4d0cd3b"
+    }
+  ],
+  "run_id": "shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b",
+  "schema_version": 1,
+  "worker_code_verification": {
+    "expected_revision": "6fd98631e1671c7109df683c85d2bbbc7469d407",
+    "identities": [
+      {
+        "package_version": "0.1.0",
+        "progress_module_sha256": "5acc38c3cc8aec9c9d414e003e50c187c8938848cae91618b3e6bc5f45db4ecd",
+        "revision": "6fd98631e1671c7109df683c85d2bbbc7469d407"
+      }
+    ],
+    "status": "verified"
+  }
+}

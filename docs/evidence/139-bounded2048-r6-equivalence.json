@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "baseline_run_id": "shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5",
+  "treatment_run_id": "shard-S30W065-2021-2025-20260903T223000Z-bounded2048-r6b",
+  "method": "Rasterio pixel-array comparison of retained exact-transform production band 16 slabs",
+  "tolerance": 0,
+  "products": {
+    "lst_p95": {
+      "shape": [
+        1,
+        512,
+        18000
+      ],
+      "dtype": "uint16",
+      "baseline_pixel_sha256": "7e2df051c1873730d28d6e624d9b47c428b021fc8b9b4e1775bc3136dcc2d057",
+      "treatment_pixel_sha256": "7e2df051c1873730d28d6e624d9b47c428b021fc8b9b4e1775bc3136dcc2d057",
+      "metadata_equal": false,
+      "differing_pixels": 0,
+      "max_abs_diff": 0,
+      "passed": true,
+      "metadata_difference": "Only longitude pixel scale differs by 3.8e-19 degrees (r5 0.0002777777777777783; r6b 0.00027777777777777794); extent delta across 18000 pixels is about 6.8e-15 degrees. CRS, origin, y scale, shape, dtype, nodata, tags, and every pixel are equal."
+    },
+    "qa_count": {
+      "shape": [
+        12,
+        512,
+        18000
+      ],
+      "dtype": "uint8",
+      "baseline_pixel_sha256": "233bcff2452950e10fef23bb6d07c725190ffa5312f2340287e14072ead65385",
+      "treatment_pixel_sha256": "233bcff2452950e10fef23bb6d07c725190ffa5312f2340287e14072ead65385",
+      "metadata_equal": false,
+      "differing_pixels": 0,
+      "max_abs_diff": 0,
+      "passed": true,
+      "metadata_difference": "Only longitude pixel scale differs by 3.8e-19 degrees (r5 0.0002777777777777783; r6b 0.00027777777777777794); extent delta across 18000 pixels is about 6.8e-15 degrees. CRS, origin, y scale, shape, dtype, nodata, tags, and every pixel are equal."
+    }
+  },
+  "passed": true,
+  "note": "Per the pre-registered acceptance criterion, equivalence gates identical shape, dtype, and pixels. metadata_equal is retained descriptively and does not gate passed. The operator explicitly approved this interpretation after disclosure of the metadata delta.",
+  "max_abs_diff": 0
+}
