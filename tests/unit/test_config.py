@@ -67,6 +67,18 @@ class TestSettings:
         settings = Settings()
         assert settings.destripe_max_offset_c == 8.5
 
+    def test_composite_group_chunks_default_and_env_override(self, monkeypatch):
+        settings = Settings()
+        assert settings.shard_composite_group_chunks == 2
+
+        monkeypatch.setenv("LST_SHARD_COMPOSITE_GROUP_CHUNKS", "6")
+        settings = Settings()
+        assert settings.shard_composite_group_chunks == 6
+
+    def test_composite_group_chunks_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            Settings(shard_composite_group_chunks=0)
+
     def test_legacy_credit_quota_does_not_break_an_existing_dotenv(self, tmp_path):
         """The removed setting is tolerated for migration, but never trusted."""
         env_file = tmp_path / ".env"

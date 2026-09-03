@@ -523,6 +523,11 @@ class Settings(BaseSettings):
         "Applied by every shard process AND by the planner, so the plan digest "
         "-- which covers load_chunk_size -- agrees across all of them.",
     )
+    shard_composite_group_chunks: int = Field(
+        default=2,
+        ge=1,
+        description="Number of longitude chunks exposed to each bounded composite compute.",
+    )
     shard_export_disk_gb: int = Field(
         default=100,
         ge=1,

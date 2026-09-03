@@ -1076,7 +1076,7 @@ def run_composite_shard(
         ):
             write_intermediates_bounded(
                 [(p.da, path) for p, path in zip(products, paths.values(), strict=True)],
-                longitude_group=2 * settings.load_chunk_size,
+                longitude_group=settings.shard_composite_group_chunks * settings.load_chunk_size,
             )
         report_phase("uploading")
         for product, path in paths.items():
