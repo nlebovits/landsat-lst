@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "claim": "A measurable request-shape defect explains at least half of the 0.691 s per distinct item a composite band spends in its exporting phase. The candidates are serialized first-touch latency, repeated header or range fetches, and reads that do not overlap across source files. This contract governs a measurement, not an optimization: the only code change is the read-trace recorder, and nothing about the read path is altered.",
+  "inputs": {
+    "workload": "Band 16 of tile S30W065, window 2021-2025, replayed from the plan and frozen item list of run shard-S30W065-2021-2025-20260823T102135Z. One composite shard, 2010 distinct Landsat items, 40596 rasterio opens, 4403 items in the plan and 912 solar days kept. Band 16 carries the highest distinct-item count among the comparable 512-row bands, so it is the band the per-item cost is largest on.",
+    "launch_command": "uv run python -c \"from landsat_lst.batch import submit_shard_stage; print(submit_shard_stage(stage='composite', run_id='shard-S30W065-2021-2025-readtrace-135', tile='S30W065', indexes=[16]))\"",
+    "baseline_revision": "32afd4b2e2aaaaa16065ed39aa05dd1c83ec6cb7",
+    "treatment_revision": "bfe34461ce6a1d49213a253c9ec1e2be37a09895",
+    "real_data": {
+      "kind": "real",
+      "identity": "Tile S30W065, window 2021-2025, the 4403 STAC items frozen in items.json of run shard-S30W065-2021-2025-20260823T102135Z, band 16 covering rows 8192 to 8704 of the tile's 18000-row geobox. The plan and item list are copied byte for byte to a new run root; the offsets record is keyed by tile, window, factor and plan digest, so the replay reads back the same estimate.",
+      "production_relationship": "This is a production band of a production tile, on the production grid, reading the production catalog from the production endpoint on the production VM type. It is one band of an acceptance run that shipped, replayed unchanged.",
+      "known_differences": [
+        "The run stops after the 90-second capture window instead of completing the band, so it produces a request log rather than a pair of slabs.",
+        "CPL_DEBUG is on, so GDAL emits one debug message per remote request and rasterio's error handler takes the GIL once per message. Wall clock under trace is therefore not comparable to the 1372.2 s baseline, and no wall-clock claim is made from this run.",
+        "The output keys differ from the retained run's, because identical keys would trip the shard's idempotency skip and the band would never read.",
+        "The retained baseline ran on a spot m6i.4xlarge; a replay may land on demand or on the configured fallback type, which changes cost but not request shape."
+      ]
+    }
+  },
+  "baseline": {
+    "metric": "seconds_per_distinct_item",
+    "value": 0.691,
+    "unit": "seconds per distinct item",
+    "classification": "measured",
+    "artifact": "135-band-baseline.json"
+  },
+  "target_metric": "seconds_per_distinct_item",
+  "measurement_plan": {
+    "target_environment": "production",
+    "phases": [
+      "exporting"
+    ],
+    "metrics": [
+      "seconds_per_distinct_item",
+      "requests_before_first_data",
+      "seconds_before_first_data",
+      "distinct_files_in_flight",
+      "refetched_requests",
+      "refetched_bytes"
+    ],
+    "raw_artifacts": [
+      "_shards/timings/{run_id}/composite.S30W065.0016.readtrace.jsonl.gz, one JSON line per remote request carrying its timestamp, thread, kind, file and byte span",
+      "_shards/timings/{run_id}/composite.S30W065.0016.readtrace.summary.json, the parsed summary, rebuildable from the raw log by scripts/summarize_read_trace.py",
+      "_shards/{run_id}/S30W065/state/composite.0016.1.json, the shard's own heartbeat and phase seconds",
+      "_shards/{run_id}/S30W065/logs/composite.0016.1.log, the shard's stdout and stderr"
+    ],
+    "profiling": {
+      "method": "GDAL request-level accounting. CPL_DEBUG=ON makes GDAL emit one debug message per remote request; rasterio routes CE_Debug to the rasterio._env logger, so landsat_lst.readtrace records each as a Python LogRecord with its timestamp, thread and raw text. Per-thread ordering bounds each request's duration, which yields concurrency without pairing heuristics.",
+      "artifact": "_shards/timings/{run_id}/composite.S30W065.0016.readtrace.summary.json",
+      "observer_effect_control": "The overhead is one GIL acquisition per GDAL debug message and is not held equal against any untraced arm, because there is no untraced arm: this run measures request counts, ordering and byte spans, never wall clock. The summary carries that caveat in its own payload, and the record count and requests-per-second are reported so the overhead can be judged rather than assumed. Recording is capped at 500000 records and the window is bounded to 90 seconds."
+    },
+    "baseline_repetitions": 1,
+    "treatment_repetitions": 1,
+    "aggregation": "single"
+  },
+  "minimum_effect": {
+    "direction": "decrease",
+    "fraction": 0.5,
+    "reading": "Not an improvement threshold, because this run changes no behaviour and improves nothing. It is the discriminator threshold: a mechanism the trace exposes must plausibly account for at least half of the 0.691 s per item, or 0.35 s, before it becomes a candidate worth an optimization ticket. Below that the ticket closes as measurement only."
+  },
+  "production_discriminator": "One composite shard, band 16 of tile S30W065, on one production VM with the trace on and a 90-second capture window. It answers all four of #135's questions from a single short run: how many round trips a first touch of a Landsat COG costs, how much requests to different source files overlap, whether any header range or size probe is fetched twice, and whether ReadMultiRange runs at all beside the effective GDAL_HTTP_VERSION that decides if multiplexing is even available.",
+  "stop_rule": "Close #135 with a findings document and no candidate if the trace shows first touch costing one size probe plus one header range plus one data range, zero repeated ranges, at most one size probe per file, and a median distinct-files-in-flight at or above the worker thread count. Close it the same way if a mechanism appears but cannot account for 0.35 s per item. Proceed to an optimization ticket only if one named, measured operation clears that bar.",
+  "result_artifact": "docs/evidence/135-read-trace-result.json",
+  "max_cloud_cost_usd": 1,
+  "max_coiled_credits": 20,
+  "code_identity_required": true,
+  "output_equivalence_required": true,
+  "output_equivalence": {
+    "method": "Static, not empirical. The run writes no product, so there is no output pair to difference. Equivalence is established by construction and checked in tests/unit/test_readtrace.py: the recorder attaches a logging handler and sets CPL_DEBUG, and touches no array, no mask, no item list, no chunk geometry and no source pass count. With settings.read_trace off the recorder installs nothing and leaves the environment untouched, which is the shipped default. max_abs_diff is 0 because the decoded data is produced by the same code either way.",
+    "acceptance_criterion": "max_abs_diff == 0, since no pipeline code differs between the two revisions outside the recorder, and the recorder alters no decoded value.",
+    "tolerance": 0,
+    "result_artifact": "docs/evidence/135-read-trace-equivalence.json"
+  },
+  "notes": [
+    "The treatment revision is the instrumentation commit. This contract lands in a later commit that adds no code, so the code that runs is the code this revision names.",
+    "The baseline artifact is committed because the #129 probe it derives from is gitignored and exists on one machine. It records the band-23 exclusion and the fit including that outlier, which moves the slope to 0.662.",
+    "The replay run id must not be the retained run id. The retained run's band 16 slabs are still in the bucket, and the shard's idempotency check would return before reading a byte."
+  ],
+  "operator_note": "This contract constrains a run; it does not authorize one."
+}
