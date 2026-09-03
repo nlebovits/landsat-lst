@@ -206,6 +206,41 @@ Rules worth keeping:
 
 ---
 
+## The composite shard is read-rate bound, and `LST_EXEC_TRACE` is how we know
+
+`LST_EXEC_TRACE=1` wraps a composite shard's `dask.compute` in
+`landsat_lst.exectrace` and publishes three objects under
+`_shards/timings/{run_id}/composite.{tile}.{index:04d}.exectrace.*`: raw events
+(host samples, one record per dask task, every 20th `rio_read` with its open and
+read split), a 1 Hz `timeline.csv` of active tasks by class beside CPU, network,
+disk, fds, and RSS, and a `summary.json`. Read the table before proposing anything
+about the read path. See [findings](docs/findings-composite-exec-trace.md) and #139.
+
+- **Aggregate read rate is fixed near 10 MB/s and does not follow thread count.**
+  S30W065 band 16 at 16 threads: 15 reads in flight, p50 0.38 s per read, 9.5 MB/s.
+  At 32 threads on the same VM: 30 in flight, p50 0.76 s, 9.6 MB/s, same wall clock.
+  CPU sat at 1.15 cores in both. Do not raise the thread count to go faster, and do
+  not spend a cloud run on any lever that leaves reads-per-second alone. Opens are
+  not the cost: 0.08 s of a 0.76 s read; the data transfer is.
+- **Per-item cost is 24 reads per item at that fixed rate**, plus 2 `open` tasks.
+  48,358 reads over 2,010 items in 1,505 s.
+- **RSS climbs while reads retire and no reduction runs**, then peaks in the final
+  reduction wave with zero reads active (42.7 GB at 32 threads, 38.9 GB at 16).
+- **Exact reprojection is the v1 scientific contract (`settings.warp_exact_transform`, default on).**
+  rasterio's default approximate transformer (0.125 px, linearised per destination window)
+  made the nearest-neighbour source pick depend on the read window: a 512 x 1024 window
+  moved 3,642 of 84M source pixels and the P95 by up to 1,681 DN. Under exact, 512 and 1024
+  are pixel-identical through the shard path (`docs/evidence/issue-139/exact-baseline-local`),
+  which is what lets `shard_composite_chunk` sit at 1024 and per-column loading bound memory.
+  Against the approximate product exact moves 4.4% of P95 pixels, 97% by under 1 C, so
+  `offsets.ALGORITHM_VERSION` is 2 and no pre-v1 record, plan, or product is comparable. The
+  one seam is a wrapper on `rasterio.warp.reproject` installed by `pipeline._install_warp_tolerance`;
+  an explicit caller tolerance is kept. Never compare a v1 tile to a pre-v1 tile pixel for pixel.
+- **The host sampler runs in a child process.** An in-thread sampler held 1.61 s
+  against a 1.0 s target while waiting for the GIL behind the worker threads. Never
+  move it back into the shard's process. `LST_DASK_MAX_THREADS` reaches a composite
+  shard through `job._thread_cap` at the seam; unset keeps dask's CPU-count pool.
+
 ## Price a configuration before you run it
 
 Never submit a run to learn a number that follows from array shape and chunking. Task count
