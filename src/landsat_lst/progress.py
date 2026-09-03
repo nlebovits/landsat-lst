@@ -29,6 +29,8 @@ becomes a reason a tile fails.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import json
 import os
 import socket
@@ -40,6 +42,7 @@ import traceback
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -48,7 +51,7 @@ import structlog
 from landsat_lst.config import settings
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from landsat_lst.job import JobResult
     from landsat_lst.models import ProcessingJob
@@ -117,6 +120,24 @@ _PUMP_JOIN_TIMEOUT_S = 5.0
 _active: ContextVar[TileHeartbeat | None] = ContextVar("landsat_lst_heartbeat", default=None)
 
 
+@lru_cache(maxsize=1)
+def worker_code_identity() -> dict[str, str | None]:
+    """Code identity observed inside this process, not on the submitting host."""
+    try:
+        package_version = importlib.metadata.version("landsat-lst")
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+        package_version = None
+    try:
+        module_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:  # pragma: no cover - observability remains best effort
+        module_sha256 = None
+    return {
+        "revision": os.environ.get("LST_CODE_REVISION"),
+        "package_version": package_version,
+        "progress_module_sha256": module_sha256,
+    }
+
+
 def peak_rss_mb() -> float | None:
     """Peak resident set size of this process in MiB, if measurable.
 
@@ -173,6 +194,7 @@ class TileHeartbeat:
         interval_s: float | None = None,
         key: str | None = None,
         pointer_key: str | None = None,
+        profile_key: Callable[[str], str] | None = None,
     ) -> None:
         self.run_id = run_id
         self.job = job
@@ -192,6 +214,10 @@ class TileHeartbeat:
         default_pointer = None if key is not None else storage.run_record_key(run_id, self.tile)
         self.key = key if key is not None else storage.run_record_key(run_id, self.tile, attempt)
         self.pointer_key = pointer_key if pointer_key is not None else default_pointer
+        # A shard overrides its state key to stay under ``_shards/``. Its
+        # profile must use the same grammar rather than falling back to a
+        # whole-tile key under ``_runs/``.
+        self._profile_key = profile_key
 
         # The tile's outcome, folded in by :meth:`set_result` and published by
         # the terminal beat. Holding it here rather than writing it to a second
@@ -229,6 +255,16 @@ class TileHeartbeat:
         # the per-beat reading alone was not enough.
         self._rss_series: list[tuple[float, float | None]] = []
 
+    def profile_key_for(self, label: str) -> str:
+        """Return the profile key for this heartbeat's artifact grammar."""
+        if self._profile_key is not None:
+            return self._profile_key(label)
+        return self.storage.profile_key(self.run_id, self.tile, label, self.attempt)
+
+    def code_identity(self) -> dict[str, str | None]:
+        """Return code identity measured by this worker process."""
+        return worker_code_identity()
+
     def _identity(self) -> dict[str, Any]:
         """The fields that never change for the life of this attempt."""
         from landsat_lst.instance import instance_identity  # noqa: PLC0415
@@ -242,6 +278,7 @@ class TileHeartbeat:
             "instance_type": machine.instance_type,
             "instance_lifecycle": machine.lifecycle.value,
             "instance_source": machine.source,
+            "code_identity": self.code_identity(),
             "schema": SCHEMA_VERSION,
             "run_id": self.run_id,
             "tile": self.tile,

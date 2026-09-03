@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from landsat_lst import shards
 from landsat_lst.config import settings
 from landsat_lst.models import ProcessingJob
 from landsat_lst.normalization import offset_graph
@@ -613,3 +614,28 @@ def test_profile_compute_propagates_the_bodys_own_exception(profiling_on):
     # The partial profile is still written, which is the point of dumping in a
     # finally: a tile that died is exactly the one worth profiling.
     assert (profiling_on / "runs" / "profiles" / "failing.profile.json").exists()
+
+
+def test_profile_compute_uses_shard_heartbeat_destination(profiling_on):
+    """Shard profiles never leak into ``_runs/`` or affect tile attempts."""
+    storage = LocalStorage(output_dir=profiling_on / "cogs")
+    job = ProcessingJob(tile=parse_tile_name(TILE), year=2021, end_year=2025)
+    root = shards.shard_root("run-1", TILE)
+    expected = shards.shard_profile_key(root, "composite", 3, 2, "composite")
+    with (
+        TileHeartbeat(
+            run_id="run-1",
+            job=job,
+            storage=storage,
+            attempt=2,
+            interval_s=3600,
+            key=shards.shard_state_key(root, "composite", 3, 2),
+            profile_key=lambda label: shards.shard_profile_key(root, "composite", 3, 2, label),
+        ),
+        profile_compute("composite"),
+    ):
+        _small_compute()
+
+    payload = json.loads(storage.read_text(expected))
+    assert payload["label"] == "composite"
+    assert storage.list_prefix(storage.run_prefix("run-1")) == {}

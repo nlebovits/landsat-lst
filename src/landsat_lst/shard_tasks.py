@@ -62,6 +62,7 @@ from landsat_lst.offsets import (
     merge_scene_partials,
     partial_payload,
 )
+from landsat_lst.profiling import PROFILE_COMPOSITE, profile_compute
 from landsat_lst.progress import TileHeartbeat, capture_task_log, report_phase, timed_section
 from landsat_lst.qa import apply_qa_mask, convert_to_celsius
 from landsat_lst.storage import PRODUCTS, get_storage
@@ -1012,7 +1013,10 @@ def run_composite_shard(
             lst_product(native, paths["lst_p95"]),
             qa_product(native, paths["qa_count"]),
         ]
-        with timed_section("exporting", scenes_found=len(ctx.items)):
+        with (
+            timed_section("exporting", scenes_found=len(ctx.items)),
+            profile_compute(PROFILE_COMPOSITE),
+        ):
             write_intermediates(
                 [(p.da, path) for p, path in zip(products, paths.values(), strict=True)]
             )
@@ -1281,6 +1285,9 @@ def run_shard(
                 storage=storage,
                 attempt=attempt,
                 key=shards.shard_state_key(root, stage, index, attempt),
+                profile_key=lambda label: shards.shard_profile_key(
+                    root, stage, index, attempt, label
+                ),
             )
         )
         report_phase(f"shard_{stage}")

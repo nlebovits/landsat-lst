@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "claim": "The proposed change reduces the named production metric without changing scientific output.",
+  "inputs": {
+    "workload": "exact tile, shard, scene count, and stage",
+    "launch_command": "exact cloud-launch command, excluding the LST_EVIDENCE_CONTRACT assignment",
+    "baseline_revision": "full git SHA",
+    "treatment_revision": "full git SHA",
+    "real_data": {
+      "kind": "real",
+      "identity": "immutable real input identity: tile, window, scene IDs, and artifact digests",
+      "production_relationship": "how this input represents production",
+      "known_differences": [
+        "explicit difference from the production workload, or state none"
+      ]
+    }
+  },
+  "baseline": {
+    "metric": "wall_s",
+    "value": 0,
+    "unit": "seconds",
+    "classification": "measured",
+    "artifact": "path to a retained machine-readable baseline"
+  },
+  "target_metric": "wall_s",
+  "measurement_plan": {
+    "target_environment": "production",
+    "phases": [
+      "named phase that can prove or reject the mechanism"
+    ],
+    "metrics": [
+      "wall_s",
+      "cpu_s",
+      "peak_rss_mb",
+      "bytes_read",
+      "bytes_written"
+    ],
+    "raw_artifacts": [
+      "raw machine-readable artifact expected from every arm"
+    ],
+    "profiling": {
+      "method": "profiling or phase-timing method appropriate to the claimed mechanism",
+      "artifact": "expected profile artifact",
+      "observer_effect_control": "how profiler overhead is bounded or held identical between arms"
+    },
+    "baseline_repetitions": 1,
+    "treatment_repetitions": 1,
+    "aggregation": "single"
+  },
+  "minimum_effect": {
+    "direction": "decrease",
+    "fraction": 0.1
+  },
+  "production_discriminator": "The smallest target-environment run that can reject the claim.",
+  "stop_rule": "Reject if the target metric improves by less than the minimum effect.",
+  "result_artifact": "path to the post-run decision manifest",
+  "max_cloud_cost_usd": 1,
+  "max_coiled_credits": 20,
+  "code_identity_required": true,
+  "output_equivalence_required": true,
+  "output_equivalence": {
+    "method": "named checksum or scientific comparison procedure",
+    "acceptance_criterion": "exact tolerance and pass condition",
+    "tolerance": 0,
+    "result_artifact": "path to a post-run JSON report recording max_abs_diff and passed; passed must equal max_abs_diff <= tolerance"
+  },
+  "operator_note": "This contract constrains a run; it does not authorize one."
+}

@@ -34,6 +34,7 @@ from landsat_lst.shards import (
     ref_marker_key,
     scene_partial_key,
     shard_log_key,
+    shard_profile_key,
     shard_root,
     shard_state_key,
 )
@@ -392,3 +393,10 @@ class TestTilePlan:
         del payload["digest"]
 
         assert TilePlan.from_dict(payload).tile == "N40W075"
+
+
+def test_shard_profile_key_stays_under_shard_state_prefix():
+    root = shard_root("run-1", "N40W075")
+    key = shard_profile_key(root, "composite", 3, 2, "composite")
+    assert key == "_shards/run-1/N40W075/state/composite.0003.2.composite.profile.json"
+    assert not key.startswith("_runs/")

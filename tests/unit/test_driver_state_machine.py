@@ -1496,3 +1496,15 @@ def _unused() -> SimpleNamespace:  # pragma: no cover - keeps the import honest
 
 def _publish(storage, plan) -> str:  # pragma: no cover - convenience for debugging
     return publish_plan(storage, plan)
+
+
+def test_a_contract_that_no_longer_binds_is_terminal() -> None:
+    """Retrying a submission against the same dirty tree cannot change the verdict.
+
+    Classified transient, a mid-run tracked edit burned every backoff round
+    before the driver said why.
+    """
+    from landsat_lst.evidence_contract import ContractError
+
+    assert classify_failure(ContractError("launch checkout has tracked changes")) == "terminal"
+    assert classify_failure(ContractError("")) == "terminal"

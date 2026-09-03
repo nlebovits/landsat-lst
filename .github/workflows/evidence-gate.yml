@@ -1,0 +1,58 @@
+# Performance-evidence declaration gate.
+#
+# Runs under pull_request_target so the gate script and its validators come
+# from the BASE branch. The pull request's own tree is checked out into a
+# separate directory and only READ (contract and evidence paths resolve there);
+# nothing from it is installed or executed. That is what makes the job safe
+# under pull_request_target, and it is the whole point: a pull request cannot
+# edit the gate that judges it in the same diff.
+#
+# `edited` is a trigger because the PR body is the gate's only input and it
+# stays mutable after a green status.
+
+name: Evidence gate
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: evidence-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  declaration:
+    name: Pull request evidence declaration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the base branch (gate code)
+        uses: actions/checkout@v7
+
+      - name: Check out the pull request tree (read only)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies (base branch)
+        run: uv sync --all-extras --frozen
+
+      - name: Check performance evidence safeguards
+        run: uv run python scripts/check_evidence_policy.py
+
+      - name: Check pull request evidence declaration
+        run: uv run python scripts/check_performance_pr.py --root pr-head

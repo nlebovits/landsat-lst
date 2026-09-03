@@ -92,6 +92,7 @@ DEFAULT_PLAN_SCENES = 300
 
 #: Labels under which :func:`profile_compute` dumps its summaries.
 PROFILE_DESTRIPE_OFFSETS = "destripe_offsets"
+PROFILE_COMPOSITE = "composite"
 
 #: Ceilings on a dumped profile, so instrumentation cannot outgrow what it
 #: instruments. The resource curve is strided rather than truncated, because
@@ -1056,10 +1057,7 @@ def _profile_destination(label: str) -> tuple[Any, str] | None:
     """
     heartbeat = active_heartbeat()
     if heartbeat is not None:
-        key = heartbeat.storage.profile_key(
-            heartbeat.run_id, heartbeat.tile, label, heartbeat.attempt
-        )
-        return heartbeat.storage, key
+        return heartbeat.storage, heartbeat.profile_key_for(label)
 
     from landsat_lst.storage import LocalStorage  # noqa: PLC0415
 
@@ -1154,6 +1152,7 @@ def _dump_profile(
             "wall_s": round(wall_s, 2),
             "run_id": heartbeat.run_id if heartbeat else None,
             "tile": heartbeat.tile if heartbeat else None,
+            "code_identity": heartbeat.code_identity() if heartbeat else None,
             "tasks": _task_summary(task_prof.results),
             "resource": _resource_summary(resource_prof.results, interval_s),
         }

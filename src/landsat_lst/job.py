@@ -216,6 +216,31 @@ def _worker_environ() -> dict[str, str]:
     for key, val in os.environ.items():
         if key.startswith("LST_") and key not in ("LST_STORAGE_BACKEND", "LST_STAC_URL"):
             environ[key] = val
+    contract_name = os.environ.get("LST_EVIDENCE_CONTRACT")
+    if contract_name:
+        # Bound on every submission, on purpose: a shard stage ships whatever
+        # the launch checkout holds at that moment, so a tracked edit between
+        # stages must refuse the next fleet rather than ship under the old
+        # revision. The refusal is terminal (``shard_driver.classify_failure``).
+        from landsat_lst.evidence_contract import (  # noqa: PLC0415
+            bind_contract_to_repository,
+            launch_root,
+            load_contract,
+        )
+
+        # The checkout the operator launched from, never the one holding this
+        # module: an installed package has no checkout, and an editable install
+        # of one worktree launched from another would bind the wrong tree.
+        root = launch_root()
+        contract_path = Path(contract_name)
+        if not contract_path.is_absolute():
+            contract_path = root / contract_path
+        contract = load_contract(contract_path)
+        identity = bind_contract_to_repository(contract, root)
+        # The contract's bound revision wins over any exported value. The VM
+        # records it after startup together with the installed package version
+        # and a hash of its actual instrumentation module.
+        environ["LST_CODE_REVISION"] = identity["revision"]
     return environ
 
 

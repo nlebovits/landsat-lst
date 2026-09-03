@@ -1027,6 +1027,22 @@ class TestSubmitShardStage:
         assert fake_coiled["vm_type"] == [settings.shard_composite_vm_type]
         assert fake_coiled["env"]["LST_LOAD_CHUNK_SIZE"] == str(settings.shard_composite_chunk)
 
+    def test_composite_stage_does_not_force_profiler_on_the_vm(self, fake_coiled, monkeypatch):
+        from landsat_lst.batch import submit_shard_stage
+
+        monkeypatch.delenv("LST_PROFILE_DASK", raising=False)
+        submit_shard_stage(stage="composite", run_id="r1", tile="N40W075", indexes=[0])
+
+        assert "LST_PROFILE_DASK" not in fake_coiled["env"]
+
+    def test_composite_stage_preserves_explicit_profile_opt_out(self, fake_coiled, monkeypatch):
+        from landsat_lst.batch import submit_shard_stage
+
+        monkeypatch.setenv("LST_PROFILE_DASK", "0")
+        submit_shard_stage(stage="composite", run_id="r1", tile="N40W075", indexes=[0])
+
+        assert fake_coiled["env"]["LST_PROFILE_DASK"] == "0"
+
     def test_the_export_stage_asks_for_scratch_disk(self, fake_coiled):
         """It holds every band slab, a full-tile intermediate, and a COG at once."""
         from landsat_lst.batch import submit_shard_stage
@@ -1193,3 +1209,64 @@ class TestSubmitFleetStage:
 
         with pytest.raises(ValueError, match="unknown shard stage"):
             submit_fleet_stage(stage="polish", run_id="r1", units=[("N40W075", 0)])
+
+
+class TestWorkerEnvironContract:
+    """``LST_EVIDENCE_CONTRACT`` binds the launch checkout on every submission."""
+
+    @staticmethod
+    def _repo(tmp_path, monkeypatch):
+        from tests.unit.test_evidence_contract import git_repo, valid_contract
+
+        root, baseline, head = git_repo(tmp_path)
+        contract = valid_contract(tmp_path, baseline_revision=baseline, treatment_revision=head)
+        # Untracked, and outside src/: exactly the kind of file the binding ignores.
+        (root / "contract.json").write_text(json.dumps(contract))
+        monkeypatch.chdir(root)
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "k")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
+        monkeypatch.setenv("LST_EVIDENCE_CONTRACT", "contract.json")
+        return root, head
+
+    def test_an_operators_revision_is_forwarded_when_no_contract_is_set(self, monkeypatch):
+        from landsat_lst.job import _worker_environ
+
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "k")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
+        monkeypatch.delenv("LST_EVIDENCE_CONTRACT", raising=False)
+        monkeypatch.setenv("LST_CODE_REVISION", "a" * 40)
+
+        assert _worker_environ()["LST_CODE_REVISION"] == "a" * 40
+
+    def test_the_contract_binds_head_of_the_launch_checkout(self, tmp_path, monkeypatch):
+        """The bound revision wins over an exported one, and it is cwd's HEAD."""
+        from landsat_lst.job import _worker_environ
+
+        _root, head = self._repo(tmp_path, monkeypatch)
+        monkeypatch.setenv("LST_CODE_REVISION", "a" * 40)
+
+        environ = _worker_environ()
+        assert environ["LST_CODE_REVISION"] == head
+        assert environ["LST_EVIDENCE_CONTRACT"] == "contract.json"
+
+    def test_a_dirty_launch_checkout_refuses_to_submit(self, tmp_path, monkeypatch):
+        from landsat_lst.evidence_contract import ContractError
+        from landsat_lst.job import _worker_environ
+
+        root, _head = self._repo(tmp_path, monkeypatch)
+        (root / "src" / "module.py").write_text("VERSION = 99\n")
+
+        with pytest.raises(ContractError, match="tracked changes"):
+            _worker_environ()
+
+    def test_a_launch_outside_any_checkout_says_so(self, tmp_path, monkeypatch):
+        from landsat_lst.evidence_contract import ContractError
+        from landsat_lst.job import _worker_environ
+
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "k")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
+        monkeypatch.setenv("LST_EVIDENCE_CONTRACT", "contract.json")
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(ContractError, match="not inside a git checkout"):
+            _worker_environ()

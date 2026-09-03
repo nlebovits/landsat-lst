@@ -52,6 +52,7 @@ import structlog
 from landsat_lst import budgets, quota, shard_tasks, shards
 from landsat_lst.batch import stage_cluster_name, submit_fleet_stage, submit_shard_stage
 from landsat_lst.config import settings
+from landsat_lst.evidence_contract import ContractError
 from landsat_lst.storage import PRODUCTS, S3Storage, get_storage
 
 if TYPE_CHECKING:
@@ -135,7 +136,10 @@ def classify_failure(error: BaseException) -> str:
     "terminal" for the unknown case would reintroduce that failure for every
     ordinary control-plane blip.
     """
-    if isinstance(error, ImportError):
+    if isinstance(error, ImportError | ContractError):
+        # An evidence contract that no longer binds the launch checkout (a
+        # tracked edit mid-run, a revision mismatch) is deterministic: retrying
+        # the submission against the same tree cannot change the verdict.
         return "terminal"
     text = f"{type(error).__name__}: {error}".lower()
     if any(marker in text for marker in _TERMINAL_MARKERS):
