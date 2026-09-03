@@ -52,6 +52,7 @@ import xarray as xr
 
 from landsat_lst import offsets, shards
 from landsat_lst.config import settings
+from landsat_lst.exectrace import exec_trace
 from landsat_lst.logging_config import configure_logging
 from landsat_lst.models import ProcessingJob
 from landsat_lst.normalization import _io_block_edge, _scene_batches, climatology_by_blocks
@@ -1054,6 +1055,10 @@ def run_composite_shard(
         with (
             timed_section("exporting", scenes_found=len(ctx.items)),
             profile_compute(PROFILE_COMPOSITE),
+            exec_trace(
+                storage=ctx.storage,
+                stem=shards.unit_trace_prefix(run_id, "composite", tile, index),
+            ),
         ):
             write_intermediates(
                 [(p.da, path) for p, path in zip(products, paths.values(), strict=True)]

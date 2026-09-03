@@ -768,6 +768,21 @@ class Settings(BaseSettings):
         "curve. One second over a two-hour phase is 7,200 samples, which the "
         "dump strides down before writing.",
     )
+    exec_trace: bool = Field(
+        default=False,
+        description="Record a per-second composite-shard execution trace. Off by "
+        "default and intended only for a bounded measurement run.",
+    )
+    exec_trace_interval_s: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="Seconds between host samples in an execution trace.",
+    )
+    exec_trace_read_sample: int = Field(
+        default=20,
+        ge=1,
+        description="Record timing and source metadata for every Nth rio_read call.",
+    )
 
     @model_validator(mode="after")
     def _grid_must_be_integral(self) -> "Settings":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.metadata
 import json
@@ -11,6 +12,7 @@ import re
 import shutil
 import statistics
 import subprocess  # nosec B404
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -107,14 +109,23 @@ def _run_artifacts(run_id: str, storage: Any) -> list[dict[str, Any]]:
 
     artifacts = []
     for key, modified in sorted(keys.items()):
-        text = storage.read_text(key)
-        raw = text.encode() if text is not None else b""
+        text = None
+        if key.endswith(".gz"):
+            with tempfile.TemporaryDirectory(prefix="lst_evidence_artifact_") as directory:
+                local = Path(directory) / Path(key).name
+                raw = local.read_bytes() if storage.download(key, local) else b""
+        else:
+            text = storage.read_text(key)
+            raw = text.encode() if text is not None else b""
         item: dict[str, Any] = {
             "key": key,
             "modified": _safe(modified),
             "bytes": len(raw),
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
+        if key.endswith(".gz"):
+            item["content_encoding"] = "base64"
+            item["content_base64"] = base64.b64encode(raw).decode("ascii")
         if key.endswith(".json") and text is not None:
             try:
                 item["content"] = _safe(json.loads(text))
