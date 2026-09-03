@@ -246,6 +246,7 @@ def load_scenes(
     fail_on_error: bool = True,
     resolution_factor: int = 1,
     geobox: GeoBox | None = None,
+    per_column: bool = False,
 ) -> xr.Dataset:
     """Load Landsat scenes as an xarray Dataset.
 
@@ -298,16 +299,56 @@ def load_scenes(
     # An explicit geobox rather than crs/resolution/bbox: odc-stac would anchor
     # the grid to this bbox, which is what left neighbouring tiles misregistered
     # by a fraction of a pixel. See ADR-008.
-    return stac_load(
-        items,
-        bands=["lwir11", "qa_pixel"],
-        geobox=geobox if geobox is not None else geobox_for_bbox(bbox, resolution_factor),
-        chunks={"time": TIME_CHUNK, "latitude": csize, "longitude": csize},
-        groupby="solar_day",
-        patch_url=patch_url,
-        fail_on_error=fail_on_error,
-        resampling=resampling,
-    )
+    target = geobox if geobox is not None else geobox_for_bbox(bbox, resolution_factor)
+
+    def _load(gbox: GeoBox) -> xr.Dataset:
+        return stac_load(
+            items,
+            bands=["lwir11", "qa_pixel"],
+            geobox=gbox,
+            chunks={"time": TIME_CHUNK, "latitude": csize, "longitude": csize},
+            groupby="solar_day",
+            patch_url=patch_url,
+            fail_on_error=fail_on_error,
+            resampling=resampling,
+        )
+
+    if not per_column:
+        return _load(target)
+    return _load_by_column(_load, target, csize)
+
+
+def _load_by_column(load: Callable[[GeoBox], xr.Dataset], geobox: GeoBox, csize: int) -> xr.Dataset:
+    """Load one column chunk at a time and concatenate lazily along longitude.
+
+    One ``stac_load`` over a whole row band gives every column's loader tasks
+    the same per-item ``open`` dependencies, and ``dask.order`` then walks the
+    graph time-major: on S30W065 band 16 every one of 3,744 source blocks was
+    resident before the first P95 ran, 29 GB, and the final reduction wave
+    took the shard to 42.7 GB. Loading each column through its own call gives
+    the order nothing to share across columns, and on the same graph the
+    reductions land column by column with one column's blocks resident at a
+    time (issue #139 follow-up, 2026-09-03).
+
+    The time axis must be identical across the columns, and it is checked
+    rather than assumed: ``groupby="solar_day"`` shifts by the geobox centroid
+    longitude, which differs by 20 minutes across a five-degree tile while
+    Landsat passes near 10:00 local, so a group cannot flip. All 36 columns of
+    band 16 matched on 106 real items. A mismatch is an error, never a guess.
+    """
+    nx = geobox.shape[1]
+    parts = [load(geobox[:, c0 : min(c0 + csize, nx)]) for c0 in range(0, nx, csize)]
+    reference = parts[0]["time"].values
+    for index, part in enumerate(parts[1:], start=1):
+        if not np.array_equal(part["time"].values, reference):
+            msg = (
+                f"per-column load: column {index} grouped {part.sizes['time']} solar days "
+                f"where column 0 grouped {reference.size}; the columns do not share a time axis"
+            )
+            raise ValueError(msg)
+    if len(parts) == 1:
+        return parts[0]
+    return xr.concat(parts, dim="longitude", coords="minimal", compat="override")
 
 
 def scene_cloud_cover(

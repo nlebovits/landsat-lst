@@ -484,22 +484,29 @@ class Settings(BaseSettings):
         "rather than a list so the chunk this stage runs at "
         "(shard_composite_chunk) describes a known core count.",
     )
+    shard_composite_per_column: bool = Field(
+        default=True,
+        description="Load a composite band one column chunk at a time and "
+        "concatenate lazily, so dask orders the P95 column by column instead of "
+        "loading every column before the first reduction (issue #139: 3,744 "
+        "blocks, 29 GB, resident before the first P95 on S30W065 band 16; 42.7 GB "
+        "at the final wave). Off reproduces the single-load graph.",
+    )
     shard_composite_chunk: int = Field(
-        default=512,
+        default=1024,
         ge=64,
         description="Spatial chunk edge a composite shard loads at, overriding "
-        "load_chunk_size. 512, not 1024: the old 1024 rationale assumed a row "
-        "band's time axis shrinks with its rows, and it does not -- odc-stac "
-        "prunes chunk reads spatially but never thins the time axis, and ~90% "
-        "of solar-day groups touch every band (measured on S30W065's 1,031 "
-        "steps). At 1024 the rechunk task holds 4.32 GB and 16 threads want "
-        "69 GB on a 64 GiB VM. The 2026-08-22 packing probe measured the real "
-        "composite at chunk 512: ~34 GB peak VmHWM per shard, 45.5 MB/s "
-        "decoded, 44% headroom on m6i.4xlarge -- and showed a second shard "
-        "OOMs, which is also why intra-VM packing was rejected "
-        "(results/probe/composite_packing.json). Applied by every shard "
-        "process AND by the planner, so the plan digest -- which covers "
-        "load_chunk_size -- agrees across all of them.",
+        "load_chunk_size. 1024 was rejected on 2026-08-22 because the rechunk "
+        "task held 4.32 GB and 16 of them ran at once, 69 GB on a 64 GiB VM; "
+        "that concurrency was the all-columns-resident ordering, which "
+        "shard_composite_per_column removes. With column-by-column order one to "
+        "two rechunks are in flight, and the larger read is the lever the #139 "
+        "traces point at: reads cost per request, not per byte (a qa_pixel window "
+        "costs what a ST_B10 window costs), and the same VM read 18 MB/s at 512 "
+        "against 33-42 MB/s at 1024 in results/probe/composite_rate_m6i4xl.json. "
+        "A 512-row band gives 512 x 1024 reads, twice the pixels of 512 x 512. "
+        "Applied by every shard process AND by the planner, so the plan digest "
+        "-- which covers load_chunk_size -- agrees across all of them.",
     )
     shard_export_disk_gb: int = Field(
         default=100,

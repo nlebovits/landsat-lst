@@ -1023,7 +1023,12 @@ def run_composite_shard(
     patch_url = _patch_url_for(ctx.items)
     report_phase("loading", scenes_found=len(ctx.items))
     data = load_scenes(
-        ctx.items, ctx.job.tile.bbox, patch_url=patch_url, fail_on_error=False, geobox=geobox
+        ctx.items,
+        ctx.job.tile.bbox,
+        patch_url=patch_url,
+        fail_on_error=False,
+        geobox=geobox,
+        per_column=settings.shard_composite_per_column,
     )
     with timed_section("land_mask"):
         land = _build_land_mask(geobox, data.latitude, data.longitude)
