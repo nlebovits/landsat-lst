@@ -998,7 +998,11 @@ def run_composite_shard(
     Returns:
         The keys written, empty when they already existed.
     """
-    from landsat_lst.cog import lst_product, qa_product, write_intermediates  # noqa: PLC0415
+    from landsat_lst.cog import (  # noqa: PLC0415
+        lst_product,
+        qa_product,
+        write_intermediates_bounded,
+    )
     from landsat_lst.job import _encode_native, _thread_cap  # noqa: PLC0415
     from landsat_lst.pipeline import (  # noqa: PLC0415
         _build_ged_gap_mask,
@@ -1070,8 +1074,9 @@ def run_composite_shard(
                 stem=shards.unit_trace_prefix(run_id, "composite", tile, index),
             ),
         ):
-            write_intermediates(
-                [(p.da, path) for p, path in zip(products, paths.values(), strict=True)]
+            write_intermediates_bounded(
+                [(p.da, path) for p, path in zip(products, paths.values(), strict=True)],
+                longitude_group=2 * settings.load_chunk_size,
             )
         report_phase("uploading")
         for product, path in paths.items():

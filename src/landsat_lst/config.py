@@ -500,12 +500,10 @@ class Settings(BaseSettings):
         "(shard_composite_chunk) describes a known core count.",
     )
     shard_composite_per_column: bool = Field(
-        default=True,
-        description="Load a composite band one column chunk at a time and "
-        "concatenate lazily, so dask orders the P95 column by column instead of "
-        "loading every column before the first reduction (issue #139: 3,744 "
-        "blocks, 29 GB, resident before the first P95 on S30W065 band 16; 42.7 GB "
-        "at the final wave). Off reproduces the single-load graph.",
+        default=False,
+        description="Experimental compatibility switch for loading a composite "
+        "band through one stac_load call per longitude chunk. Production keeps "
+        "this off: shard export bounds execution over one whole-band graph instead.",
     )
     shard_composite_chunk: int = Field(
         default=1024,
@@ -513,8 +511,8 @@ class Settings(BaseSettings):
         description="Spatial chunk edge a composite shard loads at, overriding "
         "load_chunk_size. 1024 is safe on two conditions that both hold now. "
         "Memory: the 2026-08-22 rejection (16 rechunks at 4.32 GB, 69 GB) was "
-        "the all-columns-resident ordering that shard_composite_per_column "
-        "removes; one to two rechunks are in flight column by column. Pixels: "
+        "the all-columns-resident ordering; composite shards now compute and "
+        "write two longitude chunks at a time from one whole-band graph. Pixels: "
         "the read window is also the warp window, and under rasterio's default "
         "approximate transformer a 512 x 1024 window moved 3,642 of 84M source "
         "pixels and the P95 by up to 1,681 DN; under warp_exact_transform (the "

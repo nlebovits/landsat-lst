@@ -8,6 +8,8 @@ Every fixture is synthetic and a few hundred kilobytes on disk -- the largest is
 2048 x 2048 of highly repetitive DN, which deflate crushes to nothing.
 """
 
+import dask
+import dask.array as da
 import numpy as np
 import pytest
 import rasterio
@@ -365,6 +367,47 @@ def test_dask_backed_qa_input_streams_all_twelve_bands(tmp_path):
         assert src.count == 12
         for bidx in range(1, 13):
             np.testing.assert_array_equal(src.read(bidx), values[bidx - 1])
+
+
+def test_bounded_writer_computes_only_each_longitude_group(tmp_path, monkeypatch):
+    """Each compute reaches only its own source chunks and writes one full TIFF."""
+    values = np.arange(20, dtype=np.uint16).reshape(4, 5) + 1
+    observed_blocks: list[int] = []
+
+    def observe(block, block_info=None):
+        observed_blocks.append(block_info[None]["chunk-location"][-1])
+        return block
+
+    base = da.from_array(values, chunks=(4, 2), name="bounded-source")
+    source = base.map_blocks(observe, dtype=base.dtype, meta=np.array((), dtype=base.dtype))
+    array = xr.DataArray(
+        source,
+        dims=["latitude", "longitude"],
+        coords={
+            "latitude": np.linspace(-30.0, -35.0, 4),
+            "longitude": np.linspace(-65.0, -60.0, 5),
+        },
+    )
+    array = cog_module._prep(array).rio.write_nodata(0)
+    executed: list[set[int]] = []
+    real_compute = dask.compute
+
+    def recording_compute(*collections):
+        before = len(observed_blocks)
+        result = real_compute(*collections)
+        executed.append(set(observed_blocks[before:]))
+        return result
+
+    monkeypatch.setattr(cog_module.dask, "compute", recording_compute)
+    path = tmp_path / "bounded.tif"
+
+    cog_module.write_intermediates_bounded([(array, path)], longitude_group=4)
+
+    assert len(executed) == 2
+    assert executed == [{0, 1}, {2}]
+    with rasterio.open(path) as src:
+        assert (src.height, src.width, src.count) == (4, 5, 1)
+        np.testing.assert_array_equal(src.read(1), values)
 
 
 # ---------------------------------------------------------------------------
