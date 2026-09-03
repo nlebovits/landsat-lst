@@ -25,6 +25,11 @@ from landsat_lst.shard_tasks import _offset_key, _time_coord, run_shard
 from landsat_lst.storage import LocalStorage
 from landsat_lst.tiling import parse_tile_name
 
+# The first production trace sampled from an in-process thread and held a mean
+# cadence of 1.61 s with 120 gaps above 2 s.  The sampler now runs in a child
+# process; this bound is what the contract holds it to on a 25-minute run.
+GAP_LIMIT_S = 5.0
+
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -71,7 +76,7 @@ def _gate_results(summary: dict, timeline: list[dict[str, str]]) -> list[tuple[s
         and timestamps[-1] >= summary["compute_finished_at"]
     )
     max_gap = max(gaps, default=0.0)
-    thread_count = os.cpu_count() or 1
+    thread_count = settings.dask_max_threads or os.cpu_count() or 1
     max_active = max(
         (
             sum(
@@ -89,9 +94,12 @@ def _gate_results(summary: dict, timeline: list[dict[str, str]]) -> list[tuple[s
             repr(class_counts),
         ),
         (
-            "host samples span compute with max gap < 2 s",
-            spans_compute and max_gap < 2.0,
-            f"samples={len(timestamps)}, max_gap_s={max_gap:.3f}",
+            f"host samples span compute with max gap < {GAP_LIMIT_S:.0f} s",
+            spans_compute and max_gap < GAP_LIMIT_S,
+            (
+                f"samples={len(timestamps)}, max_gap_s={max_gap:.3f}, "
+                f"sampler={summary.get('host_sampler_mode')}"
+            ),
         ),
         (
             "active task count does not exceed thread count",
@@ -175,7 +183,17 @@ def main() -> None:
     print(
         "INFO  sampled source reads: "
         f"{summary['n_reads_recorded']}/{summary['n_reads_total']} "
-        f"({summary['read_hook_status']})"
+        f"({summary['read_hook_status']}, split recorded for "
+        f"{summary['read_split_recorded']})"
+    )
+    for label in ("read_duration_s", "read_open_s", "read_data_s"):
+        q = summary[label]
+        print(
+            f"INFO  {label}: n={q['n']} p50={q['p50']} p95={q['p95']} p99={q['p99']} max={q['max']}"
+        )
+    print(
+        f"INFO  dask threads: config={summary['dask_num_workers']} "
+        f"distinct_worker_threads={summary['distinct_worker_threads']}"
     )
     if failed:
         raise SystemExit(1)

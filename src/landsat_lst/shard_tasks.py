@@ -999,7 +999,7 @@ def run_composite_shard(
         The keys written, empty when they already existed.
     """
     from landsat_lst.cog import lst_product, qa_product, write_intermediates  # noqa: PLC0415
-    from landsat_lst.job import _encode_native  # noqa: PLC0415
+    from landsat_lst.job import _encode_native, _thread_cap  # noqa: PLC0415
     from landsat_lst.pipeline import (  # noqa: PLC0415
         _build_ged_gap_mask,
         _build_land_mask,
@@ -1052,7 +1052,12 @@ def run_composite_shard(
             lst_product(native, paths["lst_p95"]),
             qa_product(native, paths["qa_count"]),
         ]
+        # settings.dask_max_threads (LST_DASK_MAX_THREADS) bounds the threaded
+        # scheduler here exactly as process_tile_job bounds a whole tile; None
+        # leaves dask's CPU-count pool, which is what every production shard
+        # has run on so far.
         with (
+            _thread_cap(),
             timed_section("exporting", scenes_found=len(ctx.items)),
             profile_compute(PROFILE_COMPOSITE),
             exec_trace(

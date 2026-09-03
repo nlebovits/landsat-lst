@@ -31,7 +31,10 @@ pytestmark = pytest.mark.unit
         ("transpose", "rechunk"),
         ("getitem", "rechunk"),
         ("shuffle-taker", "rechunk"),
+        ("shuffle-split", "rechunk"),
+        ("rechunk-split-rechunk-merge", "rechunk"),
         ("where", "compute"),
+        ("sub", "compute"),
         ("astype", "compute"),
         ("invert", "compute"),
         ("custom_nanquantile-transpose-getitem", "compute"),
@@ -89,10 +92,16 @@ def test_exec_trace_writes_three_artifacts_after_compute_and_restores_hook(monke
     monkeypatch.setattr(settings, "exec_trace_interval_s", 0.01)
     monkeypatch.setattr(settings, "exec_trace_read_sample", 1)
 
-    def fake_read(src, cfg, dst_geobox, *args, **kwargs):
+    def fake_do_read(*args, **kwargs):
         return nullcontext(), None
 
+    def fake_read(src, cfg, dst_geobox, *args, **kwargs):
+        # Mirrors _rio_read: the open happens here, then the module-global
+        # _do_read is called by name, which is what the split hook relies on.
+        return rio._do_read(None, cfg, dst_geobox, None)
+
     monkeypatch.setattr(rio, "rio_read", fake_read)
+    monkeypatch.setattr(rio, "_do_read", fake_do_read)
     stem = "_shards/timings/run/composite.S30W065.0016"
     with exec_trace(storage=storage, stem=stem):
         rio.rio_read(
@@ -103,6 +112,7 @@ def test_exec_trace_writes_three_artifacts_after_compute_and_restores_hook(monke
         assert da.ones((64, 64), chunks=32).sum().compute(scheduler="threads") == 4096
 
     assert rio.rio_read is fake_read
+    assert rio._do_read is fake_do_read
     artifacts = sorted((tmp_path / "_shards" / "timings" / "run").iterdir())
     assert [path.name for path in artifacts] == [
         "composite.S30W065.0016.exectrace.events.jsonl.gz",
@@ -114,6 +124,12 @@ def test_exec_trace_writes_three_artifacts_after_compute_and_restores_hook(monke
     assert summary["n_tasks"] > 0
     assert summary["n_reads_total"] == summary["n_reads_recorded"] == 1
     assert summary["read_hook_status"] == "enabled"
+    assert summary["read_split_recorded"] == 1
+    assert summary["read_open_s"]["n"] == summary["read_data_s"]["n"] == 1
+    assert summary["read_open_s"]["p50"] >= 0.0
+    assert summary["read_data_s"]["p50"] >= 0.0
+    assert summary["host_sampler_mode"] in {"process", "thread"}
+    assert summary["host_samples"] >= 2
     assert summary["upload_started_at"] >= summary["compute_finished_at"]
 
     with gzip.open(artifacts[0], "rt") as stream:
@@ -122,7 +138,10 @@ def test_exec_trace_writes_three_artifacts_after_compute_and_restores_hook(monke
     assert task_events
     assert all(event["end"] <= summary["compute_finished_at"] for event in task_events)
     assert any(event["kind"] == "host" for event in events)
-    assert any(event["kind"] == "read" for event in events)
+    read_events = [event for event in events if event["kind"] == "read"]
+    assert len(read_events) == 1
+    assert read_events[0]["t_start"] <= read_events[0]["t_open_end"] <= read_events[0]["t_end"]
+    assert read_events[0]["open_s"] is not None and read_events[0]["read_s"] is not None
 
     with artifacts[2].open(newline="") as stream:
         rows = list(csv.DictReader(stream))
