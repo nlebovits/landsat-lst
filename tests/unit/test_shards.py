@@ -19,6 +19,7 @@ from itertools import pairwise
 
 import pytest
 
+from landsat_lst import budgets
 from landsat_lst.config import settings
 from landsat_lst.shards import (
     SHARD_PREFIX,
@@ -228,14 +229,6 @@ class TestBalanceByLand:
         with pytest.raises(ValueError, match="disagree"):
             balance_by_land(block_spans((40, 40), 20), [True], 2)
 
-    def test_it_is_the_weighted_split_on_unit_weights(self):
-        """The land split is the weighted one with every land block at one."""
-        spans = block_spans((400, 40), 20)
-        has_land = [i % 7 < 3 for i in range(len(spans))]
-
-        weights = [1 if flag else 0 for flag in has_land]
-        assert balance_by_land(spans, has_land, 4) == balance_by_weight(spans, weights, 4)
-
 
 class TestBalanceByWeight:
     """An equal split of blocks is not an equal split of what they read (#133)."""
@@ -253,6 +246,20 @@ class TestBalanceByWeight:
             return [sum(index[s] for s in group) for group in groups]
 
         assert max(group_weights(balanced)) < max(group_weights(plain))
+
+    def test_the_slowest_group_cannot_be_worse_than_a_plain_split(self):
+        """Crossing a target must not drag a heavy next block into the first group."""
+        spans = block_spans((80, 20), 20)
+        weights = [1, 1, 2, 1]
+
+        balanced = balance_by_weight(spans, weights, 2)
+        plain = partition(spans, 2)
+        index = dict(zip(spans, weights, strict=True))
+
+        assert max(sum(index[s] for s in group) for group in balanced) <= max(
+            sum(index[s] for s in group) for group in plain
+        )
+        assert [sum(index[s] for s in group) for group in balanced] == [2, 3]
 
     def test_groups_stay_contiguous_and_complete(self):
         spans = block_spans((400, 40), 20)
@@ -286,6 +293,11 @@ class TestBalanceByWeight:
     def test_a_negative_weight_is_refused(self):
         with pytest.raises(ValueError, match="non-negative"):
             balance_by_weight(block_spans((40, 40), 20), [1, -1, 1, 1], 2)
+
+    @pytest.mark.parametrize("weight", [float("nan"), float("inf")])
+    def test_a_non_finite_weight_is_refused(self, weight):
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            balance_by_weight(block_spans((40, 40), 20), [1, weight, 1, 1], 2)
 
     def test_mismatched_inputs_are_refused(self):
         with pytest.raises(ValueError, match="disagree"):
@@ -442,6 +454,21 @@ def _plan(**overrides) -> TilePlan:
         "band_shards": 4,
     }
     return TilePlan(**{**base, **overrides})
+
+
+def test_weighted_split_cannot_narrow_the_legacy_climatology_budget():
+    """A safer assignment must not shorten the deadline protecting an old plan."""
+    spans = [(i, i + 1, 0, 1) for i in range(6)]
+    plan = _plan(
+        blocks=spans,
+        block_has_land=[True, True, True, False, True, False],
+        block_weights=[8, 6, 18, 0, 19, 0],
+        ref_shards=2,
+    )
+
+    assert max(map(len, balance_by_land(spans, plan.block_has_land, 2))) == 4
+    assert max(map(len, climatology_groups(plan))) == 3
+    assert budgets._widest_block_share(plan) == pytest.approx(4 / 6)
 
 
 class TestTilePlan:

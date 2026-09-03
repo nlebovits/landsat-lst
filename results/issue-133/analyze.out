@@ -20,11 +20,11 @@ shard blocks   items  phaseA   wait
 phase A vs items per shard: r=+0.907 r2=0.822 fit t = 111.1 + 0.2105 s/item, resid sd=79.5s
 
 measured phase A: max=990 mean=731; unit wall mean=1922s
-weighted split blocks per shard: [9, 4, 5, 5, 4, 6, 5, 4, 5, 8, 4, 5, 4, 6, 7]
-weighted split items per shard: 2565-3330 (current 1798-4191)
-point estimate: max=812s, 178s (9.2% of unit wall) below measured
+weighted split blocks per shard: [7, 5, 5, 5, 5, 6, 5, 4, 5, 8, 4, 4, 5, 5, 8]
+weighted split items per shard: 2691-3217 (current 1798-4191)
+point estimate: max=788s, 201s (10.5% of unit wall) below measured
 ideal non-contiguous bound: max=731s, 258s below measured
 
-noise-aware E[max] over 15 shards (resid sd 80s): current=1038s [965,1115] weighted=895s [837,958]
-expected difference 142s = 7.4% of unit wall
+noise-aware E[max] over 15 shards (resid sd 80s): current=1038s [965,1115] weighted=884s [828,946]
+expected difference 153s = 8.0% of unit wall
 model check: measured max 990s vs modelled current E[max] 1038s

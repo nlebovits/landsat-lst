@@ -17,8 +17,8 @@ S30W065 acceptance run **[M]**. The current split deals blocks by count when
 every block has land, so it handed one shard 4,191 footprint intersections and
 another 1,798 **[D]**, and every shard then waited for the heaviest at the
 in-process barrier. A contiguous split that deals blocks on that weight is
-modelled to end phase A 142 s sooner, with the fit's residual noise included,
-which is 7.4% of the 1,922 s unit wall and about 4.7 of the 268 credits the run
+modelled to end phase A 153 s sooner, with the fit's residual noise included,
+which is 8.0% of the 1,922 s unit wall and about 5.1 of the 268 credits the run
 billed **[D]**. The ticket's discriminator run was not made, on the operator's
 call. The change ships as a rule change to the split with no performance claim,
 and the next production tile's `phase_seconds` is the measurement.
@@ -82,15 +82,16 @@ source file.
 
 ## 3. What a weighted split would have done
 
-`shards.balance_by_weight` is the existing land walk with the 0/1 flag replaced
-by the intersection count. On the anchor plan it deals 9, 4, 5, 5, 4, 6, 5, 4,
-5, 8, 4, 5, 4, 6, 7 blocks to the 15 shards and narrows intersections per shard
-from 1,798-4,191 to 2,565-3,330 **[D]**. Three numbers from the fit **[D]**:
+`shards.balance_by_weight` finds the contiguous split whose heaviest group has
+the least total intersection count. On the anchor plan it deals 7, 5, 5, 5, 5,
+6, 5, 4, 5, 8, 4, 4, 5, 5, 8 blocks to the 15 shards and narrows intersections
+per shard from 1,798-4,191 to 2,691-3,217 **[D]**. Three numbers from the fit
+**[D]**:
 
 | Model | Phase-A max | Below the measured 990 s | Share of unit wall |
 |---|---|---|---|
-| Point estimate on the weighted split | 812 s | 178 s | 9.2% |
-| Expected max over 15 shards, residual noise included | 895 s | 142 s | 7.4% |
+| Point estimate on the weighted split | 788 s | 201 s | 10.5% |
+| Expected max over 15 shards, residual noise included | 884 s | 153 s | 8.0% |
 | Ideal non-contiguous bound (every shard at the mean) | 731 s | 258 s | 13.4% |
 
 The middle row is the honest one. The fit leaves 80 s of residual per shard,
@@ -99,9 +100,9 @@ overstates the effect. The same simulation puts the current split's expected
 max at 1,038 s with a 10-90% band of 965-1,115 s, which contains the measured
 990 s, so the model is consistent with the run it was fit on.
 
-In credits **[D]**: 142 s over 15 VMs at 8 vCPU is 4.7 credits per tile, 1.8%
-of the 268.11 credits S30W065 billed. Over 700 tiles that is about 3,300
-credits, or about $90 at the anchor's $7.28 per tile. The range on that figure
+In credits **[D]**: 153 s over 15 VMs at 8 vCPU is 5.1 credits per tile, 1.9%
+of the 268.11 credits S30W065 billed. Over 700 tiles that is about 3,600
+credits, or about $100 at the anchor's $7.28 per tile. The range on that figure
 is wide: 80-200 s per tile from the 10-90% bands above, and the fit is from one
 tile.
 
@@ -143,10 +144,11 @@ this document is where the reasoning lives.
 - A plan without `block_weights`, which is every plan written before this
   change, splits on the land flag exactly as before. The digest ignores the
   weights: they decide who reduces a block, never what it reduces to.
-- The budget keeps counting the widest group's *blocks*, not its weight. A
-  weighted split hands a thinly covered region more blocks (9 of 81 above), and
-  the block count then widens that shard's deadline, which is the safe
-  direction.
+- The budget keeps counting the widest group's *blocks*, not its weight, and
+  retains the legacy land split's widest-block share as a floor. A weighted
+  split can hand a thinly covered region more blocks (8 of 81 above), while a
+  different layout can make every weighted group narrower than the legacy
+  groups; neither case is allowed to shorten the old deadline.
 - Not changed: the estimator, the block grammar, the artifact keys, the
   serial resolve (shard 0 still writes the plan while 14 VMs poll, 136 s each),
   and phase B.

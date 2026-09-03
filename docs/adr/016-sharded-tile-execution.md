@@ -269,8 +269,9 @@ split the shards use, since an even division understates the widest group on a c
 tile. That split is on the scene footprints crossing each block when the plan stores
 them (`block_weights`, written by the planner; see
 `docs/findings-offsets-phase-a-balance.md`) and on the land flag when it does not, and
-the budget counts the widest group's *blocks* rather than its weight, so a group that
-owns many thin blocks gets a wider deadline, never a narrower one.
+the budget counts the widest group's *blocks* rather than its weight and retains the
+legacy land split's widest-block share as a floor, so the new assignment never shortens
+the old deadline.
 And the composite budget includes an `offsets_tail` phase, because that fleet is started
 from inside the offsets barrier and spends real time polling for a record the driver has
 not written yet.

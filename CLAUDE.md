@@ -775,6 +775,9 @@ Rules worth keeping:
   1,798, and phase-A time per shard tracked that count at r = 0.907 (#133,
   `docs/findings-offsets-phase-a-balance.md`). The ticket's discriminator run was skipped
   on the operator's call; the next production tile's `phase_seconds` is the measurement.
+  The weighted cut is the contiguous minimax partition, so it cannot make the heaviest
+  weighted group worse than the legacy cut; the budget separately retains the legacy
+  widest-block share as its floor.
 
 ---
 

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict, dataclass, field
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -545,9 +546,10 @@ def balance_by_weight(spans: Sequence[Span], weights: Sequence[float], n: int) -
     (#133). Splitting on cumulative weight makes the groups alike in what they
     read while staying contiguous.
 
-    Greedy and deterministic: a group closes as soon as its cumulative weight
-    reaches its share of the total, and every group is left at least one span.
-    With no weight anywhere this degenerates to :func:`partition`'s shape.
+    Deterministic minimax partitioning: among every possible contiguous split,
+    choose one whose heaviest group has the least total weight. Every group is
+    left at least one span. With no weight anywhere this degenerates to
+    :func:`partition`'s shape.
 
     Args:
         spans: Blocks in the order :func:`block_spans` produced them.
@@ -559,8 +561,8 @@ def balance_by_weight(spans: Sequence[Span], weights: Sequence[float], n: int) -
         ``n`` non-empty contiguous groups whose concatenation is ``spans``.
 
     Raises:
-        ValueError: If the inputs disagree in length, a weight is negative, or
-            ``n`` is out of range.
+        ValueError: If the inputs disagree in length, a weight is negative or
+            non-finite, or ``n`` is out of range.
     """
     if len(spans) != len(weights):
         msg = f"spans and weights disagree: {len(spans)} vs {len(weights)}"
@@ -568,42 +570,50 @@ def balance_by_weight(spans: Sequence[Span], weights: Sequence[float], n: int) -
     if n <= 0 or n > len(spans):
         msg = f"cannot split {len(spans)} spans into {n} groups"
         raise ValueError(msg)
-    if any(w < 0 for w in weights):
-        msg = "block weights must be non-negative"
+    numeric = [float(w) for w in weights]
+    if any(not isfinite(w) or w < 0 for w in numeric):
+        msg = "block weights must be finite and non-negative"
         raise ValueError(msg)
 
-    total = sum(weights)
+    total = sum(numeric)
     if total == 0:
         return partition(spans, n)
 
+    # ``best[k][end]`` is the lightest possible maximum group weight when the
+    # first ``end`` spans are split into ``k`` non-empty contiguous groups.
+    # The production plan has tens of blocks, so the O(n * blocks**2) dynamic
+    # program is tiny beside resolving thousands of scene footprints.
+    prefix = [0.0]
+    for weight in numeric:
+        prefix.append(prefix[-1] + weight)
+
+    count = len(spans)
+    best = [[float("inf")] * (count + 1) for _ in range(n + 1)]
+    cuts = [[-1] * (count + 1) for _ in range(n + 1)]
+    best[0][0] = 0.0
+    for groups in range(1, n + 1):
+        for end in range(groups, count + 1):
+            for start in range(groups - 1, end):
+                cost = max(best[groups - 1][start], prefix[end] - prefix[start])
+                if cost < best[groups][end]:
+                    best[groups][end] = cost
+                    cuts[groups][end] = start
+
     out: list[list[Span]] = []
-    start = 0
-    seen = 0.0
-    for k in range(n):
-        remaining = n - k - 1
-        if remaining == 0:
-            out.append(list(spans[start:]))
-            break
-        target = total * (k + 1) / n
-        # Never consume the spans the remaining groups need to stay non-empty.
-        ceiling = len(spans) - remaining
-        end = start + 1
-        acc = seen + weights[start]
-        while end < ceiling and acc < target:
-            acc += weights[end]
-            end += 1
+    end = count
+    for groups in range(n, 0, -1):
+        start = cuts[groups][end]
         out.append(list(spans[start:end]))
-        seen = acc
-        start = end
+        end = start
+    out.reverse()
     return out
 
 
 def balance_by_land(spans: Sequence[Span], has_land: Sequence[bool], n: int) -> list[list[Span]]:
     """Split ``spans`` into ``n`` contiguous groups holding similar land counts.
 
-    The split a plan without block weights gets: :func:`balance_by_weight`
-    with every land block weighing one and every land-free block nothing. A
-    block with no land pixel is filled with NaN and never read
+    This is the legacy split a plan without block weights gets. A block with
+    no land pixel is filled with NaN and never read
     (:func:`landsat_lst.normalization.climatology_by_blocks`), so on a coastal
     tile an equal-count split can hand one shard every scene it must read and
     another almost nothing.
@@ -622,7 +632,34 @@ def balance_by_land(spans: Sequence[Span], has_land: Sequence[bool], n: int) -> 
     if len(spans) != len(has_land):
         msg = f"spans and has_land disagree: {len(spans)} vs {len(has_land)}"
         raise ValueError(msg)
-    return balance_by_weight(spans, [1 if flag else 0 for flag in has_land], n)
+    if n <= 0 or n > len(spans):
+        msg = f"cannot split {len(spans)} spans into {n} groups"
+        raise ValueError(msg)
+
+    land = [1 if flag else 0 for flag in has_land]
+    total = sum(land)
+    if total == 0:
+        return partition(spans, n)
+
+    out: list[list[Span]] = []
+    start = 0
+    seen = 0
+    for k in range(n):
+        remaining = n - k - 1
+        if remaining == 0:
+            out.append(list(spans[start:]))
+            break
+        target = total * (k + 1) / n
+        ceiling = len(spans) - remaining
+        end = start + 1
+        acc = seen + land[start]
+        while end < ceiling and acc < target:
+            acc += land[end]
+            end += 1
+        out.append(list(spans[start:end]))
+        seen = acc
+        start = end
+    return out
 
 
 def block_scene_weights(

@@ -138,8 +138,12 @@ def _widest_block_share(plan: shards.TilePlan) -> float:
     total = len(plan.blocks)
     if total == 0:
         return 1.0
+    from landsat_lst.shards import balance_by_land  # noqa: PLC0415
+
     groups = climatology_groups(plan)
-    return max(len(group) for group in groups) / total
+    legacy_groups = balance_by_land(plan.blocks, plan.block_has_land, plan.ref_shards)
+    widest = max(*(map(len, groups)), *(map(len, legacy_groups)))
+    return widest / total
 
 
 def _widest_scene_share(plan: shards.TilePlan) -> float:
