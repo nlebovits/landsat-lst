@@ -29,7 +29,7 @@ jobs:
           version: "latest"
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.12
 
       - name: Install dependencies
         run: uv sync --all-extras --frozen
@@ -63,7 +63,7 @@ jobs:
           version: "latest"
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.12
 
       - name: Install dependencies
         run: uv sync --all-extras --frozen
@@ -86,7 +86,7 @@ jobs:
           version: "latest"
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.12
 
       - name: Install dependencies
         run: uv sync --all-extras --frozen
@@ -103,10 +103,6 @@ jobs:
   test-unit:
     name: Unit Tests
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.11', '3.12']
     steps:
       - uses: actions/checkout@v7
 
@@ -115,8 +111,8 @@ jobs:
         with:
           version: "latest"
 
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+      - name: Set up Python
+        run: uv python install 3.12
 
       - name: Install dependencies
         run: uv sync --all-extras --frozen
@@ -132,7 +128,6 @@ jobs:
           --timeout=300 --timeout-method=thread
 
       - name: Upload coverage
-        if: matrix.python-version == '3.11'
         uses: codecov/codecov-action@v7
         with:
           files: ./coverage.xml
@@ -150,7 +145,7 @@ jobs:
           version: "latest"
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.12
 
       - name: Install dependencies
         run: uv sync --all-extras --frozen
@@ -178,7 +173,7 @@ jobs:
           version: "latest"
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.12
 
       - name: Install dependencies
         run: uv sync --all-extras --frozen
@@ -205,7 +200,7 @@ jobs:
           version: "latest"
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.12
 
       - name: Build package
         run: uv build
