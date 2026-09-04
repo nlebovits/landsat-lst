@@ -402,6 +402,15 @@ on-demand although the shard policy is spot. The EC2 charge is derived at
 about $0.42 for 0.62 VM-hours at the on-demand list price and is not a
 billed number.
 
+### 2026-09-04 integration note
+
+This branch was rebased after #140 shipped exact reprojection, 1024px chunks, one
+whole-band `stac_load`, and sequential 2048px bounded compute/write groups. The
+uint16 candidate composes with that architecture: the load and composite graph are
+built once, and the writer slices the already-encoded lazy outputs. The 32 GiB
+discriminator above measured the retired all-columns path; no new cloud result has
+measured the combined path.
+
 ## 8. Where the evidence lives
 
 - `scripts/experimental/precision_audit_p95.py`: the harness. Run from the repo

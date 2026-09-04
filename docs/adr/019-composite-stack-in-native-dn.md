@@ -1,10 +1,10 @@
 # ADR-019: The composite stack is uint16 DN, not float32 Celsius
 
-**Status:** Implemented and measured, 2026-09-03. The cloud discriminator
-ran and said **stop**: band 27 on a 32 GiB `c6i.4xlarge` was OOM-killed at
-28.11 GiB, so the composite stage stays on 64 GiB VMs. The representation
-change itself stands on the local measurements and the output contract; the
-VM-size move it was meant to enable does not follow from it.
+**Status:** Implemented as an experimental treatment and measured 2026-09-03;
+rebased onto the bounded execution architecture 2026-09-04. The cloud discriminator
+ran against the earlier all-columns path and said **stop**: band 27 on a 32 GiB
+`c6i.4xlarge` was OOM-killed at 28.11 GiB. That is historical evidence, not a
+measurement of the uint16 representation combined with #140's bounded writer.
 **Tracking:** [#136](https://github.com/nlebovits/landsat-lst/issues/136),
 [findings](../findings-composite-precision-audit.md)
 
@@ -42,7 +42,8 @@ observation", from the load to the P95:
 - The offset estimator is untouched. When it must read the native stack it
   reads `qa.celsius_stack`, a lazy float32 view that is bit-identical to the
   old Celsius stack, and `seasonal_debias(apply_to=...)` lands the correction
-  on the DN stack. `offsets.ALGORITHM_VERSION` does not move.
+  on the DN stack. `offsets.ALGORITHM_VERSION` remains 2: exact reprojection changed cached
+  estimator inputs in #139; this representation change does not.
 - `_composite_graph` still accepts a float Celsius stack and takes the old
   kernel on it, so the benchmarks and the equivalence oracle keep working.
 
@@ -84,6 +85,12 @@ measurement disagreed: on a 32 GiB `c6i.4xlarge` the same band reached
 baseline's 1.75, and was killed. The sampled RSS ramp is mostly not
 stack-proportional, and the baseline's own sampled plateau (32.1 GB) sits
 11.8 GB under its VmHWM (43.9 GB). See the findings doc, section 7.
+
+After that run, #140 replaced the all-columns compute with one whole-band load and
+sequential 2048px compute/write groups. The rebased implementation feeds its lazy
+uint16 graph through that writer without rebuilding the load, masks, offsets, or
+composite graph. The historical OOM cannot establish peak RSS or throughput for this
+combined path; any such claim needs a new contract and production discriminator.
 
 Costs: two kernels instead of one, a dtype dispatch in `_composite_graph` and
 `debias_with_offsets`, an `apply_to` seam in `seasonal_debias`, and 190 lines

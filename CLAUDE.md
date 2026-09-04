@@ -231,7 +231,9 @@ about the read path. See [findings](docs/findings-composite-exec-trace.md) and #
   made the nearest-neighbour source pick depend on the read window: a 512 x 1024 window
   moved 3,642 of 84M source pixels and the P95 by up to 1,681 DN. Under exact, 512 and 1024
   are pixel-identical through the shard path (`docs/evidence/issue-139/exact-baseline-local`),
-  which is what lets `shard_composite_chunk` sit at 1024 and per-column loading bound memory.
+  which is what lets `shard_composite_chunk` sit at 1024. Production loads the whole band once,
+  builds the composite once, and bounds memory by computing and writing sequential 2048px
+  longitude groups; the retired per-column path repeated `stac_load` 18 times.
   Against the approximate product exact moves 4.4% of P95 pixels, 97% by under 1 C, so
   `offsets.ALGORITHM_VERSION` is 2 and no pre-v1 record, plan, or product is comparable. The
   one seam is a wrapper on `rasterio.warp.reproject` installed by `pipeline._install_warp_tolerance`;
@@ -439,13 +441,13 @@ load to the P95, and the affine map to Celsius runs on the 2-D float64 quantile
 float32 Celsius, which carried four bytes of precision into a product encoded at
 0.01 C from a source quantized at 0.0034 C. Halving the stack halved the
 composite shard's peak RSS on the corrected local probe (24.2 GB to 10.2 GB at 16
-column chunks), and the model put a production band at 18 to 19 GB. The cloud
-discriminator disagreed: band 27 of S30W065 on a 32 GiB `c6i.4xlarge` was OOM-killed
-at 28.1 GiB, still climbing, against 43.9 GB measured for the same band on a 64 GiB
-VM. **The composite stage stays on 64 GiB VMs.** The RSS ramp through `exporting` is
-mostly not stack-proportional (slope 0.83 of the float32 arm), and a 60 s heartbeat
-misses an 11.8 GB end-of-phase spike, so do not model the composite's peak from the
-stack's bytes. See [ADR-019](docs/adr/019-composite-stack-in-native-dn.md)
+column chunks). Its cloud discriminator ran against the retired all-columns execution
+path: band 27 of S30W065 on a 32 GiB `c6i.4xlarge` was OOM-killed at 28.1 GiB, still
+climbing, against 43.9 GB measured for the same band on a 64 GiB VM. That result rejects
+the old proposal to move that path onto 32 GiB; it does not measure the uint16 stack under
+the one-load, sequential bounded writer shipped in #140. The production default remains
+64 GiB. Do not model the current peak from stack bytes or relabel the historical evidence
+as a measurement of the combined path. See [ADR-019](docs/adr/019-composite-stack-in-native-dn.md)
 and [findings](docs/findings-composite-precision-audit.md), issue #136.
 
 Rules worth keeping:
@@ -458,7 +460,7 @@ Rules worth keeping:
   applied as a whole-DN shift, so the P95 moves by at most half a DN (0.0017 C).
   The encoder truncates, so 4 to 7% of pixels flip by exactly one output DN on real
   data and none by more. The operator accepted this on 2026-09-03. `qa_count` is
-  exact. `offsets.ALGORITHM_VERSION` did not move: the estimator still reads a
+  exact. `offsets.ALGORITHM_VERSION` remains 2: the estimator still reads a
   float32 Celsius view (`qa.celsius_stack`) that is bit-identical to the old stack.
 - **`_composite_graph` dispatches on dtype.** A float stack takes `nanquantile_last`,
   which is what `tests/benchmark` and the equivalence oracle build. Do not remove the
