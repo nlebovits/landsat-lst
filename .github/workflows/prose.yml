@@ -1,0 +1,88 @@
+name: Prose
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  VALE_VERSION: "3.19.0"
+
+jobs:
+  prose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the proposed change
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: Install Vale
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "v${VALE_VERSION}" \
+            --repo vale-cli/vale \
+            --pattern "vale_${VALE_VERSION}_Linux_64-bit.tar.gz" \
+            --output vale.tar.gz
+          tar xzf vale.tar.gz vale
+          sudo install -m 0755 vale /usr/local/bin/vale
+          vale --version
+
+      - name: Fetch pinned prose styles
+        run: vale sync
+
+      - name: Test repository-owned rules
+        run: uv run pytest -q tests/test_prose_styles.py
+
+      - name: Report all Vale findings
+        run: |
+          mapfile -d '' files < <(
+            git ls-files -z -- '*.md' '*.mdx' \
+              ':(exclude)AGENTS.md' \
+              ':(exclude)docs/evidence/**' \
+              ':(exclude)results/**'
+          )
+          if ((${#files[@]})); then
+            vale --minAlertLevel=suggestion --output=line "${files[@]}" || true
+          fi
+
+      - name: Report selected proselint findings
+        run: |
+          mapfile -d '' files < <(
+            git ls-files -z -- '*.md' '*.mdx' \
+              ':(exclude)AGENTS.md' \
+              ':(exclude)docs/evidence/**' \
+              ':(exclude)results/**'
+          )
+          if ((${#files[@]})); then
+            uvx --from proselint==0.16.0 proselint check \
+              --config proselint.json "${files[@]}" || true
+          fi
+
+      - name: Gate handwritten documentation
+        run: |
+          mapfile -d '' files < <(
+            git ls-files -z -- '*.md' '*.mdx' \
+              ':(exclude)AGENTS.md' \
+              ':(exclude)docs/evidence/**' \
+              ':(exclude)results/**'
+          )
+          if ((${#files[@]})); then
+            vale --minAlertLevel=error --output=line "${files[@]}"
+          fi

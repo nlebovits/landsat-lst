@@ -389,7 +389,13 @@ uv run pytest
 
 # Install pre-commit hooks
 uv run prek install
+
+# Run the blocking prose checks
+uv run prek run vale --all-files
 ```
+
+The [prose guide](docs/PROSE.md) documents the repository voice, advisory
+readability checks, and manual Vale and proselint audits.
 
 ### Optional extras
 

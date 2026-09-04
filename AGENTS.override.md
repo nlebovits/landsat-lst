@@ -37,3 +37,15 @@ as measured, omit contrary runs, or describe unit tests as performance evidence.
 Every PR must retain the `performance-evidence` declaration from the pull request
 template. Cloud contracts constrain experiments but never authorize spending;
 obtain explicit operator approval for every launch.
+
+## Prose written by agents
+
+Read `docs/PROSE.md` before drafting or editing Markdown. Apply its voice rules
+to generated text before committing it: remove chatbot residue, unsupported
+hype, repetitive list cadence, and stock transitions. State causal or
+conditional relationships directly. Avoid formulaic resultative frames and
+affirmative-negative sentence pairs.
+
+Run the error-level gate with `uv run prek run vale --all-files`. Run the full
+Vale and proselint audits with the manual commands in `docs/PROSE.md`; treat
+their warnings as prompts for editorial judgment, not mechanical rewrites.
