@@ -390,12 +390,24 @@ uv run pytest
 # Install pre-commit hooks
 uv run prek install
 
-# Run the blocking prose checks
-uv run prek run vale --all-files
+# Run every blocking commit-stage check
+uv run prek run --all-files --show-diff-on-failure
 ```
 
-The [prose guide](docs/PROSE.md) documents the repository voice, advisory
-readability checks, and manual Vale and proselint audits.
+Before you commit documentation, run the advisory voice checks on the files you
+changed. `prek` hides output from a successful hook unless you pass `--verbose`,
+so keep that option on the Vale audit:
+
+```bash
+uv run prek --verbose run vale-audit --files README.md --stage manual
+uv run prek run proselint --files README.md --stage manual
+```
+
+Replace `README.md` with your changed Markdown files, or use `--all-files` for a
+repository-wide audit. The repository has known findings in historical documents.
+The audits do not block CI, although proselint exits nonzero when it reports an
+advisory finding. The [prose guide](docs/PROSE.md) explains the repository voice,
+readability scores, suppressions, and rule ownership.
 
 ### Optional extras
 
