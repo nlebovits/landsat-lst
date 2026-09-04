@@ -39,10 +39,16 @@ if TYPE_CHECKING:
 
 #: Bumped when the tiering, the denominators, or the record layout change. A
 #: stored result carrying a different version was produced by different code.
-ANALYSIS_VERSION = "1.0.0"
+#: 1.1.0 added the value-gated shipped rule to ``mask_tradeoffs``; every other
+#: number in a 1.0.0 record is unchanged and still comparable.
+ANALYSIS_VERSION = "1.1.0"
 
 #: The artifact tail the mask was adopted against (docs/findings-aster-ged-gaps.md).
 DEFAULT_HOT_THRESHOLD_C = 70.0
+
+#: Name of the rule production applies: the buffered gap geometry intersected
+#: with the hot threshold. Formatted with ``buffer`` and ``threshold``.
+SHIPPED_RULE = "numobs==0 + {buffer}-cell buffer AND >= {threshold} degC (shipped)"
 
 #: Rows are walked in strips this tall by default. 512 rows of an 18,000-wide
 #: tile is 9.2 M pixels, so every per-block intermediate stays under ~75 MB.
@@ -253,6 +259,7 @@ def _walk(
     row_cells: np.ndarray,
     col_cells: np.ndarray,
     rule_cells: dict[str, np.ndarray],
+    gated_rules: frozenset[str],
     hot_dn: int,
     fill_dn: int,
     block_rows: int,
@@ -291,6 +298,12 @@ def _walk(
 
         for name, cells in rule_cells.items():
             removed = cells[index]
+            # A value-gated rule removes a pixel only where its geometry and
+            # the hot threshold agree. Measured here rather than derived from
+            # the geometric rule's tally, so the two stay independent if the
+            # production threshold and this analysis threshold ever differ.
+            if name in gated_rules:
+                removed = removed & hot
             tally = acc.rule(name)
             tally[0] += int(np.count_nonzero(removed & ~missing & ~hot))
             tally[1] += int(np.count_nonzero(removed & hot))
@@ -348,10 +361,13 @@ def _cross_tab(acc: _Accumulator) -> dict[str, Any]:
     }
 
 
-def _tradeoffs(acc: _Accumulator, totals: dict[str, Any]) -> list[dict[str, Any]]:
+def _tradeoffs(
+    acc: _Accumulator, totals: dict[str, Any], *, gated: set[str] | None = None
+) -> list[dict[str, Any]]:
     tile_valid = totals["valid_pixels"]
     tile_hot = totals["hot_pixels"]
     tile_missing = totals["missing_pixels"]
+    gated = gated or set()
     out = []
     for name, tally in acc.rules.items():
         cool_removed, hot_removed, missing_annotated = (int(v) for v in tally)
@@ -359,6 +375,7 @@ def _tradeoffs(acc: _Accumulator, totals: dict[str, Any]) -> list[dict[str, Any]
         out.append(
             {
                 "rule": name,
+                "value_gated": name in gated,
                 "valid_pixels_removed": valid_removed,
                 "valid_pixels_removed_pct": _pct(_rate(valid_removed, tile_valid)),
                 "hot_pixels_removed": hot_removed,
@@ -482,9 +499,15 @@ def analyze(
         cell_tiers = tier_codes(numobs)
         gap = numobs == 0
         low = (numobs >= 0) & (numobs <= 2)
+        buffered_gap = ged.dilate_cells(gap, buffer_cells)
+        shipped = SHIPPED_RULE.format(buffer=buffer_cells, threshold=f"{hot_threshold_c:g}")
         rule_cells = {
             "numobs==0": gap,
-            f"numobs==0 + {buffer_cells}-cell buffer": ged.dilate_cells(gap, buffer_cells),
+            f"numobs==0 + {buffer_cells}-cell buffer": buffered_gap,
+            # The shipped rule: the same geometry, intersected with the hot
+            # threshold. It is the last row so the table reads as the case
+            # against each geometric rule, then what production does instead.
+            shipped: buffered_gap,
             "numobs<=2": low,
             f"numobs<=2 + {buffer_cells}-cell buffer": ged.dilate_cells(low, buffer_cells),
         }
@@ -495,6 +518,7 @@ def analyze(
             row_cells=row_cells,
             col_cells=col_cells,
             rule_cells=rule_cells,
+            gated_rules=frozenset({shipped}),
             hot_dn=hot_dn,
             fill_dn=int(identity.nodata),
             block_rows=block_rows,
@@ -535,5 +559,5 @@ def analyze(
         },
         **table,
         "registration_scan": registration,
-        "mask_tradeoffs": _tradeoffs(acc, table["tile_totals"]),
+        "mask_tradeoffs": _tradeoffs(acc, table["tile_totals"], gated={shipped}),
     }

@@ -229,15 +229,56 @@ ambiguity in favour of equal 0.01 degree cells.
 | rule | valid removed | valid % | hot removed | hot % | hot left | missing annotated | missing % |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `NumObs == 0` | 701,279 | 0.2165 | 2,231 | 79.88 | 562 | 82,801 | 99.65 |
-| **`NumObs == 0` + 1-cell buffer** (shipped) | **2,799,286** | **0.8642** | **2,582** | **92.45** | **211** | **83,018** | **99.91** |
+| `NumObs == 0` + 1-cell buffer | 2,799,286 | 0.8642 | 2,582 | 92.45 | 211 | 83,018 | 99.91 |
+| **the same, AND `>= 70 C`** (shipped) | **2,582** | **0.0008** | **2,582** | **92.45** | **211** | **0** | **0** |
 | `NumObs <= 2` | 22,307,977 | 6.887 | 2,571 | 92.05 | 222 | 83,015 | 99.90 |
 | `NumObs <= 2` + 1-cell buffer | 36,913,817 | 11.396 | 2,793 | 100.0 | 0 | 83,095 | 100.0 |
 
-The shipped rule pays 0.8642% of valid pixels for 92.45% of the tail. Extending
-it to `NumObs <= 2` with the buffer removes the whole tail and costs 11.4% of
-the tile, which fails the dataset's rule of honest omission at a defensible
-price. The 211 survivors sit on cells with one to three observations and are
-deliberately not chased.
+Reading the third row against the second shows an identical hot tail reached
+across a difference of 2,796,704 ordinary pixels.
+
+#### Why the mask is a conjunction
+
+#116 shipped the second row: every pixel of the gap region, whatever its value.
+Weighing the hot column against the 0.8642% beside it made the second number
+look like the price of the first. Ordinary surface temperature accounts for
+2,796,704 of those pixels. At 1,083 lost pixels per artifact, removing them put
+visible holes in the product.
+
+Gap geometry and gap damage are different sets. Where `NumObs == 0`, USGS
+interpolated the emissivity, which describes the auxiliary input rather than
+the retrieval that consumed it. Most pixels in those cells carry an ordinary
+temperature. Where the retrieval did fail outright, the tile already holds no
+value: before any mask runs, 99.9% of its missing pixels sit inside this
+geometry. Annotating them again is work the mask never had to do.
+
+Production therefore intersects the two conditions. Geometry locates the
+interpolated emissivity, while the threshold
+(`settings.ged_gap_hot_threshold_c`, 70 C) selects the pixels that
+interpolation plausibly broke. Everything outside their intersection stays in
+the composite.
+
+The 70 C threshold is empirical and local. It marks where this tile's artifact
+population separates from the rest of the distribution: 2,793 pixels reaching
+77.87 C, enriched 369 times on `NumObs == 0` cells, with none of it on a cell
+carrying more than three observations. Because the threshold never acts alone,
+it carries no claim about the maximum physical land surface temperature. A
+pixel above 70 C outside a gap survives. Keeping it is what stops the rule
+from hardening into a global hot clamp, which none of this evidence supports.
+`lst_valid_max` at 80 C remains the only unconditional ceiling.
+
+One tile calibrated that number, which bounds what it can support. Check the
+tail against 70 C on the next tile carrying a substantial gap population.
+
+Because the conjunction bounds what the buffer can reach, the buffer stays at
+1. It takes 351 more artifact pixels than the bare gap cells while touching no
+ordinary ones. Its old cost of 2,098,007 additional valid pixels was entirely
+collateral.
+
+Extending the geometry to `NumObs <= 2` with the buffer removes the whole tail
+at a cost of 11.4% of the tile, applied unconditionally. The 211 survivors sit
+on cells carrying one to three observations, and chasing them is not worth that
+price.
 
 **0.8642%, not 0.863%.** Earlier prose quoted 0.863%. Both figures are the
 same calculation over different edge handling: the 2026-08-23 pass clipped its

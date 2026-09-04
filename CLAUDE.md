@@ -487,16 +487,35 @@ If you see values like -124°C, the data didn't load correctly (DN=0 → invalid
   outside `[settings.lst_valid_min, settings.lst_valid_max]` (default −50 / 80 °C).
   This removes the ~−124 °C artifacts produced when reprojection interpolates near
   the DN=0 fill (not caught by the exact `!= 0` test), plus high-DN saturation junk.
-- **ASTER GED emissivity-gap mask** (`ged.gap_mask_for_geobox`, applied in
-  `process_tile` and `run_composite_shard`): drops LST pixels whose ~1 km
-  AG100 cell has `NumObs == 0`, plus a 1-cell buffer
-  (`settings.ged_gap_mask`, `settings.ged_gap_buffer_cells`). USGS
-  interpolates emissivity there; the fringe yields spurious 70-78 °C
-  retrievals the P95 promotes, the cores yield ST fill. Verified per-pixel on
-  S30W065 (`results/decision/ged_gap_s30w065.json`, `landsat-lst ged-analyze`):
-  0.8642% of valid pixels removed, 92.45% of the ≥70 °C tail (369x enrichment
-  on `NumObs == 0`, none of the tail above 3 observations); the 211-px residue
-  on NumObs 1-3 cells is deliberately not chased. The association is spatial;
+- **ASTER GED emissivity-gap mask** (`ged.gap_mask_for_geobox` for the
+  geometry, `pipeline.apply_ged_gap_mask` for the rule, applied in
+  `process_tile` and `run_composite_shard`): **the rule is a conjunction, and
+  the geometry alone is not an approximation of it.** The mask drops a pixel
+  only where its ~1 km AG100 cell has `NumObs == 0` (or is within
+  `settings.ged_gap_buffer_cells` of one) **and** its LST is at least
+  `settings.ged_gap_hot_threshold_c` (70 °C). USGS interpolates emissivity
+  there; the fringe yields spurious 70-78 °C retrievals the P95 promotes, the
+  cores yield ST fill. Verified per-pixel on S30W065
+  (`results/decision/ged_gap_s30w065.json`, `landsat-lst ged-analyze`): the
+  shipped rule removes **2,582 pixels, 0.0008% of valid**, and takes 92.45% of
+  the ≥70 °C tail (369x enrichment on `NumObs == 0`, none of the tail above 3
+  observations). The 211-px residue on NumObs 1-3 cells is deliberately not
+  chased. **#116 shipped the geometry unconditionally and that was the defect:**
+  the same tail cost 2,799,286 valid pixels, 0.8642%, and 1,083
+  ordinary pixels per artifact removed, which showed as holes on the map. Gap
+  geometry says where emissivity was interpolated, never that the retrieval
+  failed; the cells where it did fail are already nodata (99.9% of the tile's
+  missing pixels), so the mask never had to remove them. The buffer stays at 1
+  because under the conjunction it costs 351 more artifact pixels and zero
+  ordinary ones. **There is no setting that restores the geometric form**, and
+  the threshold has a floor of 50 °C so it cannot be lowered into one either;
+  turn the mask off with `settings.ged_gap_mask`. The threshold is empirical
+  and local: 70 °C is where *this tile's* artifact tail separates, not a claim
+  about physical maximum temperature, and it is not a global hot clamp because
+  a pixel above 70 °C outside a gap is kept (`lst_valid_max` is the only
+  unconditional ceiling). Check the tail against 70 °C on the next tile with a
+  big gap population rather than assuming it carries over. The association is
+  spatial;
   causation is inference, and the docs say so. Output-side like the land mask,
   **LST only** — `qa_count` is never masked (0 observations is data) and the
   offset estimator never sees it (cached offsets stay valid; no
