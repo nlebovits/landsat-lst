@@ -17,10 +17,14 @@ from landsat_lst.config import settings
 from landsat_lst.ged_coverage import (
     ABSENT_OUTSIDE_FETCH_DOMAIN,
     ABSENT_UNVERIFIED,
+    ABSENT_UPSTREAM,
     ABSENT_WITHIN_FETCH_DOMAIN,
+    UpstreamInventory,
     build_report,
     granules_for_tile,
+    load_upstream_inventory,
     production_tiles,
+    write_upstream_inventory,
 )
 
 h5py = pytest.importorskip("h5py")
@@ -171,12 +175,132 @@ class TestClassification:
         with pytest.raises(ValueError, match=r"expected \(180, 360\)"):
             build_report(ged_dir=directory, tiles=["S30W065"], fetch_domain=domain)
 
-    def test_the_record_never_claims_upstream_absence(self, tmp_path):
+    def test_without_an_inventory_the_record_never_claims_upstream_absence(self, tmp_path):
         directory = tmp_path / "empty"
         directory.mkdir()
         report = build_report(ged_dir=directory, tiles=["S30W065"], buffer_cells=0)
-        assert "CMR" in str(report.as_dict()["upstream_inventory"])
+        assert "none given" in str(report.as_dict()["upstream_inventory"])
+        assert ABSENT_UPSTREAM not in report.classification.values()
         assert ged_coverage.COVERAGE_VERSION
+
+
+def _inventory(names: set[str]) -> UpstreamInventory:
+    return UpstreamInventory(
+        short_name="AG1km",
+        version="003",
+        queried_at="2026-09-04T07:50:00+00:00",
+        granule_count=len(names),
+        names=frozenset(names),
+    )
+
+
+class TestUpstreamInventory:
+    """Completeness is judged against what the collection holds, and only
+    against a persisted inventory -- never a local listing."""
+
+    def test_the_record_round_trips_through_cells(self, tmp_path):
+        names = {ged.granule_name(-30, -65), ged.granule_name(40, -75), ged.granule_name(0, 179)}
+        path = tmp_path / "inv.json"
+        written = write_upstream_inventory(path, names=names, short_name="AG1km", version="003")
+        loaded = load_upstream_inventory(path)
+        assert loaded == written
+        assert loaded.names == frozenset(names)
+        assert loaded.granule_count == 3
+        assert loaded.queried_at.endswith("+00:00")
+
+    def test_a_foreign_schema_is_refused(self, tmp_path):
+        path = tmp_path / "inv.json"
+        path.write_text('{"schema_version": 99, "cells": []}')
+        with pytest.raises(ValueError, match="schema v99"):
+            load_upstream_inventory(path)
+
+    def test_a_count_that_disagrees_with_the_cells_is_refused(self, tmp_path):
+        path = tmp_path / "inv.json"
+        path.write_text(
+            '{"schema_version": 1, "short_name": "AG1km", "version": "003", '
+            '"queried_at": "x", "granule_count": 2, "cells": [[-30, -65]]}'
+        )
+        with pytest.raises(ValueError, match="says 2 granules but lists 1"):
+            load_upstream_inventory(path)
+
+    def test_an_absence_the_collection_shares_is_absent_upstream(self, tmp_path):
+        directory = tmp_path / "empty"
+        directory.mkdir()
+        touched, _ = granules_for_tile("S30W065", buffer_cells=0)
+        absent = ged.granule_name(-30, -65)
+        inventory = _inventory(touched - {absent})
+        report = build_report(
+            ged_dir=directory, tiles=["S30W065"], buffer_cells=0, upstream_inventory=inventory
+        )
+        assert report.classification[absent] == ABSENT_UPSTREAM
+        assert report.classification[ged.granule_name(-31, -65)] == ABSENT_UNVERIFIED
+        assert report.absent_upstream == (absent,)
+        assert report.absent_upstream_core == (absent,)
+        assert len(report.fetchable) == 24
+
+    def test_complete_means_every_granule_the_collection_holds(self, tmp_path):
+        """An archive holding everything upstream is complete even though an
+        expected granule is missing, because nothing can ever fetch it."""
+        directory = tmp_path / "held"
+        directory.mkdir()
+        touched, _ = granules_for_tile("S30W065", buffer_cells=1)
+        absent = ged.granule_name(-30, -65)
+        for name in touched - {absent}:
+            (directory / name).write_bytes(b"")
+        inventory = _inventory(touched - {absent})
+        with_inv = build_report(
+            ged_dir=directory, tiles=["S30W065"], buffer_cells=1, upstream_inventory=inventory
+        )
+        without = build_report(ged_dir=directory, tiles=["S30W065"], buffer_cells=1)
+        assert with_inv.complete is True
+        assert without.complete is False
+        assert with_inv.counts()["missing"] == without.counts()["missing"] == 1
+        assert with_inv.counts()["fetchable"] == 0
+        assert with_inv.tiles_missing_core == ()
+        assert without.tiles_missing_core == ("S30W065",)
+
+    def test_the_record_carries_the_inventory_identity(self, tmp_path):
+        directory = tmp_path / "empty"
+        directory.mkdir()
+        touched, _ = granules_for_tile("S30W065", buffer_cells=0)
+        report = build_report(
+            ged_dir=directory,
+            tiles=["S30W065"],
+            buffer_cells=0,
+            upstream_inventory=_inventory(touched),
+        )
+        record = report.as_dict()
+        assert record["upstream_inventory"] == {
+            "short_name": "AG1km",
+            "version": "003",
+            "queried_at": "2026-09-04T07:50:00+00:00",
+            "granule_count": 25,
+        }
+        assert record["counts"]["absent_upstream"] == 0
+        assert record["counts"]["fetchable"] == 25
+
+    def test_a_path_is_loaded_like_a_record(self, tmp_path):
+        directory = tmp_path / "empty"
+        directory.mkdir()
+        touched, _ = granules_for_tile("S30W065", buffer_cells=0)
+        path = tmp_path / "inv.json"
+        write_upstream_inventory(path, names=touched, short_name="AG1km", version="003")
+        report = build_report(
+            ged_dir=directory, tiles=["S30W065"], buffer_cells=0, upstream_inventory=path
+        )
+        assert report.inventory is not None
+        assert report.inventory.granule_count == 25
+
+    def test_the_fetch_domain_source_is_recorded_relative(self, tmp_path, monkeypatch):
+        directory = tmp_path / "empty"
+        directory.mkdir()
+        domain = tmp_path / "domain.npy"
+        np.save(domain, np.zeros((180, 360), dtype=bool))
+        monkeypatch.chdir(tmp_path)
+        report = build_report(
+            ged_dir=directory, tiles=["S30W065"], buffer_cells=0, fetch_domain=domain
+        )
+        assert report.fetch_domain_source == "domain.npy"
 
 
 @pytest.mark.skipif(not _real_granules(), reason="no local AG1km archive (set LST_GED_DIR)")
@@ -213,16 +337,30 @@ class TestAgainstRealGranules:
         assert ged.GED_CELLS_PER_DEGREE == 100
 
     def test_the_reader_returns_it_north_up_and_west_left(self):
+        """The earlier form asserted ``lat[0,0] > lat[-1,0] or <flipped>``,
+        and every real granule is stored north-up, so the ``or`` short-
+        circuited and the flip was never exercised (issue #118 audit). This
+        form derives the expected orientation from the geolocation arrays
+        and compares the whole array; the synthetic single-axis flips live
+        in tests/unit/test_ged_mask.py."""
         path = _real_granules()[0]
         with h5py.File(path) as f:
             lat = f["Geolocation/Latitude"][:]
             lon = f["Geolocation/Longitude"][:]
+        raw = _raw_numobs(path)
+        expected = raw
+        if lat[0, 0] < lat[-1, 0]:
+            expected = np.flipud(expected)
+        if lon[0, 0] > lon[0, -1]:
+            expected = np.fliplr(expected)
         oriented = ged.read_granule_numobs(path)
         assert oriented.shape == (100, 100)
-        # Whatever the file's own order, the reader's row 0 is the north edge
-        # and its column 0 the west edge.
-        assert lat[0, 0] > lat[-1, 0] or np.array_equal(oriented, np.flipud(_raw_numobs(path)))
-        assert lon[0, 0] < lon[0, -1] or np.array_equal(oriented, np.fliplr(_raw_numobs(path)))
+        np.testing.assert_array_equal(oriented, expected)
+        # And the product's own convention, so the test is not code agreeing
+        # with code: the file is north-up and west-left, so no flip applied.
+        assert lat[0, 0] > lat[-1, 0]
+        assert lon[0, 0] < lon[0, -1]
+        np.testing.assert_array_equal(oriented, raw)
 
     def test_the_name_round_trips_through_the_grammar(self):
         for path in _real_granules()[:50]:

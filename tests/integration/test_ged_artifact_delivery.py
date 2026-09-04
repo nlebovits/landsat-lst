@@ -12,13 +12,11 @@ So this builds a wheel, installs it into a clean virtualenv, and runs it from
 a directory that has no repo, no ``data/``, and no ``data/aster_ged``. That is
 the VM's situation, reproduced.
 
-Today the assertion is that resolution **fails loudly, naming all three
-paths**, because no artifact is packaged: the local archive covers 8,444 of
-the 19,300 granules production needs (``landsat-lst ged-coverage``), and
-shipping a partial artifact would mask nothing over most of the world while
-looking successful. The moment a complete artifact is packaged, the same test
-asserts the resolution *kind* is ``artifact``. It needs no edit to switch --
-it branches on whether the wheel contains one.
+Since #118 a complete artifact ships inside the wheel at
+``landsat_lst/data/ged_gap_mask.npz``, so the assertion is that the resolver
+finds it from a foreign CWD with no ``data/`` at all, and that its content
+hash is pinned. The loud-failure branch is kept for a build that somehow lacks
+the file: the one thing that must never happen is a quiet wrong answer.
 """
 
 from __future__ import annotations
@@ -133,20 +131,14 @@ class TestDelivery:
             assert probe["error"] is None
 
     def test_a_packaged_artifact_is_what_the_resolver_picks(self, probe):
-        """The acceptance criterion, active as soon as an artifact ships."""
-        if probe["packaged"] is None:
-            pytest.skip(
-                "no artifact is packaged in this build: the local archive covers "
-                "8,444 of the 19,300 granules production needs, so packaging one "
-                "would ship a mask that masks nothing. See landsat-lst ged-coverage."
-            )
+        """The acceptance criterion for #118: a VM with the wheel and nothing
+        else resolves the production mask."""
+        assert probe["packaged"] is not None, "the wheel carries no ged_gap_mask.npz"
         assert probe["kind"] == "artifact"
         assert probe["packaged"] in probe["source"]
 
     def test_a_packaged_artifact_has_its_digest_pinned(self, probe):
-        if probe["packaged"] is None:
-            assert probe["pinned"] is None
-            pytest.skip("nothing packaged, so nothing to pin")
+        assert probe["packaged"] is not None
         assert probe["pinned"] is not None
 
     def test_the_failure_names_every_path_it_tried(self, probe):

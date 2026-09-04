@@ -30,7 +30,7 @@ Two sources build the same mask:
 - **The artifact** (:func:`build_artifact`'s ``.npz``): one compact global
   record of every gap cell plus the manifest of granules the build actually
   consumed, built by ``scripts/build_ged_gap_mask.py`` from a granule
-  archive. This is the production path -- a fleet VM ships one small file,
+  archive. This is the production path -- the wheel carries one small file,
   not thousands of granules. An earlier version stored a 1-degree "coverage
   grid" and read a cell outside it as holding no granule upstream; that was
   circular, because the grid was built by listing the local directory, so an
@@ -61,7 +61,7 @@ from landsat_lst.config import settings
 log = structlog.get_logger()
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from odc.geo.geobox import GeoBox
 
@@ -83,20 +83,26 @@ NUMOBS_ABSENT = -1
 #: Bumped when the artifact layout changes; a mismatched artifact is refused
 #: rather than reinterpreted. v2 adds the consumed manifest, its per-granule
 #: digests, the expected manifest, and the canonical content hash -- without
-#: which a partial archive is indistinguishable from a gap-free region.
-ARTIFACT_FORMAT_VERSION = 2
+#: which a partial archive is indistinguishable from a gap-free region. v3
+#: adds the granules the collection itself lacks (``absent_upstream``, from a
+#: persisted CMR inventory) and that inventory's identity, so completeness
+#: can be judged against what exists rather than against every cell a tile
+#: touches -- 2,374 of the 19,300 expected granules are open ocean or island
+#: groups AG100 never covered.
+ARTIFACT_FORMAT_VERSION = 3
 
 #: Recorded in the artifact and hashed into its content digest.
 GED_PRODUCT = "ASTER GED AG100 v003 (AG1km.v003, 0010)"
 
 #: The content hash of the *published* artifact, verified on load. ``None``
-#: means no artifact is published with this package: the local archive covers
-#: 8,771 of the 19,300 granules the 700 production land tiles need, so any
-#: artifact built today is partial and packaging one would ship a mask that
-#: looks successful while masking nothing over two thirds of the world. See
-#: ``landsat-lst ged-coverage``. Pin the digest here in the same commit that
-#: adds ``src/landsat_lst/data/ged_gap_mask.npz``.
-GED_ARTIFACT_CONTENT_SHA256: str | None = None
+#: means no artifact is published with this package. Pin the digest here in
+#: the same commit that adds ``src/landsat_lst/data/ged_gap_mask.npz``, and
+#: only from a build that ``scripts/build_ged_gap_mask.py --require-complete``
+#: accepted: a partial artifact masks nothing over the gaps it never saw while
+#: looking successful. See ``landsat-lst ged-coverage``.
+GED_ARTIFACT_CONTENT_SHA256: str | None = (
+    "62e9ca8f22e3bd0810f1a0034197ca327c20ef0ffef94a20a75d7ac291ac058f"
+)
 
 
 class MissingGranuleError(FileNotFoundError):
@@ -205,6 +211,17 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _as_count(value: object) -> int:
+    """An inventory granule count from whatever an identity mapping carries."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int | np.integer):
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        return int(value)
+    return 0
+
+
 def canonical_content_hash(
     *,
     gap_rows: np.ndarray,
@@ -212,6 +229,8 @@ def canonical_content_hash(
     consumed: Sequence[str],
     consumed_sha256: Sequence[str],
     product: str,
+    absent_upstream: Sequence[str] = (),
+    inventory: Mapping[str, object] | None = None,
 ) -> str:
     """Hash the artifact's *content*, independent of how it was serialized.
 
@@ -220,6 +239,10 @@ def canonical_content_hash(
     builds produce different file digests and a file digest can never be
     pinned. Gap cells are sorted and written as fixed big-endian ``int32``,
     so the digest is stable across platforms as well as across rebuilds.
+
+    The absent-upstream list and the inventory identity are part of the
+    content: they decide which tiles the artifact will *serve* rather than
+    refuse, so two builds that differ only there are different products.
     """
     order = np.lexsort((gap_cols, gap_rows))
     h = hashlib.sha256()
@@ -227,13 +250,27 @@ def canonical_content_hash(
     h.update(f"{product}\n".encode())
     for name, digest in sorted(zip(consumed, consumed_sha256, strict=True)):
         h.update(f"{name} {digest}\n".encode())
+    for name in sorted(absent_upstream):
+        h.update(f"absent-upstream {name}\n".encode())
+    for key in ("short_name", "version", "queried_at", "granule_count"):
+        value = "" if inventory is None else inventory.get(key, "")
+        if key == "granule_count":
+            # Stored as an int64 and read back as one, so an absent count
+            # must hash the same way whether it arrives as "" or 0.
+            value = _as_count(value)
+        h.update(f"inventory {key}={value}\n".encode())
     h.update(np.asarray(gap_rows, dtype=">i4")[order].tobytes())
     h.update(np.asarray(gap_cols, dtype=">i4")[order].tobytes())
     return h.hexdigest()
 
 
 def build_artifact(
-    ged_dir: Path, out_path: Path, *, expected: Sequence[str] | None = None
+    ged_dir: Path,
+    out_path: Path,
+    *,
+    expected: Sequence[str] | None = None,
+    absent_upstream: Sequence[str] | None = None,
+    inventory: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Scan every granule under ``ged_dir`` into one compact global artifact.
 
@@ -256,6 +293,13 @@ def build_artifact(
             :func:`landsat_lst.ged_coverage.expected_granules`. Recorded
             alongside the consumed set so the artifact carries its own
             completeness verdict rather than relying on a separate report.
+        absent_upstream: Expected granules the collection does not hold,
+            established against a persisted CMR inventory. These are removed
+            from ``missing_expected``: a tile touching one is served with a
+            warning rather than refused, exactly as the granule path treats
+            a margin absence, because nothing can ever be fetched for it.
+        inventory: Identity of that inventory (``short_name``, ``version``,
+            ``queried_at``, ``granule_count``), recorded and hashed.
 
     Returns:
         The build report, including the canonical content hash.
@@ -286,13 +330,17 @@ def build_artifact(
     gap_rows = np.concatenate(rows) if rows else np.empty(0, dtype=np.int32)
     gap_cols = np.concatenate(cols) if cols else np.empty(0, dtype=np.int32)
     expected_list = sorted(expected) if expected is not None else []
-    missing = sorted(set(expected_list) - set(consumed))
+    absent_list = sorted(absent_upstream) if absent_upstream is not None else []
+    inventory_identity = dict(inventory) if inventory is not None else {}
+    missing = sorted(set(expected_list) - set(consumed) - set(absent_list))
     content = canonical_content_hash(
         gap_rows=gap_rows,
         gap_cols=gap_cols,
         consumed=consumed,
         consumed_sha256=digests,
         product=GED_PRODUCT,
+        absent_upstream=absent_list,
+        inventory=inventory_identity,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -305,6 +353,11 @@ def build_artifact(
         consumed_sha256=np.array(digests, dtype=np.str_),
         expected=np.array(expected_list, dtype=np.str_),
         missing_expected=np.array(missing, dtype=np.str_),
+        absent_upstream=np.array(absent_list, dtype=np.str_),
+        inventory_short_name=np.str_(str(inventory_identity.get("short_name", ""))),
+        inventory_version=np.str_(str(inventory_identity.get("version", ""))),
+        inventory_queried_at=np.str_(str(inventory_identity.get("queried_at", ""))),
+        inventory_granule_count=np.int64(_as_count(inventory_identity.get("granule_count", 0))),
         content_sha256=np.str_(content),
         build_code_sha256=np.str_(_build_code_digest()),
     )
@@ -313,6 +366,7 @@ def build_artifact(
         "gap_cells": int(gap_rows.size),
         "expected": len(expected_list),
         "missing_expected": len(missing),
+        "absent_upstream": len(absent_list),
         "content_sha256": content,
         "build_code_sha256": _build_code_digest(),
         "complete": expected is not None and not missing,
@@ -326,6 +380,7 @@ class _Artifact:
     gap_rows: np.ndarray
     gap_cols: np.ndarray
     consumed: frozenset[str]
+    absent_upstream: frozenset[str]
 
 
 def _load_artifact(path: Path) -> _Artifact:
@@ -344,6 +399,13 @@ def _load_artifact(path: Path) -> _Artifact:
         digests = [str(x) for x in data["consumed_sha256"]]
         stored = str(data["content_sha256"])
         product = str(data["product"])
+        absent = [str(x) for x in data["absent_upstream"]]
+        inventory = {
+            "short_name": str(data["inventory_short_name"]),
+            "version": str(data["inventory_version"]),
+            "queried_at": str(data["inventory_queried_at"]),
+            "granule_count": int(data["inventory_granule_count"]),
+        }
 
     recomputed = canonical_content_hash(
         gap_rows=gap_rows,
@@ -351,6 +413,8 @@ def _load_artifact(path: Path) -> _Artifact:
         consumed=consumed,
         consumed_sha256=digests,
         product=product,
+        absent_upstream=absent,
+        inventory=inventory,
     )
     if recomputed != stored:
         msg = (
@@ -369,7 +433,12 @@ def _load_artifact(path: Path) -> _Artifact:
             "the pinned artifact."
         )
         raise ValueError(msg)
-    return _Artifact(gap_rows=gap_rows, gap_cols=gap_cols, consumed=frozenset(consumed))
+    return _Artifact(
+        gap_rows=gap_rows,
+        gap_cols=gap_cols,
+        consumed=frozenset(consumed),
+        absent_upstream=frozenset(absent),
+    )
 
 
 def _cells_from_artifact(
@@ -394,13 +463,30 @@ def _cells_from_artifact(
     consumed = data.consumed
     missing_core: list[str] = []
     missing_margin: list[str] = []
+    absent_core: list[str] = []
     for name, _, _, touches_core in granules_for_window(
         row0=row0, row1=row1, col0=col0, col1=col1, core=core
     ):
-        if name not in consumed:
-            (missing_core if touches_core else missing_margin).append(name)
+        if name in consumed:
+            continue
+        if name in data.absent_upstream:
+            if touches_core:
+                absent_core.append(name)
+            continue
+        (missing_core if touches_core else missing_margin).append(name)
     if missing_core:
         raise MissingGranuleError(missing_core, artifact, source_kind="artifact")
+    if absent_core:
+        # The collection has no granule here, verified against its inventory
+        # at build time, so nothing can be fetched and refusing would fail the
+        # tile forever. No NumObs means no ``NumObs == 0``: the cell
+        # contributes no gap and the rule is unchanged. On the production
+        # tile list these are open ocean and a few island groups.
+        log.warning(
+            "ged_upstream_granules_absent",
+            granules=absent_core,
+            note="the AG100 collection holds no granule here; no gap contribution",
+        )
     if missing_margin:
         log.warning(
             "ged_margin_granules_absent",
@@ -517,11 +603,14 @@ def numobs_window(
     whole shopping list at once -- a missing core granule means unmasked
     pixels inside the tile. A granule touching only the *margin* ring (the
     ``buffer_cells`` pad, where a neighbouring tile's gap cell could buffer
-    across the edge) may be absent: the AG100 collection genuinely lacks some
-    1-degree cells (e.g. ``AG1km.v003.-34.-066`` beside S30W065, with both
-    its neighbours present), and failing the tile for a fringe the artifact
-    path also cannot see would make the two paths disagree. The absence is
-    logged, never silent.
+    across the edge) may be absent: the AG100 collection has no granule over
+    open ocean and a few island groups (2,374 of the 19,300 cells production
+    touches, per the persisted CMR inventory), and failing the tile for a
+    fringe the artifact path also cannot see would make the two paths
+    disagree. The absence is logged, never silent. This granule path knows
+    nothing about the inventory, so a *core* granule the collection lacks
+    raises here; only the packaged artifact, which records the absent set,
+    serves such a tile.
     """
     cells = np.full((row1 - row0, col1 - col0), NUMOBS_ABSENT, dtype=np.int16)
     missing_core: list[str] = []

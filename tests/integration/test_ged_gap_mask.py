@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from landsat_lst import ged
 from landsat_lst.config import settings
 from landsat_lst.models import ProcessingJob, TileId
 from landsat_lst.pipeline import process_tile
@@ -98,6 +99,9 @@ def stubbed_pipeline(tmp_path, monkeypatch):
         _write_granule(ged_dir, lat_top, lon_west, np.full((100, 100), 7, dtype=np.int16))
     monkeypatch.setattr(settings, "ged_dir", ged_dir)
     monkeypatch.setattr(settings, "ged_artifact", tmp_path / "absent.npz")
+    # The wheel now carries the production artifact, which outranks a
+    # granule directory by design; these fixtures test the granule path.
+    monkeypatch.setattr(ged, "packaged_artifact_path", lambda: None)
 
     return ProcessingJob(tile=TileId(lat=40, lon=-75), year=2024)
 

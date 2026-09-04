@@ -1685,6 +1685,14 @@ def tile_info(tile_name: str) -> None:
     help="180x360 .npy of the 1-degree cells the archive's fetch requested. "
     "Refines *why* a granule is absent; it is not an upstream inventory.",
 )
+@click.option(
+    "--upstream-inventory",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="The AG1km v003 collection inventory scripts/fetch_ged_granules.py "
+    "persisted. With it, an expected granule the collection lacks is "
+    "absent-upstream and does not count against completeness.",
+)
 @click.option("--buffer-cells", type=int, default=None, help="Margin ring, default from settings")
 @click.option(
     "--out",
@@ -1698,6 +1706,7 @@ def ged_coverage(
     ged_dir: Path | None,
     artifact: Path | None,
     fetch_domain: Path | None,
+    upstream_inventory: Path | None,
     buffer_cells: int | None,
     out: Path | None,
     as_json: bool,
@@ -1713,9 +1722,9 @@ def ged_coverage(
     `ged_gap_mask` defaults on and a tile that reaches an unheld granule
     fails rather than shipping unmasked.
 
-    Absence is classified by what was *requested*, never by what the
-    collection holds: no authoritative offline inventory of AG100 v003
-    exists, so upstream absence cannot be established here.
+    Upstream absence is established only against a persisted collection
+    inventory (--upstream-inventory). Without one, every absence counts and
+    no source can be complete.
     """
     import json as json_module
 
@@ -1726,6 +1735,7 @@ def ged_coverage(
         artifact=artifact,
         buffer_cells=buffer_cells,
         fetch_domain=fetch_domain,
+        upstream_inventory=upstream_inventory,
     )
     counts = report.counts()
 
@@ -1756,8 +1766,13 @@ def _print_ged_coverage(report, counts: dict) -> None:
         f"(of which inside a tile, not its margin: {counts['missing_core']:,})"
     )
     console.print(
+        f"  absent upstream: {counts['absent_upstream']:,} "
+        f"({counts['absent_upstream_core']:,} inside a tile)   "
+        f"fetchable: {counts['fetchable']:,} ({counts['fetchable_core']:,} inside a tile)"
+    )
+    console.print(
         f"  tiles that would fail: {counts['tiles_missing_core']:,} of {counts['tiles']}"
-        f"   tiles missing any granule: {counts['tiles_missing_any']:,}"
+        f"   tiles missing any fetchable granule: {counts['tiles_missing_any']:,}"
     )
     console.print(f"  held but not expected: {counts['extra_not_expected']:,}")
     for key, value in sorted(counts.items()):
@@ -1769,10 +1784,17 @@ def _print_ged_coverage(report, counts: dict) -> None:
         )
     else:
         console.print(f"  [dim]fetch domain: {source}[/dim]")
-    console.print(
-        "  [dim]No offline inventory of AG100 v003 exists, so none of these "
-        "labels claims a granule is absent upstream.[/dim]"
-    )
+    if report.inventory is None:
+        console.print(
+            "  [dim]No upstream inventory given, so no label claims a granule is "
+            "absent from the collection and nothing short of every granule is complete.[/dim]"
+        )
+    else:
+        inv = report.inventory
+        console.print(
+            f"  [dim]inventory: {inv.short_name} v{inv.version}, "
+            f"{inv.granule_count:,} granules, queried {inv.queried_at}[/dim]"
+        )
     if report.complete:
         console.print("\n[green]COMPLETE[/green] -- this source covers production.")
     else:
@@ -1782,13 +1804,21 @@ def _print_ged_coverage(report, counts: dict) -> None:
 @main.command()
 @click.option(
     "--raster",
-    required=True,
+    default=None,
     help="Published LST P95 COG: a local path, or an https/vsicurl URL. "
     "S30W065 is published at https://s3.us-west-2.amazonaws.com/"
     "us-west-2.opendata.source.coop/nlebovits/landsat-lst/"
     "lst-p95-2021-2025/S30W065/lst_p95_2021-2025_S30W065.tif",
 )
-@click.option("--tile", "-t", required=True, help="Tile the raster must be, e.g. S30W065")
+@click.option("--tile", "-t", default=None, help="Tile the raster must be, e.g. S30W065")
+@click.option(
+    "--from-record",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Render the tables from a record this command wrote earlier "
+    "(results/decision/ged_gap_s30w065.json), with no raster read and no "
+    "granules. The committed record regenerates its own table this way.",
+)
 @click.option(
     "--ged-dir",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
@@ -1809,8 +1839,9 @@ def _print_ged_coverage(report, counts: dict) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Print the record instead of a table")
 def ged_analyze(
     *,
-    raster: str,
-    tile: str,
+    raster: str | None,
+    tile: str | None,
+    from_record: Path | None,
     ged_dir: Path | None,
     threshold_c: float,
     buffer_cells: int,
@@ -1836,6 +1867,16 @@ def ged_analyze(
 
     from landsat_lst.config import settings
     from landsat_lst.ged_analysis import AnalysisInputError, analyze
+
+    if from_record is not None:
+        if as_json:
+            click.echo(from_record.read_text().rstrip("\n"))
+        else:
+            _print_ged_analysis(json_module.loads(from_record.read_text()))
+        return
+    if raster is None or tile is None:
+        msg = "--raster and --tile are required unless --from-record is given"
+        raise click.UsageError(msg)
 
     source = ged_dir if ged_dir is not None else settings.ged_dir
     if not Path(source).is_dir():

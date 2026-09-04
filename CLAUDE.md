@@ -532,16 +532,28 @@ If you see values like -124°C, the data didn't load correctly (DN=0 → invalid
   (`settings.ged_gap_mask`, `settings.ged_gap_buffer_cells`). USGS
   interpolates emissivity there; the fringe yields spurious 70-78 °C
   retrievals the P95 promotes, the cores yield ST fill. Verified per-pixel on
-  S30W065 (2026-08-23): 0.863% of valid pixels removed, 92.45% of the ≥70 °C
-  tail; the 211-px residue on NumObs 1-3 cells is deliberately not chased.
-  Output-side like the land mask, **LST only** — `qa_count` is never masked
-  (0 observations is data) and the offset estimator never sees it (cached
-  offsets stay valid; no `ALGORITHM_VERSION` bump). Source is the
-  `data/ged_gap_mask.npz` artifact (preferred; 2.8 MB, gitignored — built by
-  `scripts/build_ged_gap_mask.py`, and what a fleet VM ships) or the local granules in
-  `data/aster_ged/`; a granule the mask needs but the archive lacks is an
-  error naming the ids, never a silent skip. See
-  [findings](docs/findings-aster-ged-gaps.md) and docs/methodology.md.
+  S30W065 (`results/decision/ged_gap_s30w065.json`, `landsat-lst ged-analyze`):
+  0.8642% of valid pixels removed, 92.45% of the ≥70 °C tail (369x enrichment
+  on `NumObs == 0`, none of the tail above 3 observations); the 211-px residue
+  on NumObs 1-3 cells is deliberately not chased. The association is spatial;
+  causation is inference, and the docs say so. Output-side like the land mask,
+  **LST only** — `qa_count` is never masked (0 observations is data) and the
+  offset estimator never sees it (cached offsets stay valid; no
+  `ALGORITHM_VERSION` bump). **The production source is the artifact packaged
+  inside the wheel**, `src/landsat_lst/data/ged_gap_mask.npz` (tracked, 6.7 MB,
+  format v3, content hash pinned in `ged.GED_ARTIFACT_CONTENT_SHA256` and
+  verified on load): a Coiled VM has no checkout and no `data/`, and before
+  #118 nothing could reach one. `ged._resolve_source` tries the configured
+  `settings.ged_artifact`, then the packaged copy, then `data/aster_ged/`
+  granules, else raises naming all three. "Complete" is judged against the
+  persisted CMR inventory (`results/decision/ged_upstream_inventory.json`):
+  the 700 tiles expect 19,300 granules, 2,374 do not exist in AG100 (ocean and
+  a few island groups, 5.53 deg² of land) and are recorded in the artifact and
+  served with a warning; a granule the collection *has* but the build lacks
+  raises `MissingGranuleError` naming it. Rebuild only with
+  `scripts/build_ged_gap_mask.py --require-complete` and re-pin the digest in
+  the same commit. See [findings](docs/findings-aster-ged-gaps.md) and
+  docs/methodology.md.
 - **`qa_count` is a 12-month climatology** (`(month, latitude, longitude)`, `uint8`),
   not a single annual count: month M = valid observations in calendar month M pooled
   across the window. It exports as a 12-band monthly COG (`cog.py`). It counts only

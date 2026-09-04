@@ -196,7 +196,8 @@ class Settings(BaseSettings):
         default=Path("data/ged_gap_mask.npz"),
         description="Compact global gap-cell artifact written by "
         "scripts/build_ged_gap_mask.py. Preferred over ged_dir when present: "
-        "a fleet VM ships this one file, not 8,776 granules. Verified to "
+        "the copy packaged inside the wheel at landsat_lst/data/ is what a "
+        "fleet VM finds, not 8,776 granules. Verified to "
         "produce a mask identical to the granule path on S30W065.",
     )
 

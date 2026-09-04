@@ -1,0 +1,29 @@
+{
+  "rule": "NumObs <= 2",
+  "buffer_cells": 1,
+  "shift_cells": 0,
+  "hot_c": 70.0,
+  "denominators": {
+    "valid_total": 323916905,
+    "hot_total": 2793,
+    "missing_total": 83095
+  },
+  "unbuffered": {
+    "valid_removed": 22307977,
+    "hot_removed": 2571,
+    "hot_remaining": 222,
+    "missing_annotated": 83015,
+    "pct_valid_removed": 6.886944353830499,
+    "pct_hot_removed": 92.0515574650913,
+    "pct_missing_annotated": 99.90372465250617
+  },
+  "buffered": {
+    "valid_removed": 36882713,
+    "hot_removed": 2793,
+    "hot_remaining": 0,
+    "missing_annotated": 83095,
+    "pct_valid_removed": 11.386473638972316,
+    "pct_hot_removed": 100.0,
+    "pct_missing_annotated": 100.0
+  }
+}

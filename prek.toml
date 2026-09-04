@@ -32,7 +32,11 @@ hooks = [
     # pyproject.toml on every run. Excluded by name rather than by raising
     # --maxkb, so the 500 KB ceiling still catches a COG or a parquet committed
     # by accident.
-    exclude = { glob = ["tests/fixtures/**", "uv.lock"] },
+    # src/landsat_lst/data/ged_gap_mask.npz is the packaged ASTER GED gap-cell
+    # artifact (#118): the only mask source a fleet VM can find, rebuilt
+    # deterministically by scripts/build_ged_gap_mask.py and pinned by content
+    # hash in ged.py. Excluded by exact path.
+    exclude = { glob = ["tests/fixtures/**", "uv.lock", "src/landsat_lst/data/ged_gap_mask.npz"] },
   },
 ]
 

@@ -102,3 +102,9 @@ results/decision/*
 !results/decision/destripe_composite_comparison.json
 !results/decision/ged_gap_s30w065.json
 !results/decision/ged_coverage.json
+!results/decision/ged_upstream_inventory.json
+# The independent re-derivation of the S30W065 cross-tab (issue #118 audit):
+# six small JSON records, same descent rule as results/decision/.
+!results/ged-audit/
+results/ged-audit/*
+!results/ged-audit/*.json

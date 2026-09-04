@@ -13,12 +13,15 @@ order.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import rasterio
 from rasterio.transform import Affine
 
 from landsat_lst import ged
+from landsat_lst.config import settings
 from landsat_lst.ged_analysis import (
     ANALYSIS_VERSION,
     TIER_LABELS,
@@ -200,6 +203,9 @@ class TestGridAndMapping:
         write_granule(ged_dir, 40, -75, numobs)
         monkeypatch.setattr(settings, "ged_dir", ged_dir)
         monkeypatch.setattr(settings, "ged_artifact", ged_dir / "absent.npz")
+        # The wheel now carries the production artifact, which outranks a
+        # granule directory by design; these fixtures test the granule path.
+        monkeypatch.setattr(ged, "packaged_artifact_path", lambda: None)
 
         geobox = geobox_for_bbox(BBOX)
         window, row_cells, col_cells = ged.numobs_for_geobox(
@@ -423,3 +429,47 @@ class TestRecord:
             for n in (7, 128, 360, 1024)
         ]
         assert all(a == answers[0] for a in answers)
+
+
+class TestFromRecord:
+    """The committed record regenerates its own table with no raster and no
+    granules, which is what a clean checkout needs."""
+
+    RECORD = "results/decision/ged_gap_s30w065.json"
+
+    def test_the_committed_record_renders(self, tmp_path, monkeypatch):
+        from click.testing import CliRunner
+
+        from landsat_lst.cli import main
+
+        record = Path(__file__).resolve().parents[2] / self.RECORD
+        monkeypatch.setattr(settings, "ged_dir", tmp_path / "no_granules")
+        result = CliRunner().invoke(main, ["ged-analyze", "--from-record", str(record)])
+        assert result.exit_code == 0, result.output
+        assert "NumObs" in result.output
+        assert "numobs<=2" in result.output
+        assert "buffer" in result.output
+
+    def test_from_record_json_echoes_the_record(self):
+        import json
+
+        from click.testing import CliRunner
+
+        from landsat_lst.cli import main
+
+        record = Path(__file__).resolve().parents[2] / self.RECORD
+        result = CliRunner().invoke(main, ["ged-analyze", "--from-record", str(record), "--json"])
+        assert result.exit_code == 0, result.output
+        assert (
+            json.loads(result.output)["analysis_version"]
+            == json.loads(record.read_text())["analysis_version"]
+        )
+
+    def test_raster_and_tile_are_still_required_otherwise(self):
+        from click.testing import CliRunner
+
+        from landsat_lst.cli import main
+
+        result = CliRunner().invoke(main, ["ged-analyze", "--tile", "S30W065"])
+        assert result.exit_code != 0
+        assert "--raster and --tile are required" in result.output
