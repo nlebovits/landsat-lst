@@ -1277,24 +1277,32 @@ def _drive(
         if composite_started:
             log.info("shard_composite_overlapped", run_id=run_id, tile=tile, bands=len(plan.bands))
 
-    summary.stages.append(
-        _await_stage(
-            stage="offsets",
-            run_id=run_id,
-            tile=tile,
-            root=root,
-            storage=storage,
-            prefix=f"{root}/offsets/scene/",
-            expected=_expected_keys(plan, "offsets", root),
-            submit=submit,
-            deadline_s=budgets.stage_budget("offsets", plan).deadline_s,
-            clock=clock,
-            cluster_probe=cluster_probe,
-            job=job,
-            units=units,
-            on_poll=_overlap,
+    try:
+        summary.stages.append(
+            _await_stage(
+                stage="offsets",
+                run_id=run_id,
+                tile=tile,
+                root=root,
+                storage=storage,
+                prefix=f"{root}/offsets/scene/",
+                expected=_expected_keys(plan, "offsets", root),
+                submit=submit,
+                deadline_s=budgets.stage_budget("offsets", plan).deadline_s,
+                clock=clock,
+                cluster_probe=cluster_probe,
+                job=job,
+                units=units,
+                on_poll=_overlap,
+            )
         )
-    )
+    except BaseException:
+        # The offsets side is where the coarse stage (issue #125) lives, and a
+        # tile that gives up here will never merge, so nothing will sweep it.
+        # Best-effort, and before the raise, so the failure the operator sees is
+        # the real one rather than a cleanup error standing in front of it.
+        shard_tasks.sweep_coarse_stage(run_id, tile, storage=storage)
+        raise
 
     # In the driver, not on a VM: a kilobyte of JSON in, 600 floats out. The
     # composite shards are already booting and polling for exactly this record.

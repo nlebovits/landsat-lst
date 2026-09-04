@@ -120,6 +120,14 @@ class MemoryStorage(StorageBackend):
         self.requests += max(1, math.ceil(len(out) / S3_PAGE))
         return out
 
+    def delete_prefix(self, prefix: str) -> int:
+        doomed = [k for k in self.objects if k.startswith(prefix)]
+        for key in doomed:
+            del self.objects[key]
+            self.stamps.pop(key, None)
+            self._sorted.remove(key)
+        return len(doomed)
+
     def cog_exists(self, window: str, tile: str) -> bool:
         return all(self.cog_key(window, tile, product) in self.objects for product in PRODUCTS)
 

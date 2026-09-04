@@ -1,0 +1,219 @@
+{
+  "run_id": "shard-S30W065-2021-2025-20260904T064340Z-staged",
+  "partials": 15,
+  "correctness": {
+    "reference_key": "_offsets/S30W065/2021-2025/f2/v2-eac1fa94a9fc760f.json",
+    "reference_present": true,
+    "offsets_identical": true,
+    "max_abs_delta": 0.0,
+    "n_valid_identical": true,
+    "scenes": 1031,
+    "partial_spans": [
+      [
+        0,
+        70
+      ],
+      [
+        70,
+        140
+      ],
+      [
+        140,
+        210
+      ],
+      [
+        210,
+        280
+      ],
+      [
+        280,
+        350
+      ],
+      [
+        350,
+        420
+      ],
+      [
+        420,
+        490
+      ],
+      [
+        490,
+        560
+      ],
+      [
+        560,
+        630
+      ],
+      [
+        630,
+        700
+      ],
+      [
+        700,
+        770
+      ],
+      [
+        770,
+        840
+      ],
+      [
+        840,
+        910
+      ],
+      [
+        910,
+        980
+      ],
+      [
+        980,
+        1031
+      ]
+    ],
+    "scenes_covered": 1031,
+    "provenance": {
+      "algorithm_version": [
+        2,
+        2
+      ],
+      "digest": [
+        "eac1fa94a9fc760f",
+        "eac1fa94a9fc760f"
+      ],
+      "offset_resolution_factor": [
+        2,
+        2
+      ],
+      "tile": [
+        "S30W065",
+        "S30W065"
+      ],
+      "window": [
+        "2021-2025",
+        "2021-2025"
+      ],
+      "scenes": [
+        1031,
+        1031
+      ]
+    },
+    "provenance_matches": true,
+    "times_identical": true,
+    "times_precision": "ns"
+  },
+  "timings_staged": {
+    "loading": {
+      "n": 15,
+      "min": 108.1,
+      "median": 111.0,
+      "max": 115.8
+    },
+    "land_mask": {
+      "n": 15,
+      "min": 24.6,
+      "median": 26.1,
+      "max": 28.7
+    },
+    "shard_plan_wait": {
+      "n": 15,
+      "min": 5.9,
+      "median": 6.0,
+      "max": 6.2
+    },
+    "destripe_climatology": {
+      "n": 15,
+      "min": 330.8,
+      "median": 516.0,
+      "max": 632.9
+    },
+    "shard_barrier_wait": {
+      "n": 15,
+      "min": 0.2,
+      "median": 121.9,
+      "max": 303.1
+    },
+    "destripe_climatology_merge": {
+      "n": 15,
+      "min": 18.2,
+      "median": 23.7,
+      "max": 30.5
+    },
+    "destripe_offsets": {
+      "n": 15,
+      "min": 47.4,
+      "median": 53.6,
+      "max": 61.0
+    },
+    "uploading": {
+      "n": 15,
+      "min": 2.7,
+      "median": 3.5,
+      "max": 4.7
+    }
+  },
+  "timings_baseline": {
+    "loading": {
+      "n": 24,
+      "min": 66.2,
+      "median": 134.0,
+      "max": 199.3
+    },
+    "land_mask": {
+      "n": 24,
+      "min": 12.3,
+      "median": 24.2,
+      "max": 38.5
+    },
+    "shard_plan_wait": {
+      "n": 29,
+      "min": 5.8,
+      "median": 6.1,
+      "max": 136.6
+    },
+    "destripe_climatology": {
+      "n": 15,
+      "min": 420.2,
+      "median": 704.7,
+      "max": 989.5
+    },
+    "shard_barrier_wait": {
+      "n": 29,
+      "min": 0.0,
+      "median": 0.2,
+      "max": 575.8
+    },
+    "destripe_climatology_merge": {
+      "n": 24,
+      "min": 12.5,
+      "median": 14.3,
+      "max": 17.4
+    },
+    "destripe_offsets": {
+      "n": 24,
+      "min": 488.1,
+      "median": 612.2,
+      "max": 686.9
+    },
+    "uploading": {
+      "n": 15,
+      "min": 2.9,
+      "median": 3.2,
+      "max": 3.9
+    }
+  },
+  "shards_staged": 15,
+  "shards_baseline": 29,
+  "staged_objects_before_sweep": 8424,
+  "peak_rss_mb_staged": {
+    "n": 15,
+    "min": 28318.5,
+    "median": 35408.5,
+    "max": 36064.4
+  },
+  "peak_rss_mb_baseline": {
+    "n": 29,
+    "min": 900.0,
+    "median": 55737.3,
+    "max": 59318.2
+  }
+}

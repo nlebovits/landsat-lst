@@ -41,6 +41,8 @@ from landsat_lst.progress import GraphProgress, report_phase, timed_section
 from landsat_lst.shards import block_spans
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from landsat_lst.offsets import OffsetCache
 
 _TIME_DIM = "time"
@@ -257,6 +259,7 @@ def climatology_by_blocks(
     panel: int | None = None,
     land_mask: xr.DataArray | None = None,
     spans: list[tuple[int, int, int, int]] | None = None,
+    block_reader: Callable[[tuple[int, int, int, int]], np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Phase A: the 12-month per-pixel climatology, blocks run concurrently.
 
@@ -298,6 +301,14 @@ def climatology_by_blocks(
     Returns:
         ``(ref, months)`` where ``ref`` is ``(n_months, y, x)`` float32 and
         ``months`` holds the calendar month of each ``ref`` plane.
+
+    Note:
+        ``block_reader`` returns one block's ``(scenes, y, x)`` float32 values,
+        replacing the direct source read. The staging path (issue #125) passes
+        one that also publishes the ``uint16`` DN it decoded, so phase B can
+        rebuild its scenes without reading the sources again. Its values must
+        equal what the direct read produces; ``None``, the default, *is* the
+        direct read.
     """
     block = block or _io_block_edge(lst, settings.destripe_unit_memory_gb)
     panel = panel or settings.destripe_compute_panel
@@ -334,7 +345,14 @@ def climatology_by_blocks(
             ref[:, y0:y1, x0:x1] = np.nan
             return
         # One bounded graph per block. Everything after this is numpy.
-        data = _read_values(lst.isel({y_dim: slice(y0, y1), x_dim: slice(x0, x1)}), dtype)
+        # ``block_reader`` is the staging seam (issue #125): it returns the same
+        # float32 block this line would, having also published the DN it decoded.
+        # Unset is the ordinary path and reads the sources directly.
+        data = (
+            block_reader((y0, y1, x0, x1))
+            if block_reader is not None
+            else _read_values(lst.isel({y_dim: slice(y0, y1), x_dim: slice(x0, x1)}), dtype)
+        )
         for py in range(0, y1 - y0, panel):
             py1 = min(py + panel, y1 - y0)
             for px in range(0, x1 - x0, panel):
@@ -364,6 +382,7 @@ def offsets_by_scene(
     *,
     batch: int | None = None,
     batches: list[tuple[int, int]] | None = None,
+    batch_reader: Callable[[tuple[int, int]], np.ndarray] | None = None,
 ) -> tuple[xr.DataArray, xr.DataArray]:
     """Phase B: one scalar offset and one valid count per scene, independently.
 
@@ -390,6 +409,12 @@ def offsets_by_scene(
 
     Returns:
         ``(offset, n_valid)`` on the time axis, matching :func:`offset_graph`.
+
+    Note:
+        ``batch_reader`` returns one scene batch's ``(scenes, y, x)`` float32
+        values, replacing the direct source read. The staging path (issue #125)
+        passes one that assembles the batch from what phase A staged. ``None``,
+        the default, is the direct read.
     """
     batch = batch or settings.destripe_scene_batch
     scene_months = lst[_TIME_DIM].dt.month.values.astype(np.int16)
@@ -406,7 +431,14 @@ def offsets_by_scene(
 
     def _one_batch(span: tuple[int, int]) -> int:
         start, stop = span
-        chunk = _read_values(lst.isel({_TIME_DIM: slice(start, stop)}), dtype)
+        # ``batch_reader`` is the staging seam (issue #125): it rebuilds this
+        # batch from what phase A already decoded, instead of reading the
+        # Landsat sources a second time. Unset reads the sources.
+        chunk = (
+            batch_reader(span)
+            if batch_reader is not None
+            else _read_values(lst.isel({_TIME_DIM: slice(start, stop)}), dtype)
+        )
         for j in range(stop - start):
             scene = chunk[j]
             anomaly = scene - ref[plane[int(scene_months[start + j])]]
