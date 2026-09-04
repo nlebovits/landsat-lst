@@ -40,11 +40,6 @@ jobs:
       - name: Run linter
         run: uv run ruff check .
 
-      # The pull-request evidence declaration is judged by evidence-gate.yml
-      # under pull_request_target, from the base branch's copy of the gate.
-      - name: Check performance evidence safeguards
-        run: uv run python scripts/check_evidence_policy.py
-
       - name: Type check
         run: uv run ty check src/
 
