@@ -21,6 +21,7 @@ from landsat_lst.ged import (
     dilate_cells,
     gap_mask_for_geobox,
     granule_name,
+    read_granule_numobs,
 )
 from landsat_lst.tiling import geobox_for_bbox
 
@@ -43,8 +44,14 @@ def write_granule(
     numobs: np.ndarray | None = None,
     *,
     flip: bool = False,
+    south_up: bool = False,
+    east_left: bool = False,
 ) -> None:
-    """Write one synthetic AG100 granule, north-up unless ``flip``."""
+    """Write one synthetic AG100 granule, north-up and west-left by default.
+
+    ``flip`` reverses both axes; ``south_up`` and ``east_left`` reverse one
+    each, so a reader that keys both flips off one condition is caught.
+    """
     if numobs is None:
         numobs = np.full((100, 100), 7, dtype=np.int16)
     lat = np.linspace(lat_top, lat_top - 1, 100)[:, None] * np.ones((1, 100))
@@ -52,6 +59,10 @@ def write_granule(
     if flip:
         # Flip both axes consistently: the data and its own geolocation.
         numobs, lat, lon = numobs[::-1, ::-1], np.flipud(lat), np.fliplr(lon)
+    if south_up:
+        numobs, lat = numobs[::-1, :], np.flipud(lat)
+    if east_left:
+        numobs, lon = numobs[:, ::-1], np.fliplr(lon)
     ged_dir.mkdir(parents=True, exist_ok=True)
     with h5py.File(ged_dir / granule_name(lat_top, lon_west), "w") as f:
         f["Geolocation/Latitude"] = lat
@@ -65,6 +76,11 @@ def ged_env(tmp_path, monkeypatch):
     ged_dir = tmp_path / "aster_ged"
     monkeypatch.setattr(settings, "ged_dir", ged_dir)
     monkeypatch.setattr(settings, "ged_artifact", tmp_path / "ged_gap_mask.npz")
+    # The wheel now carries the production artifact, which outranks a
+    # granule directory by design; these fixtures test the granule path.
+    monkeypatch.setattr(ged, "packaged_artifact_path", lambda: None)
+    # An artifact these tests build is not the pinned production one.
+    monkeypatch.setattr(ged, "GED_ARTIFACT_CONTENT_SHA256", None)
     return ged_dir
 
 
@@ -158,6 +174,37 @@ class TestGapMaskFootprint:
         flipped = gap_mask_for_geobox(geobox_for_bbox(BBOX), buffer_cells=1)
         np.testing.assert_array_equal(flipped, expected)
 
+    def test_a_south_up_granule_is_reoriented_on_rows_only(self, ged_env):
+        """One axis reversed, not both: the reader must key each flip off
+        its own geolocation array. Rows flip; columns must not."""
+        fixture_granules(ged_env, core_numobs=self.gap_at(2, 3))
+        expected = gap_mask_for_geobox(geobox_for_bbox(BBOX), buffer_cells=1)
+        (ged_env / granule_name(*CORE)).unlink()
+        write_granule(ged_env, *CORE, self.gap_at(2, 3), south_up=True)
+        np.testing.assert_array_equal(
+            gap_mask_for_geobox(geobox_for_bbox(BBOX), buffer_cells=1), expected
+        )
+
+    def test_an_east_left_granule_is_reoriented_on_columns_only(self, ged_env):
+        fixture_granules(ged_env, core_numobs=self.gap_at(2, 3))
+        expected = gap_mask_for_geobox(geobox_for_bbox(BBOX), buffer_cells=1)
+        (ged_env / granule_name(*CORE)).unlink()
+        write_granule(ged_env, *CORE, self.gap_at(2, 3), east_left=True)
+        np.testing.assert_array_equal(
+            gap_mask_for_geobox(geobox_for_bbox(BBOX), buffer_cells=1), expected
+        )
+
+    def test_the_reader_flips_each_axis_by_its_own_geolocation(self, tmp_path):
+        """Directly on the reader, so the check does not depend on a gap
+        happening to sit off-centre. An asymmetric field pins both axes."""
+        field = np.arange(100 * 100, dtype=np.int16).reshape(100, 100)
+        for kwargs in ({}, {"south_up": True}, {"east_left": True}, {"flip": True}):
+            d = tmp_path / "-".join(kwargs) if kwargs else tmp_path / "plain"
+            write_granule(d, *CORE, field, **kwargs)
+            np.testing.assert_array_equal(
+                read_granule_numobs(d / granule_name(*CORE)), field, err_msg=str(kwargs)
+            )
+
     def test_a_band_slice_mask_is_the_slice_of_the_tile_mask(self, ged_env):
         fixture_granules(ged_env, core_numobs=self.gap_at(2, 3))
         tile = geobox_for_bbox(BBOX)
@@ -235,7 +282,11 @@ class TestArtifact:
         numobs[3, 3] = 0
         fixture_granules(ged_env, core_numobs=numobs)
         report = build_artifact(ged_env, settings.ged_artifact)
-        assert report == {"granules": 4, "gap_cells": 1}
+        assert report["granules"] == 4
+        assert report["gap_cells"] == 1
+        # v2 also records provenance; tests/unit/test_ged_artifact.py owns it.
+        assert len(report["content_sha256"]) == 64
+        assert report["complete"] is False
 
     def test_build_refuses_an_empty_dir(self, ged_env):
         ged_env.mkdir(parents=True, exist_ok=True)

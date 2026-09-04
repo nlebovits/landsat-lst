@@ -1665,6 +1665,305 @@ def tile_info(tile_name: str) -> None:
     console.print("[red]Not yet implemented[/red]")
 
 
+@main.command()
+@click.option(
+    "--ged-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Granule archive to measure (default: settings.ged_dir)",
+)
+@click.option(
+    "--artifact",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Measure this artifact's consumed manifest instead of a directory",
+)
+@click.option(
+    "--fetch-domain",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="180x360 .npy of the 1-degree cells the archive's fetch requested. "
+    "Refines *why* a granule is absent; it is not an upstream inventory.",
+)
+@click.option(
+    "--upstream-inventory",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="The AG1km v003 collection inventory scripts/fetch_ged_granules.py "
+    "persisted. With it, an expected granule the collection lacks is "
+    "absent-upstream and does not count against completeness.",
+)
+@click.option("--buffer-cells", type=int, default=None, help="Margin ring, default from settings")
+@click.option(
+    "--out",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write the machine-readable record here",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the record instead of a table")
+def ged_coverage(
+    *,
+    ged_dir: Path | None,
+    artifact: Path | None,
+    fetch_domain: Path | None,
+    upstream_inventory: Path | None,
+    buffer_cells: int | None,
+    out: Path | None,
+    as_json: bool,
+) -> None:
+    """Check a GED source against what all 700 production land tiles need.
+
+    The expected manifest is local arithmetic over the production tile list,
+    the global grid, the configured buffer, and the granule naming grammar --
+    no network, no credentials, no fetching.
+
+    \b
+    Exits non-zero when the source cannot cover production, because
+    `ged_gap_mask` defaults on and a tile that reaches an unheld granule
+    fails rather than shipping unmasked.
+
+    Upstream absence is established only against a persisted collection
+    inventory (--upstream-inventory). Without one, every absence counts and
+    no source can be complete.
+    """
+    import json as json_module
+
+    from landsat_lst.ged_coverage import build_report
+
+    report = build_report(
+        ged_dir=ged_dir,
+        artifact=artifact,
+        buffer_cells=buffer_cells,
+        fetch_domain=fetch_domain,
+        upstream_inventory=upstream_inventory,
+    )
+    counts = report.counts()
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json_module.dumps(report.as_dict(), indent=2) + "\n")
+    if as_json:
+        click.echo(json_module.dumps(report.as_dict(), indent=2))
+    else:
+        _print_ged_coverage(report, counts)
+        if out is not None:
+            console.print(f"\n  Written to {out}")
+    if not report.complete:
+        raise SystemExit(1)
+
+
+def _print_ged_coverage(report, counts: dict) -> None:
+    """Render the completeness verdict."""
+    source = report.fetch_domain_source
+    console.print("[bold]ASTER GED coverage against the production tile list[/bold]")
+    console.print(
+        f"  {counts['tiles']} land tiles, buffer {report.buffer_cells} cell "
+        f"-> {counts['expected']:,} granules expected"
+    )
+    console.print(
+        f"  held: {counts['consumed_of_expected']:,}   "
+        f"missing: {counts['missing']:,}   "
+        f"(of which inside a tile, not its margin: {counts['missing_core']:,})"
+    )
+    console.print(
+        f"  absent upstream: {counts['absent_upstream']:,} "
+        f"({counts['absent_upstream_core']:,} inside a tile)   "
+        f"fetchable: {counts['fetchable']:,} ({counts['fetchable_core']:,} inside a tile)"
+    )
+    console.print(
+        f"  tiles that would fail: {counts['tiles_missing_core']:,} of {counts['tiles']}"
+        f"   tiles missing any fetchable granule: {counts['tiles_missing_any']:,}"
+    )
+    console.print(f"  held but not expected: {counts['extra_not_expected']:,}")
+    for key, value in sorted(counts.items()):
+        if key.startswith("class_"):
+            console.print(f"    {key[len('class_') :]:<32} {value:,}")
+    if source is None:
+        console.print(
+            "  [dim]No fetch-domain grid given, so every absence is unverified-upstream.[/dim]"
+        )
+    else:
+        console.print(f"  [dim]fetch domain: {source}[/dim]")
+    if report.inventory is None and report.artifact_inventory is None:
+        console.print(
+            "  [dim]No upstream inventory given, so no label claims a granule is "
+            "absent from the collection and nothing short of every granule is complete.[/dim]"
+        )
+    else:
+        identity = (
+            report.inventory.identity()
+            if report.inventory is not None
+            else report.artifact_inventory
+        )
+        assert identity is not None
+        console.print(
+            f"  [dim]inventory: {identity['short_name']} v{identity['version']}, "
+            f"{identity['granule_count']:,} granules, queried {identity['queried_at']}[/dim]"
+        )
+    if report.complete:
+        console.print("\n[green]COMPLETE[/green] -- this source covers production.")
+    else:
+        console.print("\n[red]INCOMPLETE[/red] -- must not be packaged as the production mask.")
+
+
+@main.command()
+@click.option(
+    "--raster",
+    default=None,
+    help="Published LST P95 COG: a local path, or an https/vsicurl URL. "
+    "S30W065 is published at https://s3.us-west-2.amazonaws.com/"
+    "us-west-2.opendata.source.coop/nlebovits/landsat-lst/"
+    "lst-p95-2021-2025/S30W065/lst_p95_2021-2025_S30W065.tif",
+)
+@click.option("--tile", "-t", default=None, help="Tile the raster must be, e.g. S30W065")
+@click.option(
+    "--from-record",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Render the tables from a record this command wrote earlier "
+    "(results/decision/ged_gap_s30w065.json), with no raster read and no "
+    "granules. The committed record regenerates its own table this way.",
+)
+@click.option(
+    "--ged-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="AG100 v003 granule directory. Defaults to settings.ged_dir. The "
+    "tiering needs observation counts, which the compact gap artifact does "
+    "not carry -- it stores only the NumObs == 0 cells.",
+)
+@click.option("--threshold-c", type=float, default=70.0, help="Hot-tail lower bound, Celsius")
+@click.option("--buffer-cells", type=int, default=1, help="Dilation radius for the mask rules")
+@click.option("--block-rows", type=int, default=512, help="Rows per windowed read")
+@click.option(
+    "--out",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write the machine-readable record here",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the record instead of a table")
+def ged_analyze(
+    *,
+    raster: str | None,
+    tile: str | None,
+    from_record: Path | None,
+    ged_dir: Path | None,
+    threshold_c: float,
+    buffer_cells: int,
+    block_rows: int,
+    out: Path | None,
+    as_json: bool,
+) -> None:
+    """Cross-tab a published LST tile by ASTER GED observation count.
+
+    Every output pixel is placed in the ~1 km GED cell it falls inside and
+    counted as valid, missing, or hot-tail, per NumObs tier. The mapping is
+    `ged.cell_indices_for_geobox`, the same one the production mask uses, so
+    the analysis and the mask cannot drift apart.
+
+    \b
+    The result is a **spatial association**, not a causal trace: it does not
+    follow which ASTER observations produced any pixel's emissivity.
+
+    Reads are windowed, so an 18,000-squared tile costs one pass and a few
+    hundred MB whether the raster is local or an https URL.
+    """
+    import json as json_module
+
+    from landsat_lst.config import settings
+    from landsat_lst.ged_analysis import AnalysisInputError, analyze
+
+    if from_record is not None:
+        if as_json:
+            click.echo(from_record.read_text().rstrip("\n"))
+        else:
+            _print_ged_analysis(json_module.loads(from_record.read_text()))
+        return
+    if raster is None or tile is None:
+        msg = "--raster and --tile are required unless --from-record is given"
+        raise click.UsageError(msg)
+
+    source = ged_dir if ged_dir is not None else settings.ged_dir
+    if not Path(source).is_dir():
+        msg = f"GED granule directory {source} does not exist; pass --ged-dir or set LST_GED_DIR"
+        raise click.ClickException(msg)
+
+    try:
+        record = analyze(
+            raster=raster,
+            tile=tile,
+            ged_dir=Path(source),
+            hot_threshold_c=threshold_c,
+            buffer_cells=buffer_cells,
+            block_rows=block_rows,
+        )
+    except AnalysisInputError as e:
+        raise click.ClickException(str(e)) from e
+
+    text = json_module.dumps(record, indent=2, sort_keys=False)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text + "\n")
+    if as_json:
+        click.echo(text)
+        return
+    _print_ged_analysis(record)
+    if out is not None:
+        console.print(f"\n  Written to {out}")
+
+
+def _print_ged_analysis(record: dict) -> None:
+    """Render the cross-tab and the mask tradeoffs as tables."""
+    from rich.table import Table
+
+    raster, totals = record["raster"], record["tile_totals"]
+    console.print(f"[bold]{raster['source']}[/bold]")
+    console.print(
+        f"  {raster['height']} x {raster['width']} {raster['dtype']}  {raster['crs']}  "
+        f"nodata {raster['nodata']}  scale {raster['scale']}  offset {raster['offset']}"
+    )
+    console.print(f"  scenes: {raster['scene_count']}  ({raster['scene_count_source']})")
+    console.print(
+        f"  threshold: >= {record['threshold']['hot_threshold_c']} C "
+        f"= DN {record['threshold']['hot_threshold_dn']}"
+    )
+    console.print(
+        f"  tile: {totals['total_pixels']:,} px, {totals['valid_pixels']:,} valid, "
+        f"{totals['missing_pixels']:,} missing, {totals['hot_pixels']:,} hot "
+        f"({totals['hot_pct_of_valid']:.6f}% of valid)"
+    )
+
+    table = Table(title="Pixels by ASTER GED NumObs tier (spatial association)")
+    for name in ("NumObs", "total", "valid", "missing", "hot", "hot/valid %", "hot enrich."):
+        table.add_column(name, justify="left" if name == "NumObs" else "right")
+    for row in record["by_numobs_tier"]:
+        enrich = row["hot_enrichment_vs_tile"]
+        table.add_row(
+            row["tier"],
+            f"{row['total_pixels']:,}",
+            f"{row['valid_pixels']:,}",
+            f"{row['missing_pixels']:,}",
+            f"{row['hot_pixels']:,}",
+            "-" if row["hot_pct_of_tier_valid"] is None else f"{row['hot_pct_of_tier_valid']:.4f}",
+            "-" if enrich is None else f"{enrich:,.1f}x",
+        )
+    console.print(table)
+
+    trade = Table(title="Candidate mask rules")
+    for name in ("rule", "valid removed", "valid %", "hot removed", "hot %", "missing annotated"):
+        trade.add_column(name, justify="left" if name == "rule" else "right")
+    for row in record["mask_tradeoffs"]:
+        trade.add_row(
+            row["rule"],
+            f"{row['valid_pixels_removed']:,}",
+            f"{row['valid_pixels_removed_pct']:.3f}",
+            f"{row['hot_pixels_removed']:,}",
+            f"{row['hot_pixels_removed_pct']:.2f}",
+            f"{row['missing_pixels_annotated']:,}",
+        )
+    console.print(trade)
+
+
 @main.group()
 def evidence() -> None:
     """Collect durable performance and cost evidence."""

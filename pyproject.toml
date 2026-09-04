@@ -124,6 +124,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/landsat_lst"]
+# The GED gap-mask artifact ships inside the wheel or it does not reach a
+# fleet VM at all: settings.ged_artifact's default resolves against the CWD,
+# and a Coiled VM has no repo. The file is tracked, so hatchling would include
+# it anyway; this line keeps it in the wheel even from an untracked or
+# VCS-ignored build tree, which is what makes ged.packaged_artifact_path()
+# dependable. Rebuild only with scripts/build_ged_gap_mask.py --require-complete
+# and re-pin ged.GED_ARTIFACT_CONTENT_SHA256 in the same commit (#118).
+artifacts = ["src/landsat_lst/data/ged_gap_mask.npz"]
 
 # ============================================================================
 # Ruff Configuration

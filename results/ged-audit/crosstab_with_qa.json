@@ -1,0 +1,98 @@
+{
+  "meta": {
+    "shape": [
+      18000,
+      18000
+    ],
+    "transform": [
+      0.00027777777777777794,
+      0.0,
+      -65.0,
+      0.0,
+      -0.00027777777777777864,
+      -30.0
+    ],
+    "bounds": [
+      -65.0,
+      -35.000000000000014,
+      -60.0,
+      -30.0
+    ],
+    "nodata": 0.0,
+    "scale": 0.01,
+    "offset": -50.0,
+    "dtype": "uint16",
+    "crs": "EPSG:4326",
+    "pixel_size_deg": 0.00027777777777777794,
+    "pixels_per_degree": 3599.9999999999977
+  },
+  "hot_c": 70.0,
+  "hot_dn": 12000.0,
+  "missing_granules": [],
+  "tiers": {
+    "NumObs==0": {
+      "total_px": 784080,
+      "valid_px": 701279,
+      "missing_px": 82801,
+      "hot_px": 2231,
+      "obs_any_px": 701279,
+      "obs_but_fill_px": 0
+    },
+    "NumObs==1": {
+      "total_px": 4446576,
+      "valid_px": 4446468,
+      "missing_px": 108,
+      "hot_px": 20,
+      "obs_any_px": 4446468,
+      "obs_but_fill_px": 0
+    },
+    "NumObs==2": {
+      "total_px": 17160336,
+      "valid_px": 17160230,
+      "missing_px": 106,
+      "hot_px": 320,
+      "obs_any_px": 17160230,
+      "obs_but_fill_px": 0
+    },
+    "NumObs==3": {
+      "total_px": 33749136,
+      "valid_px": 33749071,
+      "missing_px": 65,
+      "hot_px": 222,
+      "obs_any_px": 33749071,
+      "obs_but_fill_px": 0
+    },
+    "NumObs>=4": {
+      "total_px": 267859872,
+      "valid_px": 267859857,
+      "missing_px": 15,
+      "hot_px": 0,
+      "obs_any_px": 267859857,
+      "obs_but_fill_px": 0
+    },
+    "granule-absent": {
+      "total_px": 0,
+      "valid_px": 0,
+      "missing_px": 0,
+      "hot_px": 0,
+      "obs_any_px": 0,
+      "obs_but_fill_px": 0
+    },
+    "GED-fill(<0)": {
+      "total_px": 0,
+      "valid_px": 0,
+      "missing_px": 0,
+      "hot_px": 0,
+      "obs_any_px": 0,
+      "obs_but_fill_px": 0
+    }
+  },
+  "totals": {
+    "total_px": 324000000,
+    "valid_px": 323916905,
+    "missing_px": 83095,
+    "hot_px": 2793,
+    "obs_any_px": 323916905,
+    "obs_but_fill_px": 0
+  }
+}

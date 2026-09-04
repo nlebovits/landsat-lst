@@ -73,6 +73,9 @@ data/ghsl/
 data/aster_ged/
 # Global GED gap-cell artifact (2.8 MB, over the pre-commit size cap);
 # rebuilt deterministically by scripts/build_ged_gap_mask.py
+# Slash-anchored, so this matches the repo-root build output only and NOT
+# src/landsat_lst/data/ged_gap_mask.npz, which is the packaged artifact and
+# must stay trackable. Do not broaden this to a bare glob.
 data/ged_gap_mask.npz
 .serena/
 
@@ -85,8 +88,23 @@ data/ged_gap_mask.npz
 digest.txt
 
 # Decision-run outputs (large COGs + icechunk repo)
-results/
+results/*
 # ...except small calibration artifacts that justify a shipped default.
+# An excluded *directory* is never descended into, so a file inside it cannot
+# be re-included however specific the negation. `results/` therefore has to be
+# `results/*`, and every level down to the file re-included in turn; the bare
+# `!results/decision/x.json` these lines used to carry never matched anything,
+# and the files below are tracked only because they were force-added.
+!results/decision/
+results/decision/*
 !results/decision/destripe_cap_calibration.json
 !results/decision/offset_subsampling_validation.json
 !results/decision/destripe_composite_comparison.json
+!results/decision/ged_gap_s30w065.json
+!results/decision/ged_coverage.json
+!results/decision/ged_upstream_inventory.json
+# The independent re-derivation of the S30W065 cross-tab (issue #118 audit):
+# six small JSON records, same descent rule as results/decision/.
+!results/ged-audit/
+results/ged-audit/*
+!results/ged-audit/*.json

@@ -1,0 +1,238 @@
+{
+  "audit": "issue-118 independent GED verification",
+  "tile": "S30W065",
+  "tile_bounds_from_cog": [
+    -65.0,
+    -35.000000000000014,
+    -60.0,
+    -30.0
+  ],
+  "rasters": [
+    {
+      "product": "lst_p95",
+      "url": "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/landsat-lst/lst-p95-2021-2025/S30W065/lst_p95_2021-2025_S30W065.tif",
+      "content_length": 572230318,
+      "last_modified": "Sun, 23 Aug 2026 11:22:06 GMT",
+      "shape": [
+        18000,
+        18000
+      ],
+      "dtype": "uint16",
+      "crs": "EPSG:4326",
+      "nodata": 0.0,
+      "scale": 0.01,
+      "offset": -50.0,
+      "overviews": [
+        2,
+        4,
+        8,
+        16,
+        32,
+        64
+      ],
+      "block_shape": [
+        512,
+        512
+      ]
+    },
+    {
+      "product": "qa_count",
+      "url": "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/landsat-lst/lst-p95-2021-2025/S30W065/qa_count_2021-2025_S30W065.tif",
+      "content_length": 434926812,
+      "last_modified": "Sun, 23 Aug 2026 20:03:24 GMT",
+      "shape": [
+        18000,
+        18000
+      ],
+      "bands": 12,
+      "dtype": "uint8",
+      "nodata": null,
+      "overviews": [
+        2,
+        4,
+        8,
+        16,
+        32,
+        64
+      ]
+    }
+  ],
+  "url_notes": {
+    "working_read_base": "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/landsat-lst/",
+    "documented_read_base_is_broken": "https://data.source.coop/nlebovits/landsat-lst/ returns NoSuchBucket",
+    "filename_grammar": "{collection}/{tile}/{product}_{window}_{tile}.tif"
+  },
+  "ged": {
+    "product": "ASTER GED AG100 v003 (AG1km.v003, build 0010)",
+    "dir": "data/aster_ged",
+    "granules_required": 25,
+    "granules_present": 25,
+    "cells_per_degree": 100,
+    "pixels_per_ged_cell": 36,
+    "granule_tag_is": "north-west corner; tag (LAT,LON) spans lat [LAT-1,LAT], lon [LON,LON+1]",
+    "geolocation_caveat": "Geolocation/Latitude is a linspace over [tag, tag-1] at 1/99 spacing while the product is documented at 0.01 deg; the +-2 cell registration scan resolves the ambiguity in favour of equal 0.01 deg cells (peak at shift 0,0).",
+    "granules": [
+      {
+        "name": "AG1km.v003.-30.-065.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "a16bb75ef80857075261c4890b5d1521763a7aed3e833165d2aa8f9388d8e2d2"
+      },
+      {
+        "name": "AG1km.v003.-30.-064.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "652556092e13f9313ba4f22c6e22aef524911a6dfe9be5efe778335828b60efe"
+      },
+      {
+        "name": "AG1km.v003.-30.-063.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "5fbb58cb19af31d7e021218fdb98c6a45026d244bfcf8fd64802af6c932cb764"
+      },
+      {
+        "name": "AG1km.v003.-30.-062.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "68ad597d7990d2d063a10f2185ca8f5f2e822556f9b729a988666de29d5da5f8"
+      },
+      {
+        "name": "AG1km.v003.-30.-061.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "fa3bd06e866a8b949ae3969ae83cf400bd57b2a6ef9d3bf9ee8239e4eb4384ca"
+      },
+      {
+        "name": "AG1km.v003.-31.-065.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "c43f7d7ff2f332391661b250aa9d5cc031bb7155cbac5d77d35d4c37b1a51d8e"
+      },
+      {
+        "name": "AG1km.v003.-31.-064.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "c7fe8c082450422cf422497e3648d65dcbe31e816db958e4b77c43df28490b32"
+      },
+      {
+        "name": "AG1km.v003.-31.-063.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "fce9543595ed8eb94243556d364b748cd558d5d1ebd2c123c39a9156a7fc9678"
+      },
+      {
+        "name": "AG1km.v003.-31.-062.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "48f4a5fb831e6db58cbb329d6b5ffcb095e72dd3e7001613adb95d06cccba7e8"
+      },
+      {
+        "name": "AG1km.v003.-31.-061.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "1d4eacc82f1fd4b1f6ec9413f6f0cab28f7d6fefb2469d3f9daa89c86c26d263"
+      },
+      {
+        "name": "AG1km.v003.-32.-065.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "d243e669dbf2ac3eba79221615aa9079bf29a6901912cf2a51afe8868c0db23e"
+      },
+      {
+        "name": "AG1km.v003.-32.-064.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "715358a28e9087343535f7796eeb6e73248f1177bf7c1bd8a9b2a3b4413aac2b"
+      },
+      {
+        "name": "AG1km.v003.-32.-063.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "fc9c149fae8d68d9ad50ed62359f0c37af2b2fcebfa3d20159ba0ae6cfcc85dc"
+      },
+      {
+        "name": "AG1km.v003.-32.-062.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "40707fe2aee6d1fc6be8d1bb6b82b9993ceba7f762f8b6d11806a82393280d83"
+      },
+      {
+        "name": "AG1km.v003.-32.-061.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "d4705b57f33d0210857df08e09eb00a190bed20f5f6f5e10d0b49c16d0d03038"
+      },
+      {
+        "name": "AG1km.v003.-33.-065.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "6d1675f7ee342153b28a3bce74e408273cc5451fbdc2d0dd20f1337d4e0374a1"
+      },
+      {
+        "name": "AG1km.v003.-33.-064.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "3aa0b216223f0c7cb3b25967d0794e2be1670039e091204ab6edd3fce9adf48a"
+      },
+      {
+        "name": "AG1km.v003.-33.-063.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "d75abc371380ee66d013aed765a72e22cd788dff66eebcf83ca6e913d7962459"
+      },
+      {
+        "name": "AG1km.v003.-33.-062.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "4295050930253e7a4f2156460baf6ad0c9a4fe1d8e65b16dff40790da513ec29"
+      },
+      {
+        "name": "AG1km.v003.-33.-061.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "1f408c79c75620b199880f35455c56e5b32bc7d378afacab7cd19d822985ae73"
+      },
+      {
+        "name": "AG1km.v003.-34.-065.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "8a1385a178ad4e98543db0887e337efaaebd66c37ace3d2281c64a5e8018bddb"
+      },
+      {
+        "name": "AG1km.v003.-34.-064.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "0d1ccb3bcc422caad99851cbfd5b28199ea5b5fdfcd59f4e7a85b610b6208f6b"
+      },
+      {
+        "name": "AG1km.v003.-34.-063.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "2607838ba218460b7e3112256e2fd17aa651af065f069cbe749d175fd0f4902a"
+      },
+      {
+        "name": "AG1km.v003.-34.-062.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "cf12f3b5620081d72f72c6da3100d8a74011fcbddd727b099e37c10b2472cc8b"
+      },
+      {
+        "name": "AG1km.v003.-34.-061.0010.h5",
+        "present": true,
+        "bytes": 482064,
+        "sha256": "77d6f665a51b9032d3131d509198848de09b9f6b2a6b42ac566c9fa78cccab2c"
+      }
+    ]
+  },
+  "threshold": {
+    "hot_c": 70.0,
+    "hot_dn": 12000,
+    "formula": "(70 - offset)/scale"
+  },
+  "commands": [
+    "bash scripts/ged_audit_independent/run_all.sh      # four rules + both cross-tabs",
+    "bash scripts/ged_audit_independent/run_rest.sh     # registration scan",
+    "bash scripts/ged_audit_independent/run_compare.sh  # cross-check vs landsat_lst.ged",
+    "python scripts/ged_audit_independent/verify.py     # regression guard"
+  ]
+}
