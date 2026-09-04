@@ -131,8 +131,7 @@ on 2026-09-03, for four reasons:
 
 The consequence for the pull request is that it makes **no performance claim**.
 It changes the rule the split follows and stores the weight the rule uses.
-Under `docs/performance-evidence-policy.md` that is a `stage: none` PR, and
-this document is where the reasoning lives.
+This document is where the reasoning lives.
 
 ## 5. What the change is, and what it is not
 
