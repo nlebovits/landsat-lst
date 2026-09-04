@@ -487,13 +487,12 @@ def _build_ged_gap_mask(
     latitude: xr.DataArray,
     longitude: xr.DataArray,
 ) -> xr.DataArray:
-    """Build the ASTER GED emissivity-gap mask on the grid's exact coordinates.
+    """Build the ASTER GED emissivity-gap *region* on the grid's coordinates.
 
-    True where a pixel must be dropped from the LST output: its ~1 km GED
-    cell has NumObs == 0, or sits within ``settings.ged_gap_buffer_cells`` of
-    one. Applied to the composite *output* only, mirroring the land mask's
-    output-side application -- never to offset estimation, and never to
-    ``qa_count``. See :mod:`landsat_lst.ged` and
+    True where a pixel's ~1 km GED cell has NumObs == 0, or sits within
+    ``settings.ged_gap_buffer_cells`` of one. This is geometry alone and is
+    not the mask: :func:`apply_ged_gap_mask` intersects it with the pixel's
+    value before anything is dropped. See :mod:`landsat_lst.ged` and
     docs/findings-aster-ged-gaps.md.
     """
     gap = gap_mask_for_geobox(geobox)
@@ -502,6 +501,45 @@ def _build_ged_gap_mask(
         dims=["latitude", "longitude"],
         coords={"latitude": latitude, "longitude": longitude},
     )
+
+
+def apply_ged_gap_mask(lst: xr.DataArray, gap: xr.DataArray) -> xr.DataArray:
+    """Drop the pixels that are both inside a GED gap and implausibly hot.
+
+    The gap region says where USGS interpolated emissivity. The threshold
+    (``settings.ged_gap_hot_threshold_c``) says which pixels that
+    interpolation plausibly broke. Only their intersection is removed.
+
+    Both halves are load-bearing and neither is available alone.
+
+    The geometry alone is what #116 shipped and it was far too blunt. On
+    S30W065 it covers 2,799,286 valid pixels, of which 2,582 are the >= 70
+    degC tail the mask exists to remove: 1,083 ordinary pixels destroyed per
+    artifact, and holes visible on a map. There is no setting that brings it
+    back, because reproducing that product is not worth a switch that deletes
+    2.8 M good pixels when someone reads its default wrong. Use
+    ``settings.ged_gap_mask`` to turn the mask off.
+
+    The threshold alone would be a global hot clamp, which is a different and
+    unevidenced rule. A pixel above the threshold outside a gap is kept here;
+    ``settings.lst_valid_max`` remains the only unconditional ceiling.
+
+    The comparison is what excludes missing pixels, so no separate guard is
+    needed: both fills the composite carries, ``settings.nodata`` (-9999) and
+    NaN, compare False against the threshold.
+
+    Both the whole-tile path and every composite shard call this, so a band's
+    rule cannot drift from its tile's. LST only. ``qa_count`` is never masked,
+    because zero observations is data.
+
+    Args:
+        lst: The composite LST band, in degrees Celsius.
+        gap: The gap region from :func:`_build_ged_gap_mask`.
+
+    Returns:
+        ``lst`` with the masked pixels set to NaN.
+    """
+    return lst.where(~(gap & (lst >= settings.ged_gap_hot_threshold_c)))
 
 
 def compute_annual_composite(
@@ -930,12 +968,12 @@ def process_tile(
     # on the LST band: qa_count keeps counting over gap cells because zero-or-
     # more observations there is still the evidence layer, and the offsets
     # above were deliberately estimated without this mask (a per-scene median
-    # over a whole tile does not care about 0.86% of pixels, and keeping the
-    # mask out of the estimator keeps every cached offset record valid).
+    # over a whole tile does not care about a few thousand pixels, and keeping
+    # the mask out of the estimator keeps every cached offset record valid).
     if settings.ged_gap_mask:
         with timed_section("ged_gap_mask"):
             gap_mask_da = _build_ged_gap_mask(native_geobox, data.latitude, data.longitude)
-        composite["lst_p95"] = composite["lst_p95"].where(~gap_mask_da)
+        composite["lst_p95"] = apply_ged_gap_mask(composite["lst_p95"], gap_mask_da)
 
     composite.attrs["tile"] = job.tile.name
     composite.attrs["year"] = job.year

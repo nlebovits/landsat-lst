@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import xarray as xr
+from pydantic import ValidationError
 
 from landsat_lst import ged
-from landsat_lst.config import settings
+from landsat_lst.config import Settings, settings
 from landsat_lst.ged import (
     MissingGranuleError,
     build_artifact,
@@ -23,6 +25,7 @@ from landsat_lst.ged import (
     granule_name,
     read_granule_numobs,
 )
+from landsat_lst.pipeline import apply_ged_gap_mask
 from landsat_lst.tiling import geobox_for_bbox
 
 h5py = pytest.importorskip("h5py")
@@ -292,3 +295,82 @@ class TestArtifact:
         ged_env.mkdir(parents=True, exist_ok=True)
         with pytest.raises(FileNotFoundError, match="granules"):
             build_artifact(ged_env, settings.ged_artifact)
+
+
+class TestApplyGapMask:
+    """The value gate: geometry alone never drops a pixel.
+
+    ``gap_mask_for_geobox`` answers where emissivity was interpolated.
+    ``apply_ged_gap_mask`` decides which of those pixels to believe. Every
+    case here is one row of that truth table.
+    """
+
+    @staticmethod
+    def band(values: list[float]) -> xr.DataArray:
+        return xr.DataArray(np.array([values], dtype=np.float32), dims=["latitude", "longitude"])
+
+    @staticmethod
+    def region(flags: list[bool]) -> xr.DataArray:
+        return xr.DataArray(np.array([flags], dtype=bool), dims=["latitude", "longitude"])
+
+    def test_only_hot_pixels_inside_the_gap_are_dropped(self, monkeypatch):
+        monkeypatch.setattr(settings, "ged_gap_hot_threshold_c", 70.0)
+        # hot in gap, cool in gap, hot outside, cool outside.
+        out = apply_ged_gap_mask(
+            self.band([75.0, 25.0, 75.0, 25.0]),
+            self.region([True, True, False, False]),
+        ).values[0]
+        assert np.isnan(out[0])
+        np.testing.assert_allclose(out[1:], [25.0, 75.0, 25.0])
+
+    def test_the_threshold_is_inclusive(self, monkeypatch):
+        monkeypatch.setattr(settings, "ged_gap_hot_threshold_c", 70.0)
+        out = apply_ged_gap_mask(self.band([70.0, 69.99]), self.region([True, True])).values[0]
+        assert np.isnan(out[0])
+        assert out[1] == pytest.approx(69.99)
+
+    def test_the_geometric_mask_has_no_way_back(self, monkeypatch):
+        """#116's rule is gone, not hidden behind a setting.
+
+        There is no threshold value that drops an ordinary pixel inside a gap,
+        because the floor on the field sits above ordinary land temperatures.
+        Deleting the value gate is the only way to reintroduce the defect, and
+        that shows up as a source change rather than a configuration one.
+        """
+        monkeypatch.setattr(settings, "ged_gap_hot_threshold_c", 50.0)
+        out = apply_ged_gap_mask(
+            self.band([49.9, 25.0, 0.0]), self.region([True, True, True])
+        ).values[0]
+        np.testing.assert_allclose(out, [49.9, 25.0, 0.0])
+
+    def test_the_field_refuses_a_threshold_among_ordinary_temperatures(self):
+        with pytest.raises(ValidationError, match="ged_gap_hot_threshold_c"):
+            Settings(ged_gap_hot_threshold_c=25.0)
+
+    def test_the_threshold_alone_never_masks_outside_a_gap(self, monkeypatch):
+        """No global hot clamp. lst_valid_max is the only unconditional one."""
+        monkeypatch.setattr(settings, "ged_gap_hot_threshold_c", 70.0)
+        out = apply_ged_gap_mask(self.band([75.0, 79.0]), self.region([False, False])).values[0]
+        np.testing.assert_allclose(out, [75.0, 79.0])
+
+    def test_neither_fill_value_is_resurrected_or_re_dropped(self, monkeypatch):
+        """The comparison is the missing-pixel guard, so there is no other one.
+
+        Both fills the composite carries reach here: ``settings.nodata``
+        (-9999) from the invalid-pixel path and NaN from the land mask. Each
+        compares False against the threshold, so a gap cell leaves them as it
+        found them.
+        """
+        monkeypatch.setattr(settings, "ged_gap_hot_threshold_c", 70.0)
+        out = apply_ged_gap_mask(
+            self.band([settings.nodata, np.nan]), self.region([True, True])
+        ).values[0]
+        assert out[0] == pytest.approx(settings.nodata)
+        assert np.isnan(out[1])
+
+    def test_an_all_gap_band_of_ordinary_data_is_untouched(self, monkeypatch):
+        """The shipped defect, at unit scale: a whole gap region survives."""
+        monkeypatch.setattr(settings, "ged_gap_hot_threshold_c", 70.0)
+        values = [20.0, 30.0, 40.0, 50.0, 60.0]
+        out = apply_ged_gap_mask(self.band(values), self.region([True] * len(values))).values[0]
+        np.testing.assert_allclose(out, values)

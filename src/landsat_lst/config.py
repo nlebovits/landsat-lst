@@ -147,17 +147,21 @@ class Settings(BaseSettings):
     # results/ged-mask-check/, was an agent scratch directory and is gone.)
     ged_gap_mask: bool = Field(
         default=True,
-        description="Drop composite pixels whose ASTER GED v3 (AG100) cell has "
-        "NumObs == 0, plus a buffer (ged_gap_buffer_cells). USGS interpolates "
-        "GED emissivity over these cells, and the >= 70 degC artifact tail is "
-        "strongly associated with them: on S30W065 they carry 79.9% of that "
-        "tail at 369x the tile base rate, and 99.6% of the tile's missing "
-        "pixels. That is a measured spatial association, not an "
-        "observation-level trace of what produced any pixel. The rule removes "
-        "0.8642% of valid pixels and 92.45% of the >= 70 degC tail (maximum "
-        "77.87 degC). Applies to the LST output only, exactly like the land "
-        "mask -- never to offset estimation, and never to qa_count (zero "
-        "observations is data; the count layer stays the evidence).",
+        description="Drop composite pixels that are BOTH implausibly hot "
+        "(>= ged_gap_hot_threshold_c) and inside an ASTER GED v3 (AG100) "
+        "emissivity gap: a cell with NumObs == 0, or within "
+        "ged_gap_buffer_cells of one. USGS interpolates GED emissivity over "
+        "those cells, and the >= 70 degC artifact tail is strongly associated "
+        "with them: on S30W065 they carry 79.9% of that tail at 369x the tile "
+        "base rate, and 99.6% of the tile's missing pixels. That is a measured "
+        "spatial association, not an observation-level trace of what produced "
+        "any pixel. The conjunction is what makes the rule cheap: on S30W065 "
+        "it removes 2,582 pixels (0.0008% of valid) and takes 92.45% of the "
+        ">= 70 degC tail, where the same geometry applied unconditionally "
+        "removed 2,799,286 pixels (0.8642%) to reach the identical tail. "
+        "Applies to the LST output only, exactly like the land mask, never to "
+        "offset estimation, and never to qa_count (zero observations is data; "
+        "the count layer stays the evidence).",
     )
     warp_exact_transform: bool = Field(
         default=True,
@@ -177,13 +181,32 @@ class Settings(BaseSettings):
     ged_gap_buffer_cells: int = Field(
         default=1,
         ge=0,
-        description="Dilation radius of the GED gap mask, in GED cells (~1 km "
-        "each, 8-connected). 1 is the verified rule: on S30W065 the unbuffered "
-        "gap cores catch the ST-fill blobs but leave the hot fringe, and one "
-        "cell of buffer takes the >= 70 degC tail from 2,793 pixels to 211 "
-        "(92.45% removed) for 0.8642% of valid pixels. The residue sits on "
-        "NumObs 1-3 cells and is deliberately not chased: chasing it "
-        "(NumObs <= 2 + buffer) costs 11.4% of valid pixels.",
+        description="Dilation radius of the GED gap region, in GED cells "
+        "(~1 km each, 8-connected). On S30W065 the unbuffered gap cores catch "
+        "the ST-fill blobs but leave the hot fringe, and one cell of buffer "
+        "takes the >= 70 degC tail from 2,793 pixels to 211 (92.45% removed). "
+        "Under ged_gap_hot_threshold_c the buffer costs no ordinary data: it "
+        "removes 351 more artifact pixels and zero cool ones, which is why it "
+        "stays at 1. The 211-pixel residue sits on NumObs 1-3 cells and is "
+        "deliberately not chased.",
+    )
+    ged_gap_hot_threshold_c: float = Field(
+        default=70.0,
+        ge=50.0,
+        description="Only pixels at or above this temperature (degC) are "
+        "dropped inside a GED emissivity gap. The gap geometry says where "
+        "emissivity was interpolated; the threshold says which pixels that "
+        "interpolation plausibly broke. 70 separates the artifact tail "
+        "measured on S30W065: 2,793 pixels reaching 77.87 degC, enriched 369x "
+        "on NumObs == 0 cells, with none of it on a cell carrying more than "
+        "three observations. It is not a claim about the maximum physical "
+        "land surface temperature, and it is not a global hot clamp. The "
+        "conjunction is what keeps it from becoming one, since a pixel above "
+        "70 degC outside a gap is kept; lst_valid_max is the only "
+        "unconditional ceiling. The floor of 50 exists because a threshold "
+        "down among ordinary hot land stops selecting artifacts and starts "
+        "deleting data, which is the #116 defect by another route. Disable "
+        "the mask with ged_gap_mask, never by lowering this.",
     )
     ged_dir: Path = Field(
         default=Path("data/aster_ged"),

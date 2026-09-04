@@ -24,6 +24,7 @@ from landsat_lst import ged
 from landsat_lst.config import settings
 from landsat_lst.ged_analysis import (
     ANALYSIS_VERSION,
+    SHIPPED_RULE,
     TIER_LABELS,
     AnalysisInputError,
     analyze,
@@ -308,6 +309,35 @@ class TestCountConservation:
         ):
             for key in ("valid_pixels_removed", "hot_pixels_removed"):
                 assert rules[buffered][key] >= rules[bare][key]
+
+    def test_the_shipped_rule_removes_the_same_tail_and_nothing_else(self, mixed):
+        """The whole case for the value gate, as two numbers off one pass.
+
+        The shipped rule and the buffered geometry it is built from remove an
+        identical hot tail. They differ only in what else goes with it.
+        """
+        record, _ = mixed
+        rules = {r["rule"]: r for r in record["mask_tradeoffs"]}
+        shipped = rules[SHIPPED_RULE.format(buffer=1, threshold="70")]
+        geometric = rules["numobs==0 + 1-cell buffer"]
+
+        assert shipped["hot_pixels_removed"] == geometric["hot_pixels_removed"]
+        assert shipped["hot_pixels_removed"] > 0
+        assert shipped["cool_valid_pixels_removed"] == 0
+        assert shipped["valid_pixels_removed"] == shipped["hot_pixels_removed"]
+        assert geometric["cool_valid_pixels_removed"] > 0
+
+    def test_the_shipped_rule_annotates_no_missing_pixels(self, mixed):
+        """A fill pixel is not hot, so the gate cannot reach one."""
+        record, _ = mixed
+        shipped = next(r for r in record["mask_tradeoffs"] if r["value_gated"])
+        assert shipped["missing_pixels_annotated"] == 0
+        assert shipped["cool_pixels_lost_per_hot_pixel_removed"] == 0.0
+
+    def test_exactly_one_rule_is_value_gated(self, mixed):
+        record, _ = mixed
+        gated = [r["rule"] for r in record["mask_tradeoffs"] if r["value_gated"]]
+        assert gated == [SHIPPED_RULE.format(buffer=1, threshold="70")]
 
     def test_the_low_confidence_rule_subsumes_the_gap_rule(self, mixed):
         record, _ = mixed

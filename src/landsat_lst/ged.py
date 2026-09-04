@@ -12,10 +12,16 @@ association is not a causal trace -- nothing here follows which ASTER
 observations produced a given pixel's emissivity -- so the mask is justified
 by where the artifacts sit, not by a demonstrated mechanism.
 
-The adopted rule masks ``NumObs == 0`` cells plus a 1 km buffer, which on
-S30W065 removes 0.8642% of valid pixels and 92.45% of the >= 70 degC tail
-(whose maximum is 77.87 degC, from the published COG's own band statistics).
-Note 0.8642%, not the 0.863% quoted before: the earlier pass clipped its
+This module builds the gap *region*: ``NumObs == 0`` cells plus a 1 km
+buffer. That region is not the mask. It covers 2,799,286 valid S30W065
+pixels, 0.8642% of the tile, of which 2,582 are the >= 70 degC tail the mask
+exists to remove. :func:`landsat_lst.pipeline.apply_ged_gap_mask` intersects
+it with ``settings.ged_gap_hot_threshold_c`` and drops only the intersection,
+so the shipped rule removes those 2,582 pixels and leaves the other
+2,796,704 alone. The tail's maximum is 77.87 degC, from the published COG's
+own band statistics.
+
+Note 0.8642%, not the 0.863% quoted before: an earlier pass clipped its
 dilation at the tile edge, and the production form pads the cell window
 instead. See docs/findings-aster-ged-gaps.md and docs/methodology.md.
 
@@ -791,7 +797,14 @@ def gap_mask_for_geobox(
     *,
     buffer_cells: int | None = None,
 ) -> np.ndarray:
-    """Boolean mask on the geobox's own grid: True where a pixel must be dropped.
+    """The gap region on the geobox's own grid: True inside a GED gap.
+
+    This is geometry, not a drop decision. A pixel here had its emissivity
+    interpolated by USGS, which is a fact about the auxiliary input and not a
+    verdict on the retrieval. :func:`landsat_lst.pipeline.apply_ged_gap_mask`
+    intersects this with the pixel's own value and drops only that. Masking
+    on this array alone removes 1,083 ordinary S30W065 pixels for every
+    artifact it catches.
 
     Pixel centers come from ``geobox.transform`` -- the grid's own affine, so
     a row band's mask is the exact slice of its tile's (the same argument as

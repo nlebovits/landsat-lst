@@ -1,5 +1,5 @@
 {
-  "analysis_version": "1.0.0",
+  "analysis_version": "1.1.0",
   "association_only": "Pixels are cross-tabbed by the GED cell they fall inside. This is a spatial association between output pixels and ASTER observation counts, not a trace of which observations produced any pixel's emissivity, and it does not on its own establish causation.",
   "raster": {
     "source": "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/landsat-lst/lst-p95-2021-2025/S30W065/lst_p95_2021-2025_S30W065.tif",
@@ -322,6 +322,7 @@
   "mask_tradeoffs": [
     {
       "rule": "numobs==0",
+      "value_gated": false,
       "valid_pixels_removed": 701279,
       "valid_pixels_removed_pct": 0.2164996606151198,
       "hot_pixels_removed": 2231,
@@ -334,6 +335,7 @@
     },
     {
       "rule": "numobs==0 + 1-cell buffer",
+      "value_gated": false,
       "valid_pixels_removed": 2799286,
       "valid_pixels_removed_pct": 0.8641987981454688,
       "hot_pixels_removed": 2582,
@@ -345,7 +347,21 @@
       "cool_pixels_lost_per_hot_pixel_removed": 1083.154144074361
     },
     {
+      "rule": "numobs==0 + 1-cell buffer AND >= 70 degC (shipped)",
+      "value_gated": true,
+      "valid_pixels_removed": 2582,
+      "valid_pixels_removed_pct": 0.0007971180139548444,
+      "hot_pixels_removed": 2582,
+      "hot_pixels_removed_pct": 92.4453992123165,
+      "hot_pixels_remaining": 211,
+      "cool_valid_pixels_removed": 0,
+      "missing_pixels_annotated": 0,
+      "missing_pixels_annotated_pct": 0.0,
+      "cool_pixels_lost_per_hot_pixel_removed": 0.0
+    },
+    {
       "rule": "numobs<=2",
+      "value_gated": false,
       "valid_pixels_removed": 22307977,
       "valid_pixels_removed_pct": 6.886944353830499,
       "hot_pixels_removed": 2571,
@@ -358,6 +374,7 @@
     },
     {
       "rule": "numobs<=2 + 1-cell buffer",
+      "value_gated": false,
       "valid_pixels_removed": 36913817,
       "valid_pixels_removed_pct": 11.396076101677991,
       "hot_pixels_removed": 2793,
