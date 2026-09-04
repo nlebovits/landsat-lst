@@ -523,6 +523,13 @@ class Settings(BaseSettings):
         "Applied by every shard process AND by the planner, so the plan digest "
         "-- which covers load_chunk_size -- agrees across all of them.",
     )
+    destripe_stage_coarse: bool = Field(
+        default=True,
+        description="Stage phase A's coarse observations as uint16 DN so phase B "
+        "reuses them instead of reading the Landsat sources a second time "
+        "(issue #125). Values are unchanged: phase B reconstructs the estimator's "
+        "float32 input bit-identically. Off falls back to two source passes.",
+    )
     shard_export_disk_gb: int = Field(
         default=100,
         ge=1,

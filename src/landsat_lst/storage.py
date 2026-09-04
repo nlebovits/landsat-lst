@@ -242,6 +242,17 @@ class StorageBackend(ABC):
         of trusting a VM's. An absent prefix maps to an empty dict.
         """
 
+    @abstractmethod
+    def delete_prefix(self, prefix: str) -> int:
+        """Delete every object under ``prefix``. Returns how many were removed.
+
+        Staging (issue #125) is the only writer that needs this: a coarse
+        stage is scratch that must not outlive the record it produced, because
+        a later listing under the run prefix reads leftovers as finished work.
+        Deleting nothing is success -- the caller cannot tell a swept prefix
+        from one that never existed, and must not care.
+        """
+
 
 class LocalStorage(StorageBackend):
     """Local filesystem storage for testing."""
@@ -327,6 +338,15 @@ class LocalStorage(StorageBackend):
             for path in sorted(root.rglob("*"))
             if path.is_file() and (key := str(path.relative_to(self.output_dir))).startswith(prefix)
         }
+
+    def delete_prefix(self, prefix: str) -> int:
+        removed = 0
+        for key in list(self.list_prefix(prefix)):
+            path = self.output_dir / key
+            if path.is_file():
+                path.unlink()
+                removed += 1
+        return removed
 
 
 class S3Storage(StorageBackend):
@@ -426,6 +446,27 @@ class S3Storage(StorageBackend):
             for obj in page.get("Contents", []):
                 listed[obj["Key"][len(self.prefix) + 1 :]] = obj["LastModified"]
         return listed
+
+    def delete_prefix(self, prefix: str) -> int:
+        full = self._full_key(prefix)
+        paginator = self.client.get_paginator("list_objects_v2")
+        removed = 0
+        batch: list[dict] = []
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=full):
+            for obj in page.get("Contents", []):
+                batch.append({"Key": obj["Key"]})
+                if len(batch) == 1000:
+                    removed += self._delete_batch(batch)
+                    batch = []
+        if batch:
+            removed += self._delete_batch(batch)
+        return removed
+
+    def _delete_batch(self, batch: list[dict]) -> int:
+        response = self.client.delete_objects(
+            Bucket=self.bucket, Delete={"Objects": batch, "Quiet": True}
+        )
+        return len(batch) - len(response.get("Errors", []))
 
 
 def get_storage() -> StorageBackend:

@@ -55,7 +55,12 @@ from landsat_lst.config import settings
 from landsat_lst.exectrace import exec_trace
 from landsat_lst.logging_config import configure_logging
 from landsat_lst.models import ProcessingJob
-from landsat_lst.normalization import _io_block_edge, _scene_batches, climatology_by_blocks
+from landsat_lst.normalization import (
+    _io_block_edge,
+    _read_values,
+    _scene_batches,
+    climatology_by_blocks,
+)
 from landsat_lst.normalization import offsets_by_scene as _offsets_by_scene
 from landsat_lst.offsets import (
     OffsetCache,
@@ -65,7 +70,20 @@ from landsat_lst.offsets import (
 )
 from landsat_lst.profiling import PROFILE_COMPOSITE, profile_compute
 from landsat_lst.progress import TileHeartbeat, capture_task_log, report_phase, timed_section
-from landsat_lst.qa import apply_qa_mask, convert_to_celsius
+from landsat_lst.qa import (
+    DN_SENTINEL,
+    apply_qa_mask,
+    celsius_stack,
+    convert_to_celsius,
+    dn_stack,
+)
+from landsat_lst.staging import (
+    CoarseStage,
+    StageKey,
+    stage_batches,
+    staged_batch_reader,
+    staging_block_reader,
+)
 from landsat_lst.storage import PRODUCTS, get_storage
 from landsat_lst.tiling import geobox_for_bbox, parse_tile_name
 
@@ -536,8 +554,19 @@ def climatology_group(plan: shards.TilePlan, index: int) -> tuple[int, list[shar
     return start, groups[index]
 
 
-def _coarse_stack(ctx: ShardContext) -> tuple[xr.DataArray, xr.DataArray]:
-    """The land-masked Celsius stack both offset phases reduce, plus its mask."""
+def _coarse_stack(ctx: ShardContext) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
+    """The land-masked stack both offset phases reduce, its mask, and its DN.
+
+    The Celsius array is built *through* the DN rather than beside it, so the
+    two cannot drift: ``celsius_stack(dn_stack(...))`` is bit-identical to the
+    ``convert_to_celsius(apply_qa_mask(...))`` this replaced, which
+    ``tests/unit/test_dn_stack.py`` pins. The DN is what the staging path
+    (issue #125) publishes; a run with staging off never materializes it.
+
+    Returns:
+        ``(lst, land, dn)``. ``lst`` is the float32 Celsius stack the estimator
+        reads, ``land`` its mask, and ``dn`` the ``uint16`` carrier, all lazy.
+    """
     from landsat_lst.pipeline import _build_land_mask, _patch_url_for, load_scenes  # noqa: PLC0415
 
     patch_url = _patch_url_for(ctx.items)
@@ -548,7 +577,47 @@ def _coarse_stack(ctx: ShardContext) -> tuple[xr.DataArray, xr.DataArray]:
     )
     with timed_section("land_mask"):
         land = _build_land_mask(geobox, source.latitude, source.longitude)
-    return convert_to_celsius(apply_qa_mask(source)["lwir11"]).where(land), land
+    dn = dn_stack(source).where(land, DN_SENTINEL)
+    if dn.dtype != np.uint16:  # pragma: no cover - xarray keeps uint16 for an int fill
+        dn = dn.astype(np.uint16)
+    return celsius_stack(dn), land, dn
+
+
+def coarse_stage(ctx: ShardContext) -> CoarseStage:
+    """This tile-window's stage, keyed by the offsets record it feeds.
+
+    Both phases build it the same way from the plan, so neither has to be told
+    where the other put things, and a stage written under a different scene
+    set, factor, clamp, or ``offsets.ALGORITHM_VERSION`` is at a prefix this
+    one never lists.
+    """
+    return CoarseStage(ctx.storage, StageKey.from_offset_key(ctx.root, _offset_key(ctx.plan)))
+
+
+def _sweep_stage(ctx: ShardContext) -> int:
+    """Delete this tile's coarse stage. Never raises.
+
+    Called when the offsets record lands and when the driver gives a tile up.
+    A stage that outlives its tile is an object under the run prefix that a
+    later listing reads as finished work, which is the failure shape
+    ``runs.classify`` already warns about one level up.
+    """
+    if not settings.destripe_stage_coarse:
+        return 0
+    try:
+        return coarse_stage(ctx).cleanup()
+    except Exception as exc:  # instrumentation never fails a tile
+        log.warning("coarse_stage_cleanup_failed", tile=ctx.tile, error=repr(exc)[:200])
+        return 0
+
+
+def sweep_coarse_stage(run_id: str, tile: str, *, storage: StorageBackend | None = None) -> int:
+    """Sweep one tile's stage from outside a shard, for a tile that failed."""
+    try:
+        return _sweep_stage(load_context(run_id, tile, storage=storage))
+    except Exception as exc:  # a tile with no plan has no stage
+        log.warning("coarse_stage_sweep_failed", tile=tile, error=repr(exc)[:200])
+        return 0
 
 
 def run_climatology_shard(
@@ -589,10 +658,33 @@ def run_climatology_shard(
         log.info("shard_skipped", stage="climatology", tile=tile, index=index, blocks=len(group))
         return []
 
-    lst, land = _coarse_stack(ctx)
+    lst, land, dn = _coarse_stack(ctx)
+
+    # The staging seam (issue #125). The reader decodes the sources once, in
+    # bounded scene groups, publishes the DN it decoded, and hands back the
+    # float32 block phase A was going to read anyway. Only blocks this shard
+    # actually reduces are staged, so a land-free block is never staged and
+    # never read -- phase B reconstructs it as the all-NaN it already was.
+    block_reader = None
+    stage = None
+    if settings.destripe_stage_coarse:
+        stage = coarse_stage(ctx)
+        index_of = {span: start + offset for offset, span in enumerate(group)}
+        block_reader = staging_block_reader(
+            dn,
+            stage,
+            block_index=lambda span: index_of[span],
+            batches=stage_batches(dn),
+            read_values=_read_values,
+        )
+
     with timed_section("destripe_climatology", blocks_total=len(group)):
         ref, _months = climatology_by_blocks(
-            lst, block=ctx.plan.block_edge, land_mask=land, spans=group
+            lst,
+            block=ctx.plan.block_edge,
+            land_mask=land,
+            spans=group,
+            block_reader=block_reader,
         )
 
     written: list[str] = []
@@ -700,15 +792,29 @@ def run_offsets_shard(
         log.info("shard_skipped", stage="offsets", tile=tile, index=index)
         return None
 
-    lst, _land = _coarse_stack(ctx)
+    lst, _land, dn = _coarse_stack(ctx)
     months = np.unique(lst.time.dt.month.values.astype(np.int16))
 
     with timed_section("destripe_climatology_merge", blocks_total=len(ctx.plan.blocks)):
         ref = _assemble_ref(ctx, months, np.dtype(lst.dtype))
 
+    # The staging seam (issue #125): rebuild each scene batch from what phase A
+    # already decoded rather than reading every Landsat source a second time.
+    batch_reader = None
+    if settings.destripe_stage_coarse:
+        batch_reader = staged_batch_reader(
+            coarse_stage(ctx),
+            blocks=list(ctx.plan.blocks),
+            block_has_land=list(ctx.plan.block_has_land),
+            batches=stage_batches(dn),
+            shape=tuple(ctx.plan.coarse_shape),
+        )
+
     scenes = sum(stop - start for start, stop in group)
     with timed_section("destripe_offsets", scenes_total=scenes):
-        offset, n_valid = _offsets_by_scene(lst, ref, months, batches=group)
+        offset, n_valid = _offsets_by_scene(
+            lst, ref, months, batches=group, batch_reader=batch_reader
+        )
 
     ctx.storage.write_text(key, json.dumps(partial_payload(offset, n_valid)))
     log.info("shard_done", stage="offsets", tile=tile, index=index, scenes=scenes, key=key)
@@ -920,6 +1026,11 @@ def merge_offsets(
     # Written through the cache rather than around it, so a whole-tile run over
     # the same scenes finds these and skips its offset pass.
     cache.write(offset, n_valid)
+    # The record exists, so the stage has nothing left to answer for. Sweeping
+    # here rather than in a shard because only the driver knows every peer is
+    # done reading, and best-effort because losing 475 GB of scratch to a
+    # lifecycle rule costs less than failing a tile that already succeeded.
+    _sweep_stage(ctx)
     log.info(
         "shard_offsets_merged",
         tile=tile,
