@@ -110,10 +110,22 @@ def main(ged_dir: Path | None, inventory_out: Path, threads: int, dry_run: bool)
     _require_credentials(earthaccess)
 
     log.info("cmr_search", short_name=SHORT_NAME, version=VERSION)
-    results = earthaccess.search_data(short_name=SHORT_NAME, version=VERSION, count=-1)
+    query = earthaccess.granule_query().parameters(short_name=SHORT_NAME, version=VERSION)
+    cmr_hits = query.hits()
+    results = query.get(cmr_hits)
     by_name = {_granule_filename(g): g for g in results}
+    if len(results) != cmr_hits or len(by_name) != cmr_hits:
+        raise SystemExit(
+            f"CMR reported {cmr_hits} hits, but the query returned {len(results)} records "
+            f"and {len(by_name)} unique granule filenames; refusing to write a truncated "
+            "inventory"
+        )
     inventory = write_upstream_inventory(
-        inventory_out, names=set(by_name), short_name=SHORT_NAME, version=VERSION
+        inventory_out,
+        names=set(by_name),
+        short_name=SHORT_NAME,
+        version=VERSION,
+        cmr_hits=cmr_hits,
     )
     click.echo(f"collection holds {inventory.granule_count} granules; wrote {inventory_out}")
 

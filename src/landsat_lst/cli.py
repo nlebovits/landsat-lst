@@ -1784,16 +1784,21 @@ def _print_ged_coverage(report, counts: dict) -> None:
         )
     else:
         console.print(f"  [dim]fetch domain: {source}[/dim]")
-    if report.inventory is None:
+    if report.inventory is None and report.artifact_inventory is None:
         console.print(
             "  [dim]No upstream inventory given, so no label claims a granule is "
             "absent from the collection and nothing short of every granule is complete.[/dim]"
         )
     else:
-        inv = report.inventory
+        identity = (
+            report.inventory.identity()
+            if report.inventory is not None
+            else report.artifact_inventory
+        )
+        assert identity is not None
         console.print(
-            f"  [dim]inventory: {inv.short_name} v{inv.version}, "
-            f"{inv.granule_count:,} granules, queried {inv.queried_at}[/dim]"
+            f"  [dim]inventory: {identity['short_name']} v{identity['version']}, "
+            f"{identity['granule_count']:,} granules, queried {identity['queried_at']}[/dim]"
         )
     if report.complete:
         console.print("\n[green]COMPLETE[/green] -- this source covers production.")

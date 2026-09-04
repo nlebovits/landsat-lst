@@ -31,6 +31,7 @@ Pacific islands and Kerguelen, 5.53 square degrees of land in total.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -46,8 +47,21 @@ from landsat_lst.tiling import geobox_for_bbox
 #: Bumped when the classification or the report layout changes.
 COVERAGE_VERSION = "2.0.0"
 
-#: Layout of ``ged_upstream_inventory.json``.
-INVENTORY_SCHEMA_VERSION = 1
+#: Layout of newly written ``ged_upstream_inventory.json`` records. Schema v2
+#: binds the returned listing to CMR's independently reported hit count and to
+#: a canonical content hash. The one committed v1 record predates those fields;
+#: it is accepted only when its names match the pinned snapshot below.
+INVENTORY_SCHEMA_VERSION = 2
+LEGACY_INVENTORY_SCHEMA_VERSION = 1
+
+#: The only collection an inventory may authorize absences for.
+INVENTORY_SHORT_NAME = "AG1km"
+INVENTORY_VERSION = "003"
+
+#: Canonical name-set digest of the committed 2026-09-04 v1 inventory. A v1
+#: record has no CMR hit-count attestation, so accepting any other v1 listing
+#: would let a truncated or unrelated file classify real granules as absent.
+LEGACY_INVENTORY_CONTENT_SHA256 = "928e828f393dacae164c6c3ecbe0e4ca5cc70e6fe37ab52a7113cf256fb94440"
 
 #: How many missing granule names the committed record carries. The full list
 #: is five figures long; the counts are the finding and the names regenerate.
@@ -86,6 +100,8 @@ class UpstreamInventory:
     queried_at: str
     granule_count: int
     names: frozenset[str]
+    cmr_hits: int
+    content_sha256: str
 
     def identity(self) -> dict[str, object]:
         """The fields an artifact records about the inventory it used."""
@@ -97,12 +113,74 @@ class UpstreamInventory:
         }
 
 
+def inventory_content_hash(names: set[str] | frozenset[str]) -> str:
+    """Canonical digest of an inventory's granule-name set."""
+    h = hashlib.sha256()
+    h.update(b"ged-upstream-inventory-v1\n")
+    for name in sorted(names):
+        h.update(f"{name}\n".encode())
+    return h.hexdigest()
+
+
+def _validate_inventory(inventory: UpstreamInventory) -> UpstreamInventory:
+    """Refuse an inventory that cannot establish a complete AG1km v003 query."""
+    if inventory.short_name != INVENTORY_SHORT_NAME or inventory.version != INVENTORY_VERSION:
+        msg = (
+            "upstream inventory is for "
+            f"{inventory.short_name} v{inventory.version}, expected "
+            f"{INVENTORY_SHORT_NAME} v{INVENTORY_VERSION}"
+        )
+        raise ValueError(msg)
+    try:
+        stamp = datetime.fromisoformat(inventory.queried_at)
+    except ValueError as exc:
+        raise ValueError(
+            f"upstream inventory queried_at is not an ISO timestamp: {inventory.queried_at!r}"
+        ) from exc
+    if stamp.tzinfo is None:
+        raise ValueError("upstream inventory queried_at must include a timezone")
+    if inventory.granule_count <= 0:
+        raise ValueError("upstream inventory is empty; it cannot establish collection absence")
+    if inventory.granule_count != len(inventory.names):
+        msg = (
+            f"upstream inventory says {inventory.granule_count} granules but contains "
+            f"{len(inventory.names)} unique names"
+        )
+        raise ValueError(msg)
+    if inventory.cmr_hits != inventory.granule_count:
+        msg = (
+            f"upstream inventory retrieved {inventory.granule_count} unique granules but CMR "
+            f"reported {inventory.cmr_hits} hits; the listing may be truncated"
+        )
+        raise ValueError(msg)
+    for name in inventory.names:
+        try:
+            lat_top, lon_west = _cell_of(name)
+        except (IndexError, ValueError) as exc:
+            raise ValueError(f"invalid AG1km granule name in upstream inventory: {name!r}") from exc
+        if (
+            not -89 <= lat_top <= 90
+            or not -180 <= lon_west <= 179
+            or ged.granule_name(lat_top, lon_west) != name
+        ):
+            raise ValueError(f"invalid AG1km granule name in upstream inventory: {name!r}")
+    actual_hash = inventory_content_hash(inventory.names)
+    if inventory.content_sha256 != actual_hash:
+        msg = (
+            f"upstream inventory stores content hash {inventory.content_sha256}, but its names "
+            f"hash to {actual_hash}"
+        )
+        raise ValueError(msg)
+    return inventory
+
+
 def write_upstream_inventory(
     path: Path,
     *,
     names: set[str],
     short_name: str,
     version: str,
+    cmr_hits: int,
     queried_at: datetime | None = None,
 ) -> UpstreamInventory:
     """Persist a CMR granule listing as the compact inventory record.
@@ -112,26 +190,36 @@ def write_upstream_inventory(
     Names are rebuilt through :func:`landsat_lst.ged.granule_name`, so the
     record shares the grammar every other consumer uses.
     """
-    cells = sorted(_cell_of(n) for n in names)
+    frozen_names = frozenset(names)
     stamp = (queried_at or datetime.now(UTC)).isoformat(timespec="seconds")
+    inventory = _validate_inventory(
+        UpstreamInventory(
+            short_name=short_name,
+            version=version,
+            queried_at=stamp,
+            granule_count=len(frozen_names),
+            names=frozen_names,
+            cmr_hits=cmr_hits,
+            content_sha256=inventory_content_hash(frozen_names),
+        )
+    )
     record = {
         "schema_version": INVENTORY_SCHEMA_VERSION,
-        "short_name": short_name,
-        "version": version,
-        "queried_at": stamp,
-        "granule_count": len(cells),
-        "cells": cells,
+        **inventory.identity(),
+        "cmr_hits": inventory.cmr_hits,
+        "content_sha256": inventory.content_sha256,
+        "cells": sorted(_cell_of(n) for n in inventory.names),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, separators=(",", ":")) + "\n")
-    return load_upstream_inventory(path)
+    return inventory
 
 
 def load_upstream_inventory(path: Path) -> UpstreamInventory:
     """Read the inventory record and rebuild the granule names from its cells."""
     record = json.loads(Path(path).read_text())
     schema = record.get("schema_version")
-    if schema != INVENTORY_SCHEMA_VERSION:
+    if schema not in (LEGACY_INVENTORY_SCHEMA_VERSION, INVENTORY_SCHEMA_VERSION):
         msg = (
             f"upstream inventory {path} is schema v{schema}, this code reads "
             f"v{INVENTORY_SCHEMA_VERSION}; regenerate it with scripts/fetch_ged_granules.py"
@@ -142,12 +230,34 @@ def load_upstream_inventory(path: Path) -> UpstreamInventory:
     if count != len(names):
         msg = f"upstream inventory {path} says {count} granules but lists {len(names)} cells"
         raise ValueError(msg)
-    return UpstreamInventory(
-        short_name=str(record["short_name"]),
-        version=str(record["version"]),
-        queried_at=str(record["queried_at"]),
-        granule_count=count,
-        names=names,
+    content_sha256 = inventory_content_hash(names)
+    if schema == LEGACY_INVENTORY_SCHEMA_VERSION:
+        if content_sha256 != LEGACY_INVENTORY_CONTENT_SHA256:
+            msg = (
+                f"legacy upstream inventory {path} has unpinned content hash "
+                f"{content_sha256}; regenerate it with scripts/fetch_ged_granules.py"
+            )
+            raise ValueError(msg)
+        cmr_hits = count
+    else:
+        cmr_hits = int(record["cmr_hits"])
+        stored_hash = str(record["content_sha256"])
+        if stored_hash != content_sha256:
+            msg = (
+                f"upstream inventory {path} stores content hash {stored_hash}, but its names "
+                f"hash to {content_sha256}"
+            )
+            raise ValueError(msg)
+    return _validate_inventory(
+        UpstreamInventory(
+            short_name=str(record["short_name"]),
+            version=str(record["version"]),
+            queried_at=str(record["queried_at"]),
+            granule_count=count,
+            names=names,
+            cmr_hits=cmr_hits,
+            content_sha256=content_sha256,
+        )
     )
 
 
@@ -174,6 +284,7 @@ class CoverageReport:
     extra: tuple[str, ...]
     fetch_domain_source: str | None
     inventory: UpstreamInventory | None
+    artifact_inventory: dict[str, object] | None = None
 
     @property
     def fetchable(self) -> tuple[str, ...]:
@@ -190,11 +301,10 @@ class CoverageReport:
     def complete(self) -> bool:
         """True when every expected granule the collection holds was consumed.
 
-        Requires an inventory: without one, no absence can be attributed to
-        the collection, so nothing short of every expected granule counts.
+        An artifact's validated embedded absence set is evidence equivalent
+        to the inventory used to build it; a directory still needs an explicit
+        inventory before any missing granule can be excused.
         """
-        if self.inventory is None:
-            return not self.missing
         return not self.fetchable
 
     def counts(self) -> dict[str, int]:
@@ -221,14 +331,16 @@ class CoverageReport:
     def as_dict(self) -> dict[str, object]:
         """The machine-readable record."""
         inventory: dict[str, object] | str
-        if self.inventory is None:
+        if self.inventory is not None:
+            inventory = self.inventory.identity()
+        elif self.artifact_inventory is not None:
+            inventory = self.artifact_inventory
+        else:
             inventory = (
                 "none given; every absence is classified by what was requested "
                 "locally, never by what the collection holds. Pass the record "
                 "scripts/fetch_ged_granules.py writes to establish upstream absence."
             )
-        else:
-            inventory = self.inventory.identity()
         return {
             "coverage_version": COVERAGE_VERSION,
             "product": ged.GED_PRODUCT,
@@ -323,6 +435,42 @@ def _classify(
     return out
 
 
+def _source_manifests(
+    *, ged_dir: Path | None, artifact: Path | None
+) -> tuple[set[str], set[str], dict[str, object] | None]:
+    """Validated held/absent manifests and inventory identity for one source."""
+    if artifact is not None:
+        data = ged._load_artifact(artifact)
+        return set(data.consumed), set(data.absent_upstream), data.inventory
+    directory = ged_dir if ged_dir is not None else settings.ged_dir
+    return {p.name for p in directory.glob("AG1km.v003.*.0010.h5")}, set(), None
+
+
+def _established_absences(
+    *,
+    missing: set[str],
+    artifact: Path | None,
+    embedded_absent: set[str],
+    inventory: UpstreamInventory | None,
+) -> set[str]:
+    """Upstream absences established by an artifact or explicit inventory."""
+    if artifact is None:
+        return set() if inventory is None else missing - inventory.names
+
+    absent = missing & embedded_absent
+    if inventory is None:
+        return absent
+
+    inventory_absent = missing - inventory.names
+    if inventory_absent != absent:
+        msg = (
+            f"artifact {artifact} records {len(absent)} upstream absences, "
+            f"but the supplied inventory establishes {len(inventory_absent)}"
+        )
+        raise ValueError(msg)
+    return absent
+
+
 def build_report(
     *,
     ged_dir: Path | None = None,
@@ -361,6 +509,8 @@ def build_report(
         if isinstance(upstream_inventory, Path)
         else upstream_inventory
     )
+    if inventory is not None:
+        inventory = _validate_inventory(inventory)
 
     expected: set[str] = set()
     core_by_tile: dict[str, set[str]] = {}
@@ -370,18 +520,22 @@ def build_report(
         all_by_tile[name], core_by_tile[name] = touched, core
         expected |= touched
 
-    if artifact is not None:
-        with np.load(artifact) as data:
-            held = {str(x) for x in data["consumed"]}
-    else:
-        directory = ged_dir if ged_dir is not None else settings.ged_dir
-        held = {p.name for p in directory.glob("AG1km.v003.*.0010.h5")}
-
+    held, embedded_absent, artifact_inventory = _source_manifests(
+        ged_dir=ged_dir, artifact=artifact
+    )
     missing = expected - held
     missing_core = {n for tile in names for n in core_by_tile[tile] if n in missing}
-    absent_upstream = set() if inventory is None else missing - inventory.names
+    absent_upstream = _established_absences(
+        missing=missing,
+        artifact=artifact,
+        embedded_absent=embedded_absent,
+        inventory=inventory,
+    )
     fetchable = missing - absent_upstream
     grid, source = _load_fetch_domain(fetch_domain)
+    classification = _classify(missing, grid, inventory)
+    for name in absent_upstream:
+        classification[name] = ABSENT_UPSTREAM
     return CoverageReport(
         tiles=len(names),
         buffer_cells=buffer_cells,
@@ -391,10 +545,11 @@ def build_report(
         missing_core=tuple(sorted(missing_core)),
         absent_upstream=tuple(sorted(absent_upstream)),
         absent_upstream_core=tuple(sorted(missing_core & absent_upstream)),
-        classification=_classify(missing, grid, inventory),
+        classification=classification,
         tiles_missing_core=tuple(sorted(t for t in names if core_by_tile[t] & fetchable)),
         tiles_missing_any=tuple(sorted(t for t in names if all_by_tile[t] & fetchable)),
         extra=tuple(sorted(held - expected)),
         fetch_domain_source=source,
         inventory=inventory,
+        artifact_inventory=artifact_inventory,
     )

@@ -136,12 +136,57 @@ class TestReport:
         assert counts["consumed_of_expected"] + counts["missing"] == counts["expected"]
         assert len(report.classification) == counts["missing"]
 
-    def test_an_artifact_manifest_can_be_measured_instead_of_a_directory(self, tmp_path):
+    def test_an_artifact_is_validated_and_its_manifest_is_measured(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
         touched, _ = granules_for_tile("S30W065", buffer_cells=1)
         artifact = tmp_path / "a.npz"
-        np.savez_compressed(artifact, consumed=np.array(sorted(touched), dtype=np.str_))
+        artifact.touch()
+        calls = []
+
+        def load(path):
+            calls.append(path)
+            return SimpleNamespace(
+                consumed=frozenset(touched),
+                absent_upstream=frozenset(),
+                inventory={
+                    "short_name": "AG1km",
+                    "version": "003",
+                    "queried_at": "2026-09-04T07:50:00+00:00",
+                    "granule_count": len(touched),
+                },
+            )
+
+        monkeypatch.setattr(ged, "_load_artifact", load)
         report = build_report(artifact=artifact, tiles=["S30W065"], buffer_cells=1)
         assert report.complete is True
+        assert calls == [artifact]
+
+    def test_an_artifact_uses_its_embedded_upstream_absences(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        touched, _ = granules_for_tile("S30W065", buffer_cells=1)
+        absent = sorted(touched)[0]
+        artifact = tmp_path / "a.npz"
+        artifact.touch()
+        monkeypatch.setattr(
+            ged,
+            "_load_artifact",
+            lambda _path: SimpleNamespace(
+                consumed=frozenset(touched - {absent}),
+                absent_upstream=frozenset({absent}),
+                inventory={
+                    "short_name": "AG1km",
+                    "version": "003",
+                    "queried_at": "2026-09-04T07:50:00+00:00",
+                    "granule_count": len(touched),
+                },
+            ),
+        )
+        report = build_report(artifact=artifact, tiles=["S30W065"], buffer_cells=1)
+        assert report.complete is True
+        assert report.absent_upstream == (absent,)
+        assert report.classification[absent] == ABSENT_UPSTREAM
 
 
 class TestClassification:
@@ -185,12 +230,15 @@ class TestClassification:
 
 
 def _inventory(names: set[str]) -> UpstreamInventory:
+    frozen = frozenset(names)
     return UpstreamInventory(
         short_name="AG1km",
         version="003",
         queried_at="2026-09-04T07:50:00+00:00",
-        granule_count=len(names),
-        names=frozenset(names),
+        granule_count=len(frozen),
+        names=frozen,
+        cmr_hits=len(frozen),
+        content_sha256=ged_coverage.inventory_content_hash(frozen),
     )
 
 
@@ -201,12 +249,36 @@ class TestUpstreamInventory:
     def test_the_record_round_trips_through_cells(self, tmp_path):
         names = {ged.granule_name(-30, -65), ged.granule_name(40, -75), ged.granule_name(0, 179)}
         path = tmp_path / "inv.json"
-        written = write_upstream_inventory(path, names=names, short_name="AG1km", version="003")
+        written = write_upstream_inventory(
+            path, names=names, short_name="AG1km", version="003", cmr_hits=len(names)
+        )
         loaded = load_upstream_inventory(path)
         assert loaded == written
         assert loaded.names == frozenset(names)
         assert loaded.granule_count == 3
         assert loaded.queried_at.endswith("+00:00")
+
+    def test_a_wrong_collection_cannot_authorize_absence(self, tmp_path):
+        directory = tmp_path / "empty"
+        directory.mkdir()
+        touched, _ = granules_for_tile("S30W065", buffer_cells=0)
+        inventory = _inventory(touched)
+        wrong = UpstreamInventory(
+            short_name="NOT_GED",
+            version="999",
+            queried_at=inventory.queried_at,
+            granule_count=inventory.granule_count,
+            names=inventory.names,
+            cmr_hits=inventory.cmr_hits,
+            content_sha256=inventory.content_sha256,
+        )
+        with pytest.raises(ValueError, match="expected AG1km v003"):
+            build_report(
+                ged_dir=directory,
+                tiles=["S30W065"],
+                buffer_cells=0,
+                upstream_inventory=wrong,
+            )
 
     def test_a_foreign_schema_is_refused(self, tmp_path):
         path = tmp_path / "inv.json"
@@ -221,6 +293,24 @@ class TestUpstreamInventory:
             '"queried_at": "x", "granule_count": 2, "cells": [[-30, -65]]}'
         )
         with pytest.raises(ValueError, match="says 2 granules but lists 1"):
+            load_upstream_inventory(path)
+
+    def test_cmr_hit_count_must_match_the_retrieved_listing(self, tmp_path):
+        names = {ged.granule_name(-30, -65)}
+        path = tmp_path / "inv.json"
+        with pytest.raises(ValueError, match="may be truncated"):
+            write_upstream_inventory(
+                path, names=names, short_name="AG1km", version="003", cmr_hits=2
+            )
+
+    def test_an_unpinned_legacy_inventory_is_refused(self, tmp_path):
+        path = tmp_path / "inv.json"
+        path.write_text(
+            '{"schema_version": 1, "short_name": "AG1km", "version": "003", '
+            '"queried_at": "2026-09-04T07:50:00+00:00", "granule_count": 1, '
+            '"cells": [[-30, -65]]}'
+        )
+        with pytest.raises(ValueError, match="unpinned content hash"):
             load_upstream_inventory(path)
 
     def test_an_absence_the_collection_shares_is_absent_upstream(self, tmp_path):
@@ -284,7 +374,9 @@ class TestUpstreamInventory:
         directory.mkdir()
         touched, _ = granules_for_tile("S30W065", buffer_cells=0)
         path = tmp_path / "inv.json"
-        write_upstream_inventory(path, names=touched, short_name="AG1km", version="003")
+        write_upstream_inventory(
+            path, names=touched, short_name="AG1km", version="003", cmr_hits=len(touched)
+        )
         report = build_report(
             ged_dir=directory, tiles=["S30W065"], buffer_cells=0, upstream_inventory=path
         )

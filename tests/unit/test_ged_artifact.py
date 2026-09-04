@@ -365,5 +365,6 @@ class TestResolution:
             absent = {str(x) for x in data["absent_upstream"]}
         report = build_report(artifact=packaged)
         core_needed = set(report.missing_core) | (set(report.expected) & consumed)
+        assert report.complete is True
         assert set(report.missing_core) <= absent
         assert core_needed  # the manifest is not empty

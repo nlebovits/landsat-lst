@@ -381,6 +381,7 @@ class _Artifact:
     gap_cols: np.ndarray
     consumed: frozenset[str]
     absent_upstream: frozenset[str]
+    inventory: dict[str, object]
 
 
 def _load_artifact(path: Path) -> _Artifact:
@@ -438,6 +439,7 @@ def _load_artifact(path: Path) -> _Artifact:
         gap_cols=gap_cols,
         consumed=frozenset(consumed),
         absent_upstream=frozenset(absent),
+        inventory=inventory,
     )
 
 
