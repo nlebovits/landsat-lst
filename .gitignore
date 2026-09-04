@@ -79,6 +79,10 @@ data/aster_ged/
 data/ged_gap_mask.npz
 .serena/
 
+# Downloaded by `vale sync`; .vale.ini pins each package release.
+styles/Microsoft/
+styles/Readability/
+
 # Environment
 .env
 .env.local
