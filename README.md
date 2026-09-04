@@ -1,31 +1,41 @@
 # Landsat LST
 
-Global Land Surface Temperature composites — annual or multi-year — from Landsat Collection 2 Level-2 data.
+Build annual or multi-year land surface temperature (LST) composites from
+Landsat Collection 2 Level-2 data.
 
 ## Overview
 
-This pipeline produces annual or multi-year LST composites for municipal decision-makers analyzing urban heat. A composite pools *every* scene in its window (one year, e.g. `2024`, or a range, e.g. `2021-2025`) into a single percentile — multi-year windows fill cloud/orbit gaps. **The production default is the five-year 2021–2025 window.** Output includes:
+This pipeline produces LST composites for municipal decision-makers who analyze
+urban heat. Each composite pools *every* scene in a one-year or multi-year window
+into a single percentile. Longer windows fill cloud and orbit gaps. **Production
+uses the five-year window from 2021 through 2025 by default.**
+
+Each tile contains two assets:
 
 - **lst_p95**: 95th percentile LST (°C), pooled across all scenes in the window
 - **qa_count**: 12-month climatology of valid-observation counts (`(month, latitude, longitude)`, one band per calendar month; month M = valid observations in calendar month M pooled across the window)
 
-Before compositing, each scene is shifted by a single scene-wide offset estimated against a per-pixel monthly climatology, which removes the seams that satellite footprint boundaries would otherwise leave in the composite. Scenes needing an implausibly large correction are discarded rather than adjusted, and `qa_count` counts only the observations that survive. [`docs/methodology.md`](docs/methodology.md) explains the choices; [ADR-007](docs/adr/007-scene-normalization.md) carries the measurements.
+Before compositing, the pipeline estimates one scene-wide offset against a
+per-pixel monthly climatology and shifts the scene by that amount. This
+normalization removes seams at satellite footprint boundaries. The pipeline
+discards a scene when its correction would be implausibly large, and `qa_count`
+counts only surviving observations. [`docs/methodology.md`](docs/methodology.md)
+explains the method. [ADR-007](docs/adr/007-scene-normalization.md) records the
+measurements behind it.
 
-Data is tiled on a 5° global grid and published as **Cloud-Optimized GeoTIFFs**, two
-per tile, cataloged as a single [Portolan](https://github.com/portolan-sdi/portolan-spec)
-STAC collection. Every tile is a window cut from one shared global grid, so the whole
-collection mosaics in QGIS, GDAL, TiTiler, or odc-stac without any reprojection step.
-See [Data Access](#data-access) and [ADR-009](docs/adr/009-cog-output-and-stac-catalog.md).
+The pipeline cuts each tile from a shared 5° global grid and publishes two
+Cloud-Optimized GeoTIFFs (COGs) per tile. One
+[Portolan](https://github.com/portolan-sdi/portolan-spec) SpatioTemporal Asset
+Catalog (STAC) collection catalogs the results. Because every tile uses the same
+grid, QGIS, GDAL, TiTiler, and odc-stac can mosaic the collection without
+reprojection. See [Data access](#data-access) for examples and
+[ADR-009](docs/adr/009-cog-output-and-stac-catalog.md) for the design.
 
-## Architecture
+## Data encoding
 
-Design decisions are recorded as ADRs in [`docs/adr/`](docs/adr/README.md).
-
-## Data Encoding
-
-LST is stored as **uint16** to halve the file size. The scale and offset are embedded as
-GDAL band metadata, so QGIS, `gdalinfo`, and rioxarray all report the decoding rule
-without being told. Most readers apply it for you:
+The writer stores LST as **uint16** to halve the file size and embeds the scale
+and offset in the GDAL band metadata. QGIS, `gdalinfo`, and rioxarray read this
+decoding rule from the file. Most readers then apply it automatically:
 
 ```python
 import rioxarray
@@ -47,9 +57,9 @@ celsius = dn * 0.01 + (-50.0)  # DN 0 is nodata
 | lst_p95 | 95th percentile LST | uint16, 1 band | 0.01 | -50.0 | 0 | celsius |
 | qa_count | Valid observations per calendar month | uint8, 12 bands (Jan..Dec) | — | — | none | count |
 
-`qa_count` sets no nodata on purpose. A value of 0 means no valid observation survived
-de-striping that month, which is the number you need to diagnose a gap, so it stays
-visible rather than being masked away.
+`qa_count` has no nodata value by design. A value of 0 means that no valid
+observation survived de-striping for that month. Keeping zero visible lets you
+distinguish this gap from masked data.
 
 ## Installation
 
@@ -59,21 +69,21 @@ uv sync
 
 ## Configuration
 
-Settings live in [`landsat_lst.config`](src/landsat_lst/config.py) and can be
-overridden via environment variables (prefix `LST_`) or a `.env` file. Notable
-data-quality and performance settings:
+[`landsat_lst.config`](src/landsat_lst/config.py) defines the settings. Override
+them with `LST_`-prefixed environment variables or a `.env` file. These settings
+control data quality and resource use:
 
 | Setting | Env var | Default | Purpose |
 |---------|---------|---------|---------|
-| `lst_valid_min` | `LST_LST_VALID_MIN` | `-50.0` | Drop physically implausible cold LST (e.g. ~-124 °C DN=0 / resampling artifacts) |
-| `lst_valid_max` | `LST_LST_VALID_MAX` | `80.0` | Drop high-DN saturation/fill artifacts without clipping real extreme heat |
-| `load_chunk_size` | `LST_LOAD_CHUNK_SIZE` | `512` | odc-stac spatial (lat/lon) chunk; smaller (e.g. 256) cuts peak memory for the P95 quantile on multi-year / large-tile runs |
-| `max_cloud_cover` | `LST_MAX_CLOUD_COVER` | `100` | Scene-level cloud filter, applied as `eo:cloud_cover <` this. Not the no-op it looks like: strict less-than already drops every scene reported at exactly 100% cloud (154 of 2,912 for N40W075). Use 101 for a true no-op. See [findings](docs/findings-cloud-cover-filter.md) before lowering it |
-| `destripe` | `LST_DESTRIPE` | `True` | Normalize each scene against a monthly climatology before compositing; disable to benchmark raw composites |
-| `destripe_max_offset_c` | `LST_DESTRIPE_MAX_OFFSET_C` | `15.0` | Discard a scene whose offset exceeds this rather than adjusting it. Calibrated at Pergamino ([ADR-007](docs/adr/007-scene-normalization.md)); re-check with `scripts/calibrate_destripe_cap.py` for other climates |
-| `destripe_min_scene_pixels` | `LST_DESTRIPE_MIN_SCENE_PIXELS` | `500` | Sparse floor when offsets are estimated at native resolution. Replaced by, never converted into, `destripe_min_offset_samples` on a coarse grid |
-| `destripe_min_offset_samples` | `LST_DESTRIPE_MIN_OFFSET_SAMPLES` | `200` | Sparse floor when offsets come from a coarse grid, stated in that grid's pixels |
-| `destripe_offset_resolution_factor` | `LST_DESTRIPE_OFFSET_RESOLUTION_FACTOR` | `2` | Estimate offsets from a stack loaded at `resolution × factor`, served from the source COGs' overviews. Cuts the offset pass from 20.2 GB to 5.1 GB. The largest factor that passes validation; 4 was measured and rejected for [#81](https://github.com/nlebovits/landsat-lst/issues/81). See [findings](docs/findings-offset-subsampling.md) |
+| `lst_valid_min` | `LST_LST_VALID_MIN` | `-50.0` | Drop implausibly cold LST, such as the ~-124 °C produced by DN=0 or resampling artifacts |
+| `lst_valid_max` | `LST_LST_VALID_MAX` | `80.0` | Drop high-DN saturation and fill artifacts without clipping real extreme heat |
+| `load_chunk_size` | `LST_LOAD_CHUNK_SIZE` | `512` | Set the odc-stac spatial chunk. A smaller chunk, such as 256, reduces peak memory during the P95 quantile for multi-year or large-tile runs |
+| `max_cloud_cover` | `LST_MAX_CLOUD_COVER` | `100` | Keep scenes where `eo:cloud_cover` is below this value. The strict comparison at 100 already drops the 154 of 2,912 N40W075 scenes reported as 100% cloudy. Use 101 for a true no-op. Read the [findings](docs/findings-cloud-cover-filter.md) before lowering it |
+| `destripe` | `LST_DESTRIPE` | `True` | Normalize each scene against a monthly climatology before compositing. Disable this setting only when benchmarking raw composites |
+| `destripe_max_offset_c` | `LST_DESTRIPE_MAX_OFFSET_C` | `15.0` | Discard a scene when its offset exceeds this value. [ADR-007](docs/adr/007-scene-normalization.md) calibrates the default at Pergamino; use `scripts/calibrate_destripe_cap.py` for other climates |
+| `destripe_min_scene_pixels` | `LST_DESTRIPE_MIN_SCENE_PIXELS` | `500` | Set the sparse floor for native-resolution offset estimates. On a coarse grid, use `destripe_min_offset_samples` instead; do not convert between the two floors |
+| `destripe_min_offset_samples` | `LST_DESTRIPE_MIN_OFFSET_SAMPLES` | `200` | Set the sparse floor for coarse-grid offset estimates, measured in pixels on that grid |
+| `destripe_offset_resolution_factor` | `LST_DESTRIPE_OFFSET_RESOLUTION_FACTOR` | `2` | Estimate offsets from source COG overviews at `resolution × factor`. Factor 2 cuts the offset pass from 20.2 GB to 5.1 GB and is the largest validated value. Validation rejected factor 4 for [#81](https://github.com/nlebovits/landsat-lst/issues/81); see the [findings](docs/findings-offset-subsampling.md) |
 
 ## Usage
 
@@ -94,12 +104,12 @@ landsat-lst process --year 2023 --tile N40W075
 landsat-lst list-tiles
 ```
 
-#### Multi-year composites
+### Multi-year composites
 
-A `ProcessingJob` accepts an optional `end_year` to pool every scene across a
-multi-year window into a single P95 (percentiles are computed on the pooled
-scenes, never averaged across per-year P95s). The window label
-(`2024` or `2020-2024`) names the STAC collection the tile's COGs are published into:
+Set `ProcessingJob.end_year` to pool every scene in a multi-year window into one
+P95. The pipeline computes the percentile over the pooled scenes rather than
+averaging per-year P95 values. A label such as `2024` or `2020-2024` identifies
+the STAC collection that receives the tile COGs:
 
 ```python
 from landsat_lst.models import ProcessingJob
@@ -114,27 +124,30 @@ job = ProcessingJob(tile=parse_tile_name("N40W075"), year=2020, end_year=2024)
 composite = process_tile(job)
 ```
 
-### Distributed Processing (Coiled Batch)
+### Distributed processing with Coiled Batch
 
-Production runs go through [Coiled Batch](https://docs.coiled.io/user_guide/batch.html): one tile
-per task, one plain process per VM, no shared scheduler (see
-[ADR-010](docs/adr/010-coiled-batch-for-distributed-runs.md)).
+Production runs use [Coiled Batch](https://docs.coiled.io/user_guide/batch.html).
+Each task processes one tile in a plain process on its own virtual machine; the
+tasks do not share a scheduler. [ADR-010](docs/adr/010-coiled-batch-for-distributed-runs.md)
+explains this design.
 
-Before submitting, price the configuration. Task count and the memory floor follow from array
-shape and chunking, so both are readable on a laptop in seconds instead of sixty seconds into a
-cloud run (see [ADR-011](docs/adr/011-static-planning-and-synthetic-benchmarks.md)).
+Before submitting, inspect the configuration locally. Array shape and chunking
+determine the task count and memory floor, which the planner reports in seconds.
+[ADR-011](docs/adr/011-static-planning-and-synthetic-benchmarks.md) explains why
+these checks happen before a cloud run.
 
 ```bash
-# Both of a tile's dask graphs, built against synthetic data
+# Build both of a tile's Dask graphs against synthetic data
 landsat-lst plan -t N40W075
 
 # Chunk size crossed with thread count, cheapest floor first
 landsat-lst plan -t N40W075 --sweep
 ```
 
-Reported memory is a floor, not a forecast: a configuration that cannot fit it is ruled out for
-free, and one that fits may still run out. To measure the gap, sweep scene count against
-production chunking with `scripts/synthetic_scaling.py`.
+The planner reports a memory floor, not a forecast. Reject a configuration when
+the floor does not fit, but do not assume that a fitting floor guarantees enough
+memory. To measure the gap, sweep scene count against production chunking with
+`scripts/synthetic_scaling.py`.
 
 ```bash
 # Ensure AWS SSO session is active
@@ -150,7 +163,8 @@ landsat-lst process --distributed --wait -t N40W075 -t S05W060
 landsat-lst process --distributed --dry-run
 ```
 
-Submission prints a run id and hands the run to Coiled. Closing the shell does not affect it.
+Submission prints a run ID before handing the work to Coiled. The run continues
+after you close the shell.
 
 ```bash
 # Live view: phase, elapsed time, and heartbeat age for every tile
@@ -160,35 +174,37 @@ landsat-lst watch <run-id>
 landsat-lst reconcile <run-id>
 ```
 
-Each tile publishes a heartbeat to `_runs/{run_id}/{tile}.progress.json` every minute and at every
-phase change, and uploads its own stdout and stderr to `_runs/{run_id}/{tile}.log` when it exits.
-`watch` renders the heartbeats as one table, so a wedged tile shows a stale heartbeat within two
-minutes and a failed one leaves its traceback in the bucket. Neither command needs the submitting
-shell, or even the machine that submitted the run.
+Each tile publishes a heartbeat to `_runs/{run_id}/{tile}.progress.json` every
+minute and at each phase change. When the tile exits, it uploads stdout and stderr
+to `_runs/{run_id}/{tile}.log`. The `watch` command renders these heartbeats in one
+table. A wedged tile develops a stale heartbeat within two minutes, while a failed
+tile leaves its traceback in the bucket. You can run `watch` and `reconcile` from
+any machine; neither command depends on the submitting shell.
 
-The cluster dashboard cannot report this: a batch task is a plain process that never registers
-with the dask scheduler its panels describe (issue #68).
+The cluster dashboard cannot report tile progress because a batch task never
+registers with the Dask scheduler represented by its panels (issue #68).
 
-The manifest records per-tile status, duration, scene count, and peak memory under
-`settings.manifest_dir`. Completion comes from the S3 listing, so a resumed run reprocesses only
-the tiles missing an asset.
+The manifest stores per-tile status, duration, scene count, and peak memory under
+`settings.manifest_dir`. An S3 listing determines completion, which limits a
+resumed run to tiles that are missing an asset.
 
 ### Verifying published tiles
 
-A bucket listing proves two objects exist. It does not prove someone can read them:
+Object presence does not prove public readability. Verify each published tile:
 
 ```bash
 landsat-lst verify -t N40W075 --urls
 ```
 
-Each COG is opened unauthenticated over the public read host, and its dtype, shape, nodata, scale,
-offset, and overview levels are printed. A tile that reads only with credentials fails here. The
-command exits non-zero if any tile fails.
+The command opens each COG without credentials through the public read host. It
+prints the dtype, shape, nodata value, scale, offset, and overview levels. A tile
+that requires credentials fails verification, and any failure produces a nonzero
+exit status.
 
-## Data Access
+## Data access
 
-The output is one Portolan STAC collection per window, one item per tile, and two COG
-assets per item. Once published on Source Cooperative the layout is:
+Each window produces one Portolan STAC collection. The collection contains one
+item per tile and two COG assets per item. Source Cooperative uses this layout:
 
 ```
 nlebovits/landsat-lst/
@@ -203,8 +219,9 @@ nlebovits/landsat-lst/
         └── qa_count.tif       # uint8, 12 bands (Jan..Dec)
 ```
 
-Every asset is a window cut from one shared global grid at exactly 1/3600°, so tiles
-line up pixel for pixel and any number of them can be treated as a single raster.
+Every asset is a window on the same global grid at exactly 1/3600°. Tiles
+therefore align pixel for pixel, allowing a reader to combine any number of them
+as one raster.
 
 ### Python
 
@@ -220,7 +237,7 @@ subset = da.rio.clip_box(minx=-75, miny=40, maxx=-74, maxy=41)
 celsius = subset * da.rio.scales[0] + da.rio.offsets[0]
 ```
 
-For many tiles at once, load the STAC collection instead of the files:
+To read many tiles at once, load the STAC collection instead of individual files:
 
 ```python
 import odc.stac
@@ -231,28 +248,28 @@ items = list(catalog.get_collection("lst-p95-2021-2025").get_items())
 mosaic = odc.stac.load(items, bands=["lst_p95"], chunks={})
 ```
 
-### QGIS
+### Open a tile in QGIS
 
-No plugin and no download. In QGIS, choose **Layer > Add Layer > Add Raster Layer**, set
-the source type to **Protocol: HTTP(S)**, and paste the asset URL. QGIS reads the
-overviews for the current zoom and applies the embedded scale and offset, so the layer
-shows Celsius immediately.
+QGIS can open an asset without a plugin or local download. Choose **Layer > Add
+Layer > Add Raster Layer**, select **Protocol: HTTP(S)** as the source type, and
+paste the asset URL. QGIS reads the overview for the current zoom and applies the
+embedded scale and offset. The layer then displays temperatures in Celsius.
 
-### gdalinfo
+### Inspect a tile with gdalinfo
 
 ```bash
 gdalinfo /vsicurl/https://data.source.coop/nlebovits/landsat-lst/\
 lst-p95-2021-2025/N40W075/lst_p95.tif
 ```
 
-The report shows the block size, the overview levels, the band scale and offset, and the
-embedded statistics. Statistics are written into the file rather than a `.aux.xml`
-sidecar, so a reader working over HTTPS gets them too.
+The report includes the block size, overview levels, band scale and offset, and
+embedded statistics. Because the writer stores statistics in the COG rather than
+an `.aux.xml` sidecar, readers receive them over HTTPS.
 
 ### Producing COGs from a composite
 
-[`landsat_lst.cog`](src/landsat_lst/cog.py) writes the same pair the pipeline publishes.
-It takes a composite already encoded to the uint16 contract in
+[`landsat_lst.cog`](src/landsat_lst/cog.py) writes the same asset pair as the
+pipeline. Pass it a composite that follows the uint16 contract defined in
 [`landsat_lst.encoding`](src/landsat_lst/encoding.py):
 
 ```python
@@ -287,42 +304,43 @@ landsat-lst catalog publish ./catalog \
   --dry-run
 ```
 
-`publish` uploads each object with the media type its extension declares, re-sends JSON
-and markdown every time, and skips an asset whose remote size already matches. Add
-`--live --live-base-url https://data.source.coop/nlebovits/landsat-lst/` to `validate`
-to probe the hosting server for range support, CORS, and Content-Length once the tree is
-up.
+`publish` assigns each object the media type declared by its extension. It always
+resends JSON and Markdown but skips an asset when its remote size matches. After
+publishing the tree, add
+`--live --live-base-url https://data.source.coop/nlebovits/landsat-lst/` to
+`validate`. This probes the host for range support, CORS, and Content-Length.
 
-The dataset is not published yet. The operational sequence, including the two decisions
-still open, is written down in
-[`docs/runbook-publication.md`](docs/runbook-publication.md).
+The dataset is not yet published. Follow
+[`docs/runbook-publication.md`](docs/runbook-publication.md) for the operational
+sequence and the two unresolved decisions.
 
 ## Architecture
 
-See [docs/adr/001-architecture-decisions.md](docs/adr/001-architecture-decisions.md) for detailed design decisions.
+The project records its design decisions in
+[`docs/adr/`](docs/adr/README.md). Start with
+[ADR-001](docs/adr/001-architecture-decisions.md) for the architectural context.
 
-Key choices:
-- **Data source**: Earth Search (Landsat C2 L2)
-- **Output format**: COG with 512×512 blocks, published as a Portolan STAC catalog ([ADR-009](docs/adr/009-cog-output-and-stac-catalog.md))
-- **CRS**: EPSG:4326
-- **Tiling**: 5° × 5° grid on one shared global grid at 1/3600° ([ADR-008](docs/adr/008-global-mosaic-topology.md))
-- **Temporal**: Multi-year window composites (pooled P95); production default 2021–2025
-- **Spatial**: Land only, ±60° latitude
+- **Data source:** Earth Search with Landsat Collection 2 Level-2 data
+- **Output:** COGs with 512 × 512 blocks in a Portolan STAC catalog ([ADR-009](docs/adr/009-cog-output-and-stac-catalog.md))
+- **Coordinate reference system:** EPSG:4326
+- **Grid:** 5° × 5° tiles on one global 1/3600° grid ([ADR-008](docs/adr/008-global-mosaic-topology.md))
+- **Time:** Multi-year pooled-P95 windows, with 2021–2025 as the production default
+- **Coverage:** Land between 60° S and 60° N
 
-## Known Limitations
+## Known limitations
 
 ### Permanent gaps from ASTER emissivity
 
-Landsat Collection 2 Level-2 Surface Temperature needs an emissivity value for
-every pixel and takes it from the ASTER Global Emissivity Dataset, built from
-clear-sky ASTER scenes acquired 2000–2008. Where ASTER never caught clear sky in
-those nine years, no emissivity exists, so USGS produces no Surface Temperature.
-Those pixels are empty in every year of the archive.
+Landsat Collection 2 Level-2 Surface Temperature requires an emissivity value for
+each pixel. It draws those values from the ASTER Global Emissivity Dataset, which
+uses clear-sky ASTER scenes acquired from 2000 through 2008. Some locations had
+no clear-sky ASTER observation during that period. Without an emissivity value,
+USGS cannot produce Surface Temperature, leaving those pixels empty throughout
+the Landsat archive.
 
-**Nothing downstream fixes this.** Widening the compositing window closes cloud
-gaps, which is why multi-year pooling exists, but an emissivity gap survives
-every window length: the missing input is a static auxiliary dataset, not an
-observation.
+The pipeline leaves these gaps empty because processing cannot recover the
+missing input. A wider window closes cloud and orbit gaps but cannot replace a
+missing value in the static emissivity dataset.
 
 ![ASTER GED emissivity coverage: blue where data exists, white where it does not](docs/images/aster-ged-coverage-usgs.jpg)
 
@@ -331,10 +349,10 @@ observation.
 GED](https://www.usgs.gov/landsat-missions/landsat-collection-2-surface-temperature-data-gaps-due-missing-aster-ged).
 This view is global land; the numbers below are urban land only.*
 
-Measured against GHS-SMOD R2023A, **2.66% of the world's urban land has no
-emissivity** (80,397 km² of 3,027,063 km²), and **10.23% rests on one or two
-observations**. Every figure here is urban land only. Averaging over every city
-on Earth hides the spread, because gaps follow persistent cloud:
+Against GHS-SMOD R2023A, the analysis measured no emissivity over **2.66% of the
+world's urban land**: 80,397 km² of 3,027,063 km². Another **10.23% rests on one
+or two observations**. These figures cover urban land only. The global average
+hides regional variation because persistent cloud determines where gaps occur:
 
 | Region | Urban gap % |
 |---|---:|
@@ -346,13 +364,12 @@ on Earth hides the spread, because gaps follow persistent cloud:
 | Australia | 0.30 |
 | Sahara and Sahel | 0.00 |
 
-Deserts are the best-covered places on Earth for this product; the wet tropics
-are the worst.
+For this product, deserts have the highest coverage and the wet tropics have the
+lowest.
 
-**Detecting it.** An affected pixel reads `qa_count == 0` for all 12 months
-inside the land mask. That test alone conflates gaps with ocean, since
-`process_tile` zeroes `qa_count` over water, so use the land mask as the
-denominator:
+To detect an affected pixel, check for `qa_count == 0` in all 12 months within
+the land mask. Because `process_tile` also sets `qa_count` to zero over water,
+running the test without the land mask would conflate gaps with ocean:
 
 ```python
 from landsat_lst.masks import get_land_mask_for_bbox, load_land_polygons
@@ -366,10 +383,10 @@ land = get_land_mask_for_bbox(
 gap = (composite["qa_count"].sum("month").to_numpy() == 0) & land
 ```
 
-Full numbers and method in
-[docs/findings-aster-ged-gaps.md](docs/findings-aster-ged-gaps.md); the decision
-to leave gaps empty rather than fill them from another emissivity source is
-[ADR-006](docs/adr/006-no-aster-gap-filling.md).
+[The ASTER GED gap findings](docs/findings-aster-ged-gaps.md) contain the complete
+results and method. [ADR-006](docs/adr/006-no-aster-gap-filling.md) explains why
+the product leaves gaps empty instead of filling them from another emissivity
+source.
 
 ## Development
 
@@ -411,48 +428,50 @@ readability scores, suppressions, and rule ownership.
 
 ### Optional extras
 
-`uv sync --all-extras` installs everything; individual extras can be installed on
-their own:
+`uv sync --all-extras` installs every optional dependency. You can also select
+an individual extra:
 
 - `analysis` — `matplotlib` for figure generation in analysis/findings writeups, plus
   `h5py` and `earthaccess` for the ASTER GED gap analysis.
 - `frisky` — experimental Rust reimplementation of the Dask scheduler
-  ([getfrisky.dev](https://getfrisky.dev)). Kept behind a fallback: the multi-year
-  decision driver uses it when installed but reverts to plain Dask otherwise
-  (it crashed gathering large results, so **production uses Dask**).
+  ([getfrisky.dev](https://getfrisky.dev)). The multi-year decision driver uses
+  Frisky when available and falls back to Dask otherwise. Because Frisky crashed
+  while gathering large results, **production uses Dask**.
 
 ### Scripts
 
-Notable scripts in [`scripts/`](scripts/):
+[`scripts/`](scripts/) contains these development and analysis tools:
 
-- `pergamino_multiyear_decision.py` — multi-window (1/3/5-year) decision driver that
-  writes the COG pair per window and emits a `report.md` of gap/striping and measured
-  compression metrics. Runs locally against Planetary Computer. `--no-frisky` forces
-  plain Dask.
-- `smoke_small_tile_cog.py` — runs the whole chain on a ~0.2° slice of Pergamino, which is
-  cheap enough to confirm STAC query through COG export without recomputing a 5° tile.
-- `season_aware_p95_test.py` — the original prototype of season-aware de-striping. The
-  method now ships in `landsat_lst.normalization`; this script remains as the standalone
-  driver the investigation used. See
+- `pergamino_multiyear_decision.py` compares one-, three-, and five-year
+  windows against Planetary Computer data. It writes a COG pair for each window
+  and a `report.md` with gap, striping, and measured compression metrics. Pass
+  `--no-frisky` to force Dask.
+- `smoke_small_tile_cog.py` runs the pipeline on a ~0.2° slice of Pergamino. Use
+  it to check the path from STAC query through COG export without recomputing a
+  5° tile.
+- `season_aware_p95_test.py` preserves the original season-aware de-striping
+  prototype as a standalone driver. The production method now lives in
+  `landsat_lst.normalization`. See
   [docs/findings-destriping-and-multiyear.md](docs/findings-destriping-and-multiyear.md)
   and [ADR-007](docs/adr/007-scene-normalization.md).
-- `calibrate_destripe_cap.py` — sweeps candidate values of `destripe_max_offset_c` over a
-  single load and reports what fraction of scenes each would discard. Produced the shipped
-  15 °C default; re-run it for a climate unlike mid-latitude cropland.
-- `validate_offset_subsampling.py` — checks that offsets estimated from coarse overviews match
-  full-resolution ones, scene by scene. Produced the shipped
-  `destripe_offset_resolution_factor`; re-run before raising it, and re-run it rather than
-  citing an older table, since a factor that passed in August failed on the current grid.
-- `analyze_cloud_cover_filter.py` — prices a candidate `max_cloud_cover` in the scenes it skips
-  against the valid observations it destroys, reading the validation output rather than loading
-  anything.
-- `measure_climatology_thinning.py` — measures the indirect cost of that filter: a smaller scene
-  set builds a thinner monthly climatology, which moves the offsets of the scenes that remain.
-- `compare_destripe_composites.py` — builds the raw, natively de-striped, and coarse-offset P95
-  composites from one load and reports how far apart they are. `--cogs` writes them for QGIS.
-- `aster_gap_urban_analysis.py` — measures ASTER GED coverage gaps against GHS-SMOD to
-  quantify how much urban land has no Surface Temperature. Needs the `analysis` extra
-  and a NASA Earthdata login; see [Known Limitations](#known-limitations).
+- `calibrate_destripe_cap.py` sweeps `destripe_max_offset_c` candidates over one
+  load and reports the discarded-scene fraction. It produced the 15 °C default;
+  rerun it for climates unlike mid-latitude cropland.
+- `validate_offset_subsampling.py` compares coarse-overview offset estimates
+  with full-resolution estimates for each scene. It produced the shipped
+  `destripe_offset_resolution_factor`. Rerun it before raising the factor because
+  a value that passed in August failed on the current grid.
+- `analyze_cloud_cover_filter.py` weighs the scenes skipped by a candidate
+  `max_cloud_cover` against the valid observations lost. It reads validation
+  output without loading source imagery.
+- `measure_climatology_thinning.py` measures how a smaller scene set thins the
+  monthly climatology and changes offsets for the remaining scenes.
+- `compare_destripe_composites.py` builds raw, natively de-striped, and
+  coarse-offset P95 composites from one load. It reports their differences and
+  writes COGs for QGIS when you pass `--cogs`.
+- `aster_gap_urban_analysis.py` measures ASTER GED gaps against GHS-SMOD to find
+  the share of urban land without Surface Temperature. It requires the
+  `analysis` extra and a NASA Earthdata login; see [Known limitations](#known-limitations).
 
 ## License
 
