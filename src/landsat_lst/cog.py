@@ -434,8 +434,14 @@ class Product:
     describe: Callable[[rasterio.io.DatasetWriter], None]
 
 
-def lst_product(native: xr.Dataset, cog_path: Path) -> Product:
-    """Describe the single-band ``lst_p95`` COG (uint16 DN with scale/offset)."""
+def lst_product(native: xr.Dataset, cog_path: Path, var: str = "lst_p95") -> Product:
+    """Describe a single-band LST COG (uint16 DN with scale/offset).
+
+    ``var`` selects the variable so the pooled all-path baseline can ride the
+    identical writer, encoding, scale, offset and nodata as the shipped
+    product. Two assets that differ in anything but their pixels would not be
+    comparable in a viewer.
+    """
 
     def describe(src: rasterio.io.DatasetWriter) -> None:
         # Embed GDAL band scale/offset so viewers auto-decode DN -> Celsius.
@@ -443,7 +449,7 @@ def lst_product(native: xr.Dataset, cog_path: Path) -> Product:
         src.offsets = (LST_OFFSET,)
 
     return Product(
-        da=_prep(native["lst_p95"]).rio.write_nodata(LST_FILL_VALUE),
+        da=_prep(native[var]).rio.write_nodata(LST_FILL_VALUE),
         nodata=LST_FILL_VALUE,
         cog_path=cog_path,
         scratch_prefix="lst_cog_",

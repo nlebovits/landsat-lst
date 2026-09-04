@@ -450,6 +450,71 @@ without recomputing the composite, and refuses to upload a rebuild that fails ei
 
 ---
 
+## One P95 per WRS path, feathered across the overlap
+
+The composite pools every scene overlapping a pixel, so where two WRS-2 paths
+overlap the P95 draws on both. On S30W065 one path runs **+2.2 to +4.8 °C
+warmer in the upper tail** on identical ground at matched observation counts,
+and the pooled percentile steps where that path's coverage stops. That step is
+the diagonal seam. Fifteen sampling and weighting arms recovered at most 44% of
+it; one P95 per path, cross-faded on geometry, removed **95.8%** while keeping
+**97.7%** of spatial variance.
+
+`settings.wrs_feather` (default on) turns it on; `landsat_lst.wrs` holds the
+geometry. Rules worth keeping:
+
+- **The swath polygon is a property of the tile, never of a row band.** Every
+  band derives it from the same items at the same reduced resolution, so two
+  bands cannot disagree and invent a seam at their own boundary. Same argument
+  `masks.get_land_mask_for_geobox` and `ged.gap_mask_for_geobox` make one level
+  down about rasterising on the geobox's own affine.
+- **It is rasterised over the footprints' bounds, not the tile's.** Clipping at
+  the tile border would put that border in the polygon's boundary, weights
+  would ramp toward the edge of the tile, and two neighbouring tiles would
+  disagree along their shared edge — a new seam on the tile grid.
+- **The swath is the median footprint of each (path, row) quad**, the ground at
+  least half that quad's scenes reach. A union overreaches: one outlying scene
+  extends the swath past where the path contributes, and on the diagnostic crop
+  path 229's union covered 100% of the area and left no edge to ramp toward.
+  Grouping by quad and not by path is what makes the threshold mean anything,
+  since a path's scenes span five rows.
+- **`w_j = d_j / sum_i d_i` over the covering paths.** One path gives exactly 1,
+  so a single-path pixel is untouched. Two give the linear cross-fade. Three or
+  more stay continuous, which is not hypothetical: 5.4% of S30W065 is reached
+  by three, and 64.2% by two or more. Paths are summed in sorted order so
+  permuting the input cannot move a floating-point result.
+- **Weights come from geometry alone** — never temperature, observation count,
+  or a fitted seam position. A path contributes only where it observed, which
+  gates on presence of data and never on its value.
+- **Split after the shared `chunk({"time": -1})`, never before.** Every per-path
+  quantile must descend from the same source keys, inside one `dask.compute`.
+  The prototype called `dask.compute` once per path, which is a source pass per
+  path and the exact shape ADR-013 forbids. Pinned by
+  `test_per_path_reductions_read_each_source_block_once` and its 2.0-pass
+  negative control.
+- **The benchmark tier does not cover this.** Its graphs call
+  `_composite_graph(lst)` with no path information, so the pinned task-count and
+  RSS bands measure the pooled branch. Measured separately at CI geometry, six
+  paths cost **2.79x tasks and 1.35x peak RSS**; per-band geometry is 6.5 s on a
+  512 x 18,000 band. The composite already peaked at 28-34 GiB on 64 GiB VMs
+  (#136), so that multiplier is the number to watch.
+- **A solar-day step spanning two paths is excluded from every per-path
+  reduction**, and `settings.wrs_mixed_group_limit` (2%) fails the shard rather
+  than dropping data quietly. On S30W065 it is 3 of 1,031 steps (0.29%). Paths
+  converge toward the latitude limits, so a tile where this is common must say
+  so.
+- **`settings.wrs_emit_pooled_baseline` writes the pooled P95 beside the
+  product** as `lst_p95_pooled`, from the same compute. It is one more reduction
+  over a block already held, so it costs no extra source read, and it is the
+  only baseline built on identical inputs, worker code, and reads. It is
+  deliberately not in `storage.PRODUCTS`: that tuple is the completion contract,
+  and a diagnostic asset must not hold a tile incomplete.
+- **No pre-change tile is pixel-comparable.** Over the ~64% of a tile with
+  overlap the value is now a blend of two or three thinner per-path estimates
+  rather than one pooled percentile. `offsets.ALGORITHM_VERSION` is untouched:
+  this is downstream of the estimator, so every cached offset record stays
+  valid.
+
 ## Output grid — one shared grid, always
 
 `settings.pixels_per_degree` (3600) is the grid definition; `settings.resolution` is a

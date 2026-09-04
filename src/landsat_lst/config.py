@@ -163,6 +163,44 @@ class Settings(BaseSettings):
         "offset estimation, and never to qa_count (zero observations is data; "
         "the count layer stays the evidence).",
     )
+    wrs_feather: bool = Field(
+        default=True,
+        description="Composite one P95 per WRS-2 path and cross-fade them "
+        "across the overlap, instead of pooling every path into one "
+        "percentile. Where two paths overlap the pooled P95 draws on both, and "
+        "on S30W065 one path runs +2.2 to +4.8 degC warmer in the upper tail "
+        "on identical ground at matched observation counts, so the percentile "
+        "steps where that path's coverage stops. Measured on the S30W065 "
+        "diagnostic crop, feathering removed 95.8% of that step while "
+        "retaining 97.7% of spatial variance. Weights come from WRS geometry "
+        "alone. A pixel reached by one path is untouched.",
+    )
+    wrs_swath_factor: int = Field(
+        default=8,
+        description="Resolution factor at which each (path, row) quad's median "
+        "footprint is rasterised before being vectorised into a swath polygon. "
+        "The polygon is a property of the tile: every row band derives it the "
+        "same way from the same items, so bands cannot disagree and invent a "
+        "seam at their own boundary. Factor 8 is ~240 m against a ramp tens of "
+        "kilometres wide.",
+    )
+    wrs_mixed_group_limit: float = Field(
+        default=0.02,
+        description="Refuse the composite if more than this fraction of "
+        "solar-day steps carry items from more than one WRS path. Such a step "
+        "has no single path, so it is excluded from every per-path reduction. "
+        "On S30W065 it is 3 of 1,031 steps (0.29%); paths converge toward the "
+        "latitude limits, so a tile where this is common must fail loudly "
+        "rather than quietly drop data.",
+    )
+    wrs_emit_pooled_baseline: bool = Field(
+        default=True,
+        description="Also emit the pooled all-path P95 as a second LST asset "
+        "from the same compute. It is one more reduction over a block already "
+        "held in memory, so it costs no extra source reads, and it is what "
+        "makes a feathered tile comparable against current semantics on "
+        "identical inputs.",
+    )
     warp_exact_transform: bool = Field(
         default=True,
         description="Warp every source read with GDAL's exact transformer. This "

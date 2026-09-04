@@ -43,7 +43,7 @@ from landsat_lst.shard_tasks import (
     run_composite_shard,
     run_offsets_stage,
 )
-from landsat_lst.storage import PRODUCTS, LocalStorage
+from landsat_lst.storage import PRODUCTS, LocalStorage, band_products
 from landsat_lst.tiling import parse_tile_name
 from tests.unit.shard_fixtures import (
     COARSE,
@@ -314,7 +314,10 @@ class TestCompositeShard:
 
         written = run_composite_shard(RUN_ID, TILE, 0, storage=storage)
 
-        assert written == [shards.band_key(root, product, 0) for product in PRODUCTS]
+        # band_products() is PRODUCTS plus the pooled baseline while
+        # feathering emits it; PRODUCTS stays the tile-completion contract.
+        assert written == [shards.band_key(root, product, 0) for product in band_products()]
+        assert all(product in band_products() for product in PRODUCTS)
         for key in written:
             assert storage.read_text is not None
             assert (storage.output_dir / key).stat().st_size > 0

@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
     from landsat_lst.models import ProcessingJob
     from landsat_lst.storage import StorageBackend
+    from landsat_lst.wrs import PathWeights
 
 log = structlog.get_logger()
 
@@ -550,6 +551,9 @@ def compute_annual_composite(
     offset_land_mask: xr.DataArray | None = None,
     offset_cache: OffsetCache | None = None,
     offsets: tuple[xr.DataArray, xr.DataArray] | None = None,
+    path_of_step: np.ndarray | None = None,
+    path_weights_field: PathWeights | None = None,
+    emit_pooled: bool = False,
 ) -> xr.Dataset:
     """Compute an LST P95 composite with a per-month observation count.
 
@@ -671,10 +675,21 @@ def compute_annual_composite(
     # no task fraction, and under the old single ``compositing`` label it was
     # indistinguishable from a wedged compute. See issue #77 item 4.
     with timed_section("composite_graph", scenes_kept=scenes_kept):
-        return _composite_graph(lst)
+        return _composite_graph(
+            lst,
+            path_of_step=path_of_step,
+            weights=path_weights_field,
+            emit_pooled=emit_pooled,
+        )
 
 
-def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
+def _composite_graph(
+    lst: xr.DataArray,
+    *,
+    path_of_step: np.ndarray | None = None,
+    weights: PathWeights | None = None,
+    emit_pooled: bool = False,
+) -> xr.Dataset:
     """Build the lazy P95 and monthly-count expressions. Computes nothing.
 
     Both outputs are deliberately built on one time-contiguous view of the
@@ -719,31 +734,71 @@ def _composite_graph(lst: xr.DataArray) -> xr.Dataset:
     # (pinned by tests/unit/test_kernels.py). apply_ufunc moves time to the
     # last axis per block; the single-chunk time rechunk above guarantees the
     # core dimension is whole.
-    lst_p95 = xr.apply_ufunc(
-        nanquantile_last,
-        lst,
-        input_core_dims=[["time"]],
-        kwargs={"q": 0.95},
-        dask="parallelized",
-        output_dtypes=[np.float64],
-    )
-    lst_p95 = lst_p95.where(total_valid > 0, settings.nodata)
+    def _p95(arr: xr.DataArray) -> xr.DataArray:
+        return xr.apply_ufunc(
+            nanquantile_last,
+            arr,
+            input_core_dims=[["time"]],
+            kwargs={"q": 0.95},
+            dask="parallelized",
+            output_dtypes=[np.float64],
+        )
 
-    # Guard against a pixel that has observations yet still produces a P95 on
-    # the encoding floor (DN 0 or DN 1). Writing it would resurface the
-    # isolated -49.99 C anomalies of issue #24, so flag it as missing here and
-    # keep the composite consistent with the encoded output. Gating on
-    # total_valid keeps the existing nodata sentinel distinguishable from a
-    # genuine bad retrieval.
-    anomalous = (total_valid > 0) & (lst_p95 < LST_MIN_TRUSTED_C)
-    lst_p95 = lst_p95.where(~anomalous, settings.nodata)
+    def _guard(surface: xr.DataArray, has_data: xr.DataArray) -> xr.DataArray:
+        """Nodata where nothing was observed, and on the encoding floor.
 
-    return xr.Dataset(
-        {
-            "lst_p95": lst_p95.astype(np.float32),
-            "qa_count": qa_count,
-        }
-    )
+        Guard against a pixel that has observations yet still produces a P95 on
+        the encoding floor (DN 0 or DN 1). Writing it would resurface the
+        isolated -49.99 C anomalies of issue #24, so flag it as missing here and
+        keep the composite consistent with the encoded output. Gating on
+        ``has_data`` keeps the nodata sentinel distinguishable from a genuine
+        bad retrieval.
+        """
+        out = surface.where(has_data, settings.nodata)
+        anomalous = has_data & (out < LST_MIN_TRUSTED_C)
+        return out.where(~anomalous, settings.nodata)
+
+    pooled = _guard(_p95(lst), total_valid > 0)
+
+    if path_of_step is None or weights is None or not weights.paths:
+        return xr.Dataset({"lst_p95": pooled.astype(np.float32), "qa_count": qa_count})
+
+    # One P95 per WRS path, then a geometric cross-fade. Every subset is taken
+    # from ``lst`` *after* the shared time rechunk above, so all of them descend
+    # from the same source keys and one dask.compute materialises each block
+    # once. Rechunking a subset here instead would recreate the two-consumer
+    # fan-out ADR-013 measured at 10.88 GB, and the prototype's per-path
+    # dask.compute loop would cost a source pass per path.
+    coords = {"latitude": lst["latitude"], "longitude": lst["longitude"]}
+    numerator: xr.DataArray | None = None
+    denominator: xr.DataArray | None = None
+    # weights.paths is sorted, so the sum is accumulated in a fixed order and
+    # permuting the input items cannot move a floating-point result.
+    for index, path in enumerate(weights.paths):
+        steps = np.flatnonzero(path_of_step == path)
+        if steps.size == 0:
+            continue
+        subset = lst.isel(time=steps)
+        present = subset.notnull().sum(dim="time") > 0
+        share = xr.DataArray(weights.weight[index], dims=["latitude", "longitude"], coords=coords)
+        # A path contributes only where it actually observed. The gate is on
+        # presence of data, never on its value, so the weights stay a function
+        # of WRS geometry alone.
+        effective = share.where(present, 0.0)
+        contribution = xr.where(present, _p95(subset), 0.0) * effective
+        numerator = contribution if numerator is None else numerator + contribution
+        denominator = effective if denominator is None else denominator + effective
+
+    if numerator is None or denominator is None:
+        return xr.Dataset({"lst_p95": pooled.astype(np.float32), "qa_count": qa_count})
+
+    covered = denominator > 0
+    feathered = _guard(numerator / denominator.where(covered, 1.0), covered)
+
+    data = {"lst_p95": feathered.astype(np.float32), "qa_count": qa_count}
+    if emit_pooled:
+        data["lst_p95_pooled"] = pooled.astype(np.float32)
+    return xr.Dataset(data)
 
 
 def _patch_url_for(items: list) -> Callable[[str], str] | None:
