@@ -35,10 +35,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
+import rasterio
 import shapely
 import structlog
+import xarray as xr
 from odc.geo.geobox import GeoBox
 from rasterio.features import MergeAlg, rasterize, shapes
+from rasterio.warp import Resampling, reproject
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
@@ -53,6 +56,13 @@ log = structlog.get_logger()
 MIXED_PATH = ""
 
 _ROW_BLOCK = 256
+
+#: Smallest coarse edge worth using. Below this the ramp is computed exactly.
+#: Deliberately well under any production band: at 64 the floor sat exactly on
+#: a 512-row band, so a tile whose bands came out a few rows shorter would drop
+#: silently onto the exact path and pay 180 s instead of 4 s. This guard exists
+#: to protect a degenerate grid, not to adjudicate production geometry.
+_MIN_COARSE_EDGE = 16
 
 
 def _property(item, name: str) -> str:
@@ -148,6 +158,98 @@ def swath_polygons(items: list, tile_geobox: GeoBox) -> dict[str, BaseGeometry]:
     return {path: unary_union(parts) for path, parts in sorted(by_path.items()) if parts}
 
 
+def _exact_distances(
+    geobox: GeoBox, polygons, paths, inside: np.ndarray, multi: np.ndarray
+) -> np.ndarray:
+    """Point-to-boundary distance on ``geobox``'s own grid, where it matters."""
+    n, height, width = inside.shape
+    a = geobox.transform
+    dist = np.zeros((n, height, width), dtype=np.float32)
+    boundaries = [polygons[p].boundary for p in paths]
+    lon = a.c + a.a * (np.arange(width, dtype=np.float64) + 0.5)
+    for y0 in range(0, height, _ROW_BLOCK):
+        y1 = min(y0 + _ROW_BLOCK, height)
+        block = multi[y0:y1]
+        if not block.any():
+            continue
+        lat = a.f + a.e * (np.arange(y0, y1, dtype=np.float64) + 0.5)
+        yy, xx = np.nonzero(block)
+        px = shapely.points(lon[xx], lat[yy])
+        for j in range(n):
+            sel = inside[j, y0:y1][yy, xx]
+            if not sel.any():
+                continue
+            d = np.zeros(px.size, dtype=np.float64)
+            d[sel] = shapely.distance(px[sel], boundaries[j])
+            tgt = dist[j, y0:y1]
+            tgt[yy, xx] = d.astype(np.float32)
+    return dist
+
+
+def _coarse_distances(geobox: GeoBox, polygons, paths, factor: int) -> np.ndarray:
+    """The distance ramp computed coarse and resampled onto ``geobox``.
+
+    The ramp is smooth over tens of kilometres, so a grid ``factor`` pixels
+    coarser carries it to well under 1% of a weight while cutting the point
+    count by ``factor**2``.
+    """
+    coarse = geobox.zoom_out(factor)
+    ch, cw = coarse.shape[0], coarse.shape[1]
+    n = len(paths)
+    c_inside = np.zeros((n, ch, cw), dtype=bool)
+    for j, path in enumerate(paths):
+        m = np.zeros((ch, cw), dtype=np.uint8)
+        rasterize([(polygons[path], 1)], out=m, transform=coarse.transform)
+        c_inside[j] = m.astype(bool)
+    c_multi = c_inside.sum(axis=0) >= 2
+    c_dist = _exact_distances(coarse, polygons, paths, c_inside, c_multi)
+
+    height, width = geobox.shape[0], geobox.shape[1]
+    out = np.zeros((n, height, width), dtype=np.float32)
+    for j in range(n):
+        reproject(
+            source=c_dist[j],
+            destination=out[j],
+            src_transform=coarse.transform,
+            src_crs=rasterio.crs.CRS.from_user_input(str(coarse.crs)),
+            dst_transform=geobox.transform,
+            dst_crs=rasterio.crs.CRS.from_user_input(str(geobox.crs)),
+            resampling=Resampling.bilinear,
+        )
+    return out
+
+
+def _blend(
+    weight: np.ndarray,
+    dist: np.ndarray,
+    inside: np.ndarray,
+    multi: np.ndarray,
+    k: np.ndarray,
+) -> None:
+    """Turn distances into shares in place: ``w_j = d_j / sum_i d_i``.
+
+    Renormalised on the exact containment masks, so an interpolated ramp still
+    sums to one and still gives a single-path pixel exactly its own weight. On
+    a boundary every distance is zero; equal shares are the answer there rather
+    than a division by zero, and the pixel is a measure-zero line either way.
+    """
+    n = weight.shape[0]
+    total = dist.sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for j in range(n):
+            share = np.where(total > 0, dist[j] / np.where(total > 0, total, 1.0), 0.0)
+            weight[j] = np.where(multi & inside[j], share.astype(np.float32), weight[j])
+    wsum = weight.sum(axis=0)
+    fix = multi & (wsum > 0)
+    for j in range(n):
+        weight[j] = np.where(fix, weight[j] / np.where(wsum > 0, wsum, 1.0), weight[j])
+    degenerate = multi & (wsum <= 0)
+    if degenerate.any():
+        for j in range(n):
+            sel = degenerate & inside[j]
+            weight[j][sel] = 1.0 / k[sel]
+
+
 @dataclass(frozen=True)
 class PathWeights:
     """Per-path blend weights on one geobox.
@@ -168,7 +270,12 @@ class PathWeights:
     n_paths_at_pixel: np.ndarray
 
 
-def path_weights(geobox: GeoBox, polygons: dict[str, BaseGeometry]) -> PathWeights:
+def path_weights(
+    geobox: GeoBox,
+    polygons: dict[str, BaseGeometry],
+    *,
+    factor: int | None = None,
+) -> PathWeights:
     """Cross-fade weights for ``polygons`` on ``geobox``'s own grid.
 
     Inside a pixel's covering set the weight is its distance to its own swath
@@ -181,7 +288,18 @@ def path_weights(geobox: GeoBox, polygons: dict[str, BaseGeometry]) -> PathWeigh
     Distances are measured only where they can matter. A pixel reached by one
     path needs no distance at all, and only the covered pixels of a
     multi-path region are handed to shapely.
+
+    ``factor`` (default :attr:`~landsat_lst.config.Settings.wrs_weight_factor`)
+    computes the ramp on a grid that many pixels coarser and interpolates it
+    back. Exact distance was 99.8% of the geometry cost -- 152-180 s a band
+    against 0.04 s for containment -- because a swath polygon carries thousands
+    of vertices and shapely walks them per point. Containment stays exact
+    whatever the factor, so membership, single-path pixels and the sum-to-one
+    property are unaffected; only the ratio between overlapping paths is
+    interpolated. Pass ``factor=1`` for the exact ramp.
     """
+    if factor is None:
+        factor = settings.wrs_weight_factor
     height, width = geobox.shape[0], geobox.shape[1]
     paths = tuple(sorted(polygons))
     n = len(paths)
@@ -210,51 +328,37 @@ def path_weights(geobox: GeoBox, polygons: dict[str, BaseGeometry]) -> PathWeigh
             weight[j][single & inside[j]] = 1.0
 
     multi = k >= 2
+    # A grid too small to coarsen would carry the ramp on a handful of cells,
+    # which is worse than the cost it saves. Below the floor, compute exactly.
     if multi.any():
-        a = geobox.transform
-        dist = np.zeros((n, height, width), dtype=np.float32)
-        boundaries = [polygons[p].boundary for p in paths]
-        cols = np.arange(width, dtype=np.float64)
-        lon = a.c + a.a * (cols + 0.5)
-        for y0 in range(0, height, _ROW_BLOCK):
-            y1 = min(y0 + _ROW_BLOCK, height)
-            block = multi[y0:y1]
-            if not block.any():
-                continue
-            rows = np.arange(y0, y1, dtype=np.float64)
-            lat = a.f + a.e * (rows + 0.5)
-            yy, xx = np.nonzero(block)
-            px = shapely.points(lon[xx], lat[yy])
-            for j in range(n):
-                sel = inside[j, y0:y1][yy, xx]
-                if not sel.any():
-                    continue
-                d = np.zeros(px.size, dtype=np.float64)
-                d[sel] = shapely.distance(px[sel], boundaries[j])
-                tgt = dist[j, y0:y1]
-                tgt[yy, xx] = d.astype(np.float32)
-        total = dist.sum(axis=0)
-        # On a boundary every distance is 0. Fall back to equal shares rather
-        # than dividing by zero; the pixel is a measure-zero line either way.
-        degenerate = multi & (total <= 0)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            for j in range(n):
-                share = np.where(total > 0, dist[j] / np.where(total > 0, total, 1.0), 0.0)
-                weight[j] = np.where(multi, share.astype(np.float32), weight[j])
-        if degenerate.any():
-            for j in range(n):
-                weight[j][degenerate & inside[j]] = 1.0 / k[degenerate & inside[j]]
+        coarse_enough = (
+            factor and factor > 1 and min(height // factor, width // factor) >= _MIN_COARSE_EDGE
+        )
+        dist = (
+            _coarse_distances(geobox, polygons, paths, factor)
+            if coarse_enough
+            else _exact_distances(geobox, polygons, paths, inside, multi)
+        )
+        _blend(weight, dist, inside, multi, k)
 
     return PathWeights(paths=paths, weight=weight, covered=covered, n_paths_at_pixel=k)
 
 
-def path_of_steps(items: list, bbox, time, resolution_factor: int = 1) -> np.ndarray:
+def path_of_steps(items: list, bbox, time, resolution_factor: int = 1) -> xr.DataArray:
     """The WRS path behind each solar-day step of a loaded stack.
 
     ``load_scenes`` groups by solar day, so the loaded axis is steps and not
     items. This reproduces odc-stac's grouping the way
     :func:`landsat_lst.pipeline.scene_cloud_cover` does, and checks the derived
     stamps against the axis actually loaded rather than trusting the rule.
+
+    Returned **on the time axis as a coordinate**, not as a bare array. The
+    stack that reaches the composite is not the stack that was loaded: de-
+    striping drops rejected scenes, so a 1,031-step load reaches
+    ``_composite_graph`` with 912 steps. Labels carried positionally would
+    then address the wrong scenes, or run off the end. Joining by coordinate
+    value is the same rule ``normalization.debias_with_offsets`` follows for
+    the offsets themselves.
 
     A step whose items span more than one path is labelled :data:`MIXED_PATH`.
     That is rare -- 3 of 1,031 steps on S30W065 -- but it is not zero, so the
@@ -287,4 +391,4 @@ def path_of_steps(items: list, bbox, time, resolution_factor: int = 1) -> np.nda
     for group in grouped:
         found = {path_of(items[i]) for i in group}
         labels.append(found.pop() if len(found) == 1 else MIXED_PATH)
-    return np.array(labels, dtype=object)
+    return xr.DataArray(np.array(labels, dtype=object), dims=["time"], coords={"time": stamps})

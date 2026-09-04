@@ -55,7 +55,7 @@ class TestWeights:
             assert np.all(w.weight[j][held] == pytest.approx(1.0, abs=1e-6))
 
     def test_each_weight_runs_from_one_to_zero_across_the_overlap(self):
-        w = wrs.path_weights(grid(), two_paths())
+        w = wrs.path_weights(grid(), two_paths(), factor=1)
         west = midrow(w.weight[w.paths.index(WEST)])
         east = midrow(w.weight[w.paths.index(EAST)])
         overlap = np.flatnonzero(midrow(w.n_paths_at_pixel) == 2)
@@ -68,7 +68,7 @@ class TestWeights:
         assert np.allclose(west[overlap] + east[overlap], 1.0, atol=1e-6)
 
     def test_the_ramp_is_monotone_and_has_no_step(self):
-        w = wrs.path_weights(grid(width=200), two_paths())
+        w = wrs.path_weights(grid(width=200), two_paths(), factor=1)
         west = midrow(w.weight[w.paths.index(WEST)])
         overlap = np.flatnonzero(midrow(w.n_paths_at_pixel) == 2)
         seg = west[overlap]
@@ -87,6 +87,36 @@ class TestWeights:
         w = wrs.path_weights(grid(), {WEST: box(-5.0, -5.0, -4.0, -4.0)})
         assert not w.covered.any()
         assert np.all(w.weight == 0.0)
+
+    def test_a_grid_too_small_to_coarsen_uses_the_exact_ramp(self):
+        """Below the floor the coarse grid would carry the ramp on a few cells."""
+        small = grid(width=60, height=6)  # 6 // 8 == 0 coarse rows
+        assert np.array_equal(
+            wrs.path_weights(small, two_paths(), factor=8).weight,
+            wrs.path_weights(small, two_paths(), factor=1).weight,
+        )
+
+    def test_a_production_shaped_band_takes_the_coarse_path(self):
+        """The floor must not reach a real band. 512 rows sat exactly on it."""
+        for rows in (512, 514, 500, 256, 128):
+            assert min(rows // 8, 18000 // 8) >= wrs._MIN_COARSE_EDGE, (
+                f"a {rows}-row band would fall back to the exact ramp"
+            )
+
+    def test_the_coarse_ramp_tracks_the_exact_one(self):
+        """Interpolating the ramp must not move a weight materially."""
+        g = grid(width=2048, height=512)
+        exact = wrs.path_weights(g, two_paths(), factor=1)
+        coarse = wrs.path_weights(g, two_paths(), factor=8)
+        assert coarse.paths == exact.paths
+        assert np.array_equal(coarse.n_paths_at_pixel, exact.n_paths_at_pixel)
+        # containment is exact whatever the factor, so single-path pixels match
+        single = exact.n_paths_at_pixel == 1
+        assert np.array_equal(coarse.weight[:, single], exact.weight[:, single])
+        cov = exact.covered
+        assert np.allclose(coarse.weight.sum(axis=0)[cov], 1.0, atol=1e-5)
+        d = np.abs(coarse.weight - exact.weight)[:, cov]
+        assert d.max() < 0.02, f"coarse ramp moved a weight by {d.max():.4f}"
 
     def test_path_order_cannot_change_the_weights(self):
         polys = {**two_paths(), BOTH: box(5.0, -1.0, 11.0, 2.0)}

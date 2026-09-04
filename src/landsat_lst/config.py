@@ -184,6 +184,19 @@ class Settings(BaseSettings):
         "seam at their own boundary. Factor 8 is ~240 m against a ramp tens of "
         "kilometres wide.",
     )
+    wrs_weight_factor: int = Field(
+        default=8,
+        description="Resolution factor for the distance ramp inside a WRS "
+        "overlap. Exact point-to-boundary distance dominated everything: a "
+        "swath polygon carries 3,000-4,600 vertices, shapely walks them per "
+        "point, and one production band spent 152-180 s on 5.4-8.7 M points "
+        "against 0.04 s for containment. The ramp spans tens of kilometres, so "
+        "computing it at 8 pixels (~240 m) and interpolating costs under 1% of "
+        "a weight. Containment stays exact at full resolution, which is what "
+        "keeps a single-path pixel exactly 1.0; only the blend ratio between "
+        "overlapping paths is interpolated. Set to 1 to compute the ramp "
+        "exactly, at roughly 130x the cost.",
+    )
     wrs_mixed_group_limit: float = Field(
         default=0.02,
         description="Refuse the composite if more than this fraction of "

@@ -683,6 +683,27 @@ def compute_annual_composite(
         )
 
 
+def _labels_for(path_of_step: xr.DataArray | np.ndarray, lst: xr.DataArray) -> np.ndarray:
+    """Path labels aligned to ``lst``'s own time axis.
+
+    A time-indexed ``DataArray`` is selected by coordinate value, so scenes the
+    de-striping rejected simply do not appear. A bare array is accepted only
+    when it already matches the stack, which is the shape the unit fixtures
+    build; anything else is the positional misalignment this exists to stop.
+    """
+    if isinstance(path_of_step, xr.DataArray) and "time" in path_of_step.dims:
+        return path_of_step.sel(time=lst["time"]).values
+    labels = np.asarray(path_of_step)
+    if labels.shape[0] != lst.sizes["time"]:
+        msg = (
+            f"path labels cover {labels.shape[0]} steps but the stack carries "
+            f"{lst.sizes['time']}. Pass a time-indexed DataArray so the labels "
+            "join by coordinate value; de-striping drops rejected scenes."
+        )
+        raise ValueError(msg)
+    return labels
+
+
 def _composite_graph(
     lst: xr.DataArray,
     *,
@@ -770,12 +791,21 @@ def _composite_graph(
     # fan-out ADR-013 measured at 10.88 GB, and the prototype's per-path
     # dask.compute loop would cost a source pass per path.
     coords = {"latitude": lst["latitude"], "longitude": lst["longitude"]}
+
+    # Join the labels to THIS stack by time coordinate value, never by
+    # position. The stack that reaches here is not the stack that was loaded:
+    # de-striping drops rejected scenes, so a 1,031-step load arrives with 912.
+    # Indexing the loaded axis into the surviving one ran off the end on every
+    # shard of the 2026-09-04 S30W065 run. `sel` raises on a step the labels do
+    # not cover, which is the loud failure a silent misalignment would not be.
+    labels = np.asarray(_labels_for(path_of_step, lst))
+
     numerator: xr.DataArray | None = None
     denominator: xr.DataArray | None = None
     # weights.paths is sorted, so the sum is accumulated in a fixed order and
     # permuting the input items cannot move a floating-point result.
     for index, path in enumerate(weights.paths):
-        steps = np.flatnonzero(path_of_step == path)
+        steps = np.flatnonzero(labels == path)
         if steps.size == 0:
             continue
         subset = lst.isel(time=steps)
