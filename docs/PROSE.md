@@ -76,12 +76,19 @@ Run the blocking commit-stage checks with the same command used locally:
 uv run prek run --all-files --show-diff-on-failure
 ```
 
-Run the advisory checks through their pinned hook environments:
+Run the advisory checks through their pinned hook environments. `prek` normally
+hides output from a hook that exits successfully, so the Vale audit needs verbose
+mode to display suggestion-level findings:
 
 ```bash
-uv run prek run vale-audit --all-files --stage manual
+uv run prek --verbose run vale-audit --all-files --stage manual
 uv run prek run proselint --all-files --stage manual
 ```
+
+These commands audit every tracked document. During an edit, replace `--all-files`
+with `--files path/to/doc.md` to keep the report focused. Proselint returns a
+nonzero status when it finds an advisory issue; that status does not make the
+manual hook a CI gate.
 
 The normal Vale hook and the dedicated Prose workflow block error-level
 findings in handwritten Markdown. They exclude generated `AGENTS.md` context,
