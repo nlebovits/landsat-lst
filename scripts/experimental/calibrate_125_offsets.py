@@ -86,10 +86,16 @@ def phase_table(storage, run_id: str) -> dict:
     }
 
 
-def main() -> int:
+def main() -> int:  # noqa: PLR0915
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--collect", metavar="RUN_ID")
+    ap.add_argument("--suffix", default="125cal", help="run id suffix")
+    ap.add_argument(
+        "--merge",
+        action="store_true",
+        help="after all partials land, write the ADR-012 offsets record",
+    )
     args = ap.parse_args()
 
     from landsat_lst.config import settings  # noqa: PLC0415
@@ -143,7 +149,9 @@ def main() -> int:
         print(f"write:    {quota.preflight_write_access()}", flush=True)
         quota.preflight_credits(EST_CREDITS)
 
-        run_id = f"shard-{TILE}-{YEAR}-{END_YEAR}-{datetime.now(tz=UTC):%Y%m%dT%H%M%SZ}-125cal"
+        run_id = (
+            f"shard-{TILE}-{YEAR}-{END_YEAR}-{datetime.now(tz=UTC):%Y%m%dT%H%M%SZ}-{args.suffix}"
+        )
         print(f"run id:   {run_id}", flush=True)
         print(f"seeded:   {seed_plan(storage, run_id)}", flush=True)
         sub = submit_shard_stage(
@@ -156,7 +164,7 @@ def main() -> int:
         )
         print(f"cluster {sub.cluster_id}, job {sub.job_id}, {UNITS} units", flush=True)
         (ROOT / "results" / "probe").mkdir(parents=True, exist_ok=True)
-        (ROOT / "results" / "probe" / "125-calibration.launch.json").write_text(
+        (ROOT / "results" / "probe" / f"125-{args.suffix}.launch.json").write_text(
             json.dumps(
                 {
                     "run_id": run_id,
@@ -178,10 +186,20 @@ def main() -> int:
                 break
             time.sleep(POLL_S)
 
+    if args.merge:
+        from landsat_lst.shard_tasks import merge_offsets  # noqa: PLC0415
+
+        landed = len(storage.list_prefix(f"{_root(run_id)}/offsets/scene/"))
+        if landed < UNITS:
+            print(f"NOT merging: only {landed}/{UNITS} partials landed", flush=True)
+        else:
+            key = merge_offsets(run_id, TILE, storage=storage)
+            print(f"merged offsets record: {key.storage_key}", flush=True)
+
     out = {"run_id": run_id, "timings": phase_table(storage, run_id)}
     out["staged_objects_now"] = len(storage.list_prefix(f"{_root(run_id)}/stage/"))
     out["partials"] = len(storage.list_prefix(f"{_root(run_id)}/offsets/scene/"))
-    path = ROOT / "results" / "probe" / "125-calibration.json"
+    path = ROOT / "results" / "probe" / f"125-{args.suffix}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=2))
     print(json.dumps(out, indent=2))

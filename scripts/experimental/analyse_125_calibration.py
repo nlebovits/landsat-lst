@@ -60,7 +60,7 @@ def table(rows):
     return out
 
 
-def main() -> int:
+def main() -> int:  # noqa: PLR0915
     ap = argparse.ArgumentParser()
     ap.add_argument("run_id")
     ap.add_argument("--sweep", action="store_true", help="delete the stage after reading it")
@@ -81,9 +81,12 @@ def main() -> int:
     time_coord = shard_tasks._time_coord(plan)
 
     # --- values
-    partials = []
+    partials, spans = [], []
     for key in sorted(storage.list_prefix(f"{root}/offsets/scene/")):
         partials.append(json.loads(storage.read_text(key)))
+        m = re.search(r"scene/s(\d+)-(\d+)\.json$", key)
+        if m:
+            spans.append((int(m.group(1)), int(m.group(2))))
     offset, n_valid = merge_scene_partials(partials, time_coord)
 
     ref_key = shard_tasks._offset_key(plan).storage_key
@@ -99,6 +102,19 @@ def main() -> int:
             np.array_equal(np.asarray(ref["n_valid"]), np.asarray(n_valid.values))
         )
         verdict["scenes"] = int(offset.sizes["time"])
+        verdict["partial_spans"] = spans
+        verdict["scenes_covered"] = sum(hi - lo for lo, hi in spans)
+        # provenance: the record must describe the same estimator and inputs
+        expected = shard_tasks._offset_key(plan)
+        verdict["provenance"] = {
+            "algorithm_version": (ref.get("algorithm_version"), expected.algorithm_version),
+            "digest": (ref.get("digest"), expected.digest),
+            "offset_resolution_factor": (ref.get("offset_resolution_factor"), plan.offset_factor),
+            "tile": (ref.get("tile"), plan.tile),
+            "window": (ref.get("window"), plan.window),
+            "scenes": (ref.get("scenes"), int(offset.sizes["time"])),
+        }
+        verdict["provenance_matches"] = all(a == b for a, b in verdict["provenance"].values())
         # Records written before 2026-08-22 carry second-precision stamps, and
         # the reader accepts them through an unambiguous truncated match. The
         # comparison follows the same rule rather than demanding nanoseconds.
