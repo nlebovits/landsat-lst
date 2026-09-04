@@ -124,6 +124,15 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/landsat_lst"]
+# The GED gap-mask artifact ships inside the wheel or it does not reach a
+# fleet VM at all: settings.ged_artifact's default resolves against the CWD,
+# and a Coiled VM has no repo. hatchling excludes non-Python files from a
+# package by default, so this include is what makes
+# ged.packaged_artifact_path() findable. Nothing is packaged there yet -- the
+# local archive covers 8,444 of the 19,300 granules production needs, so any
+# artifact built today would mask nothing over most of the world while
+# looking successful. See landsat-lst ged-coverage.
+artifacts = ["src/landsat_lst/data/ged_gap_mask.npz"]
 
 # ============================================================================
 # Ruff Configuration

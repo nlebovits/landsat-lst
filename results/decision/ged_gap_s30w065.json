@@ -1,0 +1,372 @@
+{
+  "analysis_version": "1.0.0",
+  "association_only": "Pixels are cross-tabbed by the GED cell they fall inside. This is a spatial association between output pixels and ASTER observation counts, not a trace of which observations produced any pixel's emissivity, and it does not on its own establish causation.",
+  "raster": {
+    "source": "https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/landsat-lst/lst-p95-2021-2025/S30W065/lst_p95_2021-2025_S30W065.tif",
+    "width": 18000,
+    "height": 18000,
+    "crs": "EPSG:4326",
+    "transform": [
+      0.00027777777777777794,
+      0.0,
+      -65.0,
+      0.0,
+      -0.00027777777777777864,
+      -30.0
+    ],
+    "bounds": [
+      -65.0,
+      -35.000000000000014,
+      -60.0,
+      -30.0
+    ],
+    "dtype": "uint16",
+    "nodata": 0.0,
+    "scale": 0.01,
+    "offset": -50.0,
+    "block_shape": [
+      512,
+      512
+    ],
+    "overviews": [
+      2,
+      4,
+      8,
+      16,
+      32,
+      64
+    ],
+    "scene_count": 4403,
+    "scene_count_source": "GDAL dataset tag 'scene_count' on the published COG",
+    "tags": {
+      "OVERVIEW_RESAMPLING": "AVERAGE",
+      "scene_count": "4403",
+      "tile": "S30W065",
+      "window": "2021-2025",
+      "year": "2021",
+      "AREA_OR_POINT": "Area"
+    }
+  },
+  "grid_check": {
+    "tile": "S30W065",
+    "expected_shape": [
+      18000,
+      18000
+    ],
+    "expected_transform": [
+      0.0002777777777777778,
+      0.0,
+      -65.0,
+      0.0,
+      -0.0002777777777777778,
+      -30.0
+    ],
+    "matches_global_grid": true
+  },
+  "ged": {
+    "version": "ASTER GED AG100 v003 (AG1km.v003, 0010)",
+    "source_kind": "granules",
+    "cells_per_degree": 100,
+    "cell_window_shape": [
+      502,
+      502
+    ],
+    "buffer_cells": 1,
+    "absent_cells": 101,
+    "gap_cells": 611
+  },
+  "threshold": {
+    "hot_threshold_c": 70.0,
+    "hot_threshold_dn": 12000,
+    "fill_dn": 0,
+    "rule": "valid pixels with DN >= hot_threshold_dn"
+  },
+  "tile_totals": {
+    "total_pixels": 324000000,
+    "valid_pixels": 323916905,
+    "missing_pixels": 83095,
+    "hot_pixels": 2793,
+    "valid_pct": 99.97435339506173,
+    "missing_pct": 0.025646604938271603,
+    "hot_pct_of_valid": 0.0008622581769852364
+  },
+  "by_numobs_tier": [
+    {
+      "tier": "0",
+      "total_pixels": 784080,
+      "valid_pixels": 701279,
+      "missing_pixels": 82801,
+      "hot_pixels": 2231,
+      "share_of_tile_pct": 0.242,
+      "valid_pct_of_tier": 89.4397255382104,
+      "missing_pct_of_tier": 10.560274461789614,
+      "hot_pct_of_tier_valid": 0.3181330112551495,
+      "share_of_tile_hot_pct": 79.8782670963122,
+      "share_of_tile_missing_pct": 99.64618809796016,
+      "hot_enrichment_vs_tile": 368.95331322627345,
+      "missing_enrichment_vs_tile": 411.76110784281065
+    },
+    {
+      "tier": "1",
+      "total_pixels": 4446576,
+      "valid_pixels": 4446468,
+      "missing_pixels": 108,
+      "hot_pixels": 20,
+      "share_of_tile_pct": 1.3724,
+      "valid_pct_of_tier": 99.99757116486933,
+      "missing_pct_of_tier": 0.00242883513067133,
+      "hot_pct_of_tier_valid": 0.0004497952082416875,
+      "share_of_tile_hot_pct": 0.7160759040458289,
+      "share_of_tile_missing_pct": 0.12997171911667368,
+      "hot_enrichment_vs_tile": 0.5216479475026061,
+      "missing_enrichment_vs_tile": 0.09470396321529706
+    },
+    {
+      "tier": "2",
+      "total_pixels": 17160336,
+      "valid_pixels": 17160230,
+      "missing_pixels": 106,
+      "hot_pixels": 320,
+      "share_of_tile_pct": 5.296399999999999,
+      "valid_pct_of_tier": 99.99938229647718,
+      "missing_pct_of_tier": 0.0006177035228214646,
+      "hot_pct_of_tier_valid": 0.0018647768707062782,
+      "share_of_tile_hot_pct": 11.457214464733262,
+      "share_of_tile_missing_pct": 0.1275648354293279,
+      "hot_enrichment_vs_tile": 2.1626664965082805,
+      "missing_enrichment_vs_tile": 0.02408519662965937
+    },
+    {
+      "tier": "3",
+      "total_pixels": 33749136,
+      "valid_pixels": 33749071,
+      "missing_pixels": 65,
+      "hot_pixels": 222,
+      "share_of_tile_pct": 10.416400000000001,
+      "valid_pct_of_tier": 99.99980740247692,
+      "missing_pct_of_tier": 0.00019259752308918368,
+      "hot_pct_of_tier_valid": 0.0006577958842185612,
+      "share_of_tile_hot_pct": 7.9484425349087005,
+      "share_of_tile_missing_pct": 0.0782237198387388,
+      "hot_enrichment_vs_tile": 0.7628757856706576,
+      "missing_enrichment_vs_tile": 0.007509669352054337
+    },
+    {
+      "tier": ">=4",
+      "total_pixels": 267859872,
+      "valid_pixels": 267859857,
+      "missing_pixels": 15,
+      "hot_pixels": 0,
+      "share_of_tile_pct": 82.6728,
+      "valid_pct_of_tier": 99.99999440005706,
+      "missing_pct_of_tier": 5.5999429433013396e-06,
+      "hot_pct_of_tier_valid": 0.0,
+      "share_of_tile_hot_pct": 0.0,
+      "share_of_tile_missing_pct": 0.018051627655093567,
+      "hot_enrichment_vs_tile": 0.0,
+      "missing_enrichment_vs_tile": 0.0002183502633888482
+    },
+    {
+      "tier": "absent",
+      "total_pixels": 0,
+      "valid_pixels": 0,
+      "missing_pixels": 0,
+      "hot_pixels": 0,
+      "share_of_tile_pct": 0.0,
+      "valid_pct_of_tier": null,
+      "missing_pct_of_tier": null,
+      "hot_pct_of_tier_valid": null,
+      "share_of_tile_hot_pct": 0.0,
+      "share_of_tile_missing_pct": 0.0,
+      "hot_enrichment_vs_tile": null,
+      "missing_enrichment_vs_tile": null
+    }
+  ],
+  "registration_scan": {
+    "radius": 2,
+    "table": [
+      {
+        "d_row": -2,
+        "d_col": -2,
+        "hot_on_gap_cells": 593
+      },
+      {
+        "d_row": -2,
+        "d_col": -1,
+        "hot_on_gap_cells": 773
+      },
+      {
+        "d_row": -2,
+        "d_col": 0,
+        "hot_on_gap_cells": 1238
+      },
+      {
+        "d_row": -2,
+        "d_col": 1,
+        "hot_on_gap_cells": 1208
+      },
+      {
+        "d_row": -2,
+        "d_col": 2,
+        "hot_on_gap_cells": 534
+      },
+      {
+        "d_row": -1,
+        "d_col": -2,
+        "hot_on_gap_cells": 1012
+      },
+      {
+        "d_row": -1,
+        "d_col": -1,
+        "hot_on_gap_cells": 1313
+      },
+      {
+        "d_row": -1,
+        "d_col": 0,
+        "hot_on_gap_cells": 1589
+      },
+      {
+        "d_row": -1,
+        "d_col": 1,
+        "hot_on_gap_cells": 1213
+      },
+      {
+        "d_row": -1,
+        "d_col": 2,
+        "hot_on_gap_cells": 617
+      },
+      {
+        "d_row": 0,
+        "d_col": -2,
+        "hot_on_gap_cells": 779
+      },
+      {
+        "d_row": 0,
+        "d_col": -1,
+        "hot_on_gap_cells": 1297
+      },
+      {
+        "d_row": 0,
+        "d_col": 0,
+        "hot_on_gap_cells": 2231
+      },
+      {
+        "d_row": 0,
+        "d_col": 1,
+        "hot_on_gap_cells": 1699
+      },
+      {
+        "d_row": 0,
+        "d_col": 2,
+        "hot_on_gap_cells": 952
+      },
+      {
+        "d_row": 1,
+        "d_col": -2,
+        "hot_on_gap_cells": 590
+      },
+      {
+        "d_row": 1,
+        "d_col": -1,
+        "hot_on_gap_cells": 964
+      },
+      {
+        "d_row": 1,
+        "d_col": 0,
+        "hot_on_gap_cells": 1235
+      },
+      {
+        "d_row": 1,
+        "d_col": 1,
+        "hot_on_gap_cells": 1248
+      },
+      {
+        "d_row": 1,
+        "d_col": 2,
+        "hot_on_gap_cells": 1086
+      },
+      {
+        "d_row": 2,
+        "d_col": -2,
+        "hot_on_gap_cells": 555
+      },
+      {
+        "d_row": 2,
+        "d_col": -1,
+        "hot_on_gap_cells": 827
+      },
+      {
+        "d_row": 2,
+        "d_col": 0,
+        "hot_on_gap_cells": 912
+      },
+      {
+        "d_row": 2,
+        "d_col": 1,
+        "hot_on_gap_cells": 658
+      },
+      {
+        "d_row": 2,
+        "d_col": 2,
+        "hot_on_gap_cells": 745
+      }
+    ],
+    "best_shift": [
+      0,
+      0
+    ],
+    "best_count": 2231,
+    "identity_is_best": true,
+    "note": "Hot pixels landing on NumObs == 0 cells, as the GED grid is shifted against the output grid. The identity shift must win, or the cell mapping is misregistered."
+  },
+  "mask_tradeoffs": [
+    {
+      "rule": "numobs==0",
+      "valid_pixels_removed": 701279,
+      "valid_pixels_removed_pct": 0.2164996606151198,
+      "hot_pixels_removed": 2231,
+      "hot_pixels_removed_pct": 79.8782670963122,
+      "hot_pixels_remaining": 562,
+      "cool_valid_pixels_removed": 699048,
+      "missing_pixels_annotated": 82801,
+      "missing_pixels_annotated_pct": 99.64618809796016,
+      "cool_pixels_lost_per_hot_pixel_removed": 313.333930972658
+    },
+    {
+      "rule": "numobs==0 + 1-cell buffer",
+      "valid_pixels_removed": 2799286,
+      "valid_pixels_removed_pct": 0.8641987981454688,
+      "hot_pixels_removed": 2582,
+      "hot_pixels_removed_pct": 92.4453992123165,
+      "hot_pixels_remaining": 211,
+      "cool_valid_pixels_removed": 2796704,
+      "missing_pixels_annotated": 83018,
+      "missing_pixels_annotated_pct": 99.90733497803718,
+      "cool_pixels_lost_per_hot_pixel_removed": 1083.154144074361
+    },
+    {
+      "rule": "numobs<=2",
+      "valid_pixels_removed": 22307977,
+      "valid_pixels_removed_pct": 6.886944353830499,
+      "hot_pixels_removed": 2571,
+      "hot_pixels_removed_pct": 92.0515574650913,
+      "hot_pixels_remaining": 222,
+      "cool_valid_pixels_removed": 22305406,
+      "missing_pixels_annotated": 83015,
+      "missing_pixels_annotated_pct": 99.90372465250617,
+      "cool_pixels_lost_per_hot_pixel_removed": 8675.77051730844
+    },
+    {
+      "rule": "numobs<=2 + 1-cell buffer",
+      "valid_pixels_removed": 36913817,
+      "valid_pixels_removed_pct": 11.396076101677991,
+      "hot_pixels_removed": 2793,
+      "hot_pixels_removed_pct": 100.0,
+      "hot_pixels_remaining": 0,
+      "cool_valid_pixels_removed": 36911024,
+      "missing_pixels_annotated": 83095,
+      "missing_pixels_annotated_pct": 100.0,
+      "cool_pixels_lost_per_hot_pixel_removed": 13215.547440028644
+    }
+  ]
+}
