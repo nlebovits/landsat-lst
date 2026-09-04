@@ -56,6 +56,26 @@ from landsat_lst.config import settings
 #: The two assets that together make one complete tile-window output.
 PRODUCTS: tuple[str, str] = ("lst_p95", "qa_count")
 
+#: The pooled all-path P95, emitted beside ``lst_p95`` for comparison when
+#: ``settings.wrs_emit_pooled_baseline`` is on. Deliberately NOT in
+#: :data:`PRODUCTS`: that tuple is the completion contract every reader uses to
+#: decide whether a tile is finished, and a diagnostic asset must not be able
+#: to hold a tile incomplete.
+POOLED_PRODUCT = "lst_p95_pooled"
+
+
+def band_products() -> tuple[str, ...]:
+    """Products a composite shard writes and the export merges.
+
+    :data:`PRODUCTS` plus the pooled baseline when it is enabled.
+    """
+    from landsat_lst.config import settings  # noqa: PLC0415
+
+    if settings.wrs_feather and settings.wrs_emit_pooled_baseline:
+        return (*PRODUCTS, POOLED_PRODUCT)
+    return PRODUCTS
+
+
 #: Prefix for per-tile run records, a sibling of the collection directories.
 RUN_RECORD_PREFIX = "_runs"
 
