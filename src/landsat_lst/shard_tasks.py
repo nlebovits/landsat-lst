@@ -874,6 +874,7 @@ def offsets_record_present(
     tile: str,
     *,
     storage: StorageBackend | None = None,
+    plan: shards.TilePlan | None = None,
 ) -> bool:
     """Whether the canonical ADR-012 record already covers this tile's window.
 
@@ -889,14 +890,25 @@ def offsets_record_present(
     On 2026-09-04 the record for S30W065 had existed since 08:39 UTC and all
     three runs still paid a 15-VM offsets fleet, roughly 36 credits apiece,
     because the driver looked only at this run's own scene partials.
+
+    Args:
+        plan: A plan the caller already holds. Pass it. Resolving one costs a
+            read and a parse of ``items.json``, which this function never
+            looks at: 111 MB and 3.4 s of pystac for S30W065's 4,403 scenes.
+            The fleet driver asks this once per poll per tile and holds the
+            plan on the track, so a fresh ``load_context`` there put ~10 GB
+            and ~320 s of CPU into one tile's offsets stage, against a 20 s
+            poll cadence.
     """
-    try:
-        ctx = load_context(run_id, tile, storage=storage)
-    except Exception as exc:  # a tile with no plan has no key to look under
-        log.debug("offsets_record_unknown", tile=tile, error=repr(exc)[:200])
-        return False
-    cache = OffsetCache(storage=ctx.storage, key=_offset_key(ctx.plan))
-    return cache.read(_time_coord(ctx.plan)) is not None
+    if plan is None:
+        try:
+            ctx = load_context(run_id, tile, storage=storage)
+        except Exception as exc:  # a tile with no plan has no key to look under
+            log.debug("offsets_record_unknown", tile=tile, error=repr(exc)[:200])
+            return False
+        plan, storage = ctx.plan, ctx.storage
+    cache = OffsetCache(storage=storage or get_storage(), key=_offset_key(plan))
+    return cache.read(_time_coord(plan)) is not None
 
 
 def run_offsets_stage(
@@ -981,7 +993,7 @@ def run_offsets_stage(
     # there. The driver skips the stage too, but its fleet width is fixed
     # before any plan exists, so these VMs are already booted by the time
     # anyone can know. Exiting here turns a full phase-A pass into a boot.
-    if offsets_record_present(run_id, tile, storage=storage):
+    if offsets_record_present(run_id, tile, storage=ctx.storage, plan=ctx.plan):
         log.info(
             "shard_offsets_stage_skipped",
             tile=tile,
@@ -1055,7 +1067,7 @@ def merge_offsets(
     key = _offset_key(ctx.plan)
     cache = OffsetCache(storage=ctx.storage, key=key)
 
-    if offsets_record_present(run_id, tile, storage=ctx.storage):
+    if offsets_record_present(run_id, tile, storage=ctx.storage, plan=ctx.plan):
         log.info("shard_offsets_merge_skipped", tile=tile, key=key.storage_key)
         return key
 

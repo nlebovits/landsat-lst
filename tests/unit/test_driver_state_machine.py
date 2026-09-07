@@ -594,6 +594,33 @@ def _stage_prefix_for(plan) -> str:
     return StageKey.from_offset_key(root, _offset_key(plan)).prefix
 
 
+class _LateRecordStorage:
+    """Storage where a concurrent producer publishes the record at poll ``after``.
+
+    The driver's single pre-barrier check has already happened by then, which
+    is the whole point: the record and the driver's belief about it diverge.
+    """
+
+    def __init__(self, storage, plan, fleet, *, after: int) -> None:
+        self._storage = storage
+        self._plan = plan
+        self._fleet = fleet
+        self._after = after
+        self.listings = 0
+        self.published = False
+
+    def __getattr__(self, name):
+        return getattr(self._storage, name)
+
+    def list_prefix(self, prefix: str):
+        self.listings += 1
+        self._fleet.tick()
+        if self.listings >= self._after and not self.published:
+            self.published = True
+            write_offset_cache(self._storage, self._plan)
+        return self._storage.list_prefix(prefix)
+
+
 class TestOffsetsCacheHit:
     """The estimate is keyed by scene set, so an earlier run answers this one.
 
@@ -626,6 +653,84 @@ class TestOffsetsCacheHit:
         assert "offsets" in fleet.stages
         assert any(s.stage == "merge_offsets" for s in summary.stages)
         assert summary.completed
+
+    def test_a_record_published_after_the_drivers_check_settles_the_barrier(
+        self, storage, plan, job, clock
+    ):
+        """The driver asks once; every offsets shard asks on every boot.
+
+        A record landing between the two -- a concurrent run over the same
+        scene set -- makes each shard exit without a partial and leaves the
+        barrier waiting for work nobody will do. Before ``early_settle`` this
+        burned both rounds and then failed the tile, with the record sitting in
+        the bucket the whole time.
+        """
+        _seed(storage, plan, "resolve")
+        # Shards that exit early write nothing, ever.
+        fleet = ScriptedFleet(storage, plan, clock=clock, never={("offsets", 0), ("offsets", 1)})
+        late = _LateRecordStorage(storage, plan, fleet, after=2)
+
+        summary = _drive(job, late, fleet, clock)
+
+        assert late.published, "the concurrent producer wrote it mid-barrier"
+        offsets = next(s for s in summary.stages if s.stage == "offsets")
+        assert offsets.settled_early, "the record is the stage's whole output"
+        assert offsets.rounds == 1, "the fused fleet's own round, and no resubmission"
+        assert [i for stage, i in fleet.calls if stage == "offsets"] == [[0, 1]]
+        assert summary.completed
+
+    def test_a_failed_check_no_longer_strands_the_barrier(
+        self, storage, plan, job, clock, monkeypatch
+    ):
+        """One flaky read used to decide the stage on its own.
+
+        The driver's error path is "run the stage" and the shard's error path
+        ends, after a Coiled retry, in "exit early". Asking again on every poll
+        is what makes the two agree.
+        """
+        from landsat_lst import shard_tasks
+
+        _seed(storage, plan, "resolve")
+        write_offset_cache(storage, plan)
+        real = shard_tasks.offsets_record_present
+        calls = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("connection reset by peer")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(shard_tasks, "offsets_record_present", flaky)
+        fleet = ScriptedFleet(storage, plan, clock=clock, never={("offsets", 0), ("offsets", 1)})
+
+        summary = _drive(job, TickingStorage(storage, fleet), fleet, clock)
+
+        offsets = next(s for s in summary.stages if s.stage == "offsets")
+        assert offsets.settled_early
+        assert summary.completed
+
+    def test_the_check_reads_no_item_catalogue_when_it_is_given_a_plan(
+        self, storage, plan, monkeypatch
+    ):
+        """111 MB and 3.4 s of pystac for S30W065's 4,403 scenes, per call.
+
+        The fleet driver asks once per poll per tile and holds the plan on the
+        track, so a fresh ``load_context`` there put ~10 GB and ~320 s of CPU
+        into one tile's offsets stage against a 20 s poll cadence. This
+        question never looks at ``items.json``.
+        """
+        from landsat_lst import shard_tasks
+
+        publish_plan(storage, plan, run_id=RUN_ID)
+        write_offset_cache(storage, plan)
+
+        def _refuse(*_args, **_kwargs):
+            raise AssertionError("load_context re-read the item catalogue")
+
+        monkeypatch.setattr(shard_tasks, "load_context", _refuse)
+
+        assert shard_tasks.offsets_record_present(RUN_ID, TILE, storage=storage, plan=plan)
 
     def test_a_shard_whose_record_exists_exits_before_reducing_anything(
         self, storage, plan, monkeypatch
@@ -727,15 +832,112 @@ class TestSessionLifetime:
         assert quota.session_expiry("shard-test") is None
         assert quota.preflight_session_lifetime(needed_s=90 * 60) is None
 
-    def test_the_tile_horizon_is_the_sum_of_its_stage_budgets(self, plan):
+    def test_the_tile_horizon_counts_every_round_it_may_use(self, plan):
+        """A stage that expires resubmits against a *fresh* deadline.
+
+        Summing one round per stage understates the ceiling by the round count,
+        and a session gate that errs on the low side errs by passing -- which
+        is the failure it exists to prevent. On the retained S30W065 plan the
+        one-round sum is 1.95 h against a real ceiling of 3.90 h.
+        """
         from landsat_lst.shard_driver import _tile_budget_s
 
-        expected = sum(
+        one_round = sum(
             budgets.stage_budget(stage, plan).deadline_s
             for stage in ("offsets", "composite", "export")
         )
 
-        assert _tile_budget_s(plan) == expected
+        assert settings.shard_barrier_rounds == 2
+        assert _tile_budget_s(plan) == one_round * 2
+        assert quota.tile_horizon_s(plan) == _tile_budget_s(plan)
+
+    def test_the_pre_plan_horizon_is_available_before_any_tile_resolves(self):
+        """What the fleet preflight has to work from: no tile has a plan yet."""
+        assert quota.tile_horizon_s() > 0
+
+    def test_exported_credentials_are_what_the_gate_measures(self, home, monkeypatch):
+        """``job._worker_environ`` freezes the environment before the profile.
+
+        With ``AWS_ACCESS_KEY_ID`` exported, the profile's cache describes a
+        session no worker touches. Reading it is wrong in both directions: a
+        long-lived profile token passes a run whose exported credentials expire
+        in ten minutes, and a stale one refuses a run that would have worked.
+        """
+        now = datetime(2026, 9, 4, 16, 4, tzinfo=UTC)
+        # Profile says three hours. The exported session says thirty minutes.
+        self._cache(home, expires=now + timedelta(hours=3))
+        monkeypatch.setattr(settings, "aws_profile", "shard-test")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ASIAEXPORTED")
+        monkeypatch.setenv("AWS_SESSION_TOKEN", "token")
+        monkeypatch.setenv(
+            "AWS_CREDENTIAL_EXPIRATION",
+            (now + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+
+        assert quota.session_expiry("shard-test") == now + timedelta(minutes=30)
+        with pytest.raises(quota.SessionExpiryRefused):
+            quota.preflight_session_lifetime(needed_s=90 * 60, now=now)
+
+    def test_an_undatable_exported_session_is_unknown_not_the_profiles(self, home, monkeypatch):
+        """Nothing sets ``AWS_CREDENTIAL_EXPIRATION`` by rule.
+
+        A static key pair and an exported temporary session with no stamp look
+        the same from here. Both are unknown. Falling back to the profile would
+        answer for a session the workers do not use.
+        """
+        now = datetime(2026, 9, 4, 16, 4, tzinfo=UTC)
+        self._cache(home, expires=now + timedelta(minutes=1))
+        monkeypatch.setattr(settings, "aws_profile", "shard-test")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIASTATIC")
+        monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+        monkeypatch.delenv("AWS_CREDENTIAL_EXPIRATION", raising=False)
+
+        assert quota.session_expiry("shard-test") is None
+        assert quota.preflight_session_lifetime(needed_s=90 * 60, now=now) is None
+
+    def test_the_role_cache_reports_its_earliest_expiry(self, home, monkeypatch):
+        """A gate that reports the longest-lived of several cached roles hides
+        the short-lived one in use, which is the direction that lets a run
+        start and then die."""
+        monkeypatch.setattr(settings, "aws_profile", "no-such-sso-profile")
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        cache = home / ".aws" / "cli" / "cache"
+        cache.mkdir(parents=True)
+        soon = datetime(2026, 9, 4, 16, 30, tzinfo=UTC)
+        late = datetime(2026, 9, 5, 0, 0, tzinfo=UTC)
+        for name, moment in (("a.json", late), ("b.json", soon)):
+            (cache / name).write_text(
+                json.dumps({"Credentials": {"Expiration": moment.strftime("%Y-%m-%dT%H:%M:%SZ")}})
+            )
+
+        assert quota.session_expiry("no-such-sso-profile") == soon
+
+    def test_the_fleet_preflight_gates_on_it_too(self, monkeypatch):
+        """The 700-tile path is the one where an expiry is certain.
+
+        ``cli.shard_fleet`` already caught ``SessionExpiryRefused`` while
+        nothing on that path could raise it.
+        """
+        from landsat_lst.fleet_backend import CoiledFleetBackend
+
+        asked: list[float] = []
+        monkeypatch.setattr(quota, "preflight_identity", lambda *_a, **_k: "arn")
+        monkeypatch.setattr(quota, "preflight_write_access", lambda *_a, **_k: None)
+        monkeypatch.setattr(quota, "estimate_run_credits", lambda *_a, **_k: 1.0)
+        monkeypatch.setattr(
+            quota,
+            "preflight_credits",
+            lambda *_a, **_k: SimpleNamespace(remaining=1000.0, spent=0.0),
+        )
+        monkeypatch.setattr(
+            quota,
+            "preflight_session_lifetime",
+            lambda *, needed_s, **_k: asked.append(needed_s),
+        )
+
+        CoiledFleetBackend().preflight(tiles=700)
+
+        assert asked == [quota.tile_horizon_s()], "one tile, not the whole roster"
 
     def test_the_driver_gates_on_it_before_the_composite_stage(
         self, storage, plan, job, clock, monkeypatch

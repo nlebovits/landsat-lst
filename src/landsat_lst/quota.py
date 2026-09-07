@@ -256,16 +256,19 @@ def _sso_token_expiry(profile: str) -> datetime | None:
 
 
 def _role_cache_expiry(profile: str) -> datetime | None:
-    """The assume-role cache's expiry, for a profile that is not SSO.
+    """The assume-role cache's earliest expiry, for a profile that is not SSO.
 
     ``~/.aws/cli/cache`` holds one file per assumed role, and the file does not
-    name its profile, so the latest expiry among them is the best available
-    answer. Wrong in the safe direction only when several roles are cached, and
-    absent entirely on the usual laptop.
+    name its profile, so no entry can be attributed to ``profile``. The
+    **earliest** expiry among them is therefore the answer: this feeds a gate,
+    and a gate that reports the longest-lived of several cached roles hides the
+    short-lived one that is actually in use, which is the direction that lets a
+    run start and then die. Absent entirely on the usual laptop, where an SSO
+    token answers first.
     """
     del profile
     directory = Path.home() / ".aws" / "cli" / "cache"
-    latest: datetime | None = None
+    earliest: datetime | None = None
     try:
         files = sorted(directory.glob("*.json"))
     except OSError:
@@ -276,9 +279,9 @@ def _role_cache_expiry(profile: str) -> datetime | None:
         except (OSError, ValueError):
             continue
         expiry = _parse_expiry(body.get("Credentials", {}).get("Expiration"))
-        if expiry is not None and (latest is None or expiry > latest):
-            latest = expiry
-    return latest
+        if expiry is not None and (earliest is None or expiry < earliest):
+            earliest = expiry
+    return earliest
 
 
 def _parse_expiry(raw: object) -> datetime | None:
@@ -295,12 +298,25 @@ def _parse_expiry(raw: object) -> datetime | None:
 
 
 def session_expiry(profile: str | None = None) -> datetime | None:
-    """When the AWS session for ``profile`` stops working, or ``None``.
+    """When the AWS session the *workers* will run on stops working.
 
-    ``None`` means unknown, never "does not expire": a static key pair, a
-    profile shape this does not read, and a missing cache file all look the
-    same from here, and only one of them is a problem.
+    The environment comes first, because ``job._worker_environ`` reads it
+    first: an exported ``AWS_ACCESS_KEY_ID`` is what gets frozen onto every VM,
+    and the profile's cache then describes a session nothing in the run uses.
+    Reading the profile anyway is wrong in both directions -- a long-lived
+    profile token passes a run whose exported credentials expire in ten
+    minutes, and a stale one refuses a run that would have worked. Only with no
+    exported credentials does this fall through to the profile.
+
+    ``None`` means unknown, never "does not expire". A static key pair, an
+    exported session with no ``AWS_CREDENTIAL_EXPIRATION`` (nothing sets that
+    by rule), a profile shape this does not read, and a missing cache file all
+    look the same from here, and only some of them are a problem.
     """
+    import os  # noqa: PLC0415
+
+    if os.environ.get("AWS_ACCESS_KEY_ID"):
+        return _parse_expiry(os.environ.get("AWS_CREDENTIAL_EXPIRATION"))
     name = profile or settings.aws_profile
     if not name:
         return None
@@ -932,6 +948,33 @@ def estimate_run_credits(plan: TilePlan | None = None, *, units: int | None = No
     stays comparable to an invoice.
     """
     return credits_for_fleets(run_fleets(plan, units=units))
+
+
+#: The stages ``budgets`` prices, in the order they run. A tile's horizon is
+#: their sum, because a barrier does not open until the one before it closes.
+BUDGET_STAGES = ("offsets", "composite", "export")
+
+
+def tile_horizon_s(plan: TilePlan | None = None) -> float:
+    """How long one tile may run, from the same model that prices it.
+
+    The span a single set of frozen worker credentials has to cover. With a
+    plan it is the sum of that tile's stage deadlines; without one it is the
+    pre-plan projection ``run_fleets`` already trusts, which is what the fleet
+    preflight has to work from because no tile has resolved yet.
+
+    Multiplied by ``settings.shard_barrier_rounds`` in both forms, because a
+    stage that expires resubmits against a *fresh* deadline: the ceiling is
+    rounds times the budget. On the retained S30W065 plan the one-round sum is
+    1.95 h against a real ceiling of 3.90 h.
+    """
+    rounds = max(1, settings.shard_barrier_rounds)
+    if plan is not None:
+        from landsat_lst import budgets  # noqa: PLC0415
+
+        return sum(budgets.stage_budget(s, plan).deadline_s for s in BUDGET_STAGES) * rounds
+    # Per-VM wall hours, which is what a stage's slowest worker spends.
+    return sum(hours for _size, _cpus, hours in run_fleets()) * 3600.0 * rounds
 
 
 def _prompt_for_limit(balance: CreditBalance, estimated: float, needed: float) -> float | None:

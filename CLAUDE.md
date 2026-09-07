@@ -791,13 +791,25 @@ Rules worth keeping:
   creates rejected with an *empty* `ServerError`. `--ack-quota` is the escape when no
   balance can be read.
 - **A working session is not a long enough one, so a fourth gate reads its expiry.**
-  `quota.preflight_session_lifetime` reads the cached SSO token from disk the way botocore
-  resolves it and refuses a tile whose summed stage budgets end after it. It fires where
-  the budget first exists — after the plan — because `budgets.stage_budget` takes a plan,
-  so a fresh run refuses one offsets-fleet boot in rather than before. On 2026-09-04 the
-  identity gate passed at 16:04 and the composite overlap submission failed with
-  `UnauthorizedSSOTokenError` at 16:23. An unreadable expiry warns and proceeds: unknown is
-  not "does not expire", and a missing session is already the identity gate's job.
+  `quota.preflight_session_lifetime` refuses a run whose horizon ends after the session
+  does. On 2026-09-04 the identity gate passed at 16:04 and the composite overlap
+  submission failed with `UnauthorizedSSOTokenError` at 16:23. An unreadable expiry warns
+  and proceeds: unknown is not "does not expire", and a missing session is already the
+  identity gate's job. Three things decide whether it is measuring anything real:
+  - **It reads the environment before the profile**, because `job._worker_environ` does.
+    An exported `AWS_ACCESS_KEY_ID` is what gets frozen onto every VM, and the profile's
+    cache then describes a session no worker touches — wrong in both directions, since a
+    long-lived profile token passes a run whose exported credentials die in ten minutes.
+    An exported session with no `AWS_CREDENTIAL_EXPIRATION` is unknown, not assumed good.
+  - **The horizon counts every round.** A stage that expires resubmits against a *fresh*
+    deadline, so the ceiling is `shard_barrier_rounds` times the summed budgets: 3.90 h on
+    the retained S30W065 plan against a one-round sum of 1.95 h. Understating it errs by
+    passing, which is the one direction a gate must not err in. `quota.tile_horizon_s` owns
+    both forms, with and without a plan, so the two drivers cannot disagree.
+  - **The fleet path gates on one tile, not on the roster.** Every wave re-freezes the
+    credentials current at its submission, so one freeze has to cover one tile's stages.
+    Pricing 700 tiles would refuse every large build outright, and a gate that refuses the
+    only run anyone wants is a gate that gets deleted.
 - **A valid identity is not a permitted one, so `quota.preflight_write_access` probes.**
   It writes one object under `{s3_prefix}/_preflight/`, reads it back, lists that exact
   key, and deletes it. All four: listing proves the bucket-level permission every barrier
@@ -854,7 +866,21 @@ Rules worth keeping:
   and every offsets shard share. Asking needs a plan — the key's digest covers the sorted
   scene ids — so a fresh run asks once shard 0 publishes one, and its shards exit before
   reducing anything. All three Sep 4 runs paid a 15-VM fleet against a record that had
-  existed since 08:39 UTC.
+  existed since 08:39 UTC. Two rules keep the check honest:
+  - **Every shard asks on every boot, so the driver asks on every poll.** The tile driver
+    used to ask once, before the barrier. A record landing after that — a concurrent run
+    over the same scene set, or one failed read at that instant — made each shard exit
+    without a partial and left the barrier waiting for work nobody would do, through both
+    rounds, and then failed the tile with the record sitting in the bucket. That is what
+    `StageMachine.early_settle` is: a second, cheaper way for a stage to be over, asked
+    before every round and on every poll. `settled_early` on the outcome is how the tail
+    knows not to raise over artifacts the stage no longer owes.
+  - **Hand it the plan you already hold.** Resolving one costs a read and a parse of
+    `items.json`, which this question never looks at: 111 MB and 3.4 s of pystac for
+    S30W065's 4,403 scenes. The fleet driver asks once per poll per tile and keeps a plan
+    on the track, so re-resolving there put ~10 GB and ~320 s of CPU into one tile's
+    offsets stage against a 20 s poll cadence — requests scaling with tiles driven, which
+    is the thing ADR-018 exists to avoid.
 - **The coarse stage is swept on every terminal path.** Phase A's staging is 8,424 objects
   and 167 GB for one tile. Sweeping only inside the offsets barrier's `except` left that
   behind for both runs that died in the composite stage. `landsat-lst shard gc` lists a
@@ -871,7 +897,9 @@ Rules worth keeping:
   arithmetic that cannot be tested is time arithmetic nobody checks.
 - **Failure is bounded.** On barrier expiry the driver resubmits *only the missing
   indexes*, at most `shard_barrier_rounds` submissions per stage **counted across
-  drivers**, then fails naming the keys. Per-driver counting would hand every resume a
+  drivers**, then fails naming the keys. Counted across drivers means a resume of an
+  exhausted stage submits nothing and fails identically, so the failure names
+  `LST_SHARD_BARRIER_ROUNDS` as the way to let one continue. Per-driver counting would hand every resume a
   fresh budget. A fleet that resent the whole stage would also finish, which is why the
   test asserts on which indexes the second call carried.
 - **Row bands only, never column bands.** `odc-stac` derives its `solar_day` shift from

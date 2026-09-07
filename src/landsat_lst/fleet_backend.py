@@ -432,16 +432,26 @@ class CoiledFleetBackend:
         return coiled_cluster_probe(handle_id)
 
     def preflight(self, *, tiles: int) -> None:
-        """Identity, write access, then credits, priced for many tiles.
+        """Identity, session lifetime, write access, then credits, for many tiles.
 
         The estimate is the per-tile one multiplied by the tile count, which
         ignores the boot amortization the consolidation buys and therefore
         over-estimates -- the safe direction for a gate whose job is to refuse
         a run the workspace cannot pay for.
+
+        The session gate is measured against **one tile**, not the run. Every
+        wave calls ``job._worker_environ`` afresh and freezes the credentials
+        current at that moment, so the span a single freeze has to cover is one
+        tile's stages rather than the whole roster. Measuring the roster would
+        refuse every large build outright: no SSO token outlives 700 tiles, and
+        a gate that refuses the only run anyone wants is a gate that gets
+        deleted. What it does catch is the case that killed 2026-09-04, a
+        session with less left than a single tile needs.
         """
         from landsat_lst import quota  # noqa: PLC0415
 
         quota.preflight_identity()
+        quota.preflight_session_lifetime(needed_s=quota.tile_horizon_s())
         quota.preflight_write_access()
         estimate = quota.estimate_run_credits() * max(1, tiles)
         balance = quota.preflight_credits(estimate, balance_source=self.balance_source)

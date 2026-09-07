@@ -695,9 +695,19 @@ class TileTrack:
         )
 
     def _offsets_cached(self) -> bool:
-        """Whether the canonical offsets record already covers this tile."""
+        """Whether the canonical offsets record already covers this tile.
+
+        Asked once per poll per tile, so it is handed the plan the track
+        already holds. Resolving one instead costs a read and a parse of
+        ``items.json``, which this question never looks at: 111 MB and 3.4 s of
+        pystac for S30W065's 4,403 scenes, or ~10 GB and ~320 s of CPU per tile
+        across one offsets stage, against a 20 s poll cadence. Requests scale
+        with keys published, not with tiles driven (ADR-018).
+        """
         try:
-            return shard_tasks.offsets_record_present(self.run_id, self.tile, storage=self.storage)
+            return shard_tasks.offsets_record_present(
+                self.run_id, self.tile, storage=self.storage, plan=self.plan
+            )
         except Exception as exc:
             log.warning("fleet_offsets_cache_check_failed", tile=self.tile, error=repr(exc)[:200])
             return False
