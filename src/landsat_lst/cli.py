@@ -2306,6 +2306,108 @@ def shard_resume(run_id: str, tile: str, ack_quota: bool) -> None:
     _print_shard_summary(summary)
 
 
+@shard.command("reconcile")
+@click.argument("run_id")
+@click.option("-t", "--tile", default=None, help="One tile; default is every tile in the run")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of tables")
+@click.option(
+    "--no-coiled", is_flag=True, help="Skip the Coiled task records, which carry the exit codes"
+)
+def shard_reconcile(run_id: str, tile: str | None, as_json: bool, no_coiled: bool) -> None:
+    """Report what a sharded run did: per stage, done, missing, and why.
+
+    `landsat-lst reconcile` reads `_runs/`, where a batch run's records live. A
+    sharded run publishes under `_shards/`, so it needs its own reader. Without
+    one, the postmortem of the three S30W065 runs on 2026-09-04 was done by
+    hand out of the state objects, the Coiled task records, and the billing.
+
+    Reads only. Safe while the run is still going, and safe to repeat.
+    """
+    import json as json_module
+
+    from landsat_lst.shard_report import reconcile_shard_run
+
+    report = reconcile_shard_run(run_id, tile=tile, task_states={} if no_coiled else None)
+    if not report.tiles:
+        raise click.ClickException(f"run {run_id!r} published nothing under _shards/")
+
+    if as_json:
+        console.print_json(json_module.dumps(report.to_dict(), default=str))
+        return
+
+    for tile_report in report.tiles:
+        _print_shard_report(tile_report)
+
+
+def _print_shard_report(report) -> None:
+    """One tile: a stage table, then every index that did not finish."""
+    from rich.table import Table
+
+    from landsat_lst.render import format_duration, truncate
+
+    if report.completed:
+        verdict = "[green]complete[/green]"
+    else:
+        verdict = f"[red]incomplete: {report.missing} shard artifact(s) missing[/red]"
+    console.print(f"[bold]{report.tile}[/bold] {report.window}  {verdict}")
+    if report.cogs_present and not report.completed:
+        console.print(
+            "  [yellow]COGs exist at the canonical key, and this run did not write them"
+            "[/yellow] -- the key is a function of window and tile, so an earlier run's"
+            " product sits there."
+        )
+    if report.staged_objects:
+        console.print(
+            f"  [yellow]{report.staged_objects} staged object(s) still under stage/[/yellow]"
+            f"  -- landsat-lst shard gc {report.tile}"
+        )
+
+    table = Table(show_header=True)
+    for column in ("stage", "done", "missing", "rounds", "attempts"):
+        table.add_column(column, justify="left" if column == "stage" else "right")
+    for stage in report.stages:
+        attempts = sum(len(a) for a in stage.attempts.values())
+        table.add_row(
+            stage.stage,
+            f"{len(stage.done)}/{stage.expected}",
+            str(len(stage.missing)),
+            str(stage.rounds),
+            str(attempts),
+        )
+    console.print(table)
+
+    for stage in report.stages:
+        if not stage.missing:
+            continue
+        console.print(f"  [red]{stage.stage} missing:[/red] {_compact(stage.missing)}")
+        for index in stage.missing:
+            for attempt in stage.attempts.get(index, []):
+                exit_note = "" if attempt.exit_code is None else f", exit {attempt.exit_code}"
+                console.print(
+                    f"    {index:>4}.{attempt.attempt}  {attempt.phase or '-':<12}"
+                    f" {format_duration(attempt.elapsed_s):>8}"
+                    f"  peak {(attempt.peak_rss_mb or 0) / 1024:.1f}G"
+                    f"  {attempt.instance_type or '-'}{exit_note}"
+                )
+                if attempt.error:
+                    console.print(f"      [red]{truncate(attempt.error, 160)}[/red]")
+
+
+def _compact(indexes) -> str:
+    """``3, 4, 5, 6, 8`` as ``3-6, 8``, because a missing set is usually runs."""
+    if not indexes:
+        return "-"
+    spans, start, previous = [], indexes[0], indexes[0]
+    for index in indexes[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        spans.append((start, previous))
+        start = previous = index
+    spans.append((start, previous))
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in spans)
+
+
 class _StageRow(NamedTuple):
     """One tile's coarse stage, as ``shard gc`` reports it."""
 

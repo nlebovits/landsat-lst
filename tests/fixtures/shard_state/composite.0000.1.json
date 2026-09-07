@@ -1,0 +1,161 @@
+{
+  "instance_type": "m6i.4xlarge",
+  "instance_lifecycle": "spot",
+  "instance_source": "imds",
+  "code_identity": {
+    "revision": null,
+    "package_version": "0.1.0",
+    "progress_module_sha256": "5acc38c3cc8aec9c9d414e003e50c187c8938848cae91618b3e6bc5f45db4ecd"
+  },
+  "schema": 2,
+  "run_id": "shard-S30W065-2021-2025-20260904T165629Z",
+  "tile": "S30W065",
+  "window": "2021-2025",
+  "attempt": 1,
+  "year": 2021,
+  "end_year": 2025,
+  "max_scenes": null,
+  "host": "ip-10-0-44-47",
+  "pid": 1120,
+  "phase": "done",
+  "status": null,
+  "elapsed_s": 957.2,
+  "duration_s": null,
+  "phase_seconds": {
+    "starting": 0.0,
+    "shard_composite": 6.2,
+    "shard_offsets_wait": 0.1,
+    "loading": 52.0,
+    "land_mask": 15.3,
+    "wrs_geometry": 29.3,
+    "destriping": 0.1,
+    "composite_graph": 0.8,
+    "ged_gap_mask": 2.6,
+    "exporting": 849.5,
+    "uploading": 1.2,
+    "done": 0.0
+  },
+  "tasks_done": null,
+  "tasks_total": null,
+  "graph_state": "idle",
+  "graph_seq": 0,
+  "rss_mb": 4803.328125,
+  "peak_rss_mb": 37444.671875,
+  "rss_series": [
+    [
+      0.0,
+      214.27734375
+    ],
+    [
+      0.0,
+      214.3359375
+    ],
+    [
+      6.3,
+      798.67578125
+    ],
+    [
+      6.4,
+      799.3359375
+    ],
+    [
+      58.4,
+      827.5625
+    ],
+    [
+      60.0,
+      1207.96875
+    ],
+    [
+      73.7,
+      1695.67578125
+    ],
+    [
+      103.0,
+      1712.4453125
+    ],
+    [
+      103.1,
+      1713.13671875
+    ],
+    [
+      103.9,
+      1994.578125
+    ],
+    [
+      106.5,
+      1994.5859375
+    ],
+    [
+      120.1,
+      3798.91015625
+    ],
+    [
+      180.2,
+      9714.7734375
+    ],
+    [
+      240.6,
+      5741.8203125
+    ],
+    [
+      300.9,
+      17927.91796875
+    ],
+    [
+      362.2,
+      9313.5234375
+    ],
+    [
+      422.6,
+      5722.02734375
+    ],
+    [
+      483.0,
+      23011.23046875
+    ],
+    [
+      543.7,
+      8635.16015625
+    ],
+    [
+      604.0,
+      5549.81640625
+    ],
+    [
+      664.4,
+      18838.421875
+    ],
+    [
+      724.5,
+      7302.83984375
+    ],
+    [
+      784.8,
+      4063.21484375
+    ],
+    [
+      845.4,
+      23101.734375
+    ],
+    [
+      906.3,
+      7091.140625
+    ],
+    [
+      956.0,
+      4760.7578125
+    ],
+    [
+      957.2,
+      4803.328125
+    ]
+  ],
+  "scene_count": null,
+  "lst_key": null,
+  "qa_key": null,
+  "updated_at": "2026-09-04T17:32:07.190078+00:00",
+  "error": null,
+  "scenes_found": 4403,
+  "scenes_kept": 912
+}

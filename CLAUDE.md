@@ -731,6 +731,8 @@ by a **local driver polling S3**. See [ADR-016](docs/adr/016-sharded-tile-execut
 landsat-lst shard process --tile N40W075     # drives the whole tile; prints a run id
 landsat-lst shard resume <run-id> N40W075    # continues a killed driver, from the bucket
 landsat-lst shard composite --run-id <id> --tile N40W075 --index 3   # what a VM runs
+landsat-lst shard reconcile <run-id>         # per stage: done, missing, phases, exit codes
+landsat-lst shard gc <run-id> [--delete]     # what phase A staged and never swept
 ```
 
 Rules worth keeping:
@@ -788,6 +790,14 @@ Rules worth keeping:
   gets its healthy fleet killed mid-stage (2026-08-22, 400 credits) and its cluster
   creates rejected with an *empty* `ServerError`. `--ack-quota` is the escape when no
   balance can be read.
+- **A working session is not a long enough one, so a fourth gate reads its expiry.**
+  `quota.preflight_session_lifetime` reads the cached SSO token from disk the way botocore
+  resolves it and refuses a tile whose summed stage budgets end after it. It fires where
+  the budget first exists — after the plan — because `budgets.stage_budget` takes a plan,
+  so a fresh run refuses one offsets-fleet boot in rather than before. On 2026-09-04 the
+  identity gate passed at 16:04 and the composite overlap submission failed with
+  `UnauthorizedSSOTokenError` at 16:23. An unreadable expiry warns and proceeds: unknown is
+  not "does not expire", and a missing session is already the identity gate's job.
 - **A valid identity is not a permitted one, so `quota.preflight_write_access` probes.**
   It writes one object under `{s3_prefix}/_preflight/`, reads it back, lists that exact
   key, and deletes it. All four: listing proves the bucket-level permission every barrier
@@ -829,9 +839,33 @@ Rules worth keeping:
   tile now with the reason surfaced; everything else — **including an error with no
   message** — is transient and retried with backoff. An empty `ServerError` killed the
   driver once; guessing "terminal" for the unknown case would bring that back.
-- **A cluster reported dead ends its barrier early.** The probe can only end a barrier
-  *sooner*, never declare success, and a dead report is re-checked against the bucket
-  first (a fleet whose last task uploaded and then stopped is a finished stage).
+- **A cluster reported dead expires its round, and never the tile.** The probe can only
+  end a barrier *sooner*, never declare success, and a dead report is re-checked against
+  the bucket first (a fleet whose last task uploaded and then stopped is a finished
+  stage). What follows is the ordinary expiry path: the next round resubmits the missing
+  indexes alone. Raising instead killed all three runs on 2026-09-04 —
+  `("stopped", "No pending tasks for batch run")` is what Coiled says about *every* batch
+  run that ends, so the driver died with 24 of 35 composite bands in the bucket, and every
+  resume died the same way inside the round deadline. A record whose cluster the probe
+  reported dead is also dead for `_is_live`, or `check` re-adopts the fleet it just buried.
+- **A stage whose canonical output exists is skipped, not re-run.** The offsets estimate is
+  keyed by scene set, not by run id, so an earlier run over the same scenes already
+  answered. `shard_tasks.offsets_record_present` is the one check the merge, both drivers,
+  and every offsets shard share. Asking needs a plan — the key's digest covers the sorted
+  scene ids — so a fresh run asks once shard 0 publishes one, and its shards exit before
+  reducing anything. All three Sep 4 runs paid a 15-VM fleet against a record that had
+  existed since 08:39 UTC.
+- **The coarse stage is swept on every terminal path.** Phase A's staging is 8,424 objects
+  and 167 GB for one tile. Sweeping only inside the offsets barrier's `except` left that
+  behind for both runs that died in the composite stage. `landsat-lst shard gc` lists a
+  level above `staging.StageKey.prefix`, so it also catches a stage orphaned by a digest
+  the current plan does not name.
+- **`coiled_retries` is never 0 by accident.** `job._worker_environ` forwards every `LST_`
+  variable, so an exec-trace shell's `LST_COILED_RETRIES=0` reached the production run that
+  followed, and eleven SIGKILLed tasks were marked failed rather than replaced. Both
+  submitters refuse it unless `LST_ALLOW_ZERO_RETRIES` says the single attempt is
+  deliberate, and each submission logs its retry count beside the whole forwarded `LST_`
+  environment.
 - **The driver takes an injectable `Clock`.** `tests/unit/test_driver_state_machine.py`
   runs 45 scenarios in under a second. Both defects above are time arithmetic; time
   arithmetic that cannot be tested is time arithmetic nobody checks.
