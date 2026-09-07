@@ -458,6 +458,51 @@ def stage_cluster_name(run_id: str, tile: str, stage: str, submission_round: int
     return f"lst-{digest}-{tile}-{stage[:5]}-r{submission_round}"[:_CLUSTER_NAME_MAX]
 
 
+class ZeroRetriesRefused(RuntimeError):
+    """A submission asked Coiled for zero retries without saying so on purpose.
+
+    Coiled replaces a killed task only while retries remain. With none, a task
+    that is SIGKILLed -- spot reclamation, a control-plane restart, anything the
+    task itself never sees -- is marked failed, and the batch run stops with its
+    output missing. That is what happened to eleven composite shards on
+    2026-09-04: ``LST_COILED_RETRIES=0`` was still exported from an exec-trace
+    session, ``job._worker_environ`` forwarded it, and the driver read 0.
+
+    The refusal is here rather than in the driver because every submission path
+    crosses it, and because the variable arrives from the environment rather
+    than from any caller's argument.
+    """
+
+
+def _effective_retries(*, stage: str) -> int:
+    """The retry count to submit with, or a refusal.
+
+    ``settings.allow_zero_retries`` is the one way through. A diagnostic that
+    wants a single attempt sets both variables, which makes the intent explicit
+    in the shell that carries it.
+    """
+    retries = int(settings.coiled_retries)
+    if retries == 0 and not settings.allow_zero_retries:
+        msg = (
+            f"refusing to submit stage {stage!r} with coiled_retries == 0: a task "
+            "killed from outside will not be replaced, and the batch run stops "
+            "with its output missing. Unset LST_COILED_RETRIES, or set "
+            "LST_ALLOW_ZERO_RETRIES=1 to say you want exactly one attempt."
+        )
+        raise ZeroRetriesRefused(msg)
+    return retries
+
+
+def _forwarded_lst(environ: Mapping[str, str]) -> dict[str, str]:
+    """The ``LST_`` half of a worker environment, for the submission log line.
+
+    Every setting reaches a VM as ``LST_<FIELD>``, so this is the whole of what
+    one shell's exports do to a run. AWS keys are excluded by construction, so
+    no credential reaches a log.
+    """
+    return {key: value for key, value in sorted(environ.items()) if key.startswith("LST_")}
+
+
 def _shard_task_command(
     *,
     stage: str,
@@ -564,6 +609,7 @@ def submit_shard_stage(
         msg = f"no shards to submit for stage {stage!r}"
         raise ValueError(msg)
 
+    retries = _effective_retries(stage=stage)
     command = _shard_task_command(stage=stage, run_id=run_id, tile=tile, job=job, units=units)
     environ = _worker_environ()
     name = stage_cluster_name(run_id, tile, stage, submission_round)
@@ -579,7 +625,7 @@ def submit_shard_stage(
         # build into the on-demand bill without anyone deciding it.
         "spot_policy": settings.shard_spot_policy,
         "max_workers": len(indexes),
-        "max_retries": settings.coiled_retries,
+        "max_retries": retries,
         "job_timeout": settings.coiled_job_timeout,
         "map_over_values": [str(i) for i in indexes],
         "env": environ,
@@ -604,6 +650,8 @@ def submit_shard_stage(
         vm_type=kwargs["vm_type"],
         name=name,
         submission_round=submission_round,
+        retries=retries,
+        forwarded=_forwarded_lst(environ),
     )
     result = coiled.batch_run(**kwargs)
     submission = StageSubmission(
@@ -954,6 +1002,7 @@ def submit_fleet_stage(
         msg = f"no units to submit for stage {stage!r}"
         raise ValueError(msg)
 
+    retries = _effective_retries(stage=stage)
     pairs = [(str(tile), int(index)) for tile, index in units]
     command = _fleet_task_command(stage=stage, run_id=run_id, units=fleet_units)
     environ = _worker_environ()
@@ -971,7 +1020,7 @@ def submit_fleet_stage(
         # anyone choosing it.
         "spot_policy": settings.shard_spot_policy,
         "max_workers": workers,
-        "max_retries": settings.coiled_retries,
+        "max_retries": retries,
         "job_timeout": settings.coiled_job_timeout,
         "map_over_values": [shards.fleet_unit_token(tile, index) for tile, index in pairs],
         "env": environ,
@@ -996,6 +1045,8 @@ def submit_fleet_stage(
         max_workers=workers,
         vm_type=kwargs["vm_type"],
         name=name,
+        retries=retries,
+        forwarded=_forwarded_lst(environ),
     )
     result = coiled.batch_run(**kwargs)
     submission = FleetStageSubmission(

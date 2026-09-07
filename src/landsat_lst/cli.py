@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import click
 from rich.console import Console
@@ -2268,7 +2268,7 @@ def shard_process(
         # The CLI already checked this exact balance before printing the run id.
         # Reuse it so the driver's defensive preflight does not ask twice.
         summary = drive_tile(job, run_id=run_id, balance_source=lambda: balance)
-    except (ShardStageFailed, ShardBackendMismatch) as e:
+    except (ShardStageFailed, ShardBackendMismatch, quota.SessionExpiryRefused) as e:
         raise click.ClickException(str(e)) from e
 
     _print_shard_summary(summary)
@@ -2299,10 +2299,182 @@ def shard_resume(run_id: str, tile: str, ack_quota: bool) -> None:
         quota.IdentityRefused,
         quota.WriteAccessRefused,
         quota.QuotaRefused,
+        quota.SessionExpiryRefused,
     ) as e:
         raise click.ClickException(str(e)) from e
 
     _print_shard_summary(summary)
+
+
+@shard.command("reconcile")
+@click.argument("run_id")
+@click.option("-t", "--tile", default=None, help="One tile; default is every tile in the run")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of tables")
+@click.option(
+    "--no-coiled", is_flag=True, help="Skip the Coiled task records, which carry the exit codes"
+)
+def shard_reconcile(run_id: str, tile: str | None, as_json: bool, no_coiled: bool) -> None:
+    """Report what a sharded run did: per stage, done, missing, and why.
+
+    `landsat-lst reconcile` reads `_runs/`, where a batch run's records live. A
+    sharded run publishes under `_shards/`, so it needs its own reader. Without
+    one, the postmortem of the three S30W065 runs on 2026-09-04 was done by
+    hand out of the state objects, the Coiled task records, and the billing.
+
+    Reads only. Safe while the run is still going, and safe to repeat.
+    """
+    import json as json_module
+
+    from landsat_lst.shard_report import reconcile_shard_run
+
+    report = reconcile_shard_run(run_id, tile=tile, task_states={} if no_coiled else None)
+    if not report.tiles:
+        raise click.ClickException(f"run {run_id!r} published nothing under _shards/")
+
+    if as_json:
+        console.print_json(json_module.dumps(report.to_dict(), default=str))
+        return
+
+    for tile_report in report.tiles:
+        _print_shard_report(tile_report)
+
+
+def _print_shard_report(report) -> None:
+    """One tile: a stage table, then every index that did not finish."""
+    from rich.table import Table
+
+    from landsat_lst.render import format_duration, truncate
+
+    if report.completed:
+        verdict = "[green]complete[/green]"
+    else:
+        verdict = f"[red]incomplete: {report.missing} shard artifact(s) missing[/red]"
+    console.print(f"[bold]{report.tile}[/bold] {report.window}  {verdict}")
+    if report.cogs_present and not report.completed:
+        console.print(
+            "  [yellow]COGs exist at the canonical key, and this run did not write them"
+            "[/yellow] -- the key is a function of window and tile, so an earlier run's"
+            " product sits there."
+        )
+    if report.staged_objects:
+        console.print(
+            f"  [yellow]{report.staged_objects} staged object(s) still under stage/[/yellow]"
+            f"  -- landsat-lst shard gc {report.tile}"
+        )
+
+    table = Table(show_header=True)
+    for column in ("stage", "done", "missing", "rounds", "attempts"):
+        table.add_column(column, justify="left" if column == "stage" else "right")
+    for stage in report.stages:
+        attempts = sum(len(a) for a in stage.attempts.values())
+        table.add_row(
+            stage.stage,
+            f"{len(stage.done)}/{stage.expected}",
+            str(len(stage.missing)),
+            str(stage.rounds),
+            str(attempts),
+        )
+    console.print(table)
+
+    for stage in report.stages:
+        if not stage.missing:
+            continue
+        console.print(f"  [red]{stage.stage} missing:[/red] {_compact(stage.missing)}")
+        for index in stage.missing:
+            for attempt in stage.attempts.get(index, []):
+                exit_note = "" if attempt.exit_code is None else f", exit {attempt.exit_code}"
+                console.print(
+                    f"    {index:>4}.{attempt.attempt}  {attempt.phase or '-':<12}"
+                    f" {format_duration(attempt.elapsed_s):>8}"
+                    f"  peak {(attempt.peak_rss_mb or 0) / 1024:.1f}G"
+                    f"  {attempt.instance_type or '-'}{exit_note}"
+                )
+                if attempt.error:
+                    console.print(f"      [red]{truncate(attempt.error, 160)}[/red]")
+
+
+def _compact(indexes) -> str:
+    """``3, 4, 5, 6, 8`` as ``3-6, 8``, because a missing set is usually runs."""
+    if not indexes:
+        return "-"
+    spans, start, previous = [], indexes[0], indexes[0]
+    for index in indexes[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        spans.append((start, previous))
+        start = previous = index
+    spans.append((start, previous))
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in spans)
+
+
+class _StageRow(NamedTuple):
+    """One tile's coarse stage, as ``shard gc`` reports it."""
+
+    tile: str
+    prefix: str
+    objects: int
+    deleted: int
+
+
+@shard.command("gc")
+@click.argument("run_id")
+@click.option("-t", "--tile", default=None, help="One tile; default is every tile in the run")
+@click.option("--delete", is_flag=True, help="Remove the staged objects, not just count them")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table")
+def shard_gc(run_id: str, tile: str | None, delete: bool, as_json: bool) -> None:
+    """List, and with --delete remove, a run's staged coarse observations.
+
+    Phase A stages its coarse reads so phase B stops re-reading the sources.
+    That is 8,424 objects and 167 GB for one S30W065 tile, and a driver killed
+    before it could sweep leaves every one of them. The driver now sweeps on
+    every terminal path; this is for the runs that died before it did.
+
+    Safe to run against a live run only in list mode. Deleting a stage a
+    running phase B is still reading will make that phase re-read the sources,
+    which is slower rather than wrong -- but check with `shard reconcile` first.
+    """
+    import json as json_module
+
+    from landsat_lst import shards
+    from landsat_lst.storage import get_storage
+
+    storage = get_storage()
+    if tile:
+        tiles = [tile]
+    else:
+        listing = storage.list_prefix(f"{shards.SHARD_PREFIX}/{run_id}/")
+        tiles = shards.run_tiles(listing, run_id)
+    if not tiles:
+        raise click.ClickException(f"run {run_id!r} published nothing under {shards.SHARD_PREFIX}/")
+
+    rows: list[_StageRow] = []
+    for name in tiles:
+        prefix = shards.tile_stage_prefix(shards.shard_root(run_id, name))
+        objects = len(storage.list_prefix(prefix))
+        removed = storage.delete_prefix(prefix) if delete and objects else 0
+        rows.append(_StageRow(tile=name, prefix=prefix, objects=objects, deleted=removed))
+
+    if as_json:
+        payload = {"run_id": run_id, "tiles": [row._asdict() for row in rows]}
+        console.print_json(json_module.dumps(payload))
+        return
+
+    from rich.table import Table
+
+    table = Table(title=f"Staged coarse observations for {run_id}")
+    table.add_column("tile")
+    table.add_column("objects", justify="right")
+    table.add_column("deleted", justify="right")
+    table.add_column("prefix")
+    for row in rows:
+        table.add_row(row.tile, str(row.objects), str(row.deleted), row.prefix)
+    console.print(table)
+    total = sum(row.objects for row in rows)
+    if not delete and total:
+        console.print(
+            f"  Nothing removed. Re-run with [bold]--delete[/bold] to free {total} objects."
+        )
 
 
 def _print_shard_summary(summary) -> None:
@@ -2576,6 +2748,7 @@ def shard_resume_fleet(
         quota.IdentityRefused,
         quota.WriteAccessRefused,
         quota.QuotaRefused,
+        quota.SessionExpiryRefused,
     ) as e:
         raise click.ClickException(str(e)) from e
 

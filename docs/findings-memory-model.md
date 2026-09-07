@@ -48,6 +48,7 @@ locally for the same reason, and `plan` carries `--max-tasks`.
 
 ```bash
 export LST_COILED_RETRIES=0        # a retry would destroy the evidence
+export LST_ALLOW_ZERO_RETRIES=1    # and say the single attempt is deliberate
 landsat-lst benchmark --distributed
 landsat-lst benchmark --fetch <run-id>
 ```

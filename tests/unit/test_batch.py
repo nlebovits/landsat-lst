@@ -1198,6 +1198,66 @@ class TestSubmitFleetStage:
             with pytest.raises(ValueError, match="malformed fleet unit token"):
                 parse_fleet_unit(bad)
 
+
+class TestZeroRetries:
+    """The Sep 4 defect: one shell export, and a killed task is never replaced.
+
+    ``job._worker_environ`` forwards every ``LST_`` variable, so an exec-trace
+    session that set ``LST_COILED_RETRIES=0`` left it set for the production run
+    that followed. Eleven SIGKILLed composite tasks were marked failed, eleven
+    replacement VMs ran nothing, and the cluster stopped with 11 of 35 bands
+    missing.
+    """
+
+    def test_a_shard_stage_refuses_zero_retries(self, fake_coiled, monkeypatch):
+        from landsat_lst.batch import ZeroRetriesRefused, submit_shard_stage
+
+        monkeypatch.setenv("LST_COILED_RETRIES", "0")
+        monkeypatch.setattr(settings, "coiled_retries", 0)
+
+        with pytest.raises(ZeroRetriesRefused, match="LST_ALLOW_ZERO_RETRIES"):
+            submit_shard_stage(stage="composite", run_id="r1", tile="N40W075", indexes=[0, 1])
+
+        assert "map_over_values" not in fake_coiled, "nothing may reach coiled"
+
+    def test_a_fleet_wave_refuses_zero_retries(self, fake_coiled, monkeypatch):
+        from landsat_lst.batch import ZeroRetriesRefused, submit_fleet_stage
+
+        monkeypatch.setattr(settings, "coiled_retries", 0)
+
+        with pytest.raises(ZeroRetriesRefused, match="LST_ALLOW_ZERO_RETRIES"):
+            submit_fleet_stage(stage="composite", run_id="r1", units=[("N40W075", 0)])
+
+        assert "map_over_values" not in fake_coiled
+
+    def test_an_explicit_flag_permits_one_attempt(self, fake_coiled, monkeypatch):
+        """A single-shard diagnostic says so in the same shell that asks for it."""
+        from landsat_lst.batch import submit_shard_stage
+
+        monkeypatch.setattr(settings, "coiled_retries", 0)
+        monkeypatch.setattr(settings, "allow_zero_retries", True)
+
+        submit_shard_stage(stage="composite", run_id="r1", tile="N40W075", indexes=[0])
+
+        assert fake_coiled["max_retries"] == 0
+
+    def test_the_submission_log_carries_the_forwarded_variables(self, fake_coiled, monkeypatch):
+        """What one shell's exports did to a run, readable in the driver log."""
+        import structlog
+
+        from landsat_lst.batch import submit_shard_stage
+
+        monkeypatch.setenv("LST_EXEC_TRACE", "1")
+        monkeypatch.setattr(settings, "coiled_retries", 3)
+
+        with structlog.testing.capture_logs() as logs:
+            submit_shard_stage(stage="composite", run_id="r1", tile="N40W075", indexes=[0])
+
+        line = next(entry for entry in logs if entry["event"] == "shard_stage_submit")
+        assert line["retries"] == 3
+        assert line["forwarded"]["LST_EXEC_TRACE"] == "1"
+        assert not any(key.startswith("AWS_") for key in line["forwarded"])
+
     def test_an_empty_wave_is_refused(self, fake_coiled):
         from landsat_lst.batch import submit_fleet_stage
 

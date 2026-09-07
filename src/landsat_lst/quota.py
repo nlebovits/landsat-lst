@@ -54,8 +54,11 @@ catches that case.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from math import isfinite
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -205,6 +208,183 @@ def preflight_identity(*, caller: Callable[[], dict] | None = None) -> str:
     arn = str(identity.get("Arn", "")) if isinstance(identity, dict) else ""
     log.info("identity_preflight_ok", arn=arn or "unknown")
     return arn
+
+
+class SessionExpiryRefused(RuntimeError):
+    """The AWS session expires before this tile can finish."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _sso_cache_dir() -> Path:
+    """Where botocore keeps SSO tokens. One place, and it is not configurable."""
+    return Path.home() / ".aws" / "sso" / "cache"
+
+
+def _sso_token_expiry(profile: str) -> datetime | None:
+    """The cached SSO token's expiry for ``profile``, from disk alone.
+
+    Resolved the way botocore resolves it, through ``SSOTokenLoader``: the
+    cache file is named by the sha1 of the ``sso_session`` name, or of the
+    ``sso_start_url`` for the older profile shape that names the start URL
+    directly. Both shapes are in use, and this repo's profile is the older one.
+
+    No network call and no credential resolution, so it is safe on a
+    credential-less machine and costs nothing on a run that is fine.
+    """
+    from botocore.exceptions import ProfileNotFound  # noqa: PLC0415
+    from botocore.session import Session  # noqa: PLC0415
+    from botocore.utils import JSONFileCache, SSOTokenLoader  # noqa: PLC0415
+
+    try:
+        config = Session(profile=profile).get_scoped_config()
+    except ProfileNotFound:
+        return None
+    start_url = config.get("sso_start_url")
+    session_name = config.get("sso_session")
+    if not start_url and not session_name:
+        return None
+    try:
+        token = SSOTokenLoader(cache=JSONFileCache(str(_sso_cache_dir())))(
+            start_url or "", session_name
+        )
+    except Exception:
+        return None
+    return _parse_expiry(token.get("expiresAt"))
+
+
+def _role_cache_expiry(profile: str) -> datetime | None:
+    """The assume-role cache's earliest expiry, for a profile that is not SSO.
+
+    ``~/.aws/cli/cache`` holds one file per assumed role, and the file does not
+    name its profile, so no entry can be attributed to ``profile``. The
+    **earliest** expiry among them is therefore the answer: this feeds a gate,
+    and a gate that reports the longest-lived of several cached roles hides the
+    short-lived one that is actually in use, which is the direction that lets a
+    run start and then die. Absent entirely on the usual laptop, where an SSO
+    token answers first.
+    """
+    del profile
+    directory = Path.home() / ".aws" / "cli" / "cache"
+    earliest: datetime | None = None
+    try:
+        files = sorted(directory.glob("*.json"))
+    except OSError:
+        return None
+    for path in files:
+        try:
+            body = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        expiry = _parse_expiry(body.get("Credentials", {}).get("Expiration"))
+        if expiry is not None and (earliest is None or expiry < earliest):
+            earliest = expiry
+    return earliest
+
+
+def _parse_expiry(raw: object) -> datetime | None:
+    """An ISO-8601 stamp from a cache file, as an aware UTC datetime."""
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=UTC)
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def session_expiry(profile: str | None = None) -> datetime | None:
+    """When the AWS session the *workers* will run on stops working.
+
+    The environment comes first, because ``job._worker_environ`` reads it
+    first: an exported ``AWS_ACCESS_KEY_ID`` is what gets frozen onto every VM,
+    and the profile's cache then describes a session nothing in the run uses.
+    Reading the profile anyway is wrong in both directions -- a long-lived
+    profile token passes a run whose exported credentials expire in ten
+    minutes, and a stale one refuses a run that would have worked. Only with no
+    exported credentials does this fall through to the profile.
+
+    ``None`` means unknown, never "does not expire". A static key pair, an
+    exported session with no ``AWS_CREDENTIAL_EXPIRATION`` (nothing sets that
+    by rule), a profile shape this does not read, and a missing cache file all
+    look the same from here, and only some of them are a problem.
+    """
+    import os  # noqa: PLC0415
+
+    if os.environ.get("AWS_ACCESS_KEY_ID"):
+        return _parse_expiry(os.environ.get("AWS_CREDENTIAL_EXPIRATION"))
+    name = profile or settings.aws_profile
+    if not name:
+        return None
+    return _sso_token_expiry(name) or _role_cache_expiry(name)
+
+
+def preflight_session_lifetime(
+    *,
+    needed_s: float,
+    profile: str | None = None,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Refuse a tile whose budget outlives the credentials it would run on.
+
+    ``preflight_identity`` asks whether the session works. This asks how long
+    it has left, which is the question that mattered on 2026-09-04: the
+    identity gate passed at 16:04 and the composite overlap submission failed
+    with ``UnauthorizedSSOTokenError`` at 16:23, eighteen minutes later and
+    hours before the tile could have finished.
+
+    An unreadable expiry warns and proceeds. A session that is missing outright
+    is already the identity gate's job, and refusing on a cache shape this does
+    not parse would refuse a machine that is fine.
+
+    Args:
+        needed_s: The tile's horizon in seconds, summed over its stage budgets.
+        profile: Whose session. Defaults to ``settings.aws_profile``, the
+            profile every worker's frozen credentials come from.
+        now: Injectable clock, for tests.
+
+    Returns:
+        The expiry, or ``None`` when it could not be read.
+
+    Raises:
+        SessionExpiryRefused: If the session ends before the tile would.
+    """
+    name = profile or settings.aws_profile
+    expiry = session_expiry(name)
+    if expiry is None:
+        log.warning(
+            "session_expiry_unknown",
+            profile=name or "default",
+            needed_min=round(needed_s / 60, 1),
+        )
+        return None
+
+    moment = now or datetime.now(UTC)
+    remaining_s = (expiry - moment).total_seconds()
+    if remaining_s < needed_s:
+        short_min = round((needed_s - remaining_s) / 60, 1)
+        msg = (
+            f"the AWS session for profile {name!r} expires at "
+            f"{expiry.isoformat()}, {round(remaining_s / 60, 1)} minutes from now, "
+            f"and this tile is budgeted {round(needed_s / 60, 1)} minutes -- "
+            f"{short_min} minutes short. Every worker runs on credentials frozen "
+            f"at submission, so the run would fail partway with nothing to resume "
+            f"from. Run: {_sso_login_hint()}"
+        )
+        raise SessionExpiryRefused(msg)
+
+    log.info(
+        "session_lifetime_ok",
+        profile=name or "default",
+        expires_at=expiry.isoformat(),
+        remaining_min=round(remaining_s / 60, 1),
+        needed_min=round(needed_s / 60, 1),
+    )
+    return expiry
 
 
 #: Where a probe object is written. Deliberately disjoint from
@@ -768,6 +948,33 @@ def estimate_run_credits(plan: TilePlan | None = None, *, units: int | None = No
     stays comparable to an invoice.
     """
     return credits_for_fleets(run_fleets(plan, units=units))
+
+
+#: The stages ``budgets`` prices, in the order they run. A tile's horizon is
+#: their sum, because a barrier does not open until the one before it closes.
+BUDGET_STAGES = ("offsets", "composite", "export")
+
+
+def tile_horizon_s(plan: TilePlan | None = None) -> float:
+    """How long one tile may run, from the same model that prices it.
+
+    The span a single set of frozen worker credentials has to cover. With a
+    plan it is the sum of that tile's stage deadlines; without one it is the
+    pre-plan projection ``run_fleets`` already trusts, which is what the fleet
+    preflight has to work from because no tile has resolved yet.
+
+    Multiplied by ``settings.shard_barrier_rounds`` in both forms, because a
+    stage that expires resubmits against a *fresh* deadline: the ceiling is
+    rounds times the budget. On the retained S30W065 plan the one-round sum is
+    1.95 h against a real ceiling of 3.90 h.
+    """
+    rounds = max(1, settings.shard_barrier_rounds)
+    if plan is not None:
+        from landsat_lst import budgets  # noqa: PLC0415
+
+        return sum(budgets.stage_budget(s, plan).deadline_s for s in BUDGET_STAGES) * rounds
+    # Per-VM wall hours, which is what a stage's slowest worker spends.
+    return sum(hours for _size, _cpus, hours in run_fleets()) * 3600.0 * rounds
 
 
 def _prompt_for_limit(balance: CreditBalance, estimated: float, needed: float) -> float | None:

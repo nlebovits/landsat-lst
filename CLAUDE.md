@@ -731,6 +731,8 @@ by a **local driver polling S3**. See [ADR-016](docs/adr/016-sharded-tile-execut
 landsat-lst shard process --tile N40W075     # drives the whole tile; prints a run id
 landsat-lst shard resume <run-id> N40W075    # continues a killed driver, from the bucket
 landsat-lst shard composite --run-id <id> --tile N40W075 --index 3   # what a VM runs
+landsat-lst shard reconcile <run-id>         # per stage: done, missing, phases, exit codes
+landsat-lst shard gc <run-id> [--delete]     # what phase A staged and never swept
 ```
 
 Rules worth keeping:
@@ -788,6 +790,26 @@ Rules worth keeping:
   gets its healthy fleet killed mid-stage (2026-08-22, 400 credits) and its cluster
   creates rejected with an *empty* `ServerError`. `--ack-quota` is the escape when no
   balance can be read.
+- **A working session is not a long enough one, so a fourth gate reads its expiry.**
+  `quota.preflight_session_lifetime` refuses a run whose horizon ends after the session
+  does. On 2026-09-04 the identity gate passed at 16:04 and the composite overlap
+  submission failed with `UnauthorizedSSOTokenError` at 16:23. An unreadable expiry warns
+  and proceeds: unknown is not "does not expire", and a missing session is already the
+  identity gate's job. Three things decide whether it is measuring anything real:
+  - **It reads the environment before the profile**, because `job._worker_environ` does.
+    An exported `AWS_ACCESS_KEY_ID` is what gets frozen onto every VM, and the profile's
+    cache then describes a session no worker touches — wrong in both directions, since a
+    long-lived profile token passes a run whose exported credentials die in ten minutes.
+    An exported session with no `AWS_CREDENTIAL_EXPIRATION` is unknown, not assumed good.
+  - **The horizon counts every round.** A stage that expires resubmits against a *fresh*
+    deadline, so the ceiling is `shard_barrier_rounds` times the summed budgets: 3.90 h on
+    the retained S30W065 plan against a one-round sum of 1.95 h. Understating it errs by
+    passing, which is the one direction a gate must not err in. `quota.tile_horizon_s` owns
+    both forms, with and without a plan, so the two drivers cannot disagree.
+  - **The fleet path gates on one tile, not on the roster.** Every wave re-freezes the
+    credentials current at its submission, so one freeze has to cover one tile's stages.
+    Pricing 700 tiles would refuse every large build outright, and a gate that refuses the
+    only run anyone wants is a gate that gets deleted.
 - **A valid identity is not a permitted one, so `quota.preflight_write_access` probes.**
   It writes one object under `{s3_prefix}/_preflight/`, reads it back, lists that exact
   key, and deletes it. All four: listing proves the bucket-level permission every barrier
@@ -829,15 +851,55 @@ Rules worth keeping:
   tile now with the reason surfaced; everything else — **including an error with no
   message** — is transient and retried with backoff. An empty `ServerError` killed the
   driver once; guessing "terminal" for the unknown case would bring that back.
-- **A cluster reported dead ends its barrier early.** The probe can only end a barrier
-  *sooner*, never declare success, and a dead report is re-checked against the bucket
-  first (a fleet whose last task uploaded and then stopped is a finished stage).
+- **A cluster reported dead expires its round, and never the tile.** The probe can only
+  end a barrier *sooner*, never declare success, and a dead report is re-checked against
+  the bucket first (a fleet whose last task uploaded and then stopped is a finished
+  stage). What follows is the ordinary expiry path: the next round resubmits the missing
+  indexes alone. Raising instead killed all three runs on 2026-09-04 —
+  `("stopped", "No pending tasks for batch run")` is what Coiled says about *every* batch
+  run that ends, so the driver died with 24 of 35 composite bands in the bucket, and every
+  resume died the same way inside the round deadline. A record whose cluster the probe
+  reported dead is also dead for `_is_live`, or `check` re-adopts the fleet it just buried.
+- **A stage whose canonical output exists is skipped, not re-run.** The offsets estimate is
+  keyed by scene set, not by run id, so an earlier run over the same scenes already
+  answered. `shard_tasks.offsets_record_present` is the one check the merge, both drivers,
+  and every offsets shard share. Asking needs a plan — the key's digest covers the sorted
+  scene ids — so a fresh run asks once shard 0 publishes one, and its shards exit before
+  reducing anything. All three Sep 4 runs paid a 15-VM fleet against a record that had
+  existed since 08:39 UTC. Two rules keep the check honest:
+  - **Every shard asks on every boot, so the driver asks on every poll.** The tile driver
+    used to ask once, before the barrier. A record landing after that — a concurrent run
+    over the same scene set, or one failed read at that instant — made each shard exit
+    without a partial and left the barrier waiting for work nobody would do, through both
+    rounds, and then failed the tile with the record sitting in the bucket. That is what
+    `StageMachine.early_settle` is: a second, cheaper way for a stage to be over, asked
+    before every round and on every poll. `settled_early` on the outcome is how the tail
+    knows not to raise over artifacts the stage no longer owes.
+  - **Hand it the plan you already hold.** Resolving one costs a read and a parse of
+    `items.json`, which this question never looks at: 111 MB and 3.4 s of pystac for
+    S30W065's 4,403 scenes. The fleet driver asks once per poll per tile and keeps a plan
+    on the track, so re-resolving there put ~10 GB and ~320 s of CPU into one tile's
+    offsets stage against a 20 s poll cadence — requests scaling with tiles driven, which
+    is the thing ADR-018 exists to avoid.
+- **The coarse stage is swept on every terminal path.** Phase A's staging is 8,424 objects
+  and 167 GB for one tile. Sweeping only inside the offsets barrier's `except` left that
+  behind for both runs that died in the composite stage. `landsat-lst shard gc` lists a
+  level above `staging.StageKey.prefix`, so it also catches a stage orphaned by a digest
+  the current plan does not name.
+- **`coiled_retries` is never 0 by accident.** `job._worker_environ` forwards every `LST_`
+  variable, so an exec-trace shell's `LST_COILED_RETRIES=0` reached the production run that
+  followed, and eleven SIGKILLed tasks were marked failed rather than replaced. Both
+  submitters refuse it unless `LST_ALLOW_ZERO_RETRIES` says the single attempt is
+  deliberate, and each submission logs its retry count beside the whole forwarded `LST_`
+  environment.
 - **The driver takes an injectable `Clock`.** `tests/unit/test_driver_state_machine.py`
   runs 45 scenarios in under a second. Both defects above are time arithmetic; time
   arithmetic that cannot be tested is time arithmetic nobody checks.
 - **Failure is bounded.** On barrier expiry the driver resubmits *only the missing
   indexes*, at most `shard_barrier_rounds` submissions per stage **counted across
-  drivers**, then fails naming the keys. Per-driver counting would hand every resume a
+  drivers**, then fails naming the keys. Counted across drivers means a resume of an
+  exhausted stage submits nothing and fails identically, so the failure names
+  `LST_SHARD_BARRIER_ROUNDS` as the way to let one continue. Per-driver counting would hand every resume a
   fresh budget. A fleet that resent the whole stage would also finish, which is why the
   test asserts on which indexes the second call carried.
 - **Row bands only, never column bands.** `odc-stac` derives its `solar_day` shift from
