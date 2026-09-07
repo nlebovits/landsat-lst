@@ -485,6 +485,16 @@ class Settings(BaseSettings):
         "and transient object-store failures; a tile that fails deterministically "
         "burns all three and then reports.",
     )
+    allow_zero_retries: bool = Field(
+        default=False,
+        description="Permit a submission with coiled_retries == 0. Off, because "
+        "a shell that exported LST_COILED_RETRIES=0 for a single-shard "
+        "diagnostic leaks it into every later run: job._worker_environ forwards "
+        "every LST_ variable, so on 2026-09-04 eleven SIGKILLed composite tasks "
+        "were never replaced and the cluster stopped with 11 of 35 bands "
+        "missing. A diagnostic that genuinely wants one attempt sets this "
+        "alongside the retry count and says so.",
+    )
     coiled_region: str = Field(
         default="us-west-2",
         description="Cloud region for Coiled workers. Must match the Landsat "

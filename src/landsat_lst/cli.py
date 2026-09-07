@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import click
 from rich.console import Console
@@ -2268,7 +2268,7 @@ def shard_process(
         # The CLI already checked this exact balance before printing the run id.
         # Reuse it so the driver's defensive preflight does not ask twice.
         summary = drive_tile(job, run_id=run_id, balance_source=lambda: balance)
-    except (ShardStageFailed, ShardBackendMismatch) as e:
+    except (ShardStageFailed, ShardBackendMismatch, quota.SessionExpiryRefused) as e:
         raise click.ClickException(str(e)) from e
 
     _print_shard_summary(summary)
@@ -2299,10 +2299,80 @@ def shard_resume(run_id: str, tile: str, ack_quota: bool) -> None:
         quota.IdentityRefused,
         quota.WriteAccessRefused,
         quota.QuotaRefused,
+        quota.SessionExpiryRefused,
     ) as e:
         raise click.ClickException(str(e)) from e
 
     _print_shard_summary(summary)
+
+
+class _StageRow(NamedTuple):
+    """One tile's coarse stage, as ``shard gc`` reports it."""
+
+    tile: str
+    prefix: str
+    objects: int
+    deleted: int
+
+
+@shard.command("gc")
+@click.argument("run_id")
+@click.option("-t", "--tile", default=None, help="One tile; default is every tile in the run")
+@click.option("--delete", is_flag=True, help="Remove the staged objects, not just count them")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table")
+def shard_gc(run_id: str, tile: str | None, delete: bool, as_json: bool) -> None:
+    """List, and with --delete remove, a run's staged coarse observations.
+
+    Phase A stages its coarse reads so phase B stops re-reading the sources.
+    That is 8,424 objects and 167 GB for one S30W065 tile, and a driver killed
+    before it could sweep leaves every one of them. The driver now sweeps on
+    every terminal path; this is for the runs that died before it did.
+
+    Safe to run against a live run only in list mode. Deleting a stage a
+    running phase B is still reading will make that phase re-read the sources,
+    which is slower rather than wrong -- but check with `shard reconcile` first.
+    """
+    import json as json_module
+
+    from landsat_lst import shards
+    from landsat_lst.storage import get_storage
+
+    storage = get_storage()
+    if tile:
+        tiles = [tile]
+    else:
+        listing = storage.list_prefix(f"{shards.SHARD_PREFIX}/{run_id}/")
+        tiles = shards.run_tiles(listing, run_id)
+    if not tiles:
+        raise click.ClickException(f"run {run_id!r} published nothing under {shards.SHARD_PREFIX}/")
+
+    rows: list[_StageRow] = []
+    for name in tiles:
+        prefix = shards.tile_stage_prefix(shards.shard_root(run_id, name))
+        objects = len(storage.list_prefix(prefix))
+        removed = storage.delete_prefix(prefix) if delete and objects else 0
+        rows.append(_StageRow(tile=name, prefix=prefix, objects=objects, deleted=removed))
+
+    if as_json:
+        payload = {"run_id": run_id, "tiles": [row._asdict() for row in rows]}
+        console.print_json(json_module.dumps(payload))
+        return
+
+    from rich.table import Table
+
+    table = Table(title=f"Staged coarse observations for {run_id}")
+    table.add_column("tile")
+    table.add_column("objects", justify="right")
+    table.add_column("deleted", justify="right")
+    table.add_column("prefix")
+    for row in rows:
+        table.add_row(row.tile, str(row.objects), str(row.deleted), row.prefix)
+    console.print(table)
+    total = sum(row.objects for row in rows)
+    if not delete and total:
+        console.print(
+            f"  Nothing removed. Re-run with [bold]--delete[/bold] to free {total} objects."
+        )
 
 
 def _print_shard_summary(summary) -> None:
@@ -2576,6 +2646,7 @@ def shard_resume_fleet(
         quota.IdentityRefused,
         quota.WriteAccessRefused,
         quota.QuotaRefused,
+        quota.SessionExpiryRefused,
     ) as e:
         raise click.ClickException(str(e)) from e
 

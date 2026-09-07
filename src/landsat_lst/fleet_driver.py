@@ -646,6 +646,9 @@ class TileTrack:
     _overlap_demanded: bool = False
     #: When this tile was first seen without a plan, for the bootstrap deadline.
     _bootstrap_since: float | None = None
+    #: Whether this tile's coarse stage has been swept. The sweep is idempotent
+    #: but it costs a listing, and a terminal tile is stepped again every poll.
+    _swept: bool = False
 
     def __post_init__(self) -> None:
         self.outcome = TileOutcome(tile=self.tile)
@@ -682,6 +685,7 @@ class TileTrack:
         self.outcome.failed = True
         self.outcome.reason = reason
         self.outcome.stage = self.stage
+        self._sweep_stage()
         log.error(
             "fleet_tile_failed",
             run_id=self.run_id,
@@ -689,6 +693,28 @@ class TileTrack:
             stage=self.stage,
             reason=reason,
         )
+
+    def _offsets_cached(self) -> bool:
+        """Whether the canonical offsets record already covers this tile."""
+        try:
+            return shard_tasks.offsets_record_present(self.run_id, self.tile, storage=self.storage)
+        except Exception as exc:
+            log.warning("fleet_offsets_cache_check_failed", tile=self.tile, error=repr(exc)[:200])
+            return False
+
+    def _sweep_stage(self) -> None:
+        """Drop this tile's coarse stage. Best-effort, and never twice.
+
+        Phase A stages its coarse observations so phase B stops re-reading the
+        sources (issue #125): 8,424 objects and 167 GB for one S30W065 tile. A
+        tile that is over -- done or given up -- will never read them again,
+        and at 700 tiles an unswept stage is the bucket's problem rather than
+        the run's.
+        """
+        if self._swept:
+            return
+        self._swept = True
+        shard_tasks.sweep_coarse_stage(self.run_id, self.tile, storage=self.storage)
 
     def _advance(self, stage: str) -> None:
         # A settled stage holds no workers: every artifact it was waiting on is
@@ -782,6 +808,16 @@ class TileTrack:
             self.outstanding["offsets"] = set(range(self.units))
             return self._demand("offsets", tuple(range(self.units)), *_bootstrap_terms())
 
+        # An earlier run over the same scenes already produced the record this
+        # stage exists to write. The key is by scene set, not by run id, so a
+        # fresh fleet inherits it -- and asking costs one read against a stage
+        # that costs a fleet. See shard_tasks.offsets_record_present.
+        if self._offsets_cached():
+            log.info("fleet_offsets_cache_hit", run_id=self.run_id, tile=self.tile)
+            self.outstanding.pop("offsets", None)
+            self._advance("merge")
+            return None
+
         missing = _missing(
             self.storage,
             _stage_prefix(self.root, "offsets"),
@@ -865,6 +901,7 @@ class TileTrack:
             self.outcome.completed = True
             self.outstanding.pop("export", None)
             self.done_stages.add("export")
+            self._sweep_stage()
             log.info("fleet_tile_done", run_id=self.run_id, tile=self.tile)
             return None
         if self._export_since is None:

@@ -296,11 +296,15 @@ then reported. Guessing "terminal" for the unknown case would reintroduce the fa
 where an empty `ServerError` killed the driver outright.
 
 At barrier level the driver also probes the round's cluster (`coiled.list_clusters`).
-A cluster reported `error` or `stopped` while artifacts are missing raises
-`ShardFleetKilled` with the reason attached, rather than waiting out the barrier — a
-killed fleet produces no artifacts and never will. The probe can only end a barrier
-*sooner*; it never declares success, and a dead report is re-checked against the bucket
-first, because a fleet whose last task uploaded and then stopped is a finished stage.
+A cluster reported `error` or `stopped` while artifacts are missing ends that round
+immediately, exactly as a deadline would, and the next round resubmits the missing
+indexes alone. A killed fleet produces no artifacts and never will, so waiting out the
+barrier buys nothing; failing the tile costs more. `("stopped", "No pending tasks for
+batch run")` is Coiled's ordinary end-of-batch report, and reading it as a kill aborted
+the driver on 2026-09-04 with 24 of 35 composite bands already in the bucket. The probe
+can only end a barrier *sooner*; it never declares success, and a dead report is
+re-checked against the bucket first, because a fleet whose last task uploaded and then
+stopped is a finished stage.
 
 ### Nothing submits before the quota is checked
 

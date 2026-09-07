@@ -157,23 +157,6 @@ class ShardSubmissionFailed(RuntimeError):
         super().__init__(f"could not start stage {stage!r} after {attempts} attempt(s): {reason}")
 
 
-class ShardFleetKilled(RuntimeError):
-    """A stage's cluster is in an error state, and the driver noticed early.
-
-    Distinct from a barrier expiry on purpose. A fleet Coiled has already torn
-    down produces no artifacts and never will, so waiting out the deadline buys
-    nothing and costs the whole barrier -- which is exactly what happened when
-    the workspace hit its 400-credit quota mid-run and the driver read the
-    silence as slow shards.
-    """
-
-    def __init__(self, stage: str, reason: str, *, cluster: object = None) -> None:
-        self.stage = stage
-        self.reason = reason
-        self.cluster = cluster
-        super().__init__(f"stage {stage!r} cluster stopped: {reason}")
-
-
 def _coiled_credentials_present() -> bool:
     """Whether a coiled token is configured, without touching the network."""
     import os  # noqa: PLC0415
@@ -547,8 +530,8 @@ class StageMachine:
         check --(no rounds left)---> exhausted
         watch --(all artifacts)----> settled
         watch --(deadline)---------> check
+        watch --(cluster stopped)--> check
         submit --(terminal error)--> ShardSubmissionFailed
-        watch  --(cluster error)---> ShardFleetKilled
 
     Three rules the states exist to keep honest:
 
@@ -558,7 +541,10 @@ class StageMachine:
       at T+45 and failed instantly, having watched for nothing.
     - **Artifacts decide, not clusters.** The cluster probe can only make a
       barrier end *sooner*; it never declares success, and a cluster reported
-      dead is re-checked against the bucket before the stage fails.
+      dead is re-checked against the bucket first. A stopped fleet expires the
+      round rather than the tile, because ``("stopped", "No pending tasks for
+      batch run")`` is what Coiled says about a batch run that has ended for
+      any reason at all.
     - **The round budget is counted across drivers**, from the submission
       records, so a resume cannot mint itself a fresh allowance.
     """
@@ -577,6 +563,10 @@ class StageMachine:
     job: ProcessingJob | None = None
     units: int | None = None
     on_poll: Callable[[], None] | None = None
+    #: Cluster ids the probe has reported stopped or errored. A record naming
+    #: one is dead however young it is, so ``check`` opens the next round
+    #: instead of re-adopting a fleet that has already been torn down.
+    dead_clusters: set = field(default_factory=set)
 
     def missing(self) -> list[int]:
         return _missing(self.storage, self.prefix, self.expected)
@@ -668,7 +658,15 @@ class StageMachine:
         return outcome
 
     def _is_live(self, record: dict) -> bool:
-        """Whether a submission record is young enough to still be running."""
+        """Whether a submission record is young enough to still be running.
+
+        Evidence beats the clock. A cluster the probe has reported stopped is
+        not going to publish anything, so its record is dead the moment the
+        report arrives -- without this, a stopped round inside its own deadline
+        is adopted, watched, found stopped, and adopted again.
+        """
+        if record.get("cluster_id") in self.dead_clusters:
+            return False
         return self.clock.now() < float(record["submitted_at"]) + self.deadline_s
 
     def _start_round(self, submission_round: int, indexes: Sequence[int]) -> object:
@@ -768,9 +766,10 @@ class StageMachine:
         overlap that fails to start is a slower tile, not a broken one, and it
         must never take down the barrier it is riding on.
 
-        Raises:
-            ShardFleetKilled: If the round's cluster is reported dead and the
-                artifacts are still missing on a re-check.
+        A cluster reported dead ends the wait immediately, returning what is
+        still missing. That is the same answer a barrier expiry gives, and it
+        reaches the same place: ``run`` opens the next round over those indexes
+        alone. Waiting out a deadline against a torn-down fleet buys nothing.
         """
         while True:
             missing = self.missing()
@@ -786,7 +785,8 @@ class StageMachine:
                         stage=self.stage,
                         error=str(e),
                     )
-            self._check_fleet_alive(cluster)
+            if self._fleet_stopped(cluster, missing):
+                return self.missing()
             if self.clock.now() >= deadline:
                 log.warning(
                     "shard_stage_barrier_expired",
@@ -799,35 +799,44 @@ class StageMachine:
                 return missing
             self.clock.sleep(settings.shard_driver_poll_s)
 
-    def _check_fleet_alive(self, cluster: object) -> None:
-        """Fail fast when this round's cluster is gone, with its reason.
+    def _fleet_stopped(self, cluster: object, missing: Sequence[int]) -> str | None:
+        """Whether this round's cluster is gone, and why.
 
         Only ever ends a barrier *early*; it can never declare success. And a
         cluster reported dead is checked against the bucket once more first,
         because a fleet whose last task uploaded its artifact and then stopped
         is a finished stage, not a killed one.
+
+        The answer is a reason, not an exception. ``("stopped", "No pending
+        tasks for batch run")`` is what Coiled says about every batch run that
+        reaches its end, healthy or not, so reading it as a kill aborted the
+        driver on 2026-09-04 with 24 of 35 composite bands already in the
+        bucket and eleven shards left to resubmit. What the caller does with a
+        stopped fleet is open the next round over the missing indexes.
         """
         if self.cluster_probe is None or cluster is None:
-            return
+            return None
         probed = self.cluster_probe(cluster)
         if probed is None:
-            return
+            return None
         state, reason = probed
         if state.lower() not in ("error", "stopped"):
-            return
+            return None
         if not self.missing():
-            return
+            return None
         detail = reason or f"cluster reported {state!r} with no reason"
-        log.error(
-            "shard_fleet_killed",
+        self.dead_clusters.add(cluster)
+        log.warning(
+            "shard_fleet_stopped",
             run_id=self.run_id,
             tile=self.tile,
             stage=self.stage,
             cluster_id=cluster,
             state=state,
             reason=detail,
+            missing=len(missing),
         )
-        raise ShardFleetKilled(self.stage, detail, cluster=cluster)
+        return detail
 
 
 def ensure_started(
@@ -1181,7 +1190,71 @@ def resume_tile(
     )
 
 
+#: The stages ``budgets`` prices, in the order they run. A tile's horizon is
+#: their sum, because a barrier does not open until the one before it closes.
+_BUDGET_STAGES = ("offsets", "composite", "export")
+
+
+def _offsets_cached(run_id: str, tile: str, storage: StorageBackend) -> bool:
+    """Whether the canonical offsets record already covers this tile.
+
+    Delegates to the check ``shard_tasks.merge_offsets`` makes, so the driver
+    and the merge cannot disagree. Never raises: a record that cannot be read
+    is a record the stage will rebuild.
+    """
+    try:
+        return shard_tasks.offsets_record_present(run_id, tile, storage=storage)
+    except Exception as exc:
+        log.warning("shard_offsets_cache_check_failed", tile=tile, error=repr(exc)[:200])
+        return False
+
+
+def _tile_budget_s(plan: shards.TilePlan) -> float:
+    """How long this tile may run, summed over its stage deadlines.
+
+    The same numbers ``budgets.tile_budget_lines`` renders, added rather than
+    formatted. Stages run in sequence, so the sum is the tile's horizon.
+    """
+    return sum(budgets.stage_budget(stage, plan).deadline_s for stage in _BUDGET_STAGES)
+
+
 def _drive(
+    *,
+    run_id: str,
+    tile: str,
+    job: ProcessingJob | None,
+    storage: StorageBackend,
+    submit: Submitter,
+    clock: Clock,
+    cluster_probe: ClusterProbe | None,
+) -> TileRunSummary:
+    """Drive one tile, and sweep its coarse stage whatever happens.
+
+    The sweep is the whole reason this wrapper exists. Phase A stages its
+    coarse observations so phase B stops re-reading the sources (issue #125),
+    and on S30W065 that is 8,424 objects and 167 GB per tile. Sweeping only on
+    an offsets-stage failure left exactly that behind for each of the two runs
+    that died in the composite stage on 2026-09-04.
+
+    A driver that reaches any terminal path is done reading the stage, whether
+    it succeeded, failed, or was interrupted. ``sweep_coarse_stage`` swallows
+    its own exceptions, so cleanup can never stand in front of the real error.
+    """
+    try:
+        return _drive_stages(
+            run_id=run_id,
+            tile=tile,
+            job=job,
+            storage=storage,
+            submit=submit,
+            clock=clock,
+            cluster_probe=cluster_probe,
+        )
+    finally:
+        shard_tasks.sweep_coarse_stage(run_id, tile, storage=storage)
+
+
+def _drive_stages(
     *,
     run_id: str,
     tile: str,
@@ -1215,11 +1288,18 @@ def _drive(
     units = shards.offsets_fleet_units()
     plan = _read_plan(run_id, tile, root, storage)
 
+    # The estimate is keyed by scene set, not by run id, so an earlier run over
+    # the same scenes already answered this stage. Asking needs a plan, because
+    # the key's digest covers the sorted scene ids -- so a fresh run id asks
+    # again below, once shard 0 has published one.
+    offsets_cached = plan is not None and _offsets_cached(run_id, tile, storage)
+
     # Start the fused fleet only when there is offsets work left. A resumed run
     # whose offsets finished has a plan and every partial, and must start
     # nothing -- which is the whole point of resuming.
-    if plan is None or _missing(
-        storage, f"{root}/offsets/scene/", _expected_keys(plan, "offsets", root)
+    if not offsets_cached and (
+        plan is None
+        or _missing(storage, f"{root}/offsets/scene/", _expected_keys(plan, "offsets", root))
     ):
         ensure_started(
             stage="offsets",
@@ -1239,6 +1319,9 @@ def _drive(
         plan = _wait_for_plan(
             run_id, tile, root, storage, clock=clock, deadline_s=_bootstrap_deadline_s()
         )
+        # First point at which a fresh run can know its own offsets key. The
+        # fleet is booting by now; its shards make the same check and exit.
+        offsets_cached = _offsets_cached(run_id, tile, storage)
     summary.window = plan.window
     log.info(
         "shard_plan_read",
@@ -1254,14 +1337,27 @@ def _drive(
     for line in budgets.tile_budget_lines(plan):
         log.info("shard_stage_budget", run_id=run_id, tile=tile, budget=line)
 
+    # A tile outlives a session. On 2026-09-04 the composite overlap submission
+    # failed with UnauthorizedSSOTokenError eighteen minutes after the identity
+    # preflight passed, because that preflight asks whether the session works
+    # now and never how long it has left. This is the first point a budget
+    # exists to compare it against.
+    #
+    # Skipped for an injected submitter, on the same terms as every other gate
+    # in this module: a caller with its own fleet has no AWS session in play,
+    # and a gate that reads the machine rather than the code is a gate that
+    # passes on a laptop and fails on a credential-less runner.
+    if submit is submit_shard_stage:
+        quota.preflight_session_lifetime(needed_s=_tile_budget_s(plan))
+
     # Started from inside the offsets barrier, the moment phase B is
     # demonstrably producing. Guarded by a flag rather than by the submission
     # record alone so the driver does not list on every poll.
     composite_started = False
 
-    def _overlap() -> None:
+    def _start_composite(*, reason: str) -> None:
         nonlocal composite_started
-        if composite_started or not _overlap_ready(storage, root, plan):
+        if composite_started:
             return
         composite_started = ensure_started(
             stage="composite",
@@ -1275,9 +1371,25 @@ def _drive(
             clock=clock,
         )
         if composite_started:
-            log.info("shard_composite_overlapped", run_id=run_id, tile=tile, bands=len(plan.bands))
+            log.info(
+                "shard_composite_started",
+                run_id=run_id,
+                tile=tile,
+                bands=len(plan.bands),
+                reason=reason,
+            )
 
-    try:
+    def _overlap() -> None:
+        if composite_started or not _overlap_ready(storage, root, plan):
+            return
+        _start_composite(reason="offsets_overlap")
+
+    if offsets_cached:
+        # Nothing to wait for and nothing to merge. The stage's whole output is
+        # the record, and the record is already at its canonical key.
+        log.info("shard_offsets_cache_hit", run_id=run_id, tile=tile)
+        _start_composite(reason="offsets_cached")
+    else:
         summary.stages.append(
             _await_stage(
                 stage="offsets",
@@ -1296,28 +1408,21 @@ def _drive(
                 on_poll=_overlap,
             )
         )
-    except BaseException:
-        # The offsets side is where the coarse stage (issue #125) lives, and a
-        # tile that gives up here will never merge, so nothing will sweep it.
-        # Best-effort, and before the raise, so the failure the operator sees is
-        # the real one rather than a cleanup error standing in front of it.
-        shard_tasks.sweep_coarse_stage(run_id, tile, storage=storage)
-        raise
 
-    # In the driver, not on a VM: a kilobyte of JSON in, 600 floats out. The
-    # composite shards are already booting and polling for exactly this record.
-    merged = clock.now()
-    key = shard_tasks.merge_offsets(run_id, tile, storage=storage)
-    summary.stages.append(
-        StageOutcome(
-            stage="merge_offsets",
-            shards=1,
-            already_done=0,
-            submissions=0,
-            wall_s=clock.now() - merged,
+        # In the driver, not on a VM: a kilobyte of JSON in, 600 floats out.
+        # The composite shards are already booting and polling for this record.
+        merged = clock.now()
+        key = shard_tasks.merge_offsets(run_id, tile, storage=storage)
+        summary.stages.append(
+            StageOutcome(
+                stage="merge_offsets",
+                shards=1,
+                already_done=0,
+                submissions=0,
+                wall_s=clock.now() - merged,
+            )
         )
-    )
-    log.info("shard_offsets_ready", run_id=run_id, tile=tile, key=key.storage_key)
+        log.info("shard_offsets_ready", run_id=run_id, tile=tile, key=key.storage_key)
 
     summary.stages.append(
         _await_stage(

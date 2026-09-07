@@ -869,6 +869,36 @@ def wait_for_blocks(ctx: ShardContext, *, timeout_s: float | None = None) -> boo
         time.sleep(settings.shard_unit_poll_s)
 
 
+def offsets_record_present(
+    run_id: str,
+    tile: str,
+    *,
+    storage: StorageBackend | None = None,
+) -> bool:
+    """Whether the canonical ADR-012 record already covers this tile's window.
+
+    The one check every caller shares. ``merge_offsets`` asks it before
+    merging, the driver asks it before starting the offsets stage, and each
+    offsets shard asks it before reducing a block, so no two of them can
+    disagree about whether the estimate exists.
+
+    Answering needs the plan, because the record's digest covers the sorted
+    scene ids: a run id that has not resolved yet cannot know its own key. It
+    is therefore false, quietly, for a tile with no plan.
+
+    On 2026-09-04 the record for S30W065 had existed since 08:39 UTC and all
+    three runs still paid a 15-VM offsets fleet, roughly 36 credits apiece,
+    because the driver looked only at this run's own scene partials.
+    """
+    try:
+        ctx = load_context(run_id, tile, storage=storage)
+    except Exception as exc:  # a tile with no plan has no key to look under
+        log.debug("offsets_record_unknown", tile=tile, error=repr(exc)[:200])
+        return False
+    cache = OffsetCache(storage=ctx.storage, key=_offset_key(ctx.plan))
+    return cache.read(_time_coord(ctx.plan)) is not None
+
+
 def run_offsets_stage(
     run_id: str,
     tile: str,
@@ -946,6 +976,20 @@ def run_offsets_stage(
 
     ctx = load_context(run_id, tile, storage=storage)
 
+    # The same rule every shard follows about its own artifact, one level up:
+    # the whole stage exists to produce one record, and the record is already
+    # there. The driver skips the stage too, but its fleet width is fixed
+    # before any plan exists, so these VMs are already booted by the time
+    # anyone can know. Exiting here turns a full phase-A pass into a boot.
+    if offsets_record_present(run_id, tile, storage=storage):
+        log.info(
+            "shard_offsets_stage_skipped",
+            tile=tile,
+            index=index,
+            key=_offset_key(ctx.plan).storage_key,
+        )
+        return None
+
     if index < ctx.plan.ref_shards:
         run_climatology_shard(run_id, tile, index, storage=storage, ctx=ctx)
     else:
@@ -1011,7 +1055,7 @@ def merge_offsets(
     key = _offset_key(ctx.plan)
     cache = OffsetCache(storage=ctx.storage, key=key)
 
-    if cache.read(time_coord) is not None:
+    if offsets_record_present(run_id, tile, storage=ctx.storage):
         log.info("shard_offsets_merge_skipped", tile=tile, key=key.storage_key)
         return key
 

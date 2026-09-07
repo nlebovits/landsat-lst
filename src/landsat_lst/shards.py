@@ -46,7 +46,7 @@ import structlog
 from landsat_lst.config import settings
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from landsat_lst.storage import StorageBackend
 
@@ -206,6 +206,38 @@ def stage_submission_prefix(root: str, stage: str) -> str:
     carry a four-digit index where this carries the literal word.
     """
     return f"{root}/state/{stage}.submission."
+
+
+def tile_stage_prefix(root: str) -> str:
+    """Every coarse-stage object this tile has written, under any plan.
+
+    One level above :attr:`landsat_lst.staging.StageKey.prefix`, which embeds
+    the offset factor, the algorithm version, and the scene digest. That is the
+    right prefix for a sweep that knows its plan and the wrong one for a
+    garbage collector: a stage written under a scene set the current plan does
+    not describe is invisible to the first and is exactly what the second is
+    for.
+    """
+    return f"{root}/stage/"
+
+
+def run_tiles(listing: Iterable[str], run_id: str) -> list[str]:
+    """The tile names one run published under, from a single listing.
+
+    A run's own keys name its tiles, so nothing has to be remembered or passed
+    in. Keys that are not under a tile root -- a fleet manifest, a wave record
+    -- carry no tile and are skipped.
+    """
+    prefix = f"{SHARD_PREFIX}/{run_id}/"
+    tiles: set[str] = set()
+    for key in listing:
+        if not key.startswith(prefix):
+            continue
+        rest = key[len(prefix) :]
+        head, _, tail = rest.partition("/")
+        if tail and head not in ("state", "timings"):
+            tiles.add(head)
+    return sorted(tiles)
 
 
 def fleet_root(run_id: str) -> str:

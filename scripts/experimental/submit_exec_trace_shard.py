@@ -85,6 +85,11 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - each refusal is a launch
         return _refuse("LST_GED_GAP_MASK must be false for the retained pre-mask workload")
     if os.environ.get("LST_COILED_RETRIES") != "0":
         return _refuse("LST_COILED_RETRIES must be 0")
+    if os.environ.get("LST_ALLOW_ZERO_RETRIES") not in ("1", "true", "True"):
+        # batch._effective_retries refuses a zero-retry submission unless the
+        # shell says the single attempt is deliberate. It is, here: a retried
+        # trace would publish a second events file over the first.
+        return _refuse("LST_ALLOW_ZERO_RETRIES must be 1 alongside LST_COILED_RETRIES=0")
     if "LST_PROFILE_DASK" in os.environ:
         return _refuse("LST_PROFILE_DASK must be unset")
     if "LST_STAC_URL" in os.environ:
