@@ -2744,6 +2744,41 @@ def _shard_process_futures(
     _futures_verdict(summary, failure)
 
 
+@shard.command("clone-plan")
+@click.argument("source_run_id")
+@click.argument("new_run_id")
+@click.option("-t", "--tile", required=True, help="Tile whose plan is cloned")
+def shard_clone_plan(source_run_id: str, new_run_id: str, tile: str) -> None:
+    """Copy a retained run's plan and item list under a new run id.
+
+    A shard that finds its artifacts exits, so a retained run whose band slabs
+    exist cannot recompute a band. A new run id with the same plan can: its
+    composite prefix is empty, and the merged offsets record is keyed by the
+    plan's scene set, so it is found in the cache and no offsets stage runs.
+    This is how Demonstration 2 of issue #155 computes band 16 from the
+    retained S30W065 plan.
+    """
+    from landsat_lst import shards
+    from landsat_lst.storage import get_storage
+
+    storage = get_storage()
+    src = shards.shard_root(source_run_id, tile)
+    dst = shards.shard_root(new_run_id, tile)
+    if storage.read_text(shards.plan_key(dst)) is not None:
+        raise click.ClickException(f"{new_run_id} already has a plan for {tile}")
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory(prefix="lst_clone_plan_") as directory:
+        for name in ("plan.json", "items.json"):
+            local = Path(directory) / name
+            if not storage.download(f"{src}/{name}", local):
+                raise click.ClickException(f"{source_run_id} has no {name} for {tile}")
+            storage.upload(local, f"{dst}/{name}")
+            console.print(f"  copied {name} -> {dst}/{name}")
+    console.print(f"[bold]cloned[/bold] {source_run_id} -> {new_run_id} for {tile}")
+
+
 @shard.command("stop")
 @click.argument("run_id")
 @click.argument("tile")

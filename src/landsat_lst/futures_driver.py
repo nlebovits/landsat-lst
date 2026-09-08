@@ -310,6 +310,7 @@ class FuturesRunSummary(TileRunSummary):
     observability: dict[str, Any] = field(default_factory=dict)
     deadline_s: float = 0.0
     stopped_by: str | None = None
+    offsets_cached: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -328,6 +329,7 @@ class FuturesRunSummary(TileRunSummary):
             "observability": self.observability,
             "deadline_s": round(self.deadline_s, 1),
             "stopped_by": self.stopped_by,
+            "offsets_cached": self.offsets_cached,
         }
 
 
@@ -448,6 +450,7 @@ class _Run:
     resubmits: dict[tuple[str, int], int] = field(default_factory=dict)
     plan: shards.TilePlan | None = None
     units: int = 0
+    offsets_cached: bool = False
 
     def observe(self, what: str, fn: Callable[[], Any]) -> Any:
         try:
@@ -536,9 +539,39 @@ def _ensure_workers(run: _Run, n: int, *, what: str) -> None:
     run.deadline.check(f"waiting for {n} workers before {what}")
 
 
+def _offsets_cached(run: _Run) -> bool:
+    """Whether the merged offsets record for this plan is already in the cache.
+
+    ADR-012: only the estimate is cached, and it is keyed by the scene set and
+    the settings that decide it. A run whose plan already has its record pays
+    no offsets stage and no merge; the composite shards read the record back.
+    This is what lets a bounded run compute one band from a retained plan
+    without booting fifteen offsets shards it does not need.
+    """
+    if run.plan is None:
+        return False
+    from landsat_lst.shard_tasks import _offset_key  # noqa: PLC0415
+
+    key = _offset_key(run.plan).storage_key
+    present = run.storage.read_text(key) is not None
+    if present:
+        log.info("futures_offsets_cached", key=key)
+    return present
+
+
 def submit_prepare(run: _Run, *, job: ProcessingJob | None) -> None:
-    """The plan future (when no plan exists) and every offsets future."""
+    """The plan future (when no plan exists) and every offsets future.
+
+    When the plan exists and its merged offsets record is cached, no offsets
+    future and no merge future are submitted: the stage is already done in
+    the sense that matters, and the fused stage's width need not fit anywhere.
+    """
     run.units = shards.offsets_fleet_units()
+    run.plan = _read_plan(run.run_id, run.tile, run.root, run.storage)
+    if _offsets_cached(run):
+        run.offsets_cached = True
+        run.summary.offsets_cached = True
+        return
     cap = settings.futures_max_workers
     if run.units > cap:
         raise ShardFuturesFailed(
@@ -552,7 +585,6 @@ def submit_prepare(run: _Run, *, job: ProcessingJob | None) -> None:
             ),
         )
     _ensure_workers(run, run.units, what="the offsets stage")
-    run.plan = _read_plan(run.run_id, run.tile, run.root, run.storage)
     deps: list[Future] = []
     if run.plan is None:
         if job is None:
@@ -607,8 +639,19 @@ def _await_plan(run: _Run) -> shards.TilePlan:
 def submit_rest(run: _Run) -> None:
     """Merge, composite for the requested bands, export when finalizing."""
     assert run.plan is not None
-    offsets = list(run.futures.offsets.values())
-    run.futures.merge = _submit(run, "merge", 0, offsets)
+    if run.offsets_cached:
+        # The composite shards read the cached record; there is no merge to
+        # wait for and no edge to draw. Workers are sized for the bands now.
+        upstream: list[Future] = []
+        _ensure_workers(
+            run,
+            min(settings.futures_max_workers, max(1, len(run.bands or run.plan.bands))),
+            what="the composite stage",
+        )
+    else:
+        offsets = list(run.futures.offsets.values())
+        run.futures.merge = _submit(run, "merge", 0, offsets)
+        upstream = [run.futures.merge]
     all_bands = list(range(len(run.plan.bands)))
     requested = all_bands if run.bands is None else [b for b in run.bands if b in all_bands]
     unknown = [] if run.bands is None else [b for b in run.bands if b not in all_bands]
@@ -623,7 +666,7 @@ def submit_rest(run: _Run) -> None:
     expected = _expected_keys(run.plan, "composite", run.root)
     for index in requested:
         run.futures.composite[index] = _submit(
-            run, "composite", index, [run.futures.merge], artifact_keys=tuple(expected[index])
+            run, "composite", index, upstream, artifact_keys=tuple(expected[index])
         )
     if run.finalize:
         run.futures.export = _submit(run, "export", 0, list(run.futures.composite.values()))
@@ -858,10 +901,11 @@ def _finish(run: _Run, *, stopped_by: str | None) -> FuturesRunSummary:
             run.storage, run.plan, run.root, bands=summary.bands_requested or None
         )
         requested_done = not summary.missing.get("composite")
+        offsets_ok = run.offsets_cached or not summary.missing.get("offsets")
         summary.completed = (
             run.storage.cog_exists(run.plan.window, run.tile)
             if run.finalize
-            else requested_done and not summary.missing.get("offsets")
+            else requested_done and offsets_ok
         )
     summary.verification = dict(
         run.observe("verify", lambda: run.observer.verify("complete")) or {}

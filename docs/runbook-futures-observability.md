@@ -17,14 +17,29 @@ uv run python scripts/inner_visibility_demo.py   # Demonstration 1: local, free,
 
 ## Launch
 
-A bounded run, one band and no export, is the shape of Demonstration 2:
+A bounded run, one band and no export, is the shape of Demonstration 2. It
+runs from a retained plan, cloned under a new run id: a shard that finds its
+slabs exits, so the retained run's own band 16 would skip. The clone's
+composite prefix is empty, and the merged offsets record is keyed by the
+plan's scene set, so it is found in the cache (`_offsets/S30W065/2021-2025/f2/`)
+and the driver submits no offsets stage and no merge.
 
 ```bash
+landsat-lst shard clone-plan shard-S30W065-2021-2025-20260903T220000Z-v1exact1024-r5 \
+  shard-S30W065-2021-2025-20260908T140000Z-futures-demo2 -t S30W065
+
 landsat-lst shard process -t S30W065 \
+  --run-id shard-S30W065-2021-2025-20260908T140000Z-futures-demo2 \
   --executor futures --scheduler frisky --inner-scheduler frisky \
-  --n-workers 2 --bands 16 --no-finalize \
+  --n-workers 1 --bands 16 --no-finalize \
   --credit-cap 15
 ```
+
+`--inner-scheduler frisky` is the default and is passed to every shard through
+the outer binding; the worker environment's `LST_INNER_SCHEDULER` stays
+`threads` and only governs a shard with no binding (the Batch path). The
+launch line prints `outer: frisky  inner: frisky`; the shard's heartbeat
+`inner.scheduler` and its `inner.final.json` say `frisky` after the fact.
 
 A full tile:
 

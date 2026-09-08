@@ -274,12 +274,10 @@ class TestResume:
             RUN_ID, TILE, executor=again, storage=storage, task=task2, clock=again.clock
         )
         assert summary.completed
-        assert task2.computed == [("merge", 0)], (
-            "the merge is idempotent and cheap; nothing else ran"
-        )
-        assert len(again.submissions) == 1 + settings.shard_offset_vms + len(plan.bands) + 1
-        skipped = [r for r in summary.results if r.get("skipped")]
-        assert len(skipped) == len(summary.results) - 1
+        assert task2.computed == [], "the offsets record is cached, so nothing ran again"
+        assert summary.offsets_cached is True
+        assert len(again.submissions) == len(plan.bands) + 1, "composite bands and the export"
+        assert all(r.get("skipped") for r in summary.results)
 
     def test_a_resume_before_the_plan_exists_says_so(self, storage):
         with pytest.raises(FileNotFoundError, match="published no plan"):
@@ -454,3 +452,36 @@ def test_a_spot_policy_or_vm_type_never_appears_in_the_driver():
     source = Path(futures_driver.__file__).read_text()
     assert "spot" not in source.lower()
     assert "r6i" not in source and "m6i" not in source
+
+
+class TestCachedOffsets:
+    def test_a_cached_offsets_record_skips_the_offsets_stage_and_the_merge(
+        self, storage, plan, job
+    ):
+        """ADR-012: only the estimate is cached, and a plan that has it pays no offsets."""
+        from tests.unit.shard_fixtures import publish_plan, write_offset_cache
+
+        publish_plan(storage, plan)
+        write_offset_cache(storage, plan)
+        summary, executor, task = _drive(storage, plan, job, bands=[1], finalize=False)
+        assert not _by_stage(executor, "offsets")
+        assert not _by_stage(executor, "merge")
+        assert not _by_stage(executor, "resolve")
+        assert [s.key.split("-")[-2] for s in _by_stage(executor, "composite")] == ["0001"]
+        assert _by_stage(executor, "composite")[0].deps == []
+        assert summary.offsets_cached is True
+        assert summary.completed
+        assert executor.ensure_calls == [1], "sized for the one band, never for offsets"
+        assert task.computed == [("composite", 1)]
+
+    def test_an_offsets_width_above_the_cap_is_fine_when_the_record_is_cached(
+        self, storage, plan, job, monkeypatch
+    ):
+        from tests.unit.shard_fixtures import publish_plan, write_offset_cache
+
+        monkeypatch.setattr(settings, "futures_max_workers", 1)
+        monkeypatch.setattr(settings, "shard_offset_vms", 15)
+        publish_plan(storage, plan)
+        write_offset_cache(storage, plan)
+        summary, _executor, _task = _drive(storage, plan, job, bands=[0], finalize=False)
+        assert summary.completed
