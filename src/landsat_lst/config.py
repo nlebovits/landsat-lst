@@ -878,6 +878,104 @@ class Settings(BaseSettings):
         description="Closed sections carried in the heartbeat's inner block; older "
         "ones live in the flushed chunks and the final object.",
     )
+    # One tile as futures on a scheduler (landsat_lst.futures_driver, issue #155).
+    # The Batch executor stays the default until the futures path passes its
+    # full-tile acceptance. Every limit below is a spending bound in decreasing
+    # strength: the worker cap is absolute, the run deadline is absolute, the
+    # credit cap is a preflight refusal plus a best-effort stop.
+    shard_executor: Literal["batch", "futures"] = Field(
+        default="batch",
+        description="How `shard process` runs a tile: 'batch' is the ADR-016 Coiled "
+        "Batch driver; 'futures' submits each shard as one future on a Coiled Dask "
+        "cluster hijacked by Frisky. Default 'batch' until acceptance passes.",
+    )
+    futures_scheduler: Literal["frisky", "dask"] = Field(
+        default="frisky",
+        description="Outer scheduler for the futures executor: 'frisky' hijacks the "
+        "Coiled Dask cluster (issue #155); 'dask' keeps plain distributed for a "
+        "controlled comparison.",
+    )
+    futures_retries: int = Field(
+        default=2,
+        ge=0,
+        description="Scheduler-owned retries per shard future on an exception. "
+        "Distinct from coiled_retries, which restarts a VM: every shard checks "
+        "its artifacts first, so a retry recomputes nothing that landed.",
+    )
+    futures_worker_losses: int = Field(
+        default=3,
+        ge=0,
+        description="distributed.scheduler.allowed-failures for the futures cluster: "
+        "how many times a task may lose its worker before the scheduler gives up.",
+    )
+    futures_max_workers: int = Field(
+        default=16,
+        ge=1,
+        description="Hard cap on workers in the futures cluster, binding every "
+        "stage. Composite bands queue behind it in waves; the fused offsets "
+        "stage must fit under it because its shards barrier in-process, and "
+        "the driver refuses when it does not. 35 bands on 16 workers is about "
+        "three waves.",
+    )
+    futures_run_timeout_s: int | None = Field(
+        default=None,
+        description="Whole-run wall-clock budget, checked at every blocking point "
+        "(boot, plan wait, every completion). None derives it from the budget "
+        "model over the waves the band count needs. Expiry releases every "
+        "unfinished future and shuts the cluster down.",
+    )
+    futures_cleanup_timeout_s: int = Field(
+        default=600,
+        ge=0,
+        description="How long the driver polls the control plane after shutdown "
+        "before it records cleanup as unconfirmed.",
+    )
+    futures_offsets_stall_s: int = Field(
+        default=900,
+        ge=0,
+        description="An offsets future still pending this long while its peers run "
+        "is reported as stalled: the scheduler cannot see the in-process phase-A "
+        "barrier, so the driver names it.",
+    )
+    futures_require_observability: bool = Field(
+        default=True,
+        description="A run whose required visibility is missing reports "
+        "'completed_unobserved' and a non-zero exit even when its pixels are "
+        "correct. False downgrades the gate to a warning, for diagnosis runs only.",
+    )
+    futures_boot_timeout_s: int = Field(
+        default=900,
+        ge=1,
+        description="Longest wait for the first workers of the futures cluster, "
+        "bounded further by the run deadline.",
+    )
+    futures_idle_timeout: str = Field(
+        default="30 minutes",
+        description="Coiled idle timeout for the futures cluster: the backstop for a "
+        "killed driver, never the run's limit.",
+    )
+    futures_worker_ttl: str = Field(
+        default="15 minutes",
+        description="distributed.scheduler.worker-ttl for the futures cluster. ADR-010's "
+        "heartbeat-starvation guard: a worker silent this long is declared lost.",
+    )
+    frisky_tracing_capacity: int = Field(
+        default=1_000_000,
+        ge=1000,
+        description="FRISKY_TRACING_CAPACITY on every worker: the span ring buffer, "
+        "per process. Chunks dumped to storage are the durable copy.",
+    )
+    futures_observer_poll_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Seconds between outer-observer snapshots, span dumps, and the "
+        "settle loop's bounded waits.",
+    )
+    frisky_span_dump_limit: int = Field(
+        default=1_000_000,
+        ge=1,
+        description="Spans fetched per outer span dump from the Frisky scheduler.",
+    )
     inner_trace_query_limit: int = Field(
         default=200_000,
         ge=1,

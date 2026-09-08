@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -2193,6 +2195,66 @@ def _shard_job(tile: str, year: int | None, end_year: int | None, max_scenes: in
     return jobs[0]
 
 
+def _futures_options(func):
+    """The options only the futures executor reads; the Batch branch rejects them."""
+    for option in reversed(
+        [
+            click.option(
+                "--executor",
+                type=click.Choice(["batch", "futures"]),
+                default=None,
+                help="How the tile runs; default settings.shard_executor (batch until acceptance)",
+            ),
+            click.option(
+                "--scheduler",
+                type=click.Choice(["frisky", "dask"]),
+                default=None,
+                help="Outer scheduler for --executor futures; default settings.futures_scheduler",
+            ),
+            click.option(
+                "--inner-scheduler",
+                type=click.Choice(["frisky", "threads"]),
+                default="frisky",
+                show_default=True,
+                help="What each shard's own graphs run on under --executor futures (ADR-021)",
+            ),
+            click.option(
+                "--n-workers",
+                type=int,
+                default=0,
+                help="Workers for --executor futures; 0 derives from the work, never above the cap",
+            ),
+            click.option(
+                "--bands",
+                "bands",
+                type=int,
+                multiple=True,
+                help="Composite band indexes to run under --executor futures; repeatable; default all",
+            ),
+            click.option(
+                "--no-finalize",
+                is_flag=True,
+                help="Under --executor futures, submit no export: a bounded run cannot start the tile",
+            ),
+            click.option(
+                "--credit-cap",
+                type=float,
+                default=None,
+                help="Required with --executor futures: credits this run may cost; refused above it, "
+                "stopped best-effort past it",
+            ),
+            click.option(
+                "--run-timeout-s",
+                type=int,
+                default=None,
+                help="Whole-run wall-clock budget for --executor futures; default derived from the budgets",
+            ),
+        ]
+    ):
+        func = option(func)
+    return func
+
+
 @shard.command("process")
 @click.option("-t", "--tile", required=True, help="Tile to build, e.g. N40W075")
 @click.option("-y", "--year", type=int, default=None, help="Start year; omit for the window")
@@ -2204,6 +2266,7 @@ def _shard_job(tile: str, year: int | None, end_year: int | None, max_scenes: in
     is_flag=True,
     help="Proceed when the Coiled credit balance cannot be read, on your own check",
 )
+@_futures_options
 def shard_process(
     *,
     tile: str,
@@ -2212,6 +2275,14 @@ def shard_process(
     max_scenes: int | None,
     run_id: str | None,
     ack_quota: bool,
+    executor: str | None,
+    scheduler: str | None,
+    inner_scheduler: str,
+    n_workers: int,
+    bands: tuple[int, ...],
+    no_finalize: bool,
+    credit_cap: float | None,
+    run_timeout_s: int | None,
 ) -> None:
     """Build one tile as a fleet of shards, driven from this shell.
 
@@ -2220,6 +2291,11 @@ def shard_process(
     mechanism. It holds no state, though -- print the run id and
     ``landsat-lst shard resume <run-id> <tile>`` picks up wherever the bucket
     says the run got to.
+
+    With ``--executor futures`` the scheduler owns the stages instead (issue
+    #155): one future per shard on a Coiled Dask cluster, Frisky on top, and
+    every shard's inner graph observable. ``--credit-cap`` is required there,
+    and ``--bands`` with ``--no-finalize`` bounds a run to named bands.
     """
     from landsat_lst import quota
     from landsat_lst.config import settings
@@ -2233,6 +2309,28 @@ def shard_process(
     from landsat_lst.storage import get_storage
 
     job = _shard_job(tile, year, end_year, max_scenes)
+    chosen = executor or settings.shard_executor
+    if chosen == "futures":
+        _shard_process_futures(
+            tile=tile,
+            job=job,
+            run_id=run_id,
+            ack_quota=ack_quota,
+            scheduler=scheduler or settings.futures_scheduler,
+            inner_scheduler=inner_scheduler,
+            n_workers=n_workers,
+            bands=list(bands) or None,
+            finalize=not no_finalize,
+            credit_cap=credit_cap,
+            run_timeout_s=run_timeout_s,
+            resume=False,
+        )
+        return
+    if bands or no_finalize or credit_cap is not None or run_timeout_s is not None:
+        raise click.ClickException(
+            "--bands, --no-finalize, --credit-cap and --run-timeout-s apply to "
+            "--executor futures only"
+        )
     # Before the run id is printed: a driver that cannot see its shards' output,
     # or that cannot pay for them, has not started a run -- and printing a
     # resume hint for it would be a lie.
@@ -2277,17 +2375,52 @@ def shard_process(
 @shard.command("resume")
 @click.argument("run_id")
 @click.argument("tile")
+@_futures_options
 @click.option(
     "--ack-quota",
     is_flag=True,
     help="Proceed when the Coiled credit balance cannot be read, on your own check",
 )
-def shard_resume(run_id: str, tile: str, ack_quota: bool) -> None:
+def shard_resume(
+    run_id: str,
+    tile: str,
+    ack_quota: bool,
+    *,
+    executor: str | None,
+    scheduler: str | None,
+    inner_scheduler: str,
+    n_workers: int,
+    bands: tuple[int, ...],
+    no_finalize: bool,
+    credit_cap: float | None,
+    run_timeout_s: int | None,
+) -> None:
     """Continue a killed driver's run, reading its position out of the bucket."""
     from landsat_lst import quota
     from landsat_lst.config import settings
     from landsat_lst.shard_driver import ShardBackendMismatch, ShardStageFailed, resume_tile
 
+    if (executor or settings.shard_executor) == "futures":
+        _shard_process_futures(
+            tile=tile,
+            job=None,
+            run_id=run_id,
+            ack_quota=ack_quota,
+            scheduler=scheduler or settings.futures_scheduler,
+            inner_scheduler=inner_scheduler,
+            n_workers=n_workers,
+            bands=list(bands) or None,
+            finalize=not no_finalize,
+            credit_cap=credit_cap,
+            run_timeout_s=run_timeout_s,
+            resume=True,
+        )
+        return
+    if bands or no_finalize or credit_cap is not None or run_timeout_s is not None:
+        raise click.ClickException(
+            "--bands, --no-finalize, --credit-cap and --run-timeout-s apply to "
+            "--executor futures only"
+        )
     if ack_quota:
         settings.ack_quota = True
     console.print(f"[bold]Resuming {tile}[/bold] in run [cyan]{run_id}[/cyan]")
@@ -2303,6 +2436,327 @@ def shard_resume(run_id: str, tile: str, ack_quota: bool) -> None:
         raise click.ClickException(str(e)) from e
 
     _print_shard_summary(summary)
+
+
+@dataclass
+class _FuturesLaunch:
+    """What is fixed before the cluster exists, and printed as the authorized bound."""
+
+    run_id: str
+    workers: int
+    total_s: float
+    vm_type: str
+    cores: int
+    max_vcpu_hours: float
+    spot_policy: str
+    region: str
+    plan: object
+
+
+def _futures_limits(
+    *,
+    tile: str,
+    job,
+    run_id: str | None,
+    n_workers: int,
+    bands: list[int] | None,
+    run_timeout_s: int | None,
+    resume: bool,
+    storage,
+) -> _FuturesLaunch:
+    """Worker count and deadline, fixed before launch; refuses an unfit offsets width."""
+    from landsat_lst import shards
+    from landsat_lst.config import settings
+    from landsat_lst.dask_cluster import environ_summary
+    from landsat_lst.futures_driver import derive_run_timeout_s
+    from landsat_lst.projection import vcpus
+    from landsat_lst.shard_driver import _read_plan, shard_run_id
+
+    if run_id is None:
+        if job is None:
+            raise click.ClickException("a resume needs a run id")
+        run_id = shard_run_id(job)
+    plan = _read_plan(run_id, tile, shards.shard_root(run_id, tile), storage) if resume else None
+    units = shards.offsets_fleet_units()
+    cap = settings.futures_max_workers
+    if units > cap:
+        raise click.ClickException(
+            f"the fused offsets stage needs {units} concurrent shards but futures_max_workers "
+            f"is {cap}; raise the cap or lower shard_offset_vms"
+        )
+    workers = max(min(cap, n_workers) if n_workers > 0 else units, units)
+    band_count = len(bands) if bands else (len(plan.bands) if plan is not None else 1)
+    total_s = (
+        float(run_timeout_s)
+        if run_timeout_s is not None
+        else derive_run_timeout_s(plan, bands=band_count, workers=workers)
+    )
+    env = environ_summary()
+    cores = vcpus(env["vm_type"])
+    return _FuturesLaunch(
+        run_id=run_id,
+        workers=workers,
+        total_s=total_s,
+        vm_type=env["vm_type"],
+        cores=cores,
+        max_vcpu_hours=workers * cores * total_s / 3600.0,
+        spot_policy=env["spot_policy"],
+        region=env["region"],
+        plan=plan,
+    )
+
+
+def _futures_state_reader(session, *, run_id: str, tile: str):
+    """The observer's view of the scheduler, for either outer scheduler."""
+    from landsat_lst.futures_observer import normalize_dask_state, normalize_frisky_state
+
+    def read_state(reg, ts, seq):
+        state = session.scheduler_state() or {}
+        if session.scheduler == "frisky":
+            return normalize_frisky_state(state, reg, ts=ts, seq=seq, run_id=run_id, tile=tile)
+        status = {
+            k: {"memory": "finished", "erred": "error"}.get(v, "pending")
+            for k, v in session.dask_task_states().items()
+        }
+        return normalize_dask_state(
+            state.get("scheduler_info") or {},
+            status,
+            session.processing(),
+            session.who_has_all(),
+            reg,
+            ts=ts,
+            seq=seq,
+            run_id=run_id,
+            tile=tile,
+        )
+
+    return read_state
+
+
+def _futures_verdict(summary, failure) -> None:
+    """Print what the run left, then exit non-zero for a failure or a failed gate."""
+    from landsat_lst.config import settings
+    from landsat_lst.futures_driver import summarize_for_operator
+
+    if summary is not None:
+        for line in summarize_for_operator(summary):
+            console.print(f"  {line}")
+        _print_shard_summary(summary)
+    if failure is not None:
+        raise click.ClickException(str(failure))
+    if summary is None:
+        raise click.ClickException("the run produced no summary")
+    if summary.status != "accepted" and settings.futures_require_observability:
+        raise click.ClickException(
+            f"run finished with status {summary.status!r}; outputs are published, but the "
+            f"observability gate did not pass: {summary.observability.get('failures')}"
+        )
+
+
+def _futures_drive(
+    session,
+    *,
+    resume: bool,
+    job,
+    run_id: str,
+    tile: str,
+    storage,
+    observer,
+    clock,
+    deadline,
+    bands,
+    finalize,
+    inner_scheduler,
+    stop,
+):
+    """Drive or resume through the session; the caller owns the session and the observer."""
+    from landsat_lst.futures_driver import drive_tile_futures, resume_tile_futures
+
+    if resume:
+        return resume_tile_futures(
+            run_id,
+            tile,
+            executor=session,
+            storage=storage,
+            observer=observer,
+            clock=clock,
+            deadline=deadline,
+            bands=bands,
+            finalize=finalize,
+            inner_scheduler=inner_scheduler,
+            credit_stop=stop,
+        )
+    return drive_tile_futures(
+        job,
+        run_id=run_id,
+        executor=session,
+        storage=storage,
+        observer=observer,
+        clock=clock,
+        deadline=deadline,
+        bands=bands,
+        finalize=finalize,
+        inner_scheduler=inner_scheduler,
+        credit_stop=stop,
+    )
+
+
+def _shard_process_futures(
+    *,
+    tile: str,
+    job,
+    run_id: str | None,
+    ack_quota: bool,
+    scheduler: str,
+    inner_scheduler: str,
+    n_workers: int,
+    bands: list[int] | None,
+    finalize: bool,
+    credit_cap: float | None,
+    run_timeout_s: int | None,
+    resume: bool,
+) -> None:
+    """One tile as futures: gates, limits printed, cluster, drive, verdict.
+
+    Order matters and every step names its reason. The gates run before the
+    run id prints, as on the Batch path. The worker count and the deadline
+    are fixed and printed before the cluster exists, because they are the two
+    limits that bound spend outright; the credit cap is a refusal at the
+    estimate and a best-effort stop afterwards. The cluster is shut down and
+    its stop confirmed on every exit path. A run whose pixels landed but whose
+    required visibility did not reports ``completed_unobserved`` and exits
+    non-zero, with the outputs left where they are.
+    """
+    from landsat_lst import quota
+    from landsat_lst.batch import submit_shard_stage
+    from landsat_lst.config import settings
+    from landsat_lst.dask_cluster import (
+        cluster_session,
+        credit_stop,
+        frisky_span_query,
+        frisky_story,
+        preflight,
+    )
+    from landsat_lst.futures_driver import Deadline, ShardFuturesFailed
+    from landsat_lst.futures_observer import FuturesObserver, ShardRegistry
+    from landsat_lst.shard_driver import Clock, ShardBackendMismatch, require_shared_storage
+    from landsat_lst.storage import get_storage
+
+    if credit_cap is None:
+        raise click.ClickException("--credit-cap is required with --executor futures")
+    if ack_quota:
+        settings.ack_quota = True
+    storage = get_storage()
+    try:
+        require_shared_storage(storage, submit_shard_stage)
+        estimate, balance = preflight(credit_cap=credit_cap, scheduler=scheduler)
+    except (
+        ShardBackendMismatch,
+        quota.IdentityRefused,
+        quota.WriteAccessRefused,
+        quota.QuotaRefused,
+        RuntimeError,
+    ) as e:
+        raise click.ClickException(str(e)) from e
+    console.print(
+        f"  credits: ~{estimate:.1f} estimated, cap {credit_cap:.1f}, "
+        f"{'unknown' if balance.remaining is None else f'{balance.remaining:.0f}'} "
+        f"remaining ({balance.source})"
+    )
+    launch = _futures_limits(
+        tile=tile,
+        job=job,
+        run_id=run_id,
+        n_workers=n_workers,
+        bands=bands,
+        run_timeout_s=run_timeout_s,
+        resume=resume,
+        storage=storage,
+    )
+    run_id = launch.run_id
+    clock = Clock()
+    deadline = Deadline(clock=clock, total_s=launch.total_s)
+    console.print(
+        f"[bold]{'Resuming' if resume else 'Sharding'} {tile}[/bold] as futures  "
+        f"run-id [cyan]{run_id}[/cyan]"
+    )
+    console.print(
+        f"  limits: {launch.workers} x {launch.vm_type} ({launch.cores} vCPU) under a "
+        f"{launch.total_s / 60:.0f} min deadline = at most {launch.max_vcpu_hours:.0f} "
+        f"vCPU-hours; cap {settings.futures_max_workers} workers; spot policy "
+        f"{launch.spot_policy}; region {launch.region}"
+    )
+    console.print(
+        f"  bands: {bands if bands else 'all'}  finalize: {finalize}  "
+        f"outer: {scheduler}  inner: {inner_scheduler}"
+    )
+    console.print(f"  resume with: landsat-lst shard resume {run_id} {tile} --executor futures")
+    console.print(f"  stop with:   landsat-lst shard stop {run_id} {tile}")
+
+    summary = None
+    failure: ShardFuturesFailed | None = None
+    try:
+        with cluster_session(
+            run_id=run_id,
+            tile=tile,
+            n_workers=launch.workers,
+            deadline=deadline,
+            scheduler=scheduler,
+            storage=storage,
+        ) as session:
+            console.print(f"  dashboard: {session.dashboard_url}  cluster {session.cluster_id}")
+            is_frisky = session.scheduler == "frisky"
+            observer = FuturesObserver(
+                run_id=run_id,
+                tile=tile,
+                storage=storage,
+                registry=ShardRegistry(),
+                state_reader=_futures_state_reader(session, run_id=run_id, tile=tile),
+                mode=session.scheduler,
+                dashboard_url=session.dashboard_url,
+                span_query=frisky_span_query() if is_frisky else None,
+                story=frisky_story(session.dashboard_url) if is_frisky else None,
+            )
+            observer.start()
+            try:
+                summary = _futures_drive(
+                    session,
+                    resume=resume,
+                    job=job,
+                    run_id=run_id,
+                    tile=tile,
+                    storage=storage,
+                    observer=observer,
+                    clock=clock,
+                    deadline=deadline,
+                    bands=bands,
+                    finalize=finalize,
+                    inner_scheduler=inner_scheduler,
+                    stop=credit_stop(cap=credit_cap),
+                )
+            except ShardFuturesFailed as e:
+                failure = e
+                summary = e.summary
+            finally:
+                observer.stop()
+    except (ShardBackendMismatch, FileNotFoundError, RuntimeError) as e:
+        raise click.ClickException(str(e)) from e
+    _futures_verdict(summary, failure)
+
+
+@shard.command("stop")
+@click.argument("run_id")
+@click.argument("tile")
+def shard_stop(run_id: str, tile: str) -> None:
+    """Shut a futures run's cluster down by name, for a driver that died."""
+    from landsat_lst.dask_cluster import futures_cluster_name, stop_cluster
+
+    name = futures_cluster_name(run_id, tile)
+    try:
+        outcome = stop_cluster(name)
+    except Exception as e:
+        raise click.ClickException(f"could not stop {name}: {e}") from e
+    console.print(json.dumps(outcome, indent=2, default=str))
 
 
 def _print_shard_summary(summary) -> None:

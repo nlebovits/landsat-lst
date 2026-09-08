@@ -269,6 +269,50 @@ Rules worth keeping:
 - **Trace ids are 63 random bits**, not `frisky.new_trace_id()`, which is a per-process counter
   and gave two workers the same `0x1`.
 
+## One tile as futures — the scheduler owns the stages, three limits bound the spend
+
+`landsat-lst shard process --executor futures` (ADR-021 Parts B and C, issue #155). Read
+`docs/runbook-futures-observability.md` before a paid run.
+
+```bash
+landsat-lst shard process -t S30W065 --executor futures \
+  --n-workers 2 --bands 16 --no-finalize --credit-cap 15     # Demonstration 2 shape
+landsat-lst shard resume <run-id> S30W065 --executor futures --credit-cap 15
+landsat-lst shard stop <run-id> S30W065                      # a dead driver's cluster, by name
+```
+
+Rules worth keeping:
+
+- **`shard_executor` defaults to `batch`.** The Batch driver is untouched and stays the
+  default until the futures path passes full-tile acceptance. Batch rejects the futures-only
+  flags rather than ignoring them.
+- **`futures_driver` imports neither coiled, frisky, nor distributed**, and a test parses its
+  source to prove it. `dask_cluster.py` is the only importer. The driver runs against
+  `tests/unit/futures_fixtures.py` in milliseconds; put every state-machine case there first.
+- **`--credit-cap` is required, and it is the weakest of three limits.** The worker cap
+  (`futures_max_workers`, 16) binds every stage and composite bands queue in waves. The run
+  `Deadline` is created before the cluster exists and checked while waiting for workers, while
+  waiting for the plan, and at every completion; expiry releases every future and shuts the
+  cluster down. The credit cap is a preflight refusal plus a best-effort balance-poll stop.
+  The launch prints workers x vCPU x deadline as the authorized maximum; read it.
+- **The fused offsets stage still barriers in-process.** Its width must fit under the worker
+  cap (the driver refuses otherwise) and its shards must all run at once. An index pending
+  while its peers run past `futures_offsets_stall_s` is reported `stalled`; the scheduler
+  cannot see that barrier.
+- **A shard's durable completion is its artifact.** An error is classified only after the
+  bucket is checked; a shard that published and then died is a success, and its pending
+  dependents are resubmitted with the dead edge removed under a new key.
+- **`--bands` with `--no-finalize` bounds a run.** Only the named bands are submitted and no
+  export future exists, so a bounded test cannot start the whole tile.
+- **`outer_key`, never `key`, is how the task learns its own future key.** Every scheduler's
+  `submit` consumes `key` for itself; the demo and the driver both hit this once.
+- **Cleanup is confirmed through the control plane** into `state/cleanup.json`; an
+  unconfirmed stop is recorded as such, never assumed.
+- **`accepted` needs both pixels and visibility.** `completed_unobserved` exits non-zero with
+  the outputs left published. `futures_require_observability=False` is for diagnosis only.
+- **The observer never fails a tile.** Every call from the driver is guarded; an observer
+  that raises costs the run its `accepted` status, not its pixels.
+
 ## Price a configuration before you run it
 
 Never submit a run to learn a number that follows from array shape and chunking. Task count

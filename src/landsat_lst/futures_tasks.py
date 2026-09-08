@@ -92,7 +92,7 @@ def run_shard_task(
     *_deps: Any,
     job: ProcessingJob | None = None,
     units: int | None = None,
-    key: str | None = None,
+    outer_key: str | None = None,
     trace_id: int | None = None,
     inner_scheduler: InnerMode = "frisky",
     use_frisky_sink: bool = True,
@@ -102,6 +102,8 @@ def run_shard_task(
 
     ``*_deps`` are the resolved values of the futures this one depends on.
     They are ignored; they exist so the scheduler enforces the edge.
+    ``outer_key`` is the future's own key, passed under a different name
+    because every scheduler's ``submit`` consumes ``key`` for itself.
 
     The inner scheduler is named here, explicitly, for this path only. A shard
     run by Coiled Batch never passes through this function and keeps the
@@ -121,7 +123,7 @@ def run_shard_task(
     resolved_trace_id = trace_id if trace_id is not None else new_trace_id()
 
     with outer_binding(
-        outer_key=key,
+        outer_key=outer_key,
         trace_id=resolved_trace_id,
         sink=sink,
         inner_scheduler=inner_scheduler,
@@ -147,7 +149,7 @@ def run_shard_task(
     return ShardResult(
         stage=stage,
         index=index,
-        key=key,
+        key=outer_key,
         keys=written,
         skipped=skipped,
         wall_s=round(time.perf_counter() - started, 3),

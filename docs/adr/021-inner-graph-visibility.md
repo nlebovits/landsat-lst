@@ -1,8 +1,9 @@
 # ADR-021: The inner graph of a shard is observable, on an in-process scheduler
 
-Status: accepted for Part A of issue #155 (inner visibility). The futures
-orchestration that builds on it (Parts B and C of the same issue) is designed
-in the issue and lands after the bounded cloud demonstration.
+Status: accepted for issue #155 Parts A (inner visibility), B (the futures
+executor), and C (its limits and outer view). Demonstration 2 on the cloud and
+the full-tile acceptance are the remaining gates before the futures executor
+becomes the default.
 
 ## Context
 
@@ -147,3 +148,85 @@ built. The lock fix removed the only serialization obstacle.
 - `docs/findings-composite-exec-trace.md` for the read-rate ceiling the trace
   now shows per task.
 - Memory: `frisky-072-facts-for-inner-visibility`.
+
+## Part B and C: the futures executor, its limits, and its outer view
+
+Added 2026-09-08, after Demonstration 1 and before Demonstration 2.
+
+### The scheduler owns the stages
+
+`landsat_lst.futures_driver` submits one future per shard on a cluster session
+and lets the scheduler own the edges, the retries, and the task state: a plan
+future when no plan exists, an offsets future per unit that depends on it, a
+merge future that depends on every offsets future, a composite future per
+requested band that depends on the merge, and an export future that depends on
+every composite future, submitted only when the run finalizes. Every future
+runs `futures_tasks.run_shard_task`, which is the same shard the Batch path
+runs, under an outer binding that names the outer key, the trace id, the
+Frisky sink, and the inner scheduler.
+
+The driver never imports coiled, frisky, or distributed; a test parses its
+source to prove it. It takes an `Executor` and a `RunObserver`, both
+duck-typed, and the whole state machine runs against `tests/unit/futures_fixtures.py`
+in milliseconds: dependency wiring, scheduler-owned retries, a shard that
+published and then died (its dependents are resubmitted with the dead edge
+removed, because the artifact is in the bucket), a terminal error that releases
+every pending future, a resume that recomputes nothing, reconciliation per
+stage, and the deadline at every blocking point.
+
+Two things the scheduler cannot see are named by the driver. The fused
+offsets shards barrier in-process, so their width must not exceed the worker
+cap and the driver refuses when it does; an offsets index still pending while
+its peers run past `futures_offsets_stall_s` is reported as `stalled`. And a
+shard's durable completion is its artifact, so an error is classified only
+after the bucket is checked.
+
+### Three limits, in decreasing strength
+
+- **Workers.** `futures_max_workers` (16) binds every stage. Composite bands
+  queue behind it in waves. The count is fixed and printed before the cluster
+  exists, with the VM type, its vCPUs, and the deadline, as the maximum spend
+  the operator authorizes.
+- **Deadline.** One `Deadline` created before the cluster, derived from the
+  budget model over boot, the offsets stage, and the composite waves the band
+  count needs, and checked while waiting for workers, while waiting for the
+  plan, and at every completion. Expiry releases every unfinished future and
+  shuts the cluster down. `futures_run_timeout_s` overrides it outright.
+- **Credits.** `--credit-cap` is required. The estimate times the safety
+  factor must fit under it before anything boots; afterwards a balance poll
+  stops the run when the drawdown exceeds it. That stop is best-effort and
+  labelled so in the code and the summary: Coiled usage lags billing, and
+  other jobs move the same balance.
+
+Cleanup is confirmed, never assumed: after `cluster.shutdown()` the control
+plane is polled until the cluster reports stopped or `futures_cleanup_timeout_s`
+passes, and `state/cleanup.json` records what was seen. `landsat-lst shard stop
+<run-id> <tile>` shuts a dead driver's cluster by its derived name.
+
+### The outer view, persisted while the run runs
+
+`landsat_lst.futures_observer` joins what the driver submitted to what the
+scheduler reports, every `futures_observer_poll_s`, into
+`state/orchestration.json` (overwritten) and `orchestration.events.{seq}.jsonl`
+(transitions, worker joins and losses), dumps Frisky's span buffer to
+`_shards/timings/{run_id}/frisky-spans.{seq}.json` deduplicated at the cursor,
+and writes `frisky-verification.json`: whether the scheduler listed every
+submitted key, whether a running shard's story shows a placement, whether the
+`shard.*` spans arrive keyed by the outer key, one `worker.exec.call` span per
+attempt, the buffer below saturation, and spans persisted after the cluster.
+Each check records pass, fail, or not applicable with the observed values.
+
+The observability gate reads the bucket at the end: every composite shard's
+inner final object with no error and a sink that built, both trace files per
+group, no failed verification check, span chunks persisted. `summary.status`
+is `accepted` only when the tile completed and the gate passed. A run with
+correct pixels and missing visibility reports `completed_unobserved` and exits
+non-zero, with its outputs left published; `futures_require_observability`
+downgrades that to a warning for diagnosis runs.
+
+### What stays Batch
+
+`shard_executor` defaults to `batch`. The Batch driver, its barriers, rounds,
+adoption, cluster probes, and submission records are untouched. Under futures
+those are superseded by the scheduler and are not deleted until the futures
+path passes full-tile acceptance.
