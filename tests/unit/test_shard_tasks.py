@@ -919,3 +919,97 @@ def test_the_offset_key_is_the_one_a_whole_tile_would_write(plan):
         factor=plan.offset_factor,
         scene_ids=plan.scene_ids,
     )
+
+
+class TestInnerScheduler:
+    """Which scheduler a shard's graphs run on, and who chooses it (#155)."""
+
+    def test_a_batch_shard_keeps_the_threaded_scheduler(
+        self, storage, plan, published, monkeypatch
+    ):
+        """No binding, no Frisky: the Batch path is unchanged by #155.
+
+        The test blocks the frisky import outright, so a run_shard that tried
+        to build an in-process cluster would fail loudly here rather than
+        change every production shard's scheduler by default.
+        """
+        import sys
+
+        _stub_native_load(monkeypatch, plan)
+        write_offset_cache(storage, plan)
+        monkeypatch.setitem(sys.modules, "frisky", None)
+        seen: dict = {}
+
+        import dask
+
+        from landsat_lst import cog as cog_module
+
+        original = cog_module.write_intermediates_bounded
+
+        def recording(*args, **kwargs):
+            seen["scheduler"] = dask.config.get("scheduler")
+            seen["observer"] = kwargs.get("observer")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(cog_module, "write_intermediates_bounded", recording)
+
+        written = shard_tasks.run_shard("composite", RUN_ID, TILE, 0, storage=storage)
+
+        assert written
+        assert seen["scheduler"] == "threads"
+        assert seen["observer"] is not None, "the trace observes the bounded writer"
+        stem = shards.unit_trace_prefix(RUN_ID, "composite", TILE, 0)
+        final = json.loads(storage.read_text(f"{stem}.inner.a01.final.json"))
+        assert final["scheduler"] == "threads"
+        names = [s["name"] for s in final["sections"]]
+        assert "phase:composite_graph" in names
+        assert "encode" in names
+        # The fixture's arrays are numpy-backed, so the header write is the
+        # whole export and no longitude group runs; a dask-backed band adds
+        # one ``group`` section per longitude group (tests/unit/test_innertrace.py).
+        assert "header_write" in names
+        assert "upload" in names
+        assert "finalize" in names
+
+    def test_the_outer_binding_chooses_the_scheduler_and_the_trace_id(
+        self, storage, plan, published, monkeypatch
+    ):
+        from landsat_lst.innertrace import outer_binding
+
+        _stub_native_load(monkeypatch, plan)
+        write_offset_cache(storage, plan)
+        with outer_binding(outer_key="lst-outer-key", trace_id=0xBEEF, inner_scheduler="threads"):
+            shard_tasks.run_shard("composite", RUN_ID, TILE, 0, storage=storage)
+
+        stem = shards.unit_trace_prefix(RUN_ID, "composite", TILE, 0)
+        final = json.loads(storage.read_text(f"{stem}.inner.a01.final.json"))
+        assert final["trace_id"] == hex(0xBEEF)
+        assert final["outer_key"] == "lst-outer-key"
+        state = json.loads(
+            storage.read_text(
+                shards.shard_state_key(shards.shard_root(RUN_ID, TILE), "composite", 0, 1)
+            )
+        )
+        assert state["inner"]["trace_id"] == hex(0xBEEF)
+        assert state["inner"]["scheduler"] == "threads"
+
+    def test_a_shard_whose_trace_cannot_start_still_computes(
+        self, storage, plan, published, monkeypatch
+    ):
+        _stub_native_load(monkeypatch, plan)
+        write_offset_cache(storage, plan)
+
+        def broken(self, **kwargs):
+            raise RuntimeError("no trace today")
+
+        monkeypatch.setattr("landsat_lst.innertrace.InnerTrace.__init__", broken)
+
+        written = shard_tasks.run_shard("composite", RUN_ID, TILE, 0, storage=storage)
+
+        assert written
+        state = json.loads(
+            storage.read_text(
+                shards.shard_state_key(shards.shard_root(RUN_ID, TILE), "composite", 0, 1)
+            )
+        )
+        assert state["inner"]["error"] == "inner trace unavailable"

@@ -1,0 +1,77 @@
+{
+  "frisky": {
+    "mode": "frisky",
+    "pid": 2803453,
+    "wall_s": 6.8,
+    "tasks_started": 356,
+    "spill_count": 0,
+    "groups": 2,
+    "errors": [],
+    "pixel_sums": {
+      "lst_p95": 1244271772,
+      "qa_count": 2202652
+    },
+    "trace_id": "0x1",
+    "sink_error": null,
+    "final_key": "_shards/timings/inner-visibility-demo/composite.S30W065.0016.inner.a01.final.json"
+  },
+  "threads": {
+    "mode": "threads",
+    "pid": 2803454,
+    "wall_s": 5.29,
+    "tasks_started": 332,
+    "spill_count": 0,
+    "groups": 2,
+    "errors": [],
+    "pixel_sums": {
+      "lst_p95": 1244271772,
+      "qa_count": 2202652
+    },
+    "trace_id": "0x1",
+    "sink_error": null,
+    "final_key": "_shards/timings/inner-visibility-demo/composite.S30W065.0016.inner.a01.final.json"
+  },
+  "pixels_identical": {
+    "lst_p95": true,
+    "qa_count": true
+  },
+  "outer_scheduler": {
+    "dashboard": "http://127.0.0.1:43027",
+    "shard_spans": [
+      [
+        "shard.encode",
+        [
+          "lst-f945b582-composite-S30W065-0016-frisky01"
+        ]
+      ],
+      [
+        "shard.group",
+        [
+          "lst-f945b582-composite-S30W065-0016-frisky01"
+        ]
+      ],
+      [
+        "shard.header_write",
+        [
+          "lst-f945b582-composite-S30W065-0016-frisky01"
+        ]
+      ],
+      [
+        "shard.phase:composite_graph",
+        [
+          "lst-f945b582-composite-S30W065-0016-frisky01"
+        ]
+      ],
+      [
+        "shard.phase:exporting",
+        [
+          "lst-f945b582-composite-S30W065-0016-frisky01"
+        ]
+      ]
+    ],
+    "outer_exec_keys": [
+      "lst-f945b582-composite-S30W065-0016-frisky01",
+      "lst-f945b582-composite-S30W065-0016-thread01"
+    ]
+  }
+}

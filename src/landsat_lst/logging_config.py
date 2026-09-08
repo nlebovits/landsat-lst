@@ -44,8 +44,13 @@ def default_processor_chain() -> list[Processor]:
     :func:`configure_logging` with ``force=True`` install a renderer that shares
     no state with the previous one.
     """
+    from landsat_lst.innertrace import add_shard_context  # noqa: PLC0415
+
     return [
         structlog.contextvars.merge_contextvars,
+        # A running shard's trace id on every line, including lines from dask's
+        # worker threads and the heartbeat thread, which see no contextvars.
+        add_shard_context,
         structlog.processors.add_log_level,
         structlog.processors.StackInfoRenderer(),
         structlog.dev.set_exc_info,

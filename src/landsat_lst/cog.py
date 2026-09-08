@@ -96,7 +96,6 @@ from __future__ import annotations
 import calendar
 import shutil
 import tempfile
-import threading
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,6 +107,7 @@ import numpy as np
 import rasterio
 import rioxarray  # noqa: F401 - needed for .rio accessor
 import structlog
+from dask.utils import SerializableLock
 from rasterio.windows import Window
 from rio_cogeo.cogeo import cog_translate, cog_validate
 from rio_cogeo.profiles import cog_profiles
@@ -178,9 +178,14 @@ def _write_intermediate(da: xr.DataArray, src_tif: Path, *, compute: bool = True
     Returns:
         The deferred store when one was created, else ``None``.
     """
+    # A SerializableLock rather than threading.Lock: the store graph that
+    # carries it is what an inner scheduler receives, and a plain lock is the
+    # one object in the whole composite graph that cannot be pickled. That was
+    # the entire `Could not serialize object of type _HLGExprSequence` failure
+    # of 2026-09-07 (issue #155). Same exclusion in-process either way.
     return da.rio.to_raster(
         src_tif,
-        lock=threading.Lock(),
+        lock=SerializableLock(),
         tiled=True,
         blockxsize=_BLOCKSIZE,
         blockysize=_BLOCKSIZE,
@@ -204,8 +209,40 @@ def write_intermediates(pairs: Sequence[tuple[xr.DataArray, Path]]) -> None:
         dask.compute(*pending)
 
 
+#: What ``write_intermediates_bounded`` tells an observer, in order:
+#: ``header_write_start`` / ``header_write_end`` once per pair (``product=``),
+#: then per longitude group ``group_start`` (``lon_start=``, ``lon_stop=``),
+#: ``store_built``, ``compute_start`` (``n_stores=``), ``compute_end``
+#: (``error=`` when the compute raised). ``index`` and ``count`` are the group's
+#: position and the number of groups; for the header events ``index`` is the
+#: pair's position. The writer never waits on an observer and never lets one
+#: fail it: a raising observer is logged and ignored.
+GROUP_OBSERVER_EVENTS = (
+    "header_write_start",
+    "header_write_end",
+    "group_start",
+    "store_built",
+    "compute_start",
+    "compute_end",
+)
+
+
+def _notify(
+    observer: Callable[..., None] | None, event: str, index: int, count: int, **fields: Any
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer(event, index, count, **fields)
+    except Exception as exc:  # instrumentation never fails a write
+        log.warning("bounded_observer_failed", observer_event=event, error=str(exc))
+
+
 def write_intermediates_bounded(
-    pairs: Sequence[tuple[xr.DataArray, Path]], *, longitude_group: int
+    pairs: Sequence[tuple[xr.DataArray, Path]],
+    *,
+    longitude_group: int,
+    observer: Callable[..., None] | None = None,
 ) -> None:
     """Write full-shape rasters through sequential longitude-slice computes.
 
@@ -214,6 +251,13 @@ def write_intermediates_bounded(
     graph, so Dask culls source reads outside the group and can release the
     group intermediate results before the next one starts. Both products stay
     in the same compute so their common source tasks are still shared.
+
+    ``observer`` receives the events listed in :data:`GROUP_OBSERVER_EVENTS`. It is
+    how the inner trace (:mod:`landsat_lst.innertrace`) knows where one group's
+    ``dask.compute`` begins, which is the only place the delay before a
+    scheduler sees the graph can be measured from. The writer itself stays free
+    of storage, heartbeat, and scheduler concerns; the loop body is identical
+    with and without an observer.
     """
     if longitude_group <= 0:
         raise ValueError("longitude_group must be positive")
@@ -229,17 +273,23 @@ def write_intermediates_bounded(
     # the deferred store. Discard that full store graph: the loop below builds
     # only the region stores that are actually executed.
     lazy_pairs = []
-    for da, path in pairs:
+    for position, (da, path) in enumerate(pairs):
+        _notify(observer, "header_write_start", position, len(pairs), product=path.stem)
         deferred = _write_intermediate(da, path, compute=False)
+        _notify(observer, "header_write_end", position, len(pairs), product=path.stem)
         if deferred is not None:
             lazy_pairs.append((da, path))
         del deferred
     if not lazy_pairs:
         return
 
-    target_lock = threading.Lock()
-    for start in range(0, width, longitude_group):
+    # Serializable so the store graph that carries it can be handed to any
+    # scheduler; see _write_intermediate.
+    target_lock = SerializableLock()
+    count = -(-width // longitude_group)
+    for index, start in enumerate(range(0, width, longitude_group)):
         stop = min(start + longitude_group, width)
+        _notify(observer, "group_start", index, count, lon_start=start, lon_stop=stop)
         slices = [da.isel(longitude=slice(start, stop)) for da, _path in lazy_pairs]
         sources = [part.data for part in slices]
         targets: list[Any] = [RasterioWriter(path) for _da, path in lazy_pairs]
@@ -253,14 +303,22 @@ def write_intermediates_bounded(
             sources,
             targets,
             regions=regions,
-            lock=target_lock,
+            # dask's own SerializableLock; the annotation names only threading.Lock.
+            lock=target_lock,  # ty: ignore[invalid-argument-type]
             compute=False,
         )
-        if isinstance(stores, tuple | list):
-            dask.compute(*stores)
-        else:
-            dask.compute(stores)
-        del stores, targets, sources, slices
+        pending = list(stores) if isinstance(stores, tuple | list) else [stores]
+        _notify(observer, "store_built", index, count)
+        _notify(observer, "compute_start", index, count, n_stores=len(pending))
+        error: str | None = None
+        try:
+            dask.compute(*pending)
+        except BaseException as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            _notify(observer, "compute_end", index, count, error=error)
+        del stores, pending, targets, sources, slices
 
 
 def _dataset_tags(attrs: Mapping[str, Any]) -> dict[str, str]:

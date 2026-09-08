@@ -1,0 +1,55 @@
+group 0/2: 178 tasks, 264 edges
+  nodes by class: compute 84, other 26, rechunk 16, store 52
+  construction 0.1328s = pre_scheduler 0.0006 + materialize 0.0094 + capture 0.0006 + translate 0.008087 + submit 0.00022 + submitted_to_first_dispatch 0.113918
+  executed 178  not executed 0  stories queried 0
+  top prefixes by summed task seconds:
+    astype-getitem-stack-sum-sum-aggregate-store-map            5.581s
+    where                                                       0.177s
+    astype-getitem-store-map                                    0.102s
+    nanquantile_last-transpose                                  0.061s
+    integers                                                    0.040s
+    rechunk-merge                                               0.023s
+    sum-sum-aggregate                                           0.004s
+    invert                                                      0.002s
+
+task finalize-hlgfinalizecompute-a22a93980d50407c9f98c3f6c73945dd
+  group 0/2  class other  prefix finalize-hlgfinalizecompute
+  started 1788858576853908806  ended 1788858576853970272  duration 0.000s  worker 127.0.0.1:41195  thread -  gil 0.000s  deserialize 0.000s
+  delay before this task, from dask.compute entry:
+    store_build                                      0.0011s
+    pre_scheduler (dask optimize+materialize)        0.0006s
+    materialize (convert to task specs)              0.0094s
+    capture_overhead (graph file)                    0.0006s
+    translate (frisky task specs)                    0.0081s
+    submit                                           0.0002s
+    submitted_to_first_dispatch                      0.1139s
+    construction_total (entry -> first dispatch)     0.1328s
+    first_dispatch -> this key started               0.3188s
+    entry -> this key started                        0.4516s
+  dependencies (depth 4):
+    finalize-hlgfinalizecompute-a22a93980d50407c9f98c3f6c73945dd  [other]  ran 0.000s on 127.0.0.1:41195
+    ├─ ('store-map-b95bb327094de210b595a6858fd3a1f6', 0, 0)  [store]  ran 0.000s on 127.0.0.1:41195
+    │  └─ ('astype-getitem-store-map-b95bb327094de210b595a6858fd3a1f6', 0, 0)  [compute]  ran 0.043s on 127.0.0.1:41195
+    │     ├─ ('nanquantile_last_0-11ff7e41d8380bf494c1716df1ec71d6', 0, 0)  [compute]  ran 0.000s on 127.0.0.1:41195
+    │     │  └─ ('nanquantile_last-transpose-nanquantile_last_0-11ff7e41d8380bf494c1716df1ec71d6', 0, 0)  [compute]  ran 0.017s on 127.0.0.1:41195
+    │     └─ ('sum-aggregate-14d280921567b9aac2fec90810c38a4e', 0, 0)  [compute]  ran 0.000s on 127.0.0.1:41195
+    │        └─ ('sum-sum-aggregate-14d280921567b9aac2fec90810c38a4e', 0, 0)  [compute]  ran 0.000s on 127.0.0.1:41195
+    ├─ ('store-map-b95bb327094de210b595a6858fd3a1f6', 0, 1)  [store]  ran 0.000s on 127.0.0.1:41195
+    │  └─ ('astype-getitem-store-map-b95bb327094de210b595a6858fd3a1f6', 0, 1)  [compute]  ran 0.041s on 127.0.0.1:41195
+    │     ├─ ('nanquantile_last_0-11ff7e41d8380bf494c1716df1ec71d6', 0, 1)  [compute]  ran 0.000s on 127.0.0.1:41195
+    │     │  └─ ('nanquantile_last-transpose-nanquantile_last_0-11ff7e41d8380bf494c1716df1ec71d6', 0, 1)  [compute]  ran 0.007s on 127.0.0.1:41195
+    │     └─ ('sum-aggregate-14d280921567b9aac2fec90810c38a4e', 0, 1)  [compute]  ran 0.000s on 127.0.0.1:41195
+    │        └─ ('sum-sum-aggregate-14d280921567b9aac2fec90810c38a4e', 0, 1)  [compute]  ran 0.001s on 127.0.0.1:41195
+    ├─ ('store-map-b95bb327094de210b595a6858fd3a1f6', 1, 0)  [store]  ran 0.000s on 127.0.0.1:41195
+    │  └─ ('astype-getitem-store-map-b95bb327094de210b595a6858fd3a1f6', 1, 0)  [compute]  ran 0.004s on 127.0.0.1:41195
+    │     ├─ ('nanquantile_last_0-11ff7e41d8380bf494c1716df1ec71d6', 1, 0)  [compute]  ran 0.000s on 127.0.0.1:41195
+    │     │  └─ ('nanquantile_last-transpose-nanquantile_last_0-11ff7e41d8380bf494c1716df1ec71d6', 1, 0)  [compute]  ran 0.017s on 127.0.0.1:41195
+    │     └─ ('sum-aggregate-14d280921567b9aac2fec90810c38a4e', 1, 0)  [compute]  ran 0.000s on 127.0.0.1:41195
+    │        └─ ('sum-sum-aggregate-14d280921567b9aac2fec90810c38a4e', 1, 0)  [compute]  ran 0.002s on 127.0.0.1:41195
+    └─ ('store-map-b95bb327094de210b595a6858fd3a1f6', 1, 1)  [store]  ran 0.000s on 127.0.0.1:41195
+       └─ ('astype-getitem-store-map-b95bb327094de210b595a6858fd3a1f6', 1, 1)  [compute]  ran 0.014s on 127.0.0.1:41195
+          ├─ ('nanquantile_last_0-11ff7e41d8380bf494c1716df1ec71d6', 1, 1)  [compute]  ran 0.000s on 127.0.0.1:41195
+          │  └─ ('nanquantile_last-transpose-nanquantile_last_0-11ff7e41d8380bf494c1716df1ec71d6', 1, 1)  [compute]  ran 0.020s on 127.0.0.1:41195
+          └─ ('sum-aggregate-14d280921567b9aac2fec90810c38a4e', 1, 1)  [compute]  ran 0.000s on 127.0.0.1:41195
+             └─ ('sum-sum-aggregate-14d280921567b9aac2fec90810c38a4e', 1, 1)  [compute]  ran 0.001s on 127.0.0.1:41195
+  dependents (0):

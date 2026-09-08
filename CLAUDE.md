@@ -212,6 +212,63 @@ about the read path. See [findings](docs/findings-composite-exec-trace.md) and #
   move it back into the shard's process. `LST_DASK_MAX_THREADS` reaches a composite
   shard through `job._thread_cap` at the seam; unset keeps dask's CPU-count pool.
 
+## The inner graph of a shard is observable, and the Batch path did not change
+
+Every shard's dask graphs run on a scheduler that reports, and
+`landsat_lst.innertrace` persists what it reports while the shard runs
+(ADR-021, issue #155). Read `docs/adr/021-inner-graph-visibility.md` before
+touching the export loop, the scheduler binding, or anything that reads
+`_shards/timings/`.
+
+```bash
+uv run python scripts/inner_visibility_demo.py          # Demonstration 1, local, no credentials
+landsat-lst shard explain <run-id> S30W065 --index 16   # every group: counts, construction, top prefixes
+landsat-lst shard explain <run-id> S30W065 --index 16 --group 3 --task nanquantile
+```
+
+Rules worth keeping:
+
+- **`settings.inner_scheduler` defaults to `threads`, and only the futures wrapper asks for
+  `frisky`**, through `innertrace.outer_binding`. A Batch shard binds `dask.config.set(
+  scheduler="threads")` exactly as before; `tests/unit/test_shard_tasks.py::TestInnerScheduler`
+  blocks the `frisky` import and runs a composite shard to prove it. Do not flip the default.
+- **Mode `frisky` is one subprocess worker on TCP, read through the inner scheduler's REST
+  endpoint, never through `frisky.get_spans()`.** `get_spans` drains the process buffer, and a
+  process that is itself a Frisky worker (the futures path) has a worker plugin draining the
+  same buffer; an in-process inner worker left the outer scheduler with nothing (2026-09-08).
+  The REST endpoint on the random loopback port is non-draining and incremental by `start_ns`.
+- **The graph file is the dict the scheduler received.** The callable bound as dask's
+  scheduler materializes the expression once, records keys and dependency edges from that dict,
+  and hands the same object to Frisky's translate and submit. There is no second optimization
+  pass. `capture_overhead_s` is counted inside the group's construction wall, never subtracted.
+- **Construction is measured from `dask.compute` entry**, which the bounded writer reports as
+  its `compute_start` observer event. `pre_scheduler_s` is dask's own optimize and materialize,
+  which Frisky never sees and which is where #154 lives; then `materialize`, `capture`,
+  `translate`, `submit`, first dispatch. `submitted_to_first_dispatch_s` can be negative because
+  Frisky dispatches while the client is still submitting; report it, never clamp it.
+- **"Not executed" is never "ready but not started" without scheduler evidence.** A key with no
+  exec span gets `blocked_on_deps`, `released`, `erred`, `ready_not_started` (a story with a
+  placement or a ready transition), `completed_without_exec_span` (the scheduler says it
+  finished: aliases, data nodes, late spans), or `unknown`. Under threads the same grammar comes
+  from dask's `start_state` dict, where `released` and `finished` mean completed.
+- **Settle before joining.** Exec spans of the tasks behind a gathered result can land a few
+  milliseconds after `gather` returns. `_settle_spans` polls the REST endpoint until every
+  graph key has a span or 3 s pass; read too early, forty executed keys of one group were filed
+  as not executed and credited to the next group.
+- **Pixel identity, never byte identity, between schedulers.** Two threaded runs already differ
+  in tile write order. Frisky and threads agree on every pixel (`test_inner_visibility.py`).
+- **A nested Frisky client kills the shared scheduler on 0.7.2**, and `frisky.dask.get` cannot
+  pin a graph to one worker. `tests/integration/test_frisky_nested_client.py` is a strict xfail
+  so a Frisky release that fixes it is noticed; until then the inner graph stays in-process.
+- **`threading.Lock` in `dask_array.store` was the whole `_HLGExprSequence` failure.** The
+  bounded writer uses `SerializableLock`; `test_the_store_graph_carries_a_lock_that_pickles`
+  pins it. Do not put a plain lock back.
+- **Under Mode `frisky` the exec-trace's `rio_read` hook and Callback recorder see nothing**:
+  reads and tasks run in the worker subprocess. The inner spans replace the task records;
+  per-read timing under Mode `frisky` is an open item.
+- **Trace ids are 63 random bits**, not `frisky.new_trace_id()`, which is a per-process counter
+  and gave two workers the same `0x1`.
+
 ## Price a configuration before you run it
 
 Never submit a run to learn a number that follows from array shape and chunking. Task count

@@ -472,3 +472,120 @@ def test_lst_export_logs_no_coverage(tmp_path):
         export_lst_cog(_lst_dataset(_striped_lst(n=256)), tmp_path / "lst.tif")
 
     assert not [e for e in logs if e["event"] == "valid_coverage_obs_per_pixel"]
+
+
+# ---------------------------------------------------------------------------
+# The bounded writer's observer, and the lock its graph can carry (issue #155)
+# ---------------------------------------------------------------------------
+
+
+def _bounded_fixture():
+    values = np.arange(20, dtype=np.uint16).reshape(4, 5) + 1
+    base = da.from_array(values, chunks=(4, 2), name="bounded-source")
+    array = xr.DataArray(
+        base,
+        dims=["latitude", "longitude"],
+        coords={
+            "latitude": np.linspace(-30.0, -35.0, 4),
+            "longitude": np.linspace(-65.0, -60.0, 5),
+        },
+    )
+    return values, cog_module._prep(array).rio.write_nodata(0)
+
+
+def test_bounded_writer_reports_every_group_to_its_observer(tmp_path):
+    """The observer sees the header writes, then each group's four events in order."""
+    values, array = _bounded_fixture()
+    events: list[tuple] = []
+
+    def observer(event, index, count, **fields):
+        events.append((event, index, count, fields))
+
+    cog_module.write_intermediates_bounded(
+        [(array, tmp_path / "observed.tif")], longitude_group=4, observer=observer
+    )
+
+    names = [e[0] for e in events]
+    assert names == [
+        "header_write_start",
+        "header_write_end",
+        "group_start",
+        "store_built",
+        "compute_start",
+        "compute_end",
+        "group_start",
+        "store_built",
+        "compute_start",
+        "compute_end",
+    ]
+    starts = [e for e in events if e[0] == "group_start"]
+    assert [(e[1], e[2]) for e in starts] == [(0, 2), (1, 2)]
+    assert [(e[3]["lon_start"], e[3]["lon_stop"]) for e in starts] == [(0, 4), (4, 5)]
+    assert all(e[3]["error"] is None for e in events if e[0] == "compute_end")
+    assert events[0][3]["product"] == "observed"
+    with rasterio.open(tmp_path / "observed.tif") as src:
+        np.testing.assert_array_equal(src.read(1), values)
+
+
+def test_bounded_writer_output_is_pixel_identical_with_and_without_an_observer(tmp_path):
+    values, array = _bounded_fixture()
+
+    def raising(event, index, count, **fields):
+        raise RuntimeError("an observer that explodes")
+
+    cog_module.write_intermediates_bounded([(array, tmp_path / "plain.tif")], longitude_group=4)
+    cog_module.write_intermediates_bounded(
+        [(array, tmp_path / "raising.tif")], longitude_group=4, observer=raising
+    )
+
+    with rasterio.open(tmp_path / "plain.tif") as a, rasterio.open(tmp_path / "raising.tif") as b:
+        np.testing.assert_array_equal(a.read(1), b.read(1))
+        np.testing.assert_array_equal(a.read(1), values)
+
+
+def test_bounded_writer_reports_a_failing_compute_before_re_raising(tmp_path, monkeypatch):
+    _values, array = _bounded_fixture()
+    ends: list[dict] = []
+
+    def observer(event, index, count, **fields):
+        if event == "compute_end":
+            ends.append(fields)
+
+    def exploding_compute(*collections):
+        raise RuntimeError("compute died")
+
+    monkeypatch.setattr(cog_module.dask, "compute", exploding_compute)
+    with pytest.raises(RuntimeError, match="compute died"):
+        cog_module.write_intermediates_bounded(
+            [(array, tmp_path / "dead.tif")], longitude_group=4, observer=observer
+        )
+    assert ends == [{"error": "RuntimeError: compute died"}]
+
+
+def test_the_store_graph_carries_a_lock_that_pickles(tmp_path):
+    """The one object that failed serialization on 2026-09-07 is gone.
+
+    ``threading.Lock`` in ``dask_array.store(lock=...)`` was the whole
+    ``Could not serialize object of type _HLGExprSequence`` failure. The
+    writer now uses ``SerializableLock``, and the store expression it builds
+    must round-trip through pickle so an inner scheduler can receive it.
+    """
+    import pickle
+
+    from dask.base import collections_to_expr
+    from dask.utils import SerializableLock
+    from rioxarray.raster_writer import RasterioWriter
+
+    _values, array = _bounded_fixture()
+    path = tmp_path / "pickled.tif"
+    deferred = cog_module._write_intermediate(array, path, compute=False)
+    assert deferred is not None
+    stores = da.store(
+        [array.isel(longitude=slice(0, 4)).data],
+        [RasterioWriter(path)],
+        regions=[(slice(None), slice(0, 4))],
+        lock=SerializableLock(),
+        compute=False,
+    )
+    expr = collections_to_expr(list(stores) if isinstance(stores, tuple | list) else [stores], True)
+    assert pickle.loads(pickle.dumps(expr)) is not None

@@ -839,6 +839,59 @@ class Settings(BaseSettings):
         description="Record a per-second composite-shard execution trace. Off by "
         "default and intended only for a bounded measurement run.",
     )
+
+    # The inner scheduler of one shard and its trace. See landsat_lst.innertrace
+    # and issue #155. The Batch path keeps 'threads', which is what every
+    # production shard ran on before #155; only the futures task wrapper asks
+    # for 'frisky', through the outer binding rather than through this setting.
+    inner_scheduler: Literal["threads", "frisky"] = Field(
+        default="threads",
+        description="Scheduler a shard's dask graphs run on when no outer "
+        "binding names one. 'threads' is dask's threaded scheduler, the "
+        "production scheduler before #155. 'frisky' starts an in-process "
+        "Frisky cluster whose every task is a span in the shard's process, "
+        "which is how the inner graph becomes observable. Default 'threads' so "
+        "the Batch path is unchanged by this setting's existence.",
+    )
+    inner_threads: int | None = Field(
+        default=None,
+        description="Threads for the inner scheduler; None takes dask_max_threads "
+        "when set, else the VM's CPU count. The read rate does not follow the "
+        "thread count (docs/findings-composite-exec-trace.md), so this is a "
+        "memory lever, not a throughput one.",
+    )
+    inner_trace_flush_s: float = Field(
+        default=60.0,
+        gt=0.0,
+        description="Seconds between inner-trace flushes to storage. Every flush "
+        "writes one span chunk and rewrites the progress object, so an "
+        "interrupted shard keeps at most this many seconds of unflushed evidence.",
+    )
+    inner_trace_flush_spans: int = Field(
+        default=5000,
+        ge=1,
+        description="Flush the inner trace early once this many spans are pending.",
+    )
+    inner_trace_heartbeat_sections: int = Field(
+        default=32,
+        ge=1,
+        description="Closed sections carried in the heartbeat's inner block; older "
+        "ones live in the flushed chunks and the final object.",
+    )
+    inner_trace_query_limit: int = Field(
+        default=200_000,
+        ge=1,
+        description="Spans fetched per inner-trace read from the inner scheduler's "
+        "REST endpoint. A bounded composite group runs a few thousand tasks and "
+        "each task is about six spans, so one read normally covers a flush.",
+    )
+    inner_trace_story_limit: int = Field(
+        default=500,
+        ge=0,
+        description="Scheduler stories fetched per group for keys that did not "
+        "execute, outputs and erred keys first. Keys past the limit are reported "
+        "'unknown' rather than guessed at.",
+    )
     exec_trace_interval_s: float = Field(
         default=1.0,
         gt=0.0,

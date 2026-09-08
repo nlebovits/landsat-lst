@@ -2546,6 +2546,69 @@ def shard_fleet(
     _print_fleet_summary(summary)
 
 
+@shard.command("explain")
+@click.argument("run_id")
+@click.argument("tile")
+@click.option("--index", type=int, required=True, help="Shard index within the stage")
+@click.option("--stage", default="composite", show_default=True, help="Shard stage")
+@click.option("--attempt", type=int, default=None, help="Attempt; default: the highest present")
+@click.option("--group", type=int, default=None, help="Longitude group; default: every group")
+@click.option("--task", default=None, help="Inner task key, or a unique substring of one")
+@click.option("--depth", type=int, default=3, show_default=True, help="Dependency tree depth")
+def shard_explain(
+    *,
+    run_id: str,
+    tile: str,
+    index: int,
+    stage: str,
+    attempt: int | None,
+    group: int | None,
+    task: str | None,
+    depth: int,
+) -> None:
+    """One shard's inner graph, from its persisted trace: a task, its edges, its delay.
+
+    Reads the ``inner-graph`` and ``inner-exec`` artifacts the shard wrote
+    under ``_shards/timings/{run_id}/`` and nothing else, so it works during a
+    run against S3 and after the cluster is gone. With ``--task`` it renders
+    that task's dependency tree with each node's execution time, and every
+    part of the delay from ``dask.compute`` entry to the task's start. Without
+    it, the group's counts, construction breakdown, and top task prefixes.
+    """
+    from landsat_lst.shard_explain import (
+        explain_group,
+        explain_task,
+        list_groups,
+        load_group,
+        pick_output_key,
+    )
+    from landsat_lst.storage import get_storage
+
+    storage = get_storage()
+    groups = list_groups(storage, run_id, stage, tile, index)
+    if not groups:
+        raise click.ClickException(
+            f"no inner-trace artifacts for {stage} {tile} index {index} in run {run_id}"
+        )
+    chosen_attempt = attempt if attempt is not None else max(groups)
+    available = sorted(groups.get(chosen_attempt, {}))
+    if not available:
+        raise click.ClickException(
+            f"attempt {chosen_attempt} has no groups; found {sorted(groups)}"
+        )
+    targets = [group] if group is not None else available
+    for g in targets:
+        loaded = load_group(storage, run_id, stage, tile, index, attempt=chosen_attempt, group=g)
+        if loaded is None:
+            console.print(f"[yellow]group {g}: graph or exec file missing[/yellow]")
+            continue
+        console.print(explain_group(loaded), markup=False, highlight=False)
+        if task is not None or group is not None:
+            key = task if task is not None else pick_output_key(loaded)
+            if key is not None:
+                console.print(explain_task(loaded, key, depth=depth), markup=False, highlight=False)
+
+
 @shard.command("resume-fleet")
 @click.argument("run_id")
 @click.option("--max-vms", type=int, default=None, help="Hard ceiling on VMs in flight")

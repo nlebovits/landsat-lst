@@ -53,6 +53,15 @@ import xarray as xr
 from landsat_lst import offsets, shards
 from landsat_lst.config import settings
 from landsat_lst.exectrace import exec_trace
+from landsat_lst.innertrace import (
+    NullInnerTrace,
+    ShardIdentity,
+    active_inner_trace,
+    build_inner_trace,
+    current_binding,
+    inner_scheduler,
+    new_trace_id,
+)
 from landsat_lst.logging_config import configure_logging
 from landsat_lst.models import ProcessingJob
 from landsat_lst.normalization import (
@@ -1114,7 +1123,7 @@ def run_composite_shard(
         qa_product,
         write_intermediates_bounded,
     )
-    from landsat_lst.job import _encode_native, _thread_cap  # noqa: PLC0415
+    from landsat_lst.job import _encode_native  # noqa: PLC0415
     from landsat_lst.pipeline import (  # noqa: PLC0415
         _build_ged_gap_mask,
         _build_land_mask,
@@ -1149,12 +1158,18 @@ def run_composite_shard(
     with timed_section("land_mask"):
         land = _build_land_mask(geobox, data.latitude, data.longitude)
 
-    composite = compute_annual_composite(data, land_mask=land, offsets=offsets)
-    # The same two lines process_tile applies, for the same reason: ocean must
-    # be nodata in the LST band and zero in the counts, and a band that skipped
-    # them would differ from the whole tile exactly along its own rows.
-    composite["lst_p95"] = composite["lst_p95"].where(land)
-    composite["qa_count"] = composite["qa_count"].where(land, 0).astype(np.uint8)
+    # The inner trace names every stretch of this function as a section, so a
+    # silence is attributable to graph construction, encoding, one longitude
+    # group's compute, or an upload. The scheduler itself was bound by
+    # run_shard; nothing here chooses one.
+    trace = active_inner_trace() or NullInnerTrace()
+    with timed_section("composite_graph"):
+        composite = compute_annual_composite(data, land_mask=land, offsets=offsets)
+        # The same two lines process_tile applies, for the same reason: ocean
+        # must be nodata in the LST band and zero in the counts, and a band that
+        # skipped them would differ from the whole tile exactly along its rows.
+        composite["lst_p95"] = composite["lst_p95"].where(land)
+        composite["qa_count"] = composite["qa_count"].where(land, 0).astype(np.uint8)
     # The GED gap mask a whole tile applies, on the band's slice of the tile's
     # grid -- gap_mask_for_geobox reads the geobox's own affine, so a band's
     # mask is the exact slice of the tile's and the seams stay invisible
@@ -1168,40 +1183,46 @@ def run_composite_shard(
         composite["lst_p95"] = apply_ged_gap_mask(composite["lst_p95"], gap)
     composite.attrs.update(_tile_attrs(ctx.plan))
 
-    native = _encode_native(composite)
+    with trace.section("encode"):
+        native = _encode_native(composite)
     scratch = Path(tempfile.mkdtemp(prefix="lst_shard_band_"))
     try:
         paths = {product: scratch / f"{product}.tif" for product in PRODUCTS}
-        products = [
-            lst_product(native, paths["lst_p95"]),
-            qa_product(native, paths["qa_count"]),
-        ]
-        # settings.dask_max_threads (LST_DASK_MAX_THREADS) bounds the threaded
-        # scheduler here exactly as process_tile_job bounds a whole tile; None
-        # leaves dask's CPU-count pool, which is what every production shard
-        # has run on so far.
+        with trace.section("products"):
+            products = [
+                lst_product(native, paths["lst_p95"]),
+                qa_product(native, paths["qa_count"]),
+            ]
+        # The scheduler for this compute was bound by run_shard: 'threads'
+        # (dask's pool, bounded by LST_DASK_MAX_THREADS as before) on the Batch
+        # path, or the in-process Frisky cluster the futures wrapper asked for.
+        # trace.observe_computes() is the Callback the threaded scheduler needs
+        # for the same records Frisky's spans give for free.
         with (
-            _thread_cap(),
             timed_section("exporting", scenes_found=len(ctx.items)),
             profile_compute(PROFILE_COMPOSITE),
             exec_trace(
                 storage=ctx.storage,
                 stem=shards.unit_trace_prefix(run_id, "composite", tile, index),
             ),
+            trace.observe_computes(),
         ):
             write_intermediates_bounded(
                 [(p.da, path) for p, path in zip(products, paths.values(), strict=True)],
                 longitude_group=2 * settings.load_chunk_size,
+                observer=trace.group_observer(),
             )
         report_phase("uploading")
         for product, path in paths.items():
-            ctx.storage.upload(path, keys[product])
+            with trace.section("upload", product=product, key=keys[product]):
+                ctx.storage.upload(path, keys[product])
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
     log.info("shard_done", stage="composite", tile=tile, index=index, rows=(start, stop))
 
-    claim_export(ctx, index)
+    with trace.section("finalize"):
+        claim_export(ctx, index)
     return list(keys.values())
 
 
@@ -1441,6 +1462,30 @@ def run_shard(
     attempt = shards.resolve_shard_attempt(storage, root, stage, index)
     heartbeat_job = job or _heartbeat_job(storage, root, tile)
 
+    # The outer task, when there is one, names the scheduler the shard's graphs
+    # run on and the trace id its records carry. Without a binding this is a
+    # Batch task: settings.inner_scheduler, which defaults to 'threads', the
+    # scheduler every production shard ran on before issue #155. Nothing on the
+    # Batch path sets a binding, so nothing on it changes scheduler.
+    binding = current_binding()
+    mode = (
+        binding.inner_scheduler
+        if binding is not None and binding.inner_scheduler is not None
+        else settings.inner_scheduler
+    )
+    trace_id = (
+        binding.trace_id if binding is not None and binding.trace_id is not None else new_trace_id()
+    )
+    identity = ShardIdentity(
+        run_id=run_id,
+        stage=stage,
+        tile=tile,
+        index=index,
+        attempt=attempt,
+        trace_id=trace_id,
+        outer_key=binding.outer_key if binding is not None else None,
+    )
+
     with ExitStack() as stack:
         stack.enter_context(
             capture_task_log(
@@ -1451,7 +1496,7 @@ def run_shard(
                 key=shards.shard_log_key(root, stage, index, attempt),
             )
         )
-        stack.enter_context(
+        heartbeat = stack.enter_context(
             TileHeartbeat(
                 run_id=run_id,
                 job=heartbeat_job,
@@ -1462,6 +1507,31 @@ def run_shard(
                     root, stage, index, attempt, label
                 ),
             )
+        )
+        structlog.contextvars.bind_contextvars(
+            trace_id=hex(trace_id), shard=f"{stage}.{index:04d}", attempt=attempt
+        )
+        stack.callback(structlog.contextvars.unbind_contextvars, "trace_id", "shard", "attempt")
+        # The scheduler is bound for the whole shard, and the trace after it, so
+        # the trace's own flushes run under the scheduler they describe. A
+        # binding whose sink failed to build still runs; the heartbeat says so,
+        # and the run's observability gate reads it there.
+        scheduler = stack.enter_context(inner_scheduler(mode=mode, threads=settings.inner_threads))
+        trace = build_inner_trace(
+            identity=identity,
+            storage=storage,
+            stem=shards.unit_trace_prefix(run_id, stage, tile, index),
+            scheduler=scheduler,
+            sink=binding.sink if binding is not None else None,
+        )
+        if not isinstance(trace, NullInnerTrace):
+            stack.enter_context(trace)
+        heartbeat.attach(
+            "inner",
+            lambda: {
+                **trace.heartbeat_fields(),
+                "sink_error": binding.sink_error if binding is not None else None,
+            },
         )
         report_phase(f"shard_{stage}")
         return _dispatch(stage, run_id, tile, index, job=job, units=units, storage=storage)

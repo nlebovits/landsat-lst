@@ -817,3 +817,46 @@ def test_heartbeat_records_identity_observed_by_worker_process(storage, monkeypa
         assert identity["progress_module_sha256"]
     finally:
         worker_code_identity.cache_clear()
+
+
+class TestAttachedProviders:
+    """Blocks other instruments add to every beat (issue #155)."""
+
+    def test_a_provider_block_appears_under_its_name(self, storage):
+        with _beat(storage) as beat:
+            beat.attach("inner", lambda: {"scheduler": "frisky", "seq": 3})
+            beat.write()
+            payload = _published(storage)
+
+        assert payload["inner"] == {"scheduler": "frisky", "seq": 3}
+
+    def test_a_raising_provider_is_dropped_not_fatal(self, storage):
+        def broken():
+            raise RuntimeError("no trace")
+
+        with _beat(storage) as beat:
+            beat.attach("inner", broken)
+            beat.write()
+            payload = _published(storage)
+
+        assert payload["inner"] == {"error": "RuntimeError: no trace"}
+        assert payload["phase"] == "starting"
+
+    def test_timed_section_records_an_inner_section_when_a_trace_is_active(self, storage, tmp_path):
+        from landsat_lst.innertrace import InnerTrace, ShardIdentity, inner_scheduler
+        from landsat_lst.progress import timed_section
+        from landsat_lst.storage import LocalStorage
+
+        identity = ShardIdentity("run", "composite", TILE, 0, 1, 5, None)
+        with inner_scheduler(mode="threads", threads=1) as sched:
+            trace = InnerTrace(
+                identity=identity,
+                storage=LocalStorage(tmp_path),
+                stem="_shards/timings/run/composite.T.0000",
+                scheduler=sched,
+                flush_s=60,
+            )
+            with _beat(storage), trace, timed_section("land_mask"):
+                pass
+        names = [s["name"] for s in trace.snapshot()["sections"]]
+        assert names == ["phase:land_mask"]

@@ -23,6 +23,7 @@ ADRs are kept for history and link to their replacement.
 | [015](015-bounded-work-unit-offsets.md) | Bounded work units for the offset pass, replacing one graph over the window | Accepted |
 | [016](016-sharded-tile-execution.md) | One tile across many VMs, sequenced by S3 barriers | Accepted |
 | [018](018-fleet-consolidation.md) | One work array per stage per wave, carrying many tiles | Proposed |
+| [021](021-inner-graph-visibility.md) | A shard's inner graph runs on an in-process scheduler that reports, and the trace persists it | Accepted |
 
 ## Adding an ADR
 
