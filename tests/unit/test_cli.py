@@ -832,3 +832,141 @@ def _shard_summary():
         stages=[StageOutcome("resolve", 1, 0, 1, 3.0)],
         completed=True,
     )
+
+
+class TestShardFuturesRouting:
+    """`--executor futures` reaches the futures path with every limit it needs (#155)."""
+
+    def test_the_futures_path_requires_a_credit_cap(self, runner, s3_backend):
+        del s3_backend
+        result = runner.invoke(
+            main, ["shard", "process", "--tile", "N40W075", "--executor", "futures"]
+        )
+        assert result.exit_code != 0
+        assert "--credit-cap is required" in result.output
+
+    def test_bands_no_finalize_and_the_cap_reach_the_futures_path(self, runner, s3_backend):
+        del s3_backend
+        with patch("landsat_lst.cli._shard_process_futures") as futures:
+            result = runner.invoke(
+                main,
+                [
+                    "shard",
+                    "process",
+                    "--tile",
+                    "N40W075",
+                    "--executor",
+                    "futures",
+                    "--bands",
+                    "16",
+                    "--no-finalize",
+                    "--credit-cap",
+                    "15",
+                    "--n-workers",
+                    "2",
+                    "--inner-scheduler",
+                    "threads",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        kwargs = futures.call_args.kwargs
+        assert kwargs["bands"] == [16]
+        assert kwargs["finalize"] is False
+        assert kwargs["credit_cap"] == 15.0
+        assert kwargs["n_workers"] == 2
+        assert kwargs["inner_scheduler"] == "threads"
+        assert kwargs["resume"] is False
+        assert kwargs["tile"] == "N40W075"
+        assert kwargs["job"].tile.name == "N40W075"
+
+    def test_the_batch_path_rejects_futures_only_flags(self, runner, s3_backend):
+        del s3_backend
+        result = runner.invoke(main, ["shard", "process", "--tile", "N40W075", "--bands", "3"])
+        assert result.exit_code != 0
+        assert "--executor futures only" in result.output
+
+    def test_the_default_executor_is_batch(self, runner, s3_backend):
+        del s3_backend
+        summary = _shard_summary()
+        with (
+            patch("landsat_lst.shard_driver.drive_tile", return_value=summary) as drive,
+            patch("landsat_lst.cli._shard_process_futures") as futures,
+        ):
+            result = runner.invoke(main, ["shard", "process", "--tile", "N40W075"])
+        assert result.exit_code == 0, result.output
+        assert drive.called and not futures.called
+
+    def test_resume_routes_to_the_futures_path_with_resume_set(self, runner):
+        with patch("landsat_lst.cli._shard_process_futures") as futures:
+            result = runner.invoke(
+                main,
+                [
+                    "shard",
+                    "resume",
+                    "run-7",
+                    "N40W075",
+                    "--executor",
+                    "futures",
+                    "--credit-cap",
+                    "5",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        kwargs = futures.call_args.kwargs
+        assert kwargs["resume"] is True and kwargs["run_id"] == "run-7"
+        assert kwargs["job"] is None and kwargs["tile"] == "N40W075"
+
+    def test_stop_shuts_the_run_cluster_by_its_derived_name(self, runner):
+        from landsat_lst.dask_cluster import futures_cluster_name
+
+        with patch(
+            "landsat_lst.dask_cluster.stop_cluster",
+            return_value={"found": True, "confirmed": True},
+        ) as stop:
+            result = runner.invoke(main, ["shard", "stop", "run-7", "N40W075"])
+        assert result.exit_code == 0, result.output
+        assert stop.call_args.args == (futures_cluster_name("run-7", "N40W075"),)
+        assert '"confirmed": true' in result.output
+
+
+class TestFuturesVerdict:
+    def _summary(self, status, failures=()):
+        from landsat_lst.futures_driver import FuturesRunSummary
+
+        return FuturesRunSummary(
+            run_id="r",
+            tile="N40W075",
+            window="2021-2025",
+            completed=True,
+            status=status,
+            observability={"passed": status == "accepted", "failures": list(failures)},
+        )
+
+    def test_an_accepted_run_is_quiet(self):
+        from landsat_lst.cli import _futures_verdict
+
+        _futures_verdict(self._summary("accepted"), None)
+
+    def test_a_run_without_its_visibility_exits_non_zero_with_the_failures(self, monkeypatch):
+        import click
+
+        from landsat_lst.cli import _futures_verdict
+        from landsat_lst.config import settings
+
+        monkeypatch.setattr(settings, "futures_require_observability", True)
+        with pytest.raises(click.ClickException) as info:
+            _futures_verdict(self._summary("completed_unobserved", ["no span chunks"]), None)
+        assert "outputs are published" in str(info.value)
+        assert "no span chunks" in str(info.value)
+        monkeypatch.setattr(settings, "futures_require_observability", False)
+        _futures_verdict(self._summary("completed_unobserved", ["no span chunks"]), None)
+
+    def test_a_driver_failure_wins_over_the_gate(self):
+        import click
+
+        from landsat_lst.cli import _futures_verdict
+        from landsat_lst.futures_driver import ShardFuturesFailed
+
+        failure = ShardFuturesFailed("run_timeout", terminal=False, missing={"composite": [3]})
+        with pytest.raises(click.ClickException, match="run_timeout"):
+            _futures_verdict(self._summary("failed"), failure)

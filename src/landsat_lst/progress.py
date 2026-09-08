@@ -39,7 +39,7 @@ import tempfile
 import threading
 import time
 import traceback
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -51,7 +51,7 @@ import structlog
 from landsat_lst.config import settings
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
 
     from landsat_lst.job import JobResult
     from landsat_lst.models import ProcessingJob
@@ -254,6 +254,31 @@ class TileHeartbeat:
         # Memory as a time series. See the append in the beat builder for why
         # the per-beat reading alone was not enough.
         self._rss_series: list[tuple[float, float | None]] = []
+        # Extra blocks other instruments contribute to every beat, by name. The
+        # inner trace attaches its sections and counters here so one object
+        # says both that a shard is alive and what its scheduler is doing.
+        self._providers: dict[str, Callable[[], Mapping[str, Any]]] = {}
+
+    def attach(self, name: str, provider: Callable[[], Mapping[str, Any]]) -> None:
+        """Add a block named ``name`` to every beat, built by ``provider``.
+
+        Providers run outside the beat lock and each inside its own guard: a
+        provider that raises contributes ``{"error": ...}`` for that beat and
+        nothing else changes. Observability never fails a tile.
+        """
+        with self._lock:
+            self._providers[name] = provider
+
+    def _provided(self) -> dict[str, Any]:
+        with self._lock:
+            providers = dict(self._providers)
+        blocks: dict[str, Any] = {}
+        for name, provider in providers.items():
+            try:
+                blocks[name] = dict(provider())
+            except Exception as e:
+                blocks[name] = {"error": f"{type(e).__name__}: {e}"}
+        return blocks
 
     def profile_key_for(self, label: str) -> str:
         """Return the profile key for this heartbeat's artifact grammar."""
@@ -328,8 +353,10 @@ class TileHeartbeat:
                 # OOM post-mortem needs.
                 self._rss_series = self._rss_series[::2]
             rss_series = list(self._rss_series)
+        provided = self._provided()
         return {
             **self._identity(),
+            **provided,
             "phase": phase,
             "status": None,
             "elapsed_s": round(now - self._started, 1),
@@ -617,10 +644,17 @@ def timed_section(phase: str, **counts: int | None) -> Iterator[None]:
         yield
         return
 
+    from landsat_lst.innertrace import active_inner_trace  # noqa: PLC0415
+
     report_phase(phase, **counts)
     started = time.monotonic()
+    trace = active_inner_trace()
+    # The same interval lands in the inner trace as a section, so a phase that
+    # runs no graph is an interval beside the ones that do.
+    section = trace.section(f"phase:{phase}") if trace is not None else nullcontext()
     try:
-        yield
+        with section:
+            yield
     finally:
         log.info("phase_complete", phase=phase, seconds=round(time.monotonic() - started, 1))
 

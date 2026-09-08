@@ -212,6 +212,107 @@ about the read path. See [findings](docs/findings-composite-exec-trace.md) and #
   move it back into the shard's process. `LST_DASK_MAX_THREADS` reaches a composite
   shard through `job._thread_cap` at the seam; unset keeps dask's CPU-count pool.
 
+## The inner graph of a shard is observable, and the Batch path did not change
+
+Every shard's dask graphs run on a scheduler that reports, and
+`landsat_lst.innertrace` persists what it reports while the shard runs
+(ADR-021, issue #155). Read `docs/adr/021-inner-graph-visibility.md` before
+touching the export loop, the scheduler binding, or anything that reads
+`_shards/timings/`.
+
+```bash
+uv run python scripts/inner_visibility_demo.py          # Demonstration 1, local, no credentials
+landsat-lst shard explain <run-id> S30W065 --index 16   # every group: counts, construction, top prefixes
+landsat-lst shard explain <run-id> S30W065 --index 16 --group 3 --task nanquantile
+```
+
+Rules worth keeping:
+
+- **`settings.inner_scheduler` defaults to `threads`, and only the futures wrapper asks for
+  `frisky`**, through `innertrace.outer_binding`. A Batch shard binds `dask.config.set(
+  scheduler="threads")` exactly as before; `tests/unit/test_shard_tasks.py::TestInnerScheduler`
+  blocks the `frisky` import and runs a composite shard to prove it. Do not flip the default.
+- **Mode `frisky` is one subprocess worker on TCP, read through the inner scheduler's REST
+  endpoint, never through `frisky.get_spans()`.** `get_spans` drains the process buffer, and a
+  process that is itself a Frisky worker (the futures path) has a worker plugin draining the
+  same buffer; an in-process inner worker left the outer scheduler with nothing (2026-09-08).
+  The REST endpoint on the random loopback port is non-draining and incremental by `start_ns`.
+- **The graph file is the dict the scheduler received.** The callable bound as dask's
+  scheduler materializes the expression once, records keys and dependency edges from that dict,
+  and hands the same object to Frisky's translate and submit. There is no second optimization
+  pass. `capture_overhead_s` is counted inside the group's construction wall, never subtracted.
+- **Construction is measured from `dask.compute` entry**, which the bounded writer reports as
+  its `compute_start` observer event. `pre_scheduler_s` is dask's own optimize and materialize,
+  which Frisky never sees and which is where #154 lives; then `materialize`, `capture`,
+  `translate`, `submit`, first dispatch. `submitted_to_first_dispatch_s` can be negative because
+  Frisky dispatches while the client is still submitting; report it, never clamp it.
+- **"Not executed" is never "ready but not started" without scheduler evidence.** A key with no
+  exec span gets `blocked_on_deps`, `released`, `erred`, `ready_not_started` (a story with a
+  placement or a ready transition), `completed_without_exec_span` (the scheduler says it
+  finished: aliases, data nodes, late spans), or `unknown`. Under threads the same grammar comes
+  from dask's `start_state` dict, where `released` and `finished` mean completed.
+- **Settle before joining.** Exec spans of the tasks behind a gathered result can land a few
+  milliseconds after `gather` returns. `_settle_spans` polls the REST endpoint until every
+  graph key has a span or 3 s pass; read too early, forty executed keys of one group were filed
+  as not executed and credited to the next group.
+- **Pixel identity, never byte identity, between schedulers.** Two threaded runs already differ
+  in tile write order. Frisky and threads agree on every pixel (`test_inner_visibility.py`).
+- **A nested Frisky client kills the shared scheduler on 0.7.2**, and `frisky.dask.get` cannot
+  pin a graph to one worker. `tests/integration/test_frisky_nested_client.py` is a strict xfail
+  so a Frisky release that fixes it is noticed; until then the inner graph stays in-process.
+- **`threading.Lock` in `dask_array.store` was the whole `_HLGExprSequence` failure.** The
+  bounded writer uses `SerializableLock`; `test_the_store_graph_carries_a_lock_that_pickles`
+  pins it. Do not put a plain lock back.
+- **Under Mode `frisky` the exec-trace's `rio_read` hook and Callback recorder see nothing**:
+  reads and tasks run in the worker subprocess. The inner spans replace the task records;
+  per-read timing under Mode `frisky` is an open item.
+- **Trace ids are 63 random bits**, not `frisky.new_trace_id()`, which is a per-process counter
+  and gave two workers the same `0x1`.
+
+## One tile as futures — the scheduler owns the stages, three limits bound the spend
+
+`landsat-lst shard process --executor futures` (ADR-021 Parts B and C, issue #155). Read
+`docs/runbook-futures-observability.md` before a paid run.
+
+```bash
+landsat-lst shard process -t S30W065 --executor futures \
+  --n-workers 2 --bands 16 --no-finalize --credit-cap 15     # Demonstration 2 shape
+landsat-lst shard resume <run-id> S30W065 --executor futures --credit-cap 15
+landsat-lst shard stop <run-id> S30W065                      # a dead driver's cluster, by name
+```
+
+Rules worth keeping:
+
+- **`shard_executor` defaults to `batch`.** The Batch driver is untouched and stays the
+  default until the futures path passes full-tile acceptance. Batch rejects the futures-only
+  flags rather than ignoring them.
+- **`futures_driver` imports neither coiled, frisky, nor distributed**, and a test parses its
+  source to prove it. `dask_cluster.py` is the only importer. The driver runs against
+  `tests/unit/futures_fixtures.py` in milliseconds; put every state-machine case there first.
+- **`--credit-cap` is required, and it is the weakest of three limits.** The worker cap
+  (`futures_max_workers`, 16) binds every stage and composite bands queue in waves. The run
+  `Deadline` is created before the cluster exists and checked while waiting for workers, while
+  waiting for the plan, and at every completion; expiry releases every future and shuts the
+  cluster down. The credit cap is a preflight refusal plus a best-effort balance-poll stop.
+  The launch prints workers x vCPU x deadline as the authorized maximum; read it.
+- **The fused offsets stage still barriers in-process.** Its width must fit under the worker
+  cap (the driver refuses otherwise) and its shards must all run at once. An index pending
+  while its peers run past `futures_offsets_stall_s` is reported `stalled`; the scheduler
+  cannot see that barrier.
+- **A shard's durable completion is its artifact.** An error is classified only after the
+  bucket is checked; a shard that published and then died is a success, and its pending
+  dependents are resubmitted with the dead edge removed under a new key.
+- **`--bands` with `--no-finalize` bounds a run.** Only the named bands are submitted and no
+  export future exists, so a bounded test cannot start the whole tile.
+- **`outer_key`, never `key`, is how the task learns its own future key.** Every scheduler's
+  `submit` consumes `key` for itself; the demo and the driver both hit this once.
+- **Cleanup is confirmed through the control plane** into `state/cleanup.json`; an
+  unconfirmed stop is recorded as such, never assumed.
+- **`accepted` needs both pixels and visibility.** `completed_unobserved` exits non-zero with
+  the outputs left published. `futures_require_observability=False` is for diagnosis only.
+- **The observer never fails a tile.** Every call from the driver is guarded; an observer
+  that raises costs the run its `accepted` status, not its pixels.
+
 ## Price a configuration before you run it
 
 Never submit a run to learn a number that follows from array shape and chunking. Task count

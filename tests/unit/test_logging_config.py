@@ -132,9 +132,16 @@ def test_chain_matches_structlog_defaults_apart_from_the_renderer() -> None:
     A structlog release that adds or reorders a default processor would
     otherwise leave this package quietly logging less than it used to.
     """
+    from landsat_lst.innertrace import add_shard_context
+
     structlog.reset_defaults()
     default_chain = structlog.get_config()["processors"]
 
     chain = default_processor_chain()
 
-    assert [processor_identity(p) for p in chain] == [processor_identity(p) for p in default_chain]
+    # One addition of our own: the running shard's trace id on every line
+    # (ADR-021), right after the contextvars merge. Everything else is
+    # structlog's, in structlog's order.
+    ours = [p for p in chain if p is not add_shard_context]
+    assert chain.index(add_shard_context) == 1
+    assert [processor_identity(p) for p in ours] == [processor_identity(p) for p in default_chain]
