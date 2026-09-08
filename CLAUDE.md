@@ -185,6 +185,16 @@ about the read path. See [findings](docs/findings-composite-exec-trace.md) and #
   not the cost: 0.08 s of a 0.76 s read; the data transfer is.
 - **Per-item cost is 24 reads per item at that fixed rate**, plus 2 `open` tasks.
   48,358 reads over 2,010 items in 1,505 s.
+- **So the composite VM is bought for memory, not cores** (`shard_composite_vm_type`,
+  `r6i.2xlarge`). A shard sits at 2.6-2.8 busy cores, and Coiled bills per vCPU-hour,
+  so the 16 vCPU of the old `m6i.4xlarge` billed double and computed nothing. The
+  2026-09-07 discriminator ran band 16 both ways on one plan and one offsets record:
+  pixel-identical, +15.0% wall (1,657.5 s against 1,441.4 s), peak VM memory 17.52 GiB
+  against 21.35, and **3.69 credits per band against 6.43**. Keep 64 GiB: band 0 is
+  1,024 rows against band 16's 512 and peaked near 36.6 GiB at 16 threads, which is
+  the one case the discriminator did not measure directly. Shard packing was measured
+  in the same session and **not** adopted: it cut cost further and cost ~69% more wall
+  clock per shard, which moves barrier and deadline assumptions.
 - **RSS climbs while reads retire and no reduction runs**, then peaks in the final
   reduction wave with zero reads active (42.7 GB at 32 threads, 38.9 GB at 16).
 - **Exact reprojection is the v1 scientific contract (`settings.warp_exact_transform`, default on).**

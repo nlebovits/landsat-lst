@@ -864,15 +864,15 @@ class TestCreditCalibration:
         offsets, composite, export = quota.run_fleets(plan, units=2)
 
         assert offsets[1] == 8, "offsets runs on the default preference list"
-        assert composite[1] == 16, "composite runs on shard_composite_vm_type"
-        assert export[1] == 16
+        assert composite[1] == 8, "composite runs on shard_composite_vm_type"
+        assert export[1] == 8
 
     def test_a_pre_plan_estimate_still_prices_per_vcpu(self):
         """The preflight runs before a plan exists and must still be calibrated."""
         fleets = quota.run_fleets()
 
         assert fleets
-        assert all(cpus in (8, 16) for _, cpus, _ in fleets)
+        assert all(cpus == 8 for _, cpus, _ in fleets)
         assert quota.estimate_run_credits() > 0
 
     def test_the_estimate_stays_comparable_to_an_invoice(self, monkeypatch):

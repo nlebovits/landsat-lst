@@ -38,7 +38,11 @@ from landsat_lst.config import settings
 #:   measured 210-386 MB/s decoded at chunk 1024 -- but on a 4.4%-land tile
 #:   whose ocean nodata deflates ~8x on the wire. A full-land tile
 #:   compresses ~1.64x (U4), so 150 is the planning rate until the first
-#:   sharded land-tile run calibrates it.
+#:   sharded land-tile run calibrates it. The stage moved to r6i.2xlarge on
+#:   2026-09-07 and the rate is deliberately left alone: the discriminator
+#:   measured +15.0% wall on one band, which shard_budget_safety (2.0)
+#:   covers, and a planning rate should move on a probe rather than on one
+#:   shard.
 PROBE_AS_OF = "2026-08-21"
 R_OFFSETS_MB_S = 140.0  # r6i.2xlarge, chunk 1024, 8 io threads; ladder v3
 R_COMPOSITE_MB_S = 45.5  # m6i.4xlarge, native chunk 512; packing probe, real composite
@@ -50,14 +54,15 @@ COMPOSITE_BUDGET_MIN = 38.0
 #: On-demand hourly per phase VM type; spot spans 0.30-0.75 of it
 #: (pricing.json discipline: a range, never a scalar).
 VM_HOURLY_ON_DEMAND = 0.504  # r6i.2xlarge -- offsets stage
-VM_HOURLY_COMPOSITE = 0.768  # m6i.4xlarge -- composite stage
+VM_HOURLY_COMPOSITE = 0.504  # r6i.2xlarge -- composite stage
 SPOT_FACTOR_RANGE = (0.30, 0.75)
 
 #: vCPUs per configured VM type. Beside the hourly prices because they are the
 #: same kind of fact about the same machines, and because Coiled bills credits
-#: per *vCPU-hour* rather than per VM-hour -- so a fleet of 16-vCPU composite
-#: VMs costs twice what the same count of 8-vCPU offsets VMs does for the same
-#: wall clock. See :mod:`landsat_lst.quota`.
+#: per *vCPU-hour* rather than per VM-hour -- a 16-vCPU VM costs twice what an
+#: 8-vCPU one does for the same wall clock. That is what retired m6i.4xlarge
+#: from the composite stage on 2026-09-07: the shard uses 2.6-2.8 cores, so the
+#: extra eight billed and computed nothing. See :mod:`landsat_lst.quota`.
 VM_VCPUS: dict[str, int] = {
     "r6i.xlarge": 4,
     "r6i.2xlarge": 8,
