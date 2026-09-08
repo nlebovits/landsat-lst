@@ -340,6 +340,43 @@ fleet shape as its input.
 `settings.coiled_credit_safety` rises to 2.0 to carry the band's width. The estimate
 itself stays raw so it remains comparable to an invoice.
 
+### The composite VM, right-sized against that model
+
+**Amendment, 2026-09-07.** Billing per vCPU-hour has a corollary the first amendment
+did not draw: a stage that cannot use its cores is paying for them at full rate. Exec
+traces put a composite shard at 2.6-2.8 busy cores, and its read rate holds near
+10 MB/s whether the thread pool is 16 or 32, so the 16 vCPU of `m6i.4xlarge` bought
+wall clock it never delivered.
+
+A discriminator on the real composite path settled it. Both arms ran `run_composite_shard`
+over S30W065 band 16, rows 8704-9216, 1,031 solar-day steps, from the frozen Sep 4 shard
+plan, the canonical offsets record, and requester-pays `usgs-landsat` inputs.
+
+| | `m6i.4xlarge` | `r6i.2xlarge` |
+|---|---:|---:|
+| vCPU / RAM | 16 / 64 GiB | 8 / 64 GiB |
+| Shard wall | 1,441.4 s | 1,657.5 s |
+| Busy cores | 2.78 | 2.61 |
+| Peak process RSS | 20.17 GiB | 16.91 GiB |
+| Peak VM memory | 21.35 GiB | 17.52 GiB |
+| Credits / band | 6.43 | 3.69 |
+| USD / band, list | $0.308 | $0.233 |
+| Output | baseline | pixel-identical |
+
+`settings.shard_composite_vm_type` becomes `r6i.2xlarge`. The offsets stages keep the
+default preference list, which already led with the same type.
+
+The memory stays at 64 GiB deliberately. Band 0 is 1,024 rows where the traced band is
+512, and it peaked near 36.6 GiB on the 16-thread configuration; the discriminator did
+not measure it, so the right-sizing trades cores and keeps the headroom that case needs.
+`R_COMPOSITE_MB_S` is left at its probe value: `shard_budget_safety` of 2.0 absorbs the
+15% wall-clock penalty, and a planning rate should move on a probe rather than on one
+shard.
+
+Shard packing was measured in the same session and rejected here. It cut cost further
+and raised per-shard wall clock by about 69%, which moves the barrier and deadline
+assumptions this ADR rests on. That is a separate decision with its own evidence.
+
 ### Identity, before credits, before anything
 
 An AWS SSO session expires within hours, which is less than a tile takes. Three times the

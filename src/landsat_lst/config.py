@@ -520,12 +520,21 @@ class Settings(BaseSettings):
         "windowed copy (landsat_lst.shards.band_edges).",
     )
     shard_composite_vm_type: str = Field(
-        default="m6i.4xlarge",
+        default="r6i.2xlarge",
         description="VM type for composite shards. The composite is the "
-        "native-resolution read and wants cores against a 16-thread load; the "
-        "offset stages keep the default preference list. Named as one type "
-        "rather than a list so the chunk this stage runs at "
-        "(shard_composite_chunk) describes a known core count.",
+        "native-resolution read, and the read rate does not follow core count: "
+        "exec traces put a shard at 2.6-2.8 busy cores whatever the thread "
+        "pool is. So the 16 vCPU of m6i.4xlarge bought nothing and billed "
+        "twice, Coiled charging per vCPU-hour. The 2026-09-07 discriminator "
+        "(S30W065 band 16, 1,031 steps, real requester-pays inputs, cluster "
+        "2017817) ran both arms on the same plan and offsets record: "
+        "pixel-identical output, 1,657.5 s against 1,441.4 s wall (+15.0%), "
+        "peak VM memory 17.52 GiB against 21.35, and 3.69 credits per band "
+        "against 6.43 (-42.5%). Memory is why the type is r6i and not c6i: "
+        "both carry 64 GiB, and band 0 is 1,024 rows deep where the traced "
+        "band 16 is 512. Named as one type rather than a list so the chunk "
+        "this stage runs at (shard_composite_chunk) describes a known core "
+        "count. The offset stages keep the default preference list.",
     )
     shard_composite_per_column: bool = Field(
         default=False,
