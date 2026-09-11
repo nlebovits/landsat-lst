@@ -44,7 +44,7 @@ from landsat_lst.progress import (
     write_final_state,
 )
 from landsat_lst.runs import resolve_attempt
-from landsat_lst.storage import StorageBackend, get_storage
+from landsat_lst.storage import POOLED_PRODUCT, StorageBackend, get_storage
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -251,7 +251,12 @@ def _encode_native(composite: xr.Dataset) -> xr.Dataset:
     the COG writer expects the uint16 DN whose scale/offset it stamps onto the
     band. ``qa_count`` already leaves the pipeline as ``uint8`` per-month counts.
     """
-    return composite.assign(lst_p95=encode_lst_uint16(composite["lst_p95"]))
+    encoded = {"lst_p95": encode_lst_uint16(composite["lst_p95"])}
+    if POOLED_PRODUCT in composite:
+        # The pooled baseline rides the same encoder, so a viewer decodes both
+        # assets identically and any difference between them is pixels.
+        encoded[POOLED_PRODUCT] = encode_lst_uint16(composite[POOLED_PRODUCT])
+    return composite.assign(encoded)
 
 
 def _write_cogs(

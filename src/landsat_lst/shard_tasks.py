@@ -50,7 +50,7 @@ import pandas as pd
 import structlog
 import xarray as xr
 
-from landsat_lst import offsets, shards
+from landsat_lst import offsets, shards, wrs
 from landsat_lst.config import settings
 from landsat_lst.exectrace import exec_trace
 from landsat_lst.logging_config import configure_logging
@@ -84,7 +84,7 @@ from landsat_lst.staging import (
     staged_batch_reader,
     staging_block_reader,
 )
-from landsat_lst.storage import PRODUCTS, get_storage
+from landsat_lst.storage import POOLED_PRODUCT, band_products, get_storage
 from landsat_lst.tiling import geobox_for_bbox, parse_tile_name
 
 if TYPE_CHECKING:
@@ -1088,6 +1088,46 @@ def _tile_offsets(ctx: ShardContext) -> tuple[xr.DataArray, xr.DataArray]:
     return hit
 
 
+def _wrs_inputs(ctx: ShardContext, geobox, data, tile: str, index: int):
+    """Per-path labels and blend weights for one row band, or ``(None, None)``.
+
+    Swath polygons come from the WHOLE tile's geobox, never this band's. Every
+    band derives the same polygons from the same items, so two bands cannot
+    disagree and invent a seam at their own boundary -- the argument the land
+    and GED masks already make one level down about rasterising on the
+    geobox's own affine.
+    """
+    if not settings.wrs_feather:
+        return None, None
+
+    with timed_section("wrs_geometry"):
+        polygons = wrs.swath_polygons(ctx.items, geobox_for_bbox(ctx.job.tile.bbox))
+        weights = wrs.path_weights(geobox, polygons)
+        path_of_step = wrs.path_of_steps(ctx.items, ctx.job.tile.bbox, data.time)
+
+    mixed = int((path_of_step == wrs.MIXED_PATH).sum())
+    share = mixed / max(path_of_step.size, 1)
+    log.info(
+        "wrs_paths",
+        tile=tile,
+        index=index,
+        paths=list(weights.paths),
+        steps=int(path_of_step.size),
+        mixed_steps=mixed,
+        mixed_share=round(share, 5),
+    )
+    if share > settings.wrs_mixed_group_limit:
+        msg = (
+            f"{mixed} of {path_of_step.size} solar-day steps ({share:.2%}) carry "
+            f"more than one WRS path, above the {settings.wrs_mixed_group_limit:.2%} "
+            "limit. Such a step has no single path and is excluded from every "
+            "per-path reduction; at this share that is silent data loss, not a "
+            "rounding detail. Refusing rather than dropping it quietly."
+        )
+        raise ValueError(msg)
+    return path_of_step, weights
+
+
 def run_composite_shard(
     run_id: str,
     tile: str,
@@ -1126,7 +1166,7 @@ def run_composite_shard(
 
     ctx = load_context(run_id, tile, storage=storage)
     start, stop = ctx.plan.bands[index]
-    keys = {product: shards.band_key(ctx.root, product, index) for product in PRODUCTS}
+    keys = {product: shards.band_key(ctx.root, product, index) for product in band_products()}
 
     published = ctx.keys("composite/")
     if all(key in published for key in keys.values()):
@@ -1149,11 +1189,22 @@ def run_composite_shard(
     with timed_section("land_mask"):
         land = _build_land_mask(geobox, data.latitude, data.longitude)
 
-    composite = compute_annual_composite(data, land_mask=land, offsets=offsets)
+    path_of_step, weights = _wrs_inputs(ctx, geobox, data, tile, index)
+
+    composite = compute_annual_composite(
+        data,
+        land_mask=land,
+        offsets=offsets,
+        path_of_step=path_of_step,
+        path_weights_field=weights,
+        emit_pooled=POOLED_PRODUCT in band_products(),
+    )
     # The same two lines process_tile applies, for the same reason: ocean must
     # be nodata in the LST band and zero in the counts, and a band that skipped
     # them would differ from the whole tile exactly along its own rows.
-    composite["lst_p95"] = composite["lst_p95"].where(land)
+    lst_vars = [v for v in ("lst_p95", POOLED_PRODUCT) if v in composite]
+    for var in lst_vars:
+        composite[var] = composite[var].where(land)
     composite["qa_count"] = composite["qa_count"].where(land, 0).astype(np.uint8)
     # The GED gap mask a whole tile applies, on the band's slice of the tile's
     # grid -- gap_mask_for_geobox reads the geobox's own affine, so a band's
@@ -1165,17 +1216,22 @@ def run_composite_shard(
     if settings.ged_gap_mask:
         with timed_section("ged_gap_mask"):
             gap = _build_ged_gap_mask(geobox, data.latitude, data.longitude)
-        composite["lst_p95"] = apply_ged_gap_mask(composite["lst_p95"], gap)
+        for var in lst_vars:
+            composite[var] = apply_ged_gap_mask(composite[var], gap)
     composite.attrs.update(_tile_attrs(ctx.plan))
 
     native = _encode_native(composite)
     scratch = Path(tempfile.mkdtemp(prefix="lst_shard_band_"))
     try:
-        paths = {product: scratch / f"{product}.tif" for product in PRODUCTS}
+        paths = {product: scratch / f"{product}.tif" for product in band_products()}
         products = [
             lst_product(native, paths["lst_p95"]),
             qa_product(native, paths["qa_count"]),
         ]
+        if POOLED_PRODUCT in paths:
+            # Emitted from the same compute: one more reduction over a block
+            # already held, so it costs no extra source read.
+            products.append(lst_product(native, paths[POOLED_PRODUCT], var=POOLED_PRODUCT))
         # settings.dask_max_threads (LST_DASK_MAX_THREADS) bounds the threaded
         # scheduler here exactly as process_tile_job bounds a whole tile; None
         # leaves dask's CPU-count pool, which is what every production shard
@@ -1230,7 +1286,7 @@ def claim_export(ctx: ShardContext, index: int) -> bool:
     try:
         bands = {
             shards.band_key(ctx.root, product, i)
-            for product in PRODUCTS
+            for product in band_products()
             for i in range(len(ctx.plan.bands))
         }
         if bands - ctx.keys("composite/"):
@@ -1354,7 +1410,7 @@ def run_export_merge(
 
     scratch = Path(tempfile.mkdtemp(prefix="lst_shard_merge_"))
     try:
-        for product in PRODUCTS:
+        for product in band_products():
             report_phase("exporting")
             with timed_section("exporting", blocks_total=len(bands)):
                 slabs = []

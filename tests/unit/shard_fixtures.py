@@ -101,16 +101,29 @@ def make_items(plan) -> list[dict]:
     import pystac
 
     out = []
-    for scene_id, stamp in zip(plan.scene_ids, plan.scene_times, strict=True):
+    for index, (scene_id, stamp) in enumerate(zip(plan.scene_ids, plan.scene_times, strict=True)):
+        # Two alternating paths whose footprints overlap in the middle, so the
+        # fixture exercises the feathered branch rather than skipping it. Every
+        # real landsat-c2-l2 item carries these properties.
+        path = "014" if index % 2 == 0 else "015"
+        west = -75.0 if path == "014" else -73.0
         item = pystac.Item(
             id=scene_id,
             geometry={
                 "type": "Polygon",
-                "coordinates": [[[-75, 35], [-70, 35], [-70, 40], [-75, 40], [-75, 35]]],
+                "coordinates": [
+                    [
+                        [west, 35],
+                        [west + 5, 35],
+                        [west + 5, 40],
+                        [west, 40],
+                        [west, 35],
+                    ]
+                ],
             },
-            bbox=[-75.0, 35.0, -70.0, 40.0],
+            bbox=[west, 35.0, west + 5.0, 40.0],
             datetime=pd.Timestamp(stamp).to_pydatetime(),
-            properties={},
+            properties={"landsat:wrs_path": path, "landsat:wrs_row": "032"},
         )
         out.append(item.to_dict())
     return out
